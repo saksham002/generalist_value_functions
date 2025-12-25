@@ -13,14 +13,17 @@ import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 
+import openpi.models.mlp_config as mlp_config
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.d4rl_policy as d4rl_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
+import openpi.shared.minari_utils as minari_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -161,6 +164,10 @@ class ModelTransformFactory(GroupFactory):
                         )
                     ],
                 )
+            case _model.ModelType.MLP:
+                # MLP model: no tokenization or image processing.
+                # Dimensions are handled by the model config and dataset loader.
+                return _transforms.Group(inputs=[])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -453,6 +460,43 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             outputs=[droid_policy.DroidOutputs()],
         )
         model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class D4RLDataConfig(DataConfigFactory):
+    """
+    Data config for D4RL datasets (state-only, no images).
+
+    D4RL datasets contain state observations and actions only.
+    To convert D4RL data to LeRobot format, see examples/d4rl/convert_d4rl_to_lerobot.py
+    """
+
+    # Action dimension for the D4RL environment. If None, will be inferred from model_config.
+    action_dim: int | None = None
+    # Default task name (environment name) if not provided in data
+    default_task: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Infer action_dim from model_config if not explicitly set
+        action_dim = self.action_dim if self.action_dim is not None else model_config.action_dim
+
+        # No repack needed - D4RL LeRobot datasets already have 'state' and 'actions' keys
+        repack_transform = _transforms.Group(inputs=[])
+
+        data_transforms = _transforms.Group(
+            inputs=[d4rl_policy.D4RLInputs()],
+            outputs=[d4rl_policy.D4RLOutputs(action_dim=action_dim)],
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_task)(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -963,6 +1007,46 @@ _CONFIGS = [
         num_train_steps=10,
         overwrite=True,
         exp_name="debug_pi05",
+        wandb_enabled=False,
+    ),
+    #
+    # MLP D4RL configs.
+    #
+    TrainConfig(
+        name="antmaze_large_diverse_v1_mlp_bc",
+        # Auto-detect state_dim and action_dim from Minari dataset
+        model=minari_utils.create_mlp_config_from_minari(
+            "D4RL/antmaze/large-diverse-v1",
+            action_horizon=1,
+            hidden_dims=(256, 256),
+        ),
+        data=D4RLDataConfig(
+            repo_id="debug/minari_D4RL_antmaze_large_diverse_v1",
+            default_task="antmaze-large-diverse-v1",
+            # action_dim is auto-inferred from model_config
+        ),
+        num_train_steps=50_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3e-4,
+            decay_steps=50_000,
+            decay_lr=1e-5,
+        ),
+    ),
+    TrainConfig(
+        name="debug_mlp",
+        model=mlp_config.MLPConfig(
+            state_dim=29,
+            action_dim=8,
+            action_horizon=1,
+            hidden_dims=(64, 64),
+        ),
+        data=FakeDataConfig(),
+        batch_size=4,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_mlp",
         wandb_enabled=False,
     ),
     # RoboArena & PolaRiS configs.

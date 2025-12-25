@@ -33,6 +33,7 @@ class ModelType(enum.Enum):
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
+    MLP = "mlp"
 
 
 # The model always expects these images
@@ -112,15 +113,23 @@ class Observation(Generic[ArrayT]):
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+
+        # Handle images - may be missing for state-only models like MLP
+        images = data.get("image", {})
+        image_masks = data.get("image_mask", {})
+
         # If images are uint8, convert them to [-1, 1] float32.
-        for key in data["image"]:
-            if data["image"][key].dtype == np.uint8:
-                data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        for key, img in images.items():
+            if img.dtype == np.uint8:
+                # [0, 255] -> [-1, 1]
+                images[key] = img.astype(np.float32) / 127.5 - 1.0
+            elif hasattr(img, "dtype") and img.dtype == torch.uint8:
+                # [H, W, C] uint8 -> [C, H, W] float32 in [-1, 1]
+                images[key] = img.to(torch.float32).permute(0, 3, 1, 2) / 127.5 - 1.0
+
         return cls(
-            images=data["image"],
-            image_masks=data["image_mask"],
+            images=images,
+            image_masks=image_masks,
             state=data["state"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
