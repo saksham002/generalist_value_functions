@@ -31,6 +31,8 @@ import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+import openpi.value_functions.base as _value_functions_base
+import openpi.value_functions.value_mlp as value_mlp
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -99,6 +101,10 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+
+    # RL training mode options (for value function training)
+    rl_mode: bool = False  # If True, use value function training pipeline
+    discount: float = 0.99  # Discount factor (used if MC returns not in dataset)
 
 
 class GroupFactory(Protocol):
@@ -476,6 +482,11 @@ class D4RLDataConfig(DataConfigFactory):
 
     D4RL datasets contain state observations and actions only.
     To convert D4RL data to LeRobot format, see examples/d4rl/convert_d4rl_to_lerobot.py
+
+    When rl_mode=True, the data loader will:
+    1. Load transitions as SARSA tuples: (s, a, r, s', a')
+    2. Compute discounted Monte-Carlo returns for each trajectory
+    3. Include 'mc_return' in the data dict for value function training
     """
 
     # Action dimension for the D4RL environment. If None, will be inferred from model_config.
@@ -483,26 +494,42 @@ class D4RLDataConfig(DataConfigFactory):
     # Default task name (environment name) if not provided in data
     default_task: str | None = None
 
+    # RL training mode options
+    rl_mode: bool = False  # If True, load SARSA tuples + MC returns
+    discount: float = 0.99  # Discount factor for MC return computation
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        # Infer action_dim from model_config if not explicitly set
-        action_dim = self.action_dim if self.action_dim is not None else model_config.action_dim
-
         # No repack needed - D4RL LeRobot datasets already have 'state' and 'actions' keys
         repack_transform = _transforms.Group(inputs=[])
 
-        data_transforms = _transforms.Group(
-            inputs=[d4rl_policy.D4RLInputs()],
-            outputs=[d4rl_policy.D4RLOutputs(action_dim=action_dim)],
-        )
+        if self.rl_mode:
+            # RL mode: use value function transforms
+            # All RL fields are stored in the dataset (computed at conversion time)
+            from openpi.value_functions import value_transforms
 
-        model_transforms = ModelTransformFactory(default_prompt=self.default_task)(model_config)
+            data_transforms = _transforms.Group(
+                inputs=[value_transforms.ValueFunctionInputs()],
+                outputs=[],
+            )
+            # Value function configs don't have model_type, skip model transforms
+            model_transforms = _transforms.Group(inputs=[], outputs=[])
+        else:
+            # Standard policy training mode - action_dim required
+            action_dim = self.action_dim if self.action_dim is not None else model_config.action_dim
+            data_transforms = _transforms.Group(
+                inputs=[d4rl_policy.D4RLInputs()],
+                outputs=[d4rl_policy.D4RLOutputs(action_dim=action_dim)],
+            )
+            model_transforms = ModelTransformFactory(default_prompt=self.default_task)(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            rl_mode=self.rl_mode,
+            discount=self.discount,
         )
 
 
@@ -515,10 +542,11 @@ class TrainConfig:
     # Experiment name. Will be used to name the metadata and checkpoint directories.
     exp_name: str = tyro.MISSING
 
-    # Defines the model config. Some attributes (action_dim, action_horizon, and max_token_len) are shared by all models
-    # -- see BaseModelConfig. Specific model implementations (e.g., Pi0Config) inherit from BaseModelConfig and may
-    # define additional attributes.
-    model: _model.BaseModelConfig = dataclasses.field(default_factory=pi0_config.Pi0Config)
+    # Defines the model config. Accepts either a policy model config (BaseModelConfig)
+    # or a value function config (BaseValueFunctionConfig).
+    model: _model.BaseModelConfig | _value_functions_base.BaseValueFunctionConfig = dataclasses.field(
+        default_factory=pi0_config.Pi0Config
+    )
 
     # A weight loader can optionally load (possibly partial) weights from disk after the model is initialized.
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
@@ -558,6 +586,10 @@ class TrainConfig:
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
+    # How often (in steps) to generate validation plots.
+    plot_interval: int = 1000
+    # Number of validation trajectories to use for plotting.
+    num_val_trajectories: int = 3
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
@@ -1048,6 +1080,61 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_mlp",
         wandb_enabled=False,
+    ),
+    #
+    # Value Function Training configs (Q-function with MC returns).
+    #
+    TrainConfig(
+        name="antmaze_large_diverse_v1_q_regression",
+        model=value_mlp.RegressionValueMLPConfig(
+            state_dim=27,
+            action_conditioned=True,
+            action_dim=8,
+            action_horizon=1,
+            hidden_dims=(256, 256),
+        ),
+        data=D4RLDataConfig(
+            repo_id="debug/minari_D4RL_antmaze_large_diverse_v1",
+            default_task="antmaze-large-diverse-v1",
+            rl_mode=True,  # Enable SARSA tuples + MC returns
+            discount=0.99,
+        ),
+        num_train_steps=100_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3e-4,
+            decay_steps=100_000,
+            decay_lr=1e-5,
+        ),
+    ),
+    TrainConfig(
+        name="antmaze_large_diverse_v1_q_hl_gauss",
+        model=value_mlp.CategoricalValueMLPConfig(
+            v_min=0.0,  # Antmaze rewards are 0 or 1
+            v_max=1.0,  # MC returns in [0, 1] for antmaze
+            state_dim=27,
+            action_conditioned=True,
+            action_dim=8,
+            action_horizon=1,
+            hidden_dims=(256, 256),
+            num_bins=51,
+            sigma=0.75,
+        ),
+        data=D4RLDataConfig(
+            repo_id="debug/minari_D4RL_antmaze_large_diverse_v1",
+            default_task="antmaze-large-diverse-v1",
+            rl_mode=True,  # Enable SARSA tuples + MC returns
+            discount=0.99,
+        ),
+        num_train_steps=100_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3e-4,
+            decay_steps=100_000,
+            decay_lr=1e-5,
+        ),
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

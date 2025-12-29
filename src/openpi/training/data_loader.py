@@ -169,8 +169,19 @@ def create_rlds_dataset(
     )
 
 
-def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
-    """Transform the dataset by applying the data transforms."""
+def transform_dataset(
+    dataset: Dataset,
+    data_config: _config.DataConfig,
+    *,
+    skip_norm_stats: bool = False,
+) -> Dataset:
+    """Transform the dataset by applying the data transforms.
+
+    Args:
+        dataset: The dataset to transform.
+        data_config: The data configuration.
+        skip_norm_stats: Whether to skip data normalization.
+    """
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
@@ -180,15 +191,13 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
-    return TransformedDataset(
-        dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.model_transforms.inputs,
-        ],
-    )
+    # Build the transform pipeline
+    input_transforms = list(data_config.repack_transforms.inputs)
+    input_transforms.extend(data_config.data_transforms.inputs)
+    input_transforms.append(_transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm))
+    input_transforms.extend(data_config.model_transforms.inputs)
+
+    return TransformedDataset(dataset, input_transforms)
 
 
 def transform_iterable_dataset(
@@ -537,4 +546,9 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            if self._data_config.rl_mode:
+                # RL mode: yield raw batch dict for value function training
+                yield batch
+            else:
+                # Policy mode: yield (Observation, Actions) tuple
+                yield _model.Observation.from_dict(batch), batch["actions"]

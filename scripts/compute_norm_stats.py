@@ -32,11 +32,21 @@ def create_torch_dataloader(
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+
+    # Filter out RL-specific transforms - we only need raw state/actions for norm stats
+    input_transforms = []
+    for t in data_config.data_transforms.inputs:
+        # Skip transforms that require RL field computation
+        transform_name = type(t).__name__
+        if transform_name == "ValueFunctionInputs":
+            continue
+        input_transforms.append(t)
+
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
             *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
+            *input_transforms,
             # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
             RemoveStrings(),
         ],
