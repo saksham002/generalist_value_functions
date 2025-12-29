@@ -84,20 +84,12 @@ def init_wandb(
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
-def _load_weights_and_validate(
-    loader: _weight_loaders.WeightLoader, params_shape: at.Params
-) -> at.Params:
+def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
-    at.check_pytree_equality(
-        expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True
-    )
+    at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
     return traverse_util.unflatten_dict(
-        {
-            k: v
-            for k, v in traverse_util.flatten_dict(loaded_params).items()
-            if not isinstance(v, jax.ShapeDtypeStruct)
-        }
+        {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
     )
 
 
@@ -110,17 +102,13 @@ def init_train_state(
     resume: bool,
 ) -> tuple[training_utils.TrainState, Any]:
     """Initialize training state for a value function model."""
-    tx = _optimizer.create_optimizer(
-        config.optimizer, config.lr_schedule, weight_decay_mask=None
-    )
+    tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
 
     if not isinstance(config.model, _value_fn.BaseValueFunctionConfig):
         raise TypeError(f"Expected BaseValueFunctionConfig, got {type(config.model)}")
     model_config: _value_fn.BaseValueFunctionConfig = config.model
 
-    def init(
-        rng: at.KeyArrayLike, partial_params: at.Params | None = None
-    ) -> training_utils.TrainState:
+    def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)
         model = model_config.create(model_rng)
 
@@ -152,9 +140,7 @@ def init_train_state(
     if resume:
         return train_state_shape, state_sharding
 
-    partial_params = _load_weights_and_validate(
-        config.weight_loader, train_state_shape.params.to_pure_dict()
-    )
+    partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     train_state = jax.jit(
@@ -185,9 +171,7 @@ def train_step(
         return jnp.mean(per_sample_loss), value_info
 
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    (loss, value_info), grads = nnx.value_and_grad(
-        loss_fn, argnums=diff_state, has_aux=True
-    )(model)
+    (loss, value_info), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(model)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -196,9 +180,7 @@ def train_step(
     nnx.update(model, new_params)
     new_params = nnx.state(model)
 
-    new_state = dataclasses.replace(
-        state, step=state.step + 1, params=new_params, opt_state=new_opt_state
-    )
+    new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
     if state.ema_decay is not None:
         new_state = dataclasses.replace(
             new_state,
@@ -213,9 +195,7 @@ def train_step(
         model,
         nnx.All(
             nnx.Param,
-            nnx.Not(
-                nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")
-            ),
+            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
             lambda _, x: x.value.ndim > 1,
         ),
     )
@@ -324,11 +304,7 @@ def generate_validation_plots(
                 continue
             if hasattr(mc_return, "numpy"):
                 mc_return = mc_return.numpy()
-            mc_return = (
-                np.asarray(mc_return).item()
-                if np.asarray(mc_return).size == 1
-                else np.asarray(mc_return)
-            )
+            mc_return = np.asarray(mc_return).item() if np.asarray(mc_return).size == 1 else np.asarray(mc_return)
             mc_returns.append(float(mc_return))
 
             # Build observation for prediction
@@ -402,17 +378,13 @@ def main(config: _config.TrainConfig):
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update(
-        "jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser())
-    )
+    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
     rng = jax.random.key(config.seed)
     _, init_rng = jax.random.split(rng)
 
     mesh = sharding.make_mesh(config.fsdp_devices)
-    data_sharding = jax.sharding.NamedSharding(
-        mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS)
-    )
+    data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
@@ -437,9 +409,7 @@ def main(config: _config.TrainConfig):
     else:
         batch = raw_batch
 
-    logging.info(
-        f"Initialized data loader. Batch keys: {list(batch.keys()) if isinstance(batch, dict) else 'tuple'}"
-    )
+    logging.info(f"Initialized data loader. Batch keys: {list(batch.keys()) if isinstance(batch, dict) else 'tuple'}")
 
     # Select fixed validation trajectories for plotting
     from lerobot.common.datasets import lerobot_dataset
@@ -453,18 +423,12 @@ def main(config: _config.TrainConfig):
     logging.info(f"Selected validation episodes: {val_episode_indices}")
     action_conditioned = getattr(config.model, "action_conditioned", False)
 
-    train_state, train_state_sharding = init_train_state(
-        config, init_rng, mesh, resume=resuming
-    )
+    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
-    logging.info(
-        f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}"
-    )
+    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(
-            checkpoint_manager, train_state, data_loader
-        )
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -483,10 +447,21 @@ def main(config: _config.TrainConfig):
 
     infos = []
     timer = Timer()
+
+    # Log initial timing info
+    logging.info(f"Starting training with batch_size={config.batch_size}, num_workers={config.num_workers}")
+
     for step in pbar:
-        with timer.context("train_step"):
+        # Time train step, including device sync
+        with timer.context("train_step_compute"):
             with sharding.set_mesh(mesh):
                 train_state, info = ptrain_step(train_state, batch)
+
+        # Time blocking on train step completion
+        with timer.context("train_step_sync"):
+            jax.block_until_ready(train_state)
+            jax.block_until_ready(info)
+
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
@@ -497,26 +472,30 @@ def main(config: _config.TrainConfig):
             timing_info = {f"average_times/{k}": v for k, v in avg_times.items()}
             timing_info.update({f"total_times/{k}": v for k, v in total_times.items()})
             reduced_info.update(timing_info)
+
+            # Also log timing summary to console for debugging
+            timing_summary = {k: f"{v:.4f}s" for k, v in avg_times.items()}
+            logging.info(f"Step {step} timing: {timing_summary}")
+
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
 
-        with timer.context("data_loading"):
+        # Break down data loading into components
+        with timer.context("data_fetch"):
             raw_batch = next(data_iter)
+
+        with timer.context("data_postprocess"):
             if isinstance(raw_batch, tuple):
                 obs, _ = raw_batch
                 batch = {"state": obs.state}
             else:
                 batch = raw_batch
 
-        if (
-            step % config.save_interval == 0 and step > start_step
-        ) or step == config.num_train_steps - 1:
+        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             with timer.context("checkpoint_save"):
-                _checkpoints.save_state(
-                    checkpoint_manager, train_state, data_loader, step
-                )
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
         # Generate validation plots
         if step % config.plot_interval == 0 and step > 0:

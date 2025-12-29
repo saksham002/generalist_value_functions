@@ -680,6 +680,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
             ),
             num_train_steps=100_000,
             batch_size=256,
+            num_workers=16,
             lr_schedule=_optimizer.CosineDecaySchedule(
                 warmup_steps=1_000,
                 peak_lr=3e-4,
@@ -709,6 +710,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
             ),
             num_train_steps=100_000,
             batch_size=256,
+            num_workers=16,
             lr_schedule=_optimizer.CosineDecaySchedule(
                 warmup_steps=1_000,
                 peak_lr=3e-4,
