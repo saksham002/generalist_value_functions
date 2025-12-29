@@ -587,7 +587,7 @@ class TrainConfig:
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # How often (in steps) to generate validation plots.
-    plot_interval: int = 1000
+    plot_interval: int = 5000
     # Number of validation trajectories to use for plotting.
     num_val_trajectories: int = 3
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.

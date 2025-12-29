@@ -51,11 +51,15 @@ class Timer:
     def get_total_times(self, reset=True):
         ret = {key: self.times[key] for key in self.times}
         if reset:
-            self.reset()
+            # Only reset counts and times, not active start_times
+            self.counts = defaultdict(int)
+            self.times = defaultdict(float)
         return ret
 
     def get_average_times(self, reset=True):
         ret = {key: self.times[key] / self.counts[key] for key in self.counts}
         if reset:
-            self.reset()
+            # Only reset counts and times, not active start_times
+            self.counts = defaultdict(int)
+            self.times = defaultdict(float)
         return ret
