@@ -28,6 +28,7 @@ import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 import openpi.value_functions.base as _value_fn
+from openpi.training.time_utils import Timer
 
 
 def init_logging():
@@ -416,40 +417,52 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
+    timer = Timer()
     for step in pbar:
-        with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_state, batch)
+        with timer.context("train_step"):
+            with sharding.set_mesh(mesh):
+                train_state, info = ptrain_step(train_state, batch)
         infos.append(info)
         if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            with timer.context("logging"):
+                stacked_infos = common_utils.stack_forest(infos)
+                reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+                # Add timing info to logged metrics (average and total)
+                total_times = timer.get_total_times(reset=False)
+                avg_times = timer.get_average_times(reset=True)
+                timing_info = {f"average_times/{k}": v for k, v in avg_times.items()}
+                timing_info.update({f"total_times/{k}": v for k, v in total_times.items()})
+                reduced_info.update(timing_info)
+                info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                pbar.write(f"Step {step}: {info_str}")
+                wandb.log(reduced_info, step=step)
             infos = []
 
-        raw_batch = next(data_iter)
-        if isinstance(raw_batch, tuple):
-            obs, _ = raw_batch
-            batch = {"state": obs.state}
-        else:
-            batch = raw_batch
+        with timer.context("data_loading"):
+            raw_batch = next(data_iter)
+            if isinstance(raw_batch, tuple):
+                obs, _ = raw_batch
+                batch = {"state": obs.state}
+            else:
+                batch = raw_batch
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            with timer.context("checkpoint_save"):
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
         # Generate validation plots
         if step % config.plot_interval == 0 and step > 0:
-            model = nnx.merge(train_state.model_def, train_state.params)
-            plot_images = generate_validation_plots(
-                model=model,
-                dataset=val_dataset,
-                val_episode_indices=val_episode_indices,
-                step=step,
-                action_conditioned=action_conditioned,
-            )
-            if plot_images:
-                wandb.log(plot_images, step=step)
+            with timer.context("validation_plot"):
+                model = nnx.merge(train_state.model_def, train_state.params)
+                plot_images = generate_validation_plots(
+                    model=model,
+                    dataset=val_dataset,
+                    val_episode_indices=val_episode_indices,
+                    step=step,
+                    action_conditioned=action_conditioned,
+                )
+                if plot_images:
+                    wandb.log(plot_images, step=step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

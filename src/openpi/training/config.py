@@ -632,6 +632,93 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
+    """Create antmaze-large-diverse-v1 configs."""
+    # Get dimensions from Minari dataset environment spec
+    state_dim, action_dim, action_low, action_high = minari_utils.get_minari_dims("D4RL/antmaze/large-diverse-v1")
+
+    return [
+        # MLP BC config
+        TrainConfig(
+            name="antmaze_large_diverse_v1_mlp_bc",
+            model=mlp_config.MLPConfig(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                action_horizon=1,
+                hidden_dims=(256, 256),
+                action_low=tuple(action_low.tolist()),
+                action_high=tuple(action_high.tolist()),
+            ),
+            data=D4RLDataConfig(
+                repo_id="debug/minari_D4RL_antmaze_large_diverse_v1",
+                default_task="antmaze-large-diverse-v1",
+            ),
+            num_train_steps=50_000,
+            batch_size=256,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=3e-4,
+                decay_steps=50_000,
+                decay_lr=1e-5,
+            ),
+        ),
+        # Q-function with MSE regression
+        TrainConfig(
+            name="antmaze_large_diverse_v1_q_regression",
+            model=value_mlp.RegressionValueMLPConfig(
+                state_dim=state_dim,
+                action_conditioned=True,
+                action_dim=action_dim,
+                action_horizon=1,
+                hidden_dims=(256, 256),
+            ),
+            data=D4RLDataConfig(
+                repo_id="debug/minari_D4RL_antmaze_large_diverse_v1",
+                default_task="antmaze-large-diverse-v1",
+                rl_mode=True,
+                discount=0.99,
+            ),
+            num_train_steps=100_000,
+            batch_size=256,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=3e-4,
+                decay_steps=100_000,
+                decay_lr=1e-5,
+            ),
+        ),
+        # Q-function with HL-Gauss categorical loss
+        TrainConfig(
+            name="antmaze_large_diverse_v1_q_hl_gauss",
+            model=value_mlp.CategoricalValueMLPConfig(
+                v_min=0.0,  # Antmaze rewards are 0 or 1
+                v_max=1.0,  # MC returns in [0, 1] for antmaze
+                state_dim=state_dim,
+                action_conditioned=True,
+                action_dim=action_dim,
+                action_horizon=1,
+                hidden_dims=(256, 256),
+                num_bins=51,
+                sigma=0.75,
+            ),
+            data=D4RLDataConfig(
+                repo_id="debug/minari_D4RL_antmaze_large_diverse_v1",
+                default_task="antmaze-large-diverse-v1",
+                rl_mode=True,
+                discount=0.99,
+            ),
+            num_train_steps=100_000,
+            batch_size=256,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=3e-4,
+                decay_steps=100_000,
+                decay_lr=1e-5,
+            ),
+        ),
+    ]
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -1043,29 +1130,9 @@ _CONFIGS = [
     ),
     #
     # MLP D4RL configs.
+    # Auto-detect state_dim and action_dim from Minari dataset.
     #
-    TrainConfig(
-        name="antmaze_large_diverse_v1_mlp_bc",
-        # Auto-detect state_dim and action_dim from Minari dataset
-        model=minari_utils.create_mlp_config_from_minari(
-            "D4RL/antmaze/large-diverse-v1",
-            action_horizon=1,
-            hidden_dims=(256, 256),
-        ),
-        data=D4RLDataConfig(
-            repo_id="debug/minari_D4RL_antmaze_large_diverse_v1",
-            default_task="antmaze-large-diverse-v1",
-            # action_dim is auto-inferred from model_config
-        ),
-        num_train_steps=50_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=3e-4,
-            decay_steps=50_000,
-            decay_lr=1e-5,
-        ),
-    ),
+    *_make_antmaze_large_diverse_configs(),
     TrainConfig(
         name="debug_mlp",
         model=mlp_config.MLPConfig(
@@ -1080,61 +1147,6 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_mlp",
         wandb_enabled=False,
-    ),
-    #
-    # Value Function Training configs (Q-function with MC returns).
-    #
-    TrainConfig(
-        name="antmaze_large_diverse_v1_q_regression",
-        model=value_mlp.RegressionValueMLPConfig(
-            state_dim=27,
-            action_conditioned=True,
-            action_dim=8,
-            action_horizon=1,
-            hidden_dims=(256, 256),
-        ),
-        data=D4RLDataConfig(
-            repo_id="debug/minari_D4RL_antmaze_large_diverse_v1",
-            default_task="antmaze-large-diverse-v1",
-            rl_mode=True,  # Enable SARSA tuples + MC returns
-            discount=0.99,
-        ),
-        num_train_steps=100_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=3e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),
-    ),
-    TrainConfig(
-        name="antmaze_large_diverse_v1_q_hl_gauss",
-        model=value_mlp.CategoricalValueMLPConfig(
-            v_min=0.0,  # Antmaze rewards are 0 or 1
-            v_max=1.0,  # MC returns in [0, 1] for antmaze
-            state_dim=27,
-            action_conditioned=True,
-            action_dim=8,
-            action_horizon=1,
-            hidden_dims=(256, 256),
-            num_bins=51,
-            sigma=0.75,
-        ),
-        data=D4RLDataConfig(
-            repo_id="debug/minari_D4RL_antmaze_large_diverse_v1",
-            default_task="antmaze-large-diverse-v1",
-            rl_mode=True,  # Enable SARSA tuples + MC returns
-            discount=0.99,
-        ),
-        num_train_steps=100_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=3e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
