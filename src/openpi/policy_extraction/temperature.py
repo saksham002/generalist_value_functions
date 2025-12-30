@@ -1,6 +1,6 @@
 """Learnable temperature for SAC-style entropy regularization.
 
-The temperature (α) controls the trade-off between exploration (entropy)
+The temperature (alpha) controls the trade-off between exploration (entropy)
 and exploitation (reward maximization) in SAC. It can be fixed or learned
 automatically to maintain a target entropy level.
 """
@@ -61,14 +61,14 @@ class Temperature(nnx.Module):
 
     The temperature loss encourages the policy to maintain a target
     entropy level:
-    - If actual entropy < target: loss is positive, gradient increases α
-    - If actual entropy > target: loss is negative, gradient decreases α
+    - If actual entropy < target: loss is positive, gradient increases alpha
+    - If actual entropy > target: loss is negative, gradient decreases alpha
     """
 
     target_entropy: float
     learnable: bool
 
-    def __init__(self, log_temperature: float, target_entropy: float, learnable: bool):
+    def __init__(self, log_temperature: float, target_entropy: float, *, learnable: bool):
         """Initialize Temperature module.
 
         Args:
@@ -93,20 +93,20 @@ class Temperature(nnx.Module):
 
     def compute_loss(
         self,
-        log_prob: at.Float[at.Array, "batch"],
+        log_prob: at.Float[at.Array, "*b"],
     ) -> tuple[at.Float[at.Array, ""], dict[str, at.Array]]:
         """Compute temperature loss for automatic tuning.
 
         The loss is:
-            L(α) = -α * mean(log π(a|s) + H_target)
-                 = -α * mean(log π(a|s) - (-H_target))
-                 = α * mean(H_target - (-log π(a|s)))
-                 = α * mean(H_target - entropy)
+            L(alpha) = -alpha * mean(log pi(a|s) + H_target)
+                     = -alpha * mean(log pi(a|s) - (-H_target))
+                     = alpha * mean(H_target - (-log pi(a|s)))
+                     = alpha * mean(H_target - entropy)
 
-        Gradient w.r.t. log(α):
-            ∂L/∂log(α) = α * mean(H_target - entropy)
+        Gradient w.r.t. log(alpha):
+            dL/dlog(alpha) = alpha * mean(H_target - entropy)
 
-        This pushes α:
+        This pushes alpha:
         - Up when entropy < target (need more exploration)
         - Down when entropy > target (need less exploration)
 
@@ -125,7 +125,7 @@ class Temperature(nnx.Module):
         # Current entropy estimate (negative log prob)
         current_entropy = jnp.mean(-log_prob)
 
-        # Loss: -α * mean(log π + H_target) = α * mean(H_target - entropy)
+        # Loss: -alpha * mean(log pi + H_target) = alpha * mean(H_target - entropy)
         loss = -self.value * jnp.mean(log_prob + self.target_entropy)
 
         info = {

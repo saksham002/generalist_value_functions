@@ -3,9 +3,9 @@
 import numpy as np
 
 from openpi.value_functions.value_transforms import CategoricalValueOutputs
-from openpi.value_functions.value_transforms import make_value_function_example
 from openpi.value_functions.value_transforms import RegressionValueOutputs
 from openpi.value_functions.value_transforms import ValueFunctionInputs
+from openpi.value_functions.value_transforms import make_value_function_example
 
 
 class TestValueFunctionInputs:

@@ -1,7 +1,7 @@
 """Timer utility."""
 
-import time
 from collections import defaultdict
+import time
 
 
 class _TimerContextManager:
@@ -48,7 +48,7 @@ class Timer:
         """
         return _TimerContextManager(self, key)
 
-    def get_total_times(self, reset=True):
+    def get_total_times(self, *, reset=True):
         ret = {key: self.times[key] for key in self.times}
         if reset:
             # Only reset counts and times, not active start_times
@@ -56,7 +56,7 @@ class Timer:
             self.times = defaultdict(float)
         return ret
 
-    def get_average_times(self, reset=True):
+    def get_average_times(self, *, reset=True):
         ret = {key: self.times[key] / self.counts[key] for key in self.counts}
         if reset:
             # Only reset counts and times, not active start_times

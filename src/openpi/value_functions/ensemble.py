@@ -9,7 +9,6 @@ multiple Q-functions for stability.
 import dataclasses
 
 import flax.nnx as nnx
-import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
@@ -90,6 +89,7 @@ class EnsembleValueFunction(BaseValueFunction):
         self,
         vectorized_member: BaseValueFunction,
         num_ensemble: int,
+        *,
         action_conditioned: bool,
     ):
         super().__init__()
@@ -127,7 +127,7 @@ class EnsembleValueFunction(BaseValueFunction):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
-    ) -> at.Float[at.Array, "batch"]:
+    ) -> at.Float[at.Array, "*b"]:
         """Compute min value across ensemble (pessimistic estimate).
 
         This is used in SAC/TD3 to prevent overestimation bias.
@@ -146,7 +146,7 @@ class EnsembleValueFunction(BaseValueFunction):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
-    ) -> at.Float[at.Array, "batch"]:
+    ) -> at.Float[at.Array, "*b"]:
         """Compute mean value across ensemble.
 
         Args:
@@ -163,7 +163,7 @@ class EnsembleValueFunction(BaseValueFunction):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
-    ) -> at.Float[at.Array, "batch"]:
+    ) -> at.Float[at.Array, "*b"]:
         """Compute std of values across ensemble (uncertainty estimate).
 
         Args:
@@ -183,7 +183,7 @@ class EnsembleValueFunction(BaseValueFunction):
         *,
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
-    ) -> tuple[at.Float[at.Array, "batch"], dict[str, at.Array]]:
+    ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
         """Compute mean loss across ensemble members.
 
         Each member computes loss against the same target (from transition).
@@ -200,7 +200,7 @@ class EnsembleValueFunction(BaseValueFunction):
         @nnx.vmap(in_axes=(0, None), out_axes=(0, 0))
         def compute_single_loss(
             member: BaseValueFunction, trans: Transition
-        ) -> tuple[at.Float[at.Array, "batch"], dict[str, at.Array]]:
+        ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
             return member.compute_loss(trans, train=train, rng=rng)
 
         # Returns (num_ensemble, batch) losses and dict of (num_ensemble, ...) infos

@@ -34,10 +34,10 @@ from openpi.policy_extraction.temperature import Temperature
 from openpi.policy_extraction.temperature import TemperatureConfig
 
 __all__ = [
+    "Temperature",
+    "TemperatureConfig",
     "bc_regularization_objective",
     "ddpg_objective",
     "entropy_objective",
     "weighted_sum_objective",
-    "Temperature",
-    "TemperatureConfig",
 ]

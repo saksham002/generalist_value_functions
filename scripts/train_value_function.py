@@ -25,10 +25,10 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
+from openpi.training.time_utils import Timer
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 import openpi.value_functions.base as _value_fn
-from openpi.training.time_utils import Timer
 
 
 def init_logging():
@@ -378,7 +378,7 @@ def generate_validation_plots(
         ax.set_ylabel("Value", fontsize=12)
         ax.set_title(f"Episode {ep_idx} - Step {step}", fontsize=14)
         ax.legend(fontsize=11)
-        ax.grid(True, alpha=0.3)
+        ax.grid(visible=True, alpha=0.3)
 
         plt.tight_layout()
         images[f"val/episode_{ep_idx}"] = wandb.Image(fig)
@@ -490,9 +490,8 @@ def main(config: _config.TrainConfig):
         rng, step_rng = jax.random.split(rng)
 
         # Time train step, including device sync
-        with timer.context("train_step_compute"):
-            with sharding.set_mesh(mesh):
-                train_state, info = ptrain_step(train_state, batch, step_rng)
+        with timer.context("train_step_compute"), sharding.set_mesh(mesh):
+            train_state, info = ptrain_step(train_state, batch, step_rng)
 
         # Time blocking on train step completion
         with timer.context("train_step_sync"):

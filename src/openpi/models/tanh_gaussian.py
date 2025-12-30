@@ -207,10 +207,7 @@ class TanhGaussian(_model.BaseModel):
             bijectors.append(distrax.Block(distrax.ScalarAffine(shift=shift, scale=scale), ndims=1))
 
         # Chain bijectors (applied in order: first Tanh, then ScalarAffine)
-        if len(bijectors) > 1:
-            bijector = distrax.Chain(bijectors[::-1])  # Chain applies in reverse order
-        else:
-            bijector = bijectors[0]
+        bijector = distrax.Chain(bijectors[::-1]) if len(bijectors) > 1 else bijectors[0]
 
         return distrax.Transformed(base_dist, bijector)
 
@@ -234,11 +231,7 @@ class TanhGaussian(_model.BaseModel):
         deterministic = kwargs.get("deterministic", False)
         dist = self.action_distribution(rng, observation)
 
-        if deterministic:
-            # Return mean (mode) of the distribution
-            actions_flat = dist.mode()
-        else:
-            actions_flat = dist.sample(seed=rng)
+        actions_flat = dist.mode() if deterministic else dist.sample(seed=rng)
 
         batch_size = observation.state.shape[0]
         return actions_flat.reshape(batch_size, self.action_horizon, self.action_dim)

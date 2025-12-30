@@ -4,11 +4,11 @@ This module tests the functional objectives in objectives.py using fake critics
 and policies with known, deterministic outputs to verify correctness.
 """
 
+import distrax
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import distrax
 
 from openpi.models import model as _model
 from openpi.models.tanh_gaussian import TanhGaussianConfig
@@ -143,8 +143,6 @@ class TestDDPGObjective:
 
     def test_loss_equals_negative_q(self):
         """Test that loss = -Q(s, a)."""
-        batch_size = 2
-        state_dim = 5
         action_dim = 3
         action_horizon = 1
 
@@ -168,8 +166,6 @@ class TestDDPGObjective:
 
     def test_min_aggregation_uses_min_value(self):
         """Test that aggregation='min' uses compute_min_value."""
-        batch_size = 2
-        state_dim = 5
         action_dim = 3
         action_horizon = 1
 
@@ -190,8 +186,6 @@ class TestDDPGObjective:
 
     def test_mean_aggregation_uses_mean_value(self):
         """Test that aggregation='mean' uses compute_mean_value."""
-        batch_size = 2
-        state_dim = 5
         action_dim = 3
         action_horizon = 1
 
@@ -360,7 +354,6 @@ class TestWeightedSumObjective:
     def test_weighted_combination(self):
         """Test that weighted sum correctly combines objectives."""
         batch_size = 2
-        state_dim = 5
         action_dim = 3
         action_horizon = 1
 
@@ -395,8 +388,6 @@ class TestWeightedSumObjective:
 
     def test_single_objective(self):
         """Test that single objective works correctly."""
-        batch_size = 2
-        state_dim = 5
         action_dim = 3
         action_horizon = 1
 

@@ -9,8 +9,7 @@ Each objective returns (per_sample_loss, info_dict) where:
 - info_dict contains metrics for logging
 """
 
-from collections.abc import Callable
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Literal
 
 import jax
@@ -20,9 +19,8 @@ from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.value_functions.base import BaseValueFunction
 
-
 # Type alias for objective functions
-PolicyObjective = Callable[..., tuple[at.Float[at.Array, "batch"], dict[str, at.Array]]]
+PolicyObjective = Callable[..., tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]]
 
 
 def ddpg_objective(
@@ -32,7 +30,7 @@ def ddpg_objective(
     q_function: BaseValueFunction,
     *,
     aggregation: Literal["min", "mean"] = "min",
-) -> tuple[at.Float[at.Array, "batch"], dict[str, at.Array]]:
+) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
     """DDPG objective: maximize Q(s, a) where a ~ π(·|s).
 
     This is the core policy improvement objective in actor-critic methods.
@@ -82,7 +80,7 @@ def bc_regularization_objective(
     observation: _model.Observation,
     rng: at.KeyArrayLike,
     data_action: _model.Actions,
-) -> tuple[at.Float[at.Array, "batch"], dict[str, at.Array]]:
+) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
     """Behavior cloning regularization: penalize deviation from data actions.
 
     This objective encourages the policy to stay close to the behavior
@@ -124,7 +122,7 @@ def entropy_objective(
     policy: _model.BaseModel,
     observation: _model.Observation,
     rng: at.KeyArrayLike,
-) -> tuple[at.Float[at.Array, "batch"], dict[str, at.Array]]:
+) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
     """Entropy objective: log π(a|s).
 
     This objective encourages exploration by maximizing policy entropy.
@@ -132,7 +130,7 @@ def entropy_objective(
     or via temperature scaling) maximizes entropy.
 
     In SAC, this is combined with the DDPG objective:
-        L = -Q(s, a) + α * log π(a|s)
+        L = -Q(s, a) + alpha * log pi(a|s)
 
     Args:
         policy: Policy model with action_distribution method.
@@ -163,7 +161,7 @@ def weighted_sum_objective(
     observation: _model.Observation,
     rng: at.KeyArrayLike,
     objectives_and_weights: Sequence[tuple[PolicyObjective, float, dict]],
-) -> tuple[at.Float[at.Array, "batch"], dict[str, at.Array]]:
+) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
     """Compute weighted sum of policy objectives.
 
     This function combines multiple policy objectives into a single loss.

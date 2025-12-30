@@ -334,6 +334,13 @@ The repository uses pre-commit hooks that run:
 - Tests marked with `@pytest.mark.manual` are excluded from CI
 - Use for long-running or resource-intensive tests
 
+### Lint Ignore Rules
+**IMPORTANT**: Do not add new lint ignores (in `pyproject.toml` or inline `# noqa` comments) without explicit user approval.
+- If you encounter lint errors, first try to fix the code to comply with the linting rules
+- For jaxtyping array annotations, use `*b` instead of `batch` for batch dimensions (e.g., `at.Float[at.Array, "*b"]` not `at.Float[at.Array, "batch"]`)
+- If a new ignore is genuinely needed, it must follow patterns already established in the codebase
+- Any added lint ignores MUST be mentioned in the walkthrough document so the user can review and approve
+
 ### GPU Memory Management
 - Set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` to allow JAX to use 90% of GPU memory (default 75%)
 - Use `--fsdp-devices <n>` for multi-GPU memory distribution (trades speed for memory)

@@ -53,9 +53,7 @@ class SACValueFunctionConfig(BaseValueFunctionConfig):
     tau: float = 0.005
 
     # Temperature configuration
-    temperature_config: TemperatureConfig = dataclasses.field(
-        default_factory=TemperatureConfig
-    )
+    temperature_config: TemperatureConfig = dataclasses.field(default_factory=TemperatureConfig)
 
     # Loss type: "regression" (MSE) or "categorical" (HL-Gauss)
     loss_type: Literal["regression", "categorical"] = "regression"
@@ -105,8 +103,8 @@ class SACValueFunction(BaseValueFunction):
     """SAC Q-function ensemble with soft Bellman backup.
 
     This implements the SAC critic training objective:
-    1. Sample next actions from policy: a' ~ π(·|s')
-    2. Compute soft target: y = r + γ * (1 - done) * (min Q_target(s', a') - α * log π(a'|s'))
+    1. Sample next actions from policy: a' ~ pi(.|s')
+    2. Compute soft target: y = r + gamma * (1 - done) * (min Q_target(s', a') - alpha * log pi(a'|s'))
     3. Update Q-functions to minimize loss between Q(s, a) and y
 
     Supports both regression (MSE) and categorical (HL-Gauss) losses.
@@ -156,15 +154,15 @@ class SACValueFunction(BaseValueFunction):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
-    ) -> at.Float[at.Array, "batch"]:
+    ) -> at.Float[at.Array, "*b"]:
         """Compute min Q-value across ensemble (pessimistic estimate)."""
         return self.q_ensemble.compute_min_value(observation, action)
 
     def _compute_critic_loss_regression(
         self,
-        q_values: at.Float[at.Array, "num_ensemble batch"],
-        target: at.Float[at.Array, "batch"],
-    ) -> tuple[at.Float[at.Array, "batch"], dict[str, at.Array]]:
+        q_values: at.Array,
+        target: at.Float[at.Array, "*b"],
+    ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
         """Compute MSE loss for regression Q-functions.
 
         Args:
@@ -188,8 +186,8 @@ class SACValueFunction(BaseValueFunction):
         self,
         observation: _model.Observation,
         action: _model.Actions,
-        target: at.Float[at.Array, "batch"],
-    ) -> tuple[at.Float[at.Array, "batch"], dict[str, at.Array]]:
+        target: at.Float[at.Array, "*b"],
+    ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
         """Compute HL-Gauss loss for categorical Q-functions.
 
         Args:
@@ -204,14 +202,14 @@ class SACValueFunction(BaseValueFunction):
         all_logits = self.q_ensemble.compute_logits(observation, action)
 
         # Compute HL-Gauss loss for each ensemble member
-        def single_member_loss(logits: at.Float[at.Array, "batch num_bins"]) -> at.Float[at.Array, "batch"]:
+        def single_member_loss(logits: at.Float[at.Array, "*b num_bins"]) -> at.Float[at.Array, "*b"]:
             return _hl_gauss.hl_gauss_loss(logits, target, self.v_min, self.v_max, self.sigma)
 
         all_losses = jax.vmap(single_member_loss)(all_logits)  # (num_ensemble, batch)
         mean_loss = jnp.mean(all_losses, axis=0)
 
         # Compute predicted values for logging
-        def logits_to_value(logits: at.Float[at.Array, "batch num_bins"]) -> at.Float[at.Array, "batch"]:
+        def logits_to_value(logits: at.Float[at.Array, "*b num_bins"]) -> at.Float[at.Array, "*b"]:
             return _hl_gauss.logits_to_expected_value(logits, self.v_min, self.v_max)
 
         all_values = jax.vmap(logits_to_value)(all_logits)  # (num_ensemble, batch)
@@ -231,13 +229,13 @@ class SACValueFunction(BaseValueFunction):
         *,
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
-    ) -> tuple[at.Float[at.Array, "batch"], dict[str, at.Array]]:
+    ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
         """Compute SAC critic loss with soft Bellman backup.
 
         The soft Bellman target is:
-            y = r + γ * (1 - done) * (min Q_target(s', a') - α * log π(a'|s'))
+            y = r + gamma * (1 - done) * (min Q_target(s', a') - alpha * log pi(a'|s'))
 
-        where a' ~ π(·|s') is sampled from the current policy.
+        where a' ~ pi(.|s') is sampled from the current policy.
 
         Args:
             transition: SARSA transition with (s, a, r, s', a', mc_return, termination, truncation).
@@ -259,20 +257,14 @@ class SACValueFunction(BaseValueFunction):
 
         # Reshape actions for Q-function
         batch_size = transition.next_observation.state.shape[0]
-        next_actions = next_actions_flat.reshape(
-            batch_size, self.policy.action_horizon, self.policy.action_dim
-        )
+        next_actions = next_actions_flat.reshape(batch_size, self.policy.action_horizon, self.policy.action_dim)
 
         # Compute target Q-values (min over target ensemble)
-        target_q = self.target_q_ensemble.compute_min_value(
-            transition.next_observation, next_actions
-        )
+        target_q = self.target_q_ensemble.compute_min_value(transition.next_observation, next_actions)
 
-        # Soft Bellman target: r + γ * (1 - done) * (Q_target - α * log π)
+        # Soft Bellman target: r + gamma * (1 - done) * (Q_target - alpha * log pi)
         not_done = 1.0 - transition.termination.astype(jnp.float32)
-        target = transition.reward + self.discount * not_done * (
-            target_q - self.temperature.value * next_log_prob
-        )
+        target = transition.reward + self.discount * not_done * (target_q - self.temperature.value * next_log_prob)
         target = jax.lax.stop_gradient(target)
 
         # Compute loss based on loss type
@@ -283,9 +275,7 @@ class SACValueFunction(BaseValueFunction):
             q_mean = jnp.mean(all_q_values)
             q_std = jnp.std(all_q_values)
         else:  # categorical
-            loss, loss_info = self._compute_critic_loss_categorical(
-                transition.observation, transition.action, target
-            )
+            loss, loss_info = self._compute_critic_loss_categorical(transition.observation, transition.action, target)
             # For logging, compute expected values
             all_q_values = self.q_ensemble.compute_value(transition.observation, transition.action)
             q_mean = jnp.mean(all_q_values)
@@ -325,6 +315,7 @@ class SACValueFunction(BaseValueFunction):
         self,
         rng: at.KeyArrayLike,
         observation: _model.Observation,
+        *,
         deterministic: bool = False,
     ) -> _model.Actions:
         """Sample actions from the policy.
