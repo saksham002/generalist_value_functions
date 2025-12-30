@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import dataclasses
 import logging
 import multiprocessing
 import os
@@ -8,10 +9,12 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import minari
 import numpy as np
 import torch
 
 import openpi.models.model as _model
+import openpi.shared.rl_utils as rl_utils
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
@@ -125,6 +128,171 @@ class FakeDataset(Dataset):
 
     def __len__(self) -> int:
         return self._num_samples
+
+
+@dataclasses.dataclass
+class NumpyDataset(Dataset):
+    """In-memory dataset storing all data as numpy arrays.
+
+    This is much faster than LeRobot for state-only datasets that fit in memory,
+    as it avoids disk I/O on each batch.
+    """
+
+    states: np.ndarray  # [N, state_dim]
+    actions: np.ndarray  # [N, action_dim]
+    next_states: np.ndarray  # [N, state_dim]
+    next_actions: np.ndarray  # [N, action_dim]
+    rewards: np.ndarray  # [N]
+    mc_returns: np.ndarray  # [N]
+    terminations: np.ndarray  # [N] bool
+    truncations: np.ndarray  # [N] bool
+    episode_starts: np.ndarray  # [num_episodes] - start index of each episode
+    episode_ends: np.ndarray  # [num_episodes] - end index of each episode (exclusive)
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        idx = index.__index__()
+        return {
+            "state": self.states[idx],
+            "actions": self.actions[idx],
+            "next_state": self.next_states[idx],
+            "next_actions": self.next_actions[idx],
+            "reward": np.float32(self.rewards[idx]),
+            "mc_return": np.float32(self.mc_returns[idx]),
+            "termination": self.terminations[idx],
+            "truncation": self.truncations[idx],
+        }
+
+    def __len__(self) -> int:
+        return len(self.states)
+
+    @property
+    def num_episodes(self) -> int:
+        return len(self.episode_starts)
+
+    def get_episode_frames(self, episode_idx: int) -> list[dict]:
+        """Get all frames for a specific episode."""
+        start = self.episode_starts[episode_idx]
+        end = self.episode_ends[episode_idx]
+        return [self[i] for i in range(start, end)]
+
+
+def create_numpy_dataset_from_minari(
+    minari_dataset_id: str,
+    discount: float = 0.99,
+    max_episodes: int | None = None,
+) -> NumpyDataset:
+    """Create a NumpyDataset by loading data directly from a Minari dataset.
+
+    This computes MC returns on-the-fly and applies antmaze-specific corrections
+    (same logic as convert_d4rl_to_lerobot.py).
+
+    Args:
+        minari_dataset_id: Minari dataset ID (e.g., 'D4RL/antmaze/large-diverse-v1')
+        discount: Discount factor for MC return computation
+        max_episodes: If set, only load up to this many episodes
+
+    Returns:
+        NumpyDataset with all data in memory
+    """
+    logging.info(f"Loading Minari dataset: {minari_dataset_id}")
+    dataset = minari.load_dataset(minari_dataset_id, download=True)
+
+    is_antmaze = "antmaze" in minari_dataset_id.lower()
+
+    # Collect all transitions
+    all_states = []
+    all_actions = []
+    all_next_states = []
+    all_next_actions = []
+    all_rewards = []
+    all_mc_returns = []
+    all_terminations = []
+    all_truncations = []
+    episode_starts = []
+    episode_ends = []
+
+    num_episodes = dataset.total_episodes
+    if max_episodes is not None:
+        num_episodes = min(num_episodes, max_episodes)
+
+    current_idx = 0
+    for ep_idx in range(num_episodes):
+        if ep_idx % 100 == 0:
+            logging.info(f"Processing episode {ep_idx}/{num_episodes}")
+
+        episode = dataset[ep_idx]
+        observations = episode.observations
+        actions = episode.actions
+        rewards = episode.rewards
+        terminations = episode.terminations
+        truncations = episode.truncations
+
+        # Handle dict observations - only use 'observation' key
+        if isinstance(observations, dict):
+            if "observation" in observations:
+                observations = observations["observation"]
+            else:
+                raise ValueError(f"Dict observations must have 'observation' key, got: {list(observations.keys())}")
+
+        if is_antmaze:
+            # For antmaze: truncate episode after first positive reward
+            positive_reward_idx = np.where(rewards > 0)[0]
+            if len(positive_reward_idx) > 0:
+                end_idx = positive_reward_idx[0] + 1
+                observations = observations[: end_idx + 1]
+                actions = actions[:end_idx]
+                rewards = rewards[:end_idx]
+                terminations = terminations[:end_idx]
+                truncations = truncations[:end_idx]
+
+            # For antmaze: termination = (reward == 1), truncation = False
+            terminations = rewards > 0
+            truncations = np.zeros_like(truncations, dtype=bool)
+
+        # Compute MC returns
+        dones = np.logical_or(terminations, truncations)
+        mc_returns = rl_utils.compute_mc_returns(rewards, dones, discount)
+
+        # Process each transition (T+1 observations, T actions)
+        num_transitions = len(actions)
+        episode_starts.append(current_idx)
+
+        for t in range(num_transitions):
+            obs = observations[t].astype(np.float32)
+            next_obs = (
+                observations[t + 1].astype(np.float32)
+                if t + 1 < len(observations)
+                else observations[-1].astype(np.float32)
+            )
+            action = actions[t].astype(np.float32)
+            next_action = actions[t + 1].astype(np.float32) if t + 1 < len(actions) else actions[-1].astype(np.float32)
+
+            all_states.append(obs)
+            all_actions.append(action)
+            all_next_states.append(next_obs)
+            all_next_actions.append(next_action)
+            all_rewards.append(rewards[t])
+            all_mc_returns.append(mc_returns[t])
+            all_terminations.append(terminations[t])
+            all_truncations.append(truncations[t])
+
+        current_idx += num_transitions
+        episode_ends.append(current_idx)
+
+    logging.info(f"Loaded {num_episodes} episodes, {current_idx} transitions")
+
+    return NumpyDataset(
+        states=np.stack(all_states),
+        actions=np.stack(all_actions),
+        next_states=np.stack(all_next_states),
+        next_actions=np.stack(all_next_actions),
+        rewards=np.array(all_rewards, dtype=np.float32),
+        mc_returns=np.array(all_mc_returns, dtype=np.float32),
+        terminations=np.array(all_terminations, dtype=bool),
+        truncations=np.array(all_truncations, dtype=bool),
+        episode_starts=np.array(episode_starts, dtype=np.int64),
+        episode_ends=np.array(episode_ends, dtype=np.int64),
+    )
 
 
 def create_torch_dataset(
@@ -250,6 +418,19 @@ def create_data_loader(
     """
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
+
+    # Check for minari dataset first (fastest option for in-memory datasets)
+    if data_config.minari_dataset_id is not None:
+        return create_numpy_data_loader(
+            data_config,
+            batch_size=config.batch_size,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            skip_norm_stats=skip_norm_stats,
+            seed=config.seed,
+            framework=framework,
+        )
 
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
@@ -382,6 +563,73 @@ def create_rlds_data_loader(
         dataset,
         sharding=sharding,
         num_batches=num_batches,
+    )
+
+    return DataLoaderImpl(data_config, data_loader)
+
+
+def create_numpy_data_loader(
+    data_config: _config.DataConfig,
+    batch_size: int,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    skip_norm_stats: bool = False,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    seed: int = 0,
+    framework: str = "jax",
+) -> DataLoader:
+    """Create a numpy-based data loader for fast in-memory data loading.
+
+    This is optimized for state-only datasets (like D4RL/Minari) that fit in memory.
+    It bypasses disk I/O by loading all data into numpy arrays upfront.
+
+    Args:
+        data_config: The data configuration (must have minari_dataset_id set).
+        batch_size: The batch size.
+        sharding: The sharding to use for the data loader.
+        skip_norm_stats: Whether to skip data normalization.
+        shuffle: Whether to shuffle the data.
+        num_batches: Determines the number of batches to return.
+        seed: Random seed for shuffling.
+        framework: The framework to use ("jax" or "pytorch").
+
+    Returns:
+        DataLoader wrapping the in-memory numpy dataset.
+    """
+    if data_config.minari_dataset_id is None:
+        raise ValueError("minari_dataset_id must be set to use numpy data loader")
+
+    # Create the in-memory dataset
+    dataset = create_numpy_dataset_from_minari(
+        data_config.minari_dataset_id,
+        discount=data_config.discount,
+    )
+
+    # Apply transforms
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+    # Compute local batch size
+    if framework == "pytorch":
+        if torch.distributed.is_initialized():
+            local_batch_size = batch_size // torch.distributed.get_world_size()
+        else:
+            local_batch_size = batch_size
+    else:
+        local_batch_size = batch_size // jax.process_count()
+
+    logging.info(f"numpy data loader: local_batch_size={local_batch_size}, total_samples={len(dataset)}")
+
+    # Use TorchDataLoader for batching (reuses existing infrastructure)
+    data_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=local_batch_size,
+        sharding=None if framework == "pytorch" else sharding,
+        shuffle=shuffle,
+        num_batches=num_batches,
+        num_workers=0,  # No workers needed for in-memory data
+        seed=seed,
+        framework=framework,
     )
 
     return DataLoaderImpl(data_config, data_loader)

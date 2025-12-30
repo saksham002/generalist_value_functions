@@ -145,7 +145,9 @@ class RegressionValueMLP(BaseValueFunction):
         transition: Transition,
         *,
         train: bool = False,
+        rng: at.KeyArrayLike | None = None,
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
+        del rng  # Unused for regression value function
         action = transition.action if self.action_conditioned else None
         predicted_value = self.compute_value(transition.observation, action)
         # MC learning: target is the Monte-Carlo return
@@ -310,7 +312,9 @@ class CategoricalValueMLP(BaseValueFunction):
         transition: Transition,
         *,
         train: bool = False,
+        rng: at.KeyArrayLike | None = None,
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
+        del rng  # Unused for categorical value function
         action = transition.action if self.action_conditioned else None
         logits = self._forward(transition.observation.state, action)
         # MC learning: target is the Monte-Carlo return

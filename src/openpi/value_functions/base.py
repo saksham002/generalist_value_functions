@@ -139,6 +139,7 @@ class BaseValueFunction(nnx.Module, abc.ABC):
         transition: Transition,
         *,
         train: bool = False,
+        rng: at.KeyArrayLike | None = None,
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
         """Compute the loss for value function training.
 
@@ -146,13 +147,24 @@ class BaseValueFunction(nnx.Module, abc.ABC):
         - MC: uses transition.mc_return directly
         - TD: computes target from reward + gamma * V(next_state)
         - SARSA: computes target from reward + gamma * Q(next_state, next_action)
+        - SAC: computes soft Bellman target with entropy bonus
 
         Args:
             transition: Full SARSA transition with (s, a, r, s', a', mc_return).
             train: Whether in training mode.
+            rng: Random key for algorithms that need stochasticity (e.g., SAC).
 
         Returns:
             Tuple of:
             - Per-sample loss of shape [batch]
             - Dict of additional info to log (e.g., predicted values, TD errors)
+        """
+
+    def post_step_update(self) -> None:
+        """Called after each training step.
+
+        Override this method for operations that should happen after each
+        gradient update, such as target network updates (Polyak averaging).
+
+        Default implementation does nothing.
         """

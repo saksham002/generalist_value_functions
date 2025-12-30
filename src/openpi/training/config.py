@@ -106,6 +106,9 @@ class DataConfig:
     rl_mode: bool = False  # If True, use value function training pipeline
     discount: float = 0.99  # Discount factor (used if MC returns not in dataset)
 
+    # If set, load data directly from Minari dataset (fastest option for in-memory datasets)
+    minari_dataset_id: str | None = None
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -534,6 +537,51 @@ class D4RLDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class MinariDataConfig(DataConfigFactory):
+    """Data config for direct Minari dataset loading (fast, in-memory).
+
+    This config enables the numpy data loader path, which loads the entire
+    dataset into memory for maximum training speed. Best for state-only
+    datasets that fit in RAM (e.g., D4RL/Minari antmaze, locomotion).
+
+    MC returns and RL fields are computed on-the-fly when loading the dataset.
+    """
+
+    # Minari dataset ID (e.g., 'D4RL/antmaze/large-diverse-v1')
+    minari_dataset_id: str = tyro.MISSING
+    # Discount factor for MC return computation
+    discount: float = 0.99
+
+    # Override repo_id from parent - not used for minari loading
+    repo_id: str = "minari"  # Dummy value, not used
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Value function transforms for RL training
+        from openpi.value_functions import value_transforms
+
+        data_transforms = _transforms.Group(
+            inputs=[value_transforms.ValueFunctionInputs()],
+            outputs=[],
+        )
+        model_transforms = _transforms.Group(inputs=[], outputs=[])
+
+        # Don't call create_base_config - we don't need norm stats or repo_id
+        return DataConfig(
+            repo_id=None,  # Not using LeRobot
+            asset_id=None,
+            norm_stats=None,  # Numpy loader handles raw data
+            repack_transforms=_transforms.Group(inputs=[]),
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            use_quantile_norm=False,
+            rl_mode=True,
+            discount=self.discount,
+            minari_dataset_id=self.minari_dataset_id,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -662,7 +710,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
                 decay_lr=1e-5,
             ),
         ),
-        # Q-function with MSE regression
+        # Q-function with MSE regression - using MinariDataConfig for fast in-memory loading
         TrainConfig(
             name="antmaze_large_diverse_v1_q_regression",
             model=value_mlp.RegressionValueMLPConfig(
@@ -672,15 +720,12 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
                 action_horizon=1,
                 hidden_dims=(256, 256),
             ),
-            data=D4RLDataConfig(
-                repo_id="debug/minari_D4RL_antmaze_large_diverse_v1",
-                default_task="antmaze-large-diverse-v1",
-                rl_mode=True,
+            data=MinariDataConfig(
+                minari_dataset_id="D4RL/antmaze/large-diverse-v1",
                 discount=0.99,
             ),
             num_train_steps=100_000,
             batch_size=256,
-            num_workers=16,
             lr_schedule=_optimizer.CosineDecaySchedule(
                 warmup_steps=1_000,
                 peak_lr=3e-4,
@@ -688,7 +733,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
                 decay_lr=1e-5,
             ),
         ),
-        # Q-function with HL-Gauss categorical loss
+        # Q-function with HL-Gauss categorical loss - using MinariDataConfig for fast in-memory loading
         TrainConfig(
             name="antmaze_large_diverse_v1_q_hl_gauss",
             model=value_mlp.CategoricalValueMLPConfig(
@@ -702,15 +747,12 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
                 num_bins=51,
                 sigma=0.75,
             ),
-            data=D4RLDataConfig(
-                repo_id="debug/minari_D4RL_antmaze_large_diverse_v1",
-                default_task="antmaze-large-diverse-v1",
-                rl_mode=True,
+            data=MinariDataConfig(
+                minari_dataset_id="D4RL/antmaze/large-diverse-v1",
                 discount=0.99,
             ),
             num_train_steps=100_000,
             batch_size=256,
-            num_workers=16,
             lr_schedule=_optimizer.CosineDecaySchedule(
                 warmup_steps=1_000,
                 peak_lr=3e-4,

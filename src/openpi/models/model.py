@@ -7,6 +7,7 @@ import pathlib
 from typing import Generic, TypeVar
 
 import augmax
+import distrax
 from flax import nnx
 from flax import struct
 from flax import traverse_util
@@ -35,6 +36,7 @@ class ModelType(enum.Enum):
     PI05 = "pi05"
     MLP = "mlp"
     MLP_CRITIC = "mlp_critic"
+    TANH_GAUSSIAN = "tanh_gaussian"
 
 
 # The model always expects these images
@@ -291,6 +293,29 @@ class BaseModel(nnx.Module, abc.ABC):
 
     @abc.abstractmethod
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
+
+    def action_distribution(
+        self,
+        rng: at.KeyArrayLike,
+        observation: Observation,
+    ) -> distrax.Distribution:
+        """Return the action distribution for the given observation.
+
+        Default implementation returns a deterministic distribution
+        centered at sample_actions output. Models with stochastic policies
+        should override this to return the actual distribution.
+
+        Args:
+            rng: Random key for sampling (used by sample_actions).
+            observation: Observation to condition on.
+
+        Returns:
+            A distrax.Distribution over actions (flattened to [batch, action_horizon * action_dim]).
+        """
+        actions = self.sample_actions(rng, observation)
+        batch_size = actions.shape[0]
+        actions_flat = actions.reshape(batch_size, -1)
+        return distrax.Deterministic(loc=actions_flat)
 
 
 def restore_params(

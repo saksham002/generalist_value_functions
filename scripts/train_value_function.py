@@ -156,10 +156,22 @@ def init_train_state(
 @at.typecheck
 def train_step(
     config: _config.TrainConfig,
+    lr_schedule: optax.Schedule,
     state: training_utils.TrainState,
     batch: dict[str, Any],
+    rng: at.KeyArrayLike,
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
-    """Single training step for value function."""
+    """Single training step for value function.
+
+    Args:
+        config: Training configuration.
+        state: Current training state.
+        batch: Batch of data.
+        rng: Random key for algorithms that need stochasticity (e.g., SAC).
+
+    Returns:
+        Tuple of (new_state, info_dict).
+    """
     model = nnx.merge(state.model_def, state.params)
 
     # Create transition once for both loss computation and batch stats
@@ -167,7 +179,7 @@ def train_step(
 
     def loss_fn(model: _value_fn.BaseValueFunction):
         # compute_loss returns (per_sample_loss, info_dict)
-        per_sample_loss, value_info = model.compute_loss(transition, train=True)
+        per_sample_loss, value_info = model.compute_loss(transition, train=True, rng=rng)
         return jnp.mean(per_sample_loss), value_info
 
     diff_state = nnx.DiffState(0, config.trainable_filter)
@@ -178,6 +190,10 @@ def train_step(
     new_params = optax.apply_updates(params, updates)
 
     nnx.update(model, new_params)
+
+    # Call post_step_update for algorithms that need it (e.g., SAC target network update)
+    model.post_step_update()
+
     new_params = nnx.state(model)
 
     new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
@@ -239,6 +255,7 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        "learning_rate": lr_schedule(state.step),
         **value_info,
         **batch_stats,
     }
@@ -246,8 +263,15 @@ def train_step(
 
 
 def get_trajectory_frames(dataset, episode_idx: int) -> list[dict]:
-    """Extract all frames from a specific episode in the dataset."""
-    # Get episode boundary indices
+    """Extract all frames from a specific episode in the dataset.
+
+    Supports both NumpyDataset and LeRobotDataset.
+    """
+    # Check if this is a NumpyDataset (has get_episode_frames method)
+    if hasattr(dataset, "get_episode_frames"):
+        return dataset.get_episode_frames(episode_idx)
+
+    # LeRobotDataset path: use episode_data_index
     episode_data_index = dataset.episode_data_index
     start_idx = episode_data_index["from"][episode_idx].item()
     end_idx = episode_data_index["to"][episode_idx].item()
@@ -381,7 +405,7 @@ def main(config: _config.TrainConfig):
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
     rng = jax.random.key(config.seed)
-    _, init_rng = jax.random.split(rng)
+    rng, init_rng = jax.random.split(rng)
 
     mesh = sharding.make_mesh(config.fsdp_devices)
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
@@ -412,9 +436,18 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized data loader. Batch keys: {list(batch.keys()) if isinstance(batch, dict) else 'tuple'}")
 
     # Select fixed validation trajectories for plotting
-    from lerobot.common.datasets import lerobot_dataset
+    # Create validation dataset - use NumpyDataset for minari, LeRobotDataset otherwise
+    data_config = config.data.create(config.assets_dirs, config.model)
+    if data_config.minari_dataset_id is not None:
+        val_dataset = _data_loader.create_numpy_dataset_from_minari(
+            data_config.minari_dataset_id,
+            discount=data_config.discount,
+        )
+    else:
+        from lerobot.common.datasets import lerobot_dataset
 
-    val_dataset = lerobot_dataset.LeRobotDataset(config.data.repo_id)
+        val_dataset = lerobot_dataset.LeRobotDataset(config.data.repo_id)
+
     num_episodes = val_dataset.num_episodes
     val_rng = np.random.default_rng(config.seed)
     val_episode_indices = val_rng.choice(
@@ -430,9 +463,10 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
+    lr_schedule = config.lr_schedule.create()
     ptrain_step = jax.jit(
-        functools.partial(train_step, config),
-        in_shardings=(train_state_sharding, data_sharding),
+        functools.partial(train_step, config, lr_schedule),
+        in_shardings=(train_state_sharding, data_sharding, replicated_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(0,),
     )
@@ -452,10 +486,13 @@ def main(config: _config.TrainConfig):
     logging.info(f"Starting training with batch_size={config.batch_size}, num_workers={config.num_workers}")
 
     for step in pbar:
+        # Split rng for this step
+        rng, step_rng = jax.random.split(rng)
+
         # Time train step, including device sync
         with timer.context("train_step_compute"):
             with sharding.set_mesh(mesh):
-                train_state, info = ptrain_step(train_state, batch)
+                train_state, info = ptrain_step(train_state, batch, step_rng)
 
         # Time blocking on train step completion
         with timer.context("train_step_sync"):

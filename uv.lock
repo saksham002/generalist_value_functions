@@ -643,6 +643,24 @@ wheels = [
 ]
 
 [[package]]
+name = "distrax"
+version = "0.1.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "absl-py", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "chex", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "jax", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "jaxlib", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "setuptools", marker = "(python_full_version >= '3.12' and sys_platform == 'darwin') or (python_full_version >= '3.12' and sys_platform == 'linux')" },
+    { name = "tensorflow-probability", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/81/a7/d87f5c5caf2ae9e28a9f506274870c25eb7e38c1ce0a1b7b3696afc73ac9/distrax-0.1.5.tar.gz", hash = "sha256:ec41522d389af69efedc8d475a7e6d8f229429c00f2140dcd641feacf7e21948", size = 190162, upload-time = "2023-11-22T12:53:44.836Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d8/42/efa7985eefd516f273bc5557550539ebd687cc6a3a2a176d5e1f5b0398ca/distrax-0.1.5-py3-none-any.whl", hash = "sha256:5020f4b53a9a480d019c12e44292fbacb7de857cce478bc594dacf29519c61b7", size = 319716, upload-time = "2023-11-22T12:53:42.449Z" },
+]
+
+[[package]]
 name = "dlimp"
 version = "0.0.1"
 source = { git = "https://github.com/kvablack/dlimp?rev=ad72ce3a9b414db2185bc0b38461d4101a65477a#ad72ce3a9b414db2185bc0b38461d4101a65477a" }
@@ -658,8 +676,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "dm-env", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
-    { name = "dm-tree", version = "0.1.8", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and sys_platform == 'darwin') or (python_full_version >= '3.13' and sys_platform == 'linux')" },
-    { name = "dm-tree", version = "0.1.9", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux')" },
+    { name = "dm-tree", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "glfw", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "labmaze", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "lxml", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -684,8 +701,7 @@ version = "1.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
-    { name = "dm-tree", version = "0.1.8", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and sys_platform == 'darwin') or (python_full_version >= '3.13' and sys_platform == 'linux')" },
-    { name = "dm-tree", version = "0.1.9", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux')" },
+    { name = "dm-tree", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/62/c9/93e8d6239d5806508a2ee4b370e67c6069943ca149f59f533923737a99b7/dm-env-1.6.tar.gz", hash = "sha256:a436eb1c654c39e0c986a516cee218bea7140b510fceff63f97eb4fcff3d93de", size = 20187, upload-time = "2022-12-21T00:25:29.306Z" }
@@ -697,11 +713,6 @@ wheels = [
 name = "dm-tree"
 version = "0.1.8"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.13' and sys_platform == 'darwin'",
-    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
-]
 sdist = { url = "https://files.pythonhosted.org/packages/f8/6d/f1997aac42e0f550c1e952a0b920eaa0bfc4d27d0421499881b934b969fc/dm-tree-0.1.8.tar.gz", hash = "sha256:0fcaabbb14e7980377439e7140bd05552739ca5e515ecb3119f234acee4b9430", size = 35384, upload-time = "2022-12-18T09:46:55.953Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e2/64/901b324804793743f0fdc9e47db893bf0ded9e074850fab2440af330fe83/dm_tree-0.1.8-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:ad16ceba90a56ec47cf45b21856d14962ac314787975ef786efb5e6e9ca75ec7", size = 167628, upload-time = "2022-12-18T09:46:14.195Z" },
@@ -717,40 +728,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/4a/da/3d3d04f7a572f7649f48edc9402ff5836e2f90e18445ffde110fd6142889/dm_tree-0.1.8-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:09964470f76a5201aff2e8f9b26842976de7889300676f927930f6285e256760", size = 146828, upload-time = "2024-02-13T21:25:21.639Z" },
     { url = "https://files.pythonhosted.org/packages/c4/12/0a8c2152655ca39c1059c762ea1dc12784166c735126eb0ab929c518ef4e/dm_tree-0.1.8-cp312-cp312-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:75c5d528bb992981c20793b6b453e91560784215dffb8a5440ba999753c14ceb", size = 175054, upload-time = "2024-02-13T21:25:23.532Z" },
     { url = "https://files.pythonhosted.org/packages/c9/d4/8cbb857612ca69763ee4f4f97c7b91659df1d373d62237cb9c772e55ae97/dm_tree-0.1.8-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c0a94aba18a35457a1b5cd716fd7b46c5dafdc4cf7869b4bae665b91c4682a8e", size = 152834, upload-time = "2024-02-06T09:09:18.536Z" },
-]
-
-[[package]]
-name = "dm-tree"
-version = "0.1.9"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version == '3.12.*' and sys_platform == 'darwin'",
-    "python_full_version < '3.12' and sys_platform == 'darwin'",
-    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux'",
-]
-dependencies = [
-    { name = "absl-py", marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux')" },
-    { name = "attrs", marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux')" },
-    { name = "numpy", marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux')" },
-    { name = "wrapt", marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux')" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/a6/83/ce29720ccf934c6cfa9b9c95ebbe96558386e66886626066632b5e44afed/dm_tree-0.1.9.tar.gz", hash = "sha256:a4c7db3d3935a5a2d5e4b383fc26c6b0cd6f78c6d4605d3e7b518800ecd5342b", size = 35623, upload-time = "2025-01-30T20:45:37.13Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ac/b6/2d2de9f8901ccc5b6f34aea678e732816853015b9d756c86efcec189bf4b/dm_tree-0.1.9-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:7d7d784afaeb4b67d87d858261aaf02503939ddc1f09c4cca70728f9892ab004", size = 173561, upload-time = "2025-03-31T08:35:40.042Z" },
-    { url = "https://files.pythonhosted.org/packages/3e/07/57459f32cf5683c25b596ab58f42a3305f91876c2f03d2fa6e9d0df75fcb/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:e660d1779ddcbd1348410d08f67db4870d413a3ec4ba8b4b045bd5ce4bd8f35c", size = 146926, upload-time = "2025-01-30T20:45:20.622Z" },
-    { url = "https://files.pythonhosted.org/packages/e8/46/939fbf81177c7cb3b1e5ddebd696237b3be9520769cce882f064de497103/dm_tree-0.1.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:294dc1cecf87552a45cdd5ddb215e7f5295a5a47c46f1f0a0463c3dd02a527d7", size = 152851, upload-time = "2025-01-30T20:45:23.032Z" },
-    { url = "https://files.pythonhosted.org/packages/ee/02/61aa90ab695918b4389d75c99bf0ec3cd0abacf1cadbef4053626f23ce34/dm_tree-0.1.9-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:a8d20eeab7fde77a3ed71f07716021eb0edfb4812a128eb381d108af3a310257", size = 175012, upload-time = "2025-03-31T08:35:41.476Z" },
-    { url = "https://files.pythonhosted.org/packages/81/10/120cd40556407879c1069941bd8b0d1a75754128c1a5bf0e27dbcf2a49fc/dm_tree-0.1.9-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:80c43417814b1181d3367b335460bfdd30b79ee187a64220e11f6ddd093a4b15", size = 147204, upload-time = "2025-01-30T20:45:25.541Z" },
-    { url = "https://files.pythonhosted.org/packages/86/52/27607a275c12858b979b8e943d2bd3bd0f9028503bb7079d5830a8b3cac0/dm_tree-0.1.9-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:2334cfe9d2ed4293f9f1c7aefba0657deaab9ea74b5fadd966f6d01d9b6b42d9", size = 153013, upload-time = "2025-01-30T20:45:26.886Z" },
-    { url = "https://files.pythonhosted.org/packages/5f/13/823788cd0f7964cadcfa56d1e0f9e5e987ee73b5db6273bc00168f524f1a/dm_tree-0.1.9-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:cfa33c2e028155810ad1b4e11928707bf47489516763a86e79cab2954d23bf68", size = 175000, upload-time = "2025-03-31T08:35:42.483Z" },
-    { url = "https://files.pythonhosted.org/packages/37/6a/512abdf7f20acc6cd6fce77f7663014d129aa313b5953aa2603d58fdb0c9/dm_tree-0.1.9-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:d05622d074353cf434049206e53c12147903a048c4bd7d77f2800d427413ad78", size = 147210, upload-time = "2025-01-30T20:45:29.732Z" },
-    { url = "https://files.pythonhosted.org/packages/e5/0a/f4d72ffb64ab3edc1fa66261f81ee3b4142ab14cd8aa1dfc7bbeca5ee4ba/dm_tree-0.1.9-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:f68b0efad76703dd4648586c75618a48cdd671b68c3266fe980e323c15423607", size = 153043, upload-time = "2025-01-30T20:45:30.834Z" },
-    { url = "https://files.pythonhosted.org/packages/ee/3c/5b40f8862390e9172e776cf610f3791c1af01f140a5698799fbe4a97206f/dm_tree-0.1.9-cp313-cp313t-macosx_10_13_universal2.whl", hash = "sha256:b06e7a5da1c31a82521a60060573527e8d24b9920fdd20b2ec86f08412737598", size = 180821, upload-time = "2025-03-31T08:35:44.474Z" },
-    { url = "https://files.pythonhosted.org/packages/84/1d/3cdbeeb3f6937a47a26cee502bffeccc2e55b97dfcce8a1d1135ea1b5b47/dm_tree-0.1.9-cp313-cp313t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:6893fcdc5cf1a4f459cfc383526d35d42e7c671ae565d7e429a2f2cb2cb93e89", size = 147282, upload-time = "2025-01-30T20:45:33.896Z" },
-    { url = "https://files.pythonhosted.org/packages/c5/37/15603079854394f16e3833a7b50696c1f3cbf30a2243a119f64f18a16f36/dm_tree-0.1.9-cp313-cp313t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e1f5d1e96b3a7de22b25b13a5eb30f41f8cf9c02dd4479a24920de99e780903c", size = 153052, upload-time = "2025-01-30T20:45:35.907Z" },
 ]
 
 [[package]]
@@ -2666,8 +2643,8 @@ source = { editable = "." }
 dependencies = [
     { name = "augmax", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "beartype", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
-    { name = "dm-tree", version = "0.1.8", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and sys_platform == 'darwin') or (python_full_version >= '3.13' and sys_platform == 'linux')" },
-    { name = "dm-tree", version = "0.1.9", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux')" },
+    { name = "distrax", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "dm-tree", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "einops", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "equinox", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "filelock", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -2721,7 +2698,8 @@ rlds = [
 requires-dist = [
     { name = "augmax", specifier = ">=0.3.4" },
     { name = "beartype", specifier = "==0.19.0" },
-    { name = "dm-tree", specifier = ">=0.1.8" },
+    { name = "distrax", specifier = ">=0.1.5" },
+    { name = "dm-tree", specifier = "==0.1.8" },
     { name = "einops", specifier = ">=0.8.0" },
     { name = "equinox", specifier = ">=0.11.8" },
     { name = "filelock", specifier = ">=3.16.1" },
@@ -2776,8 +2754,7 @@ name = "openpi-client"
 version = "0.1.0"
 source = { editable = "packages/openpi-client" }
 dependencies = [
-    { name = "dm-tree", version = "0.1.8", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and sys_platform == 'darwin') or (python_full_version >= '3.13' and sys_platform == 'linux')" },
-    { name = "dm-tree", version = "0.1.9", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux')" },
+    { name = "dm-tree", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "msgpack", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "pillow", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -4167,8 +4144,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "array-record", marker = "sys_platform == 'linux'" },
-    { name = "dm-tree", version = "0.1.8", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and sys_platform == 'darwin') or (python_full_version >= '3.13' and sys_platform == 'linux')" },
-    { name = "dm-tree", version = "0.1.9", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux')" },
+    { name = "dm-tree", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "etils", extra = ["edc", "enp", "epath", "epy", "etree"], marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "immutabledict", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -4223,6 +4199,23 @@ dependencies = [
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/33/30/944470f0ec0f00ccf25f0fdc84cf28be83838da5636c2b2b002960ba7ac1/tensorflow_metadata-1.17.1-py3-none-any.whl", hash = "sha256:f60d6605a16094c46921ffcf064747ba4b57840adad9fad682e2f28d0bac20eb", size = 31555, upload-time = "2025-04-10T18:29:33.596Z" },
+]
+
+[[package]]
+name = "tensorflow-probability"
+version = "0.25.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "absl-py", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "cloudpickle", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "decorator", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "dm-tree", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "gast", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "six", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fe/b6/e116761ceeb880b7ad4c6a7e1203538754dd7dda42538f08d6daaf8dfa4d/tensorflow_probability-0.25.0-py2.py3-none-any.whl", hash = "sha256:f3f4d6431656c0122906888afe1b67b4400e82bd7f254b45b92e6c5b84ea8e3e", size = 6979403, upload-time = "2024-11-08T16:25:57.238Z" },
 ]
 
 [[package]]
