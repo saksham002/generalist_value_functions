@@ -132,11 +132,7 @@ class FakeDataset(Dataset):
 
 @dataclasses.dataclass
 class NumpyDataset(Dataset):
-    """In-memory dataset storing all data as numpy arrays.
-
-    This is much faster than LeRobot for state-only datasets that fit in memory,
-    as it avoids disk I/O on each batch.
-    """
+    """In-memory dataset storing all data as numpy arrays."""
 
     states: np.ndarray  # [N, state_dim]
     actions: np.ndarray  # [N, action_dim]
@@ -606,7 +602,8 @@ def create_numpy_data_loader(
         discount=data_config.discount,
     )
 
-    # Apply transforms
+    # Apply transforms.
+    # We apply repack transforms (usually empty for numpy loader), data transforms, and normalization.
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Compute local batch size

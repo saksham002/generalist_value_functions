@@ -566,11 +566,14 @@ class MinariDataConfig(DataConfigFactory):
         )
         model_transforms = _transforms.Group(inputs=[], outputs=[])
 
-        # Don't call create_base_config - we don't need norm stats or repo_id
+        # Load norm stats using sanitized minari_dataset_id
+        asset_id = self.minari_dataset_id.replace("/", "_")
+        norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
+
         return DataConfig(
             repo_id=None,  # Not using LeRobot
-            asset_id=None,
-            norm_stats=None,  # Numpy loader handles raw data
+            asset_id=asset_id,
+            norm_stats=norm_stats,
             repack_transforms=_transforms.Group(inputs=[]),
             data_transforms=data_transforms,
             model_transforms=model_transforms,
