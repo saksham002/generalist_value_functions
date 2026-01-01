@@ -509,10 +509,6 @@ def main(config: _config.TrainConfig):
             timing_info.update({f"total_times/{k}": v for k, v in total_times.items()})
             reduced_info.update(timing_info)
 
-            # Also log timing summary to console for debugging
-            timing_summary = {k: f"{v:.4f}s" for k, v in avg_times.items()}
-            logging.info(f"Step {step} timing: {timing_summary}")
-
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
