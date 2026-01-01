@@ -11,8 +11,7 @@ from openpi.value_functions.hl_gauss import compute_bin_centers
 from openpi.value_functions.hl_gauss import compute_hl_gauss_targets
 from openpi.value_functions.hl_gauss import hl_gauss_loss
 from openpi.value_functions.hl_gauss import logits_to_expected_value
-from openpi.value_functions.value_mlp import CategoricalValueMLPConfig
-from openpi.value_functions.value_mlp import RegressionValueMLPConfig
+from openpi.value_functions.value_mlp import ValueMLPConfig
 
 
 def make_observation(state: jnp.ndarray) -> Observation:
@@ -96,7 +95,7 @@ class TestRegressionValueMLP:
 
     def test_create_and_compute_value(self):
         """Test creating model and computing values."""
-        config = RegressionValueMLPConfig(state_dim=10, hidden_dims=(64, 64))
+        config = ValueMLPConfig(state_dim=10, hidden_dims=(64, 64))
         rng = jax.random.key(0)
         model = config.create(rng)
 
@@ -107,7 +106,7 @@ class TestRegressionValueMLP:
 
     def test_compute_loss(self):
         """Test loss computation."""
-        config = RegressionValueMLPConfig(state_dim=10, hidden_dims=(64, 64))
+        config = ValueMLPConfig(state_dim=10, hidden_dims=(64, 64))
         rng = jax.random.key(0)
         model = config.create(rng)
 
@@ -120,7 +119,7 @@ class TestRegressionValueMLP:
 
     def test_inputs_spec(self):
         """Test input specification for V(s)."""
-        config = RegressionValueMLPConfig(state_dim=10)
+        config = ValueMLPConfig(state_dim=10)
         spec = config.inputs_spec(batch_size=8)
         assert len(spec) == 2  # (obs, target) for V(s)
         obs_spec, target_spec = spec
@@ -133,7 +132,7 @@ class TestRegressionQMLP:
 
     def test_create_and_compute_value(self):
         """Test creating model and computing Q-values."""
-        config = RegressionValueMLPConfig(
+        config = ValueMLPConfig(
             state_dim=10,
             action_conditioned=True,
             action_dim=4,
@@ -151,7 +150,7 @@ class TestRegressionQMLP:
 
     def test_compute_loss(self):
         """Test loss computation."""
-        config = RegressionValueMLPConfig(
+        config = ValueMLPConfig(
             state_dim=10,
             action_conditioned=True,
             action_dim=4,
@@ -169,7 +168,7 @@ class TestRegressionQMLP:
 
     def test_inputs_spec(self):
         """Test input specification for Q(s,a)."""
-        config = RegressionValueMLPConfig(state_dim=10, action_conditioned=True, action_dim=4, action_horizon=1)
+        config = ValueMLPConfig(state_dim=10, action_conditioned=True, action_dim=4, action_horizon=1)
         spec = config.inputs_spec(batch_size=8)
         assert len(spec) == 3  # (obs, actions, target) for Q(s,a)
         obs_spec, action_spec, target_spec = spec
@@ -183,7 +182,9 @@ class TestCategoricalValueMLP:
 
     def test_create_and_compute_value(self):
         """Test creating model and computing values."""
-        config = CategoricalValueMLPConfig(v_min=-10.0, v_max=10.0, state_dim=10, hidden_dims=(64, 64), num_bins=51)
+        config = ValueMLPConfig(
+            state_dim=10, hidden_dims=(64, 64), use_hl_gauss=True, v_min=-10.0, v_max=10.0, num_bins=51
+        )
         rng = jax.random.key(0)
         model = config.create(rng)
 
@@ -194,7 +195,9 @@ class TestCategoricalValueMLP:
 
     def test_compute_logits(self):
         """Test logits computation."""
-        config = CategoricalValueMLPConfig(v_min=-10.0, v_max=10.0, state_dim=10, hidden_dims=(64, 64), num_bins=51)
+        config = ValueMLPConfig(
+            state_dim=10, hidden_dims=(64, 64), use_hl_gauss=True, v_min=-10.0, v_max=10.0, num_bins=51
+        )
         rng = jax.random.key(0)
         model = config.create(rng)
 
@@ -205,7 +208,7 @@ class TestCategoricalValueMLP:
 
     def test_compute_loss(self):
         """Test loss computation."""
-        config = CategoricalValueMLPConfig(v_min=-10.0, v_max=10.0, state_dim=10, hidden_dims=(64, 64))
+        config = ValueMLPConfig(state_dim=10, hidden_dims=(64, 64), use_hl_gauss=True, v_min=-10.0, v_max=10.0)
         rng = jax.random.key(0)
         model = config.create(rng)
 
@@ -221,14 +224,15 @@ class TestCategoricalQMLP:
 
     def test_create_and_compute_value(self):
         """Test creating model and computing Q-values."""
-        config = CategoricalValueMLPConfig(
-            v_min=-10.0,
-            v_max=10.0,
+        config = ValueMLPConfig(
             state_dim=10,
             action_conditioned=True,
             action_dim=4,
             action_horizon=1,
             hidden_dims=(64, 64),
+            use_hl_gauss=True,
+            v_min=-10.0,
+            v_max=10.0,
             num_bins=51,
         )
         rng = jax.random.key(0)
@@ -242,14 +246,15 @@ class TestCategoricalQMLP:
 
     def test_compute_logits(self):
         """Test logits computation."""
-        config = CategoricalValueMLPConfig(
-            v_min=-10.0,
-            v_max=10.0,
+        config = ValueMLPConfig(
             state_dim=10,
             action_conditioned=True,
             action_dim=4,
             action_horizon=1,
             hidden_dims=(64, 64),
+            use_hl_gauss=True,
+            v_min=-10.0,
+            v_max=10.0,
             num_bins=51,
         )
         rng = jax.random.key(0)
@@ -263,14 +268,15 @@ class TestCategoricalQMLP:
 
     def test_compute_loss(self):
         """Test loss computation."""
-        config = CategoricalValueMLPConfig(
-            v_min=-10.0,
-            v_max=10.0,
+        config = ValueMLPConfig(
             state_dim=10,
             action_conditioned=True,
             action_dim=4,
             action_horizon=1,
             hidden_dims=(64, 64),
+            use_hl_gauss=True,
+            v_min=-10.0,
+            v_max=10.0,
         )
         rng = jax.random.key(0)
         model = config.create(rng)

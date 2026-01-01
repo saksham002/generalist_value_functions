@@ -228,7 +228,7 @@ class EnsembleValueFunction(BaseValueFunction):
     ) -> at.Float[at.Array, "num_ensemble batch num_bins"]:
         """Compute logits for categorical ensemble members.
 
-        This is only valid for ensembles of CategoricalValueMLP.
+        This is only valid for ensembles of ValueMLP with use_hl_gauss=True.
 
         Args:
             observation: Observation containing state.
@@ -244,7 +244,7 @@ class EnsembleValueFunction(BaseValueFunction):
             obs: _model.Observation,
             act: _model.Actions | None,
         ):
-            # Assumes member has compute_logits method (CategoricalValueMLP)
+            # Assumes member has compute_logits method (ValueMLP with use_hl_gauss=True)
             return member.compute_logits(obs, act)
 
         return compute_single_logits(self.vectorized_member, observation, action)
