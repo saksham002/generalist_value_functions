@@ -176,6 +176,8 @@ def create_numpy_dataset_from_minari(
     minari_dataset_id: str,
     discount: float = 0.99,
     max_episodes: int | None = None,
+    reward_scale: float = 1.0,
+    reward_bias: float = 0.0,
 ) -> NumpyDataset:
     """Create a NumpyDataset by loading data directly from a Minari dataset.
 
@@ -186,11 +188,15 @@ def create_numpy_dataset_from_minari(
         minari_dataset_id: Minari dataset ID (e.g., 'D4RL/antmaze/large-diverse-v1')
         discount: Discount factor for MC return computation
         max_episodes: If set, only load up to this many episodes
+        reward_scale: Scale factor for reward transformation (r' = scale * r + bias)
+        reward_bias: Bias for reward transformation (r' = scale * r + bias)
 
     Returns:
         NumpyDataset with all data in memory
     """
     logging.info(f"Loading Minari dataset: {minari_dataset_id}")
+    if reward_scale != 1.0 or reward_bias != 0.0:
+        logging.info(f"Applying reward transformation: r' = {reward_scale} * r + {reward_bias}")
     dataset = minari.load_dataset(minari_dataset_id, download=True)
 
     is_antmaze = "antmaze" in minari_dataset_id.lower()
@@ -245,9 +251,12 @@ def create_numpy_dataset_from_minari(
             terminations = rewards > 0
             truncations = np.zeros_like(truncations, dtype=bool)
 
-        # Compute MC returns
+        # Apply reward transformation before MC return computation
+        transformed_rewards = rewards * reward_scale + reward_bias
+
+        # Compute MC returns using transformed rewards
         dones = np.logical_or(terminations, truncations)
-        mc_returns = rl_utils.compute_mc_returns(rewards, dones, discount)
+        mc_returns = rl_utils.compute_mc_returns(transformed_rewards, dones, discount)
 
         # Process each transition (T+1 observations, T actions)
         num_transitions = len(actions)
@@ -267,7 +276,7 @@ def create_numpy_dataset_from_minari(
             all_actions.append(action)
             all_next_states.append(next_obs)
             all_next_actions.append(next_action)
-            all_rewards.append(rewards[t])
+            all_rewards.append(transformed_rewards[t])
             all_mc_returns.append(mc_returns[t])
             all_terminations.append(terminations[t])
             all_truncations.append(truncations[t])
@@ -600,6 +609,8 @@ def create_numpy_data_loader(
     dataset = create_numpy_dataset_from_minari(
         data_config.minari_dataset_id,
         discount=data_config.discount,
+        reward_scale=data_config.reward_scale,
+        reward_bias=data_config.reward_bias,
     )
 
     # Apply transforms.

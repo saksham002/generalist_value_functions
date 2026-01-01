@@ -106,6 +106,10 @@ class DataConfig:
     rl_mode: bool = False  # If True, use value function training pipeline
     discount: float = 0.99  # Discount factor (used if MC returns not in dataset)
 
+    # Reward transformation: r' = reward_scale * r + reward_bias (applied before MC return computation)
+    reward_scale: float = 1.0
+    reward_bias: float = 0.0
+
     # If set, load data directly from Minari dataset (fastest option for in-memory datasets)
     minari_dataset_id: str | None = None
 
@@ -551,6 +555,9 @@ class MinariDataConfig(DataConfigFactory):
     minari_dataset_id: str = tyro.MISSING
     # Discount factor for MC return computation
     discount: float = 0.99
+    # Reward transformation: r' = reward_scale * r + reward_bias
+    reward_scale: float = 1.0
+    reward_bias: float = 0.0
 
     # Override repo_id from parent - not used for minari loading
     repo_id: str = "minari"  # Dummy value, not used
@@ -580,6 +587,8 @@ class MinariDataConfig(DataConfigFactory):
             use_quantile_norm=False,
             rl_mode=True,
             discount=self.discount,
+            reward_scale=self.reward_scale,
+            reward_bias=self.reward_bias,
             minari_dataset_id=self.minari_dataset_id,
         )
 
@@ -716,12 +725,14 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
         # Q-function with MSE regression - using MinariDataConfig for fast in-memory loading
         TrainConfig(
             name="antmaze_large_diverse_v1_q_regression",
-            model=value_mlp.RegressionValueMLPConfig(
+            model=value_mlp.ValueMLPConfig(
                 state_dim=state_dim,
                 action_conditioned=True,
                 action_dim=action_dim,
                 action_horizon=1,
                 hidden_dims=(256, 256),
+                use_layer_norm=True,
+                orthogonal_init_scale=1e-2,
             ),
             data=MinariDataConfig(
                 minari_dataset_id="D4RL/antmaze/large-diverse-v1",
@@ -729,25 +740,23 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
             ),
             num_train_steps=100_000,
             batch_size=256,
-            lr_schedule=_optimizer.CosineDecaySchedule(
-                warmup_steps=1_000,
-                peak_lr=3e-4,
-                decay_steps=100_000,
-                decay_lr=1e-5,
-            ),
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
         ),
         # Q-function with HL-Gauss categorical loss - using MinariDataConfig for fast in-memory loading
         TrainConfig(
             name="antmaze_large_diverse_v1_q_hl_gauss",
-            model=value_mlp.CategoricalValueMLPConfig(
-                v_min=0.0,  # Antmaze rewards are 0 or 1
-                v_max=1.0,  # MC returns in [0, 1] for antmaze
+            model=value_mlp.ValueMLPConfig(
                 state_dim=state_dim,
                 action_conditioned=True,
                 action_dim=action_dim,
                 action_horizon=1,
                 hidden_dims=(256, 256),
-                num_bins=51,
+                use_layer_norm=True,
+                orthogonal_init_scale=1e-2,
+                use_hl_gauss=True,
+                v_min=0.0,  # Antmaze rewards are 0 or 1
+                v_max=1.0,  # MC returns in [0, 1] for antmaze
+                num_bins=128,
                 sigma=0.75,
             ),
             data=MinariDataConfig(
@@ -756,12 +765,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
             ),
             num_train_steps=100_000,
             batch_size=256,
-            lr_schedule=_optimizer.CosineDecaySchedule(
-                warmup_steps=1_000,
-                peak_lr=3e-4,
-                decay_steps=100_000,
-                decay_lr=1e-5,
-            ),
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
         ),
     ]
 
