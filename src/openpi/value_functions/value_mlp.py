@@ -6,6 +6,7 @@ configured to be action-conditioned (Q-function) or not (V-function).
 """
 
 import dataclasses
+import functools
 
 import flax.nnx as nnx
 import jax
@@ -19,6 +20,18 @@ from openpi.value_functions import hl_gauss as _hl_gauss
 from openpi.value_functions.base import BaseValueFunction
 from openpi.value_functions.base import BaseValueFunctionConfig
 from openpi.value_functions.base import Transition
+
+
+@functools.cache
+def _get_orthogonal_init(scale: float):
+    """Get a cached orthogonal initializer for the given scale.
+
+    Caching ensures the same function object is returned for the same scale.
+    This is required because jax.eval_shape and actual jit calls both invoke
+    the model constructor, and we need the kernel_init function to have a
+    consistent identity for pytree structure matching.
+    """
+    return nnx.initializers.orthogonal(scale=scale)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -113,8 +126,8 @@ class ValueMLP(BaseValueFunction):
         self.num_bins = config.num_bins
         self.sigma = config.sigma
 
-        # Kernel initializer - always use orthogonal init
-        kernel_init = nnx.initializers.orthogonal(scale=config.orthogonal_init_scale)
+        # Kernel initializer - use cached function for consistent pytree identity
+        kernel_init = _get_orthogonal_init(config.orthogonal_init_scale)
 
         # Build MLP layers
         layers: list[nnx.Linear] = []
