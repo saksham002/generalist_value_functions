@@ -291,7 +291,7 @@ def generate_validation_plots(
     step: int,
     *,
     action_conditioned: bool,
-    data_config: _data_loader.DataConfig,
+    data_config: _config.DataConfig,
 ) -> dict:
     """Generate validation plots comparing predicted values vs MC returns.
 
