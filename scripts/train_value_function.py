@@ -28,6 +28,7 @@ import openpi.training.sharding as sharding
 from openpi.training.time_utils import Timer
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+import openpi.transforms as _transforms
 import openpi.value_functions.base as _value_fn
 
 
@@ -290,6 +291,7 @@ def generate_validation_plots(
     step: int,
     *,
     action_conditioned: bool,
+    data_config: _data_loader.DataConfig,
 ) -> dict:
     """Generate validation plots comparing predicted values vs MC returns.
 
@@ -299,11 +301,19 @@ def generate_validation_plots(
         val_episode_indices: List of episode indices to plot
         step: Current training step
         action_conditioned: Whether the model is action-conditioned (Q vs V)
+        data_config: Data configuration containing norm_stats for normalization
 
     Returns:
         Dictionary of wandb images keyed by trajectory index
     """
     from openpi.models import model as _model
+
+    # Create normalization transform matching training data
+    normalize = _transforms.Normalize(
+        data_config.norm_stats,
+        use_quantiles=data_config.use_quantile_norm,
+        strict=False,
+    )
 
     images = {}
 
@@ -337,10 +347,14 @@ def generate_validation_plots(
                 state = state.numpy()
             state = np.asarray(state, dtype=np.float32)
 
+            # Apply normalization to state (matching training data)
+            normalized_data = normalize({"state": state})
+            normalized_state = normalized_data["state"]
+
             obs = _model.Observation(
                 images={},
                 image_masks={},
-                state=jnp.asarray(state[None, ...]),  # Add batch dim
+                state=jnp.asarray(normalized_state[None, ...]),  # Add batch dim
                 tokenized_prompt=None,
                 tokenized_prompt_mask=None,
             )
@@ -351,7 +365,12 @@ def generate_validation_plots(
                 act = frame.get("actions", frame.get("action"))
                 if hasattr(act, "numpy"):
                     act = act.numpy()
-                action = jnp.asarray(np.asarray(act, dtype=np.float32)[None, ...])
+                act = np.asarray(act, dtype=np.float32)
+
+                # Apply normalization to action (matching training data)
+                normalized_act_data = normalize({"actions": act})
+                normalized_act = normalized_act_data["actions"]
+                action = jnp.asarray(normalized_act[None, ...])
 
             # Compute predicted value
             pred_value = model.compute_value(obs, action)
@@ -442,6 +461,8 @@ def main(config: _config.TrainConfig):
         val_dataset = _data_loader.create_numpy_dataset_from_minari(
             data_config.minari_dataset_id,
             discount=data_config.discount,
+            reward_scale=data_config.reward_scale,
+            reward_bias=data_config.reward_bias,
         )
     else:
         from lerobot.common.datasets import lerobot_dataset
@@ -539,6 +560,7 @@ def main(config: _config.TrainConfig):
                     val_episode_indices=val_episode_indices,
                     step=step,
                     action_conditioned=action_conditioned,
+                    data_config=data_config,
                 )
                 if plot_images:
                     wandb.log(plot_images, step=step)
