@@ -53,10 +53,10 @@ class ValueFunctionInputs(transforms.DataTransformFn):
 
         result = {
             "state": data["state"],
-            "action": action,
+            "actions": action,  # Keep as 'actions' for normalization compatibility
             "reward": to_scalar(data["reward"]),
             "next_state": data["next_state"],
-            "next_action": next_action,
+            "next_actions": next_action,  # Keep as 'next_actions' for consistency
             "mc_return": np.float32(mc_return),
             "termination": np.array(to_bool(data["termination"]), dtype=np.bool_),
             "truncation": np.array(to_bool(data["truncation"]), dtype=np.bool_),

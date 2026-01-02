@@ -26,8 +26,8 @@ class TestValueFunctionInputs:
         transform = ValueFunctionInputs()
         result = transform(data)
 
-        assert "action" in result
-        assert result["action"].shape == (8,)
+        assert "actions" in result
+        assert result["actions"].shape == (8,)
 
     def test_includes_rl_fields(self):
         """Test that RL fields are included."""
@@ -37,7 +37,7 @@ class TestValueFunctionInputs:
 
         assert "reward" in result
         assert "next_state" in result
-        assert "next_action" in result
+        assert "next_actions" in result
         assert "mc_return" in result
         assert "termination" in result
         assert "truncation" in result

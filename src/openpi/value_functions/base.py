@@ -66,10 +66,10 @@ class Transition:
         )
         return cls(
             observation=observation,
-            action=jnp.asarray(batch["action"]),
+            action=jnp.asarray(batch["actions"]),
             reward=jnp.asarray(batch["reward"]),
             next_observation=next_observation,
-            next_action=jnp.asarray(batch["next_action"]),
+            next_action=jnp.asarray(batch["next_actions"]),
             mc_return=jnp.asarray(batch["mc_return"]),
             termination=jnp.asarray(batch["termination"]),
             truncation=jnp.asarray(batch["truncation"]),

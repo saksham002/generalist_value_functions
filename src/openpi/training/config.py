@@ -577,6 +577,14 @@ class MinariDataConfig(DataConfigFactory):
         asset_id = self.minari_dataset_id.replace("/", "_")
         norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
 
+        # Add next_state and next_actions with same normalization as their current counterparts
+        # This ensures TD/SARSA targets use consistent normalization
+        if norm_stats is not None:
+            if "state" in norm_stats:
+                norm_stats["next_state"] = norm_stats["state"]
+            if "actions" in norm_stats:
+                norm_stats["next_actions"] = norm_stats["actions"]
+
         return DataConfig(
             repo_id=None,  # Not using LeRobot
             asset_id=asset_id,
