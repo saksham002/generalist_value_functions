@@ -66,8 +66,8 @@ class ValueMLPConfig(BaseValueFunctionConfig):
     # Use layer normalization after each hidden layer.
     use_layer_norm: bool = False
 
-    # Scale for orthogonal initialization.
-    orthogonal_init_scale: float = 1e-2
+    # Scale for orthogonal initialization. If None, use default Flax initialization.
+    orthogonal_init_scale: float | None = None
 
     # ========== HL-Gauss (Categorical) Configuration ==========
     # If True, use HL-Gauss categorical loss. If False, use MSE regression loss.
@@ -127,7 +127,7 @@ class ValueMLP(BaseValueFunction):
         self.sigma = config.sigma
 
         # Kernel initializer - use cached function for consistent pytree identity
-        kernel_init = _get_orthogonal_init(config.orthogonal_init_scale)
+        kernel_init = _get_orthogonal_init(config.orthogonal_init_scale) if config.orthogonal_init_scale else None
 
         # Build MLP layers
         layers: list[nnx.Linear] = []
@@ -138,7 +138,10 @@ class ValueMLP(BaseValueFunction):
             in_dim = config.state_dim
 
         for hidden_dim in config.hidden_dims:
-            layers.append(nnx.Linear(in_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs))
+            if kernel_init is not None:
+                layers.append(nnx.Linear(in_dim, hidden_dim, kernel_init=kernel_init, rngs=rngs))
+            else:
+                layers.append(nnx.Linear(in_dim, hidden_dim, rngs=rngs))
             if config.use_layer_norm:
                 layer_norms.append(nnx.LayerNorm(hidden_dim, rngs=rngs))
             else:
@@ -147,7 +150,10 @@ class ValueMLP(BaseValueFunction):
 
         # Output layer: num_bins for HL-Gauss, 1 for regression
         out_dim = config.num_bins if config.use_hl_gauss else 1
-        layers.append(nnx.Linear(in_dim, out_dim, kernel_init=kernel_init, rngs=rngs))
+        if kernel_init is not None:
+            layers.append(nnx.Linear(in_dim, out_dim, kernel_init=kernel_init, rngs=rngs))
+        else:
+            layers.append(nnx.Linear(in_dim, out_dim, rngs=rngs))
 
         self.layers = layers
         self.layer_norms = layer_norms
