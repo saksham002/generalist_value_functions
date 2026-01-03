@@ -32,7 +32,9 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 import openpi.value_functions.base as _value_functions_base
-import openpi.value_functions.value_mlp as value_mlp
+import openpi.value_functions.heads as _heads
+import openpi.value_functions.networks.mlp as _mlp_network
+import openpi.value_functions.value_function as _value_function
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -730,16 +732,19 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
                 decay_lr=1e-5,
             ),
         ),
-        # Q-function with MSE regression - using MinariDataConfig for fast in-memory loading
+        # MC Q-function with MSE regression - using MinariDataConfig for fast in-memory loading
         TrainConfig(
             name="antmaze_large_diverse_v1_q_regression",
-            model=value_mlp.ValueMLPConfig(
-                state_dim=state_dim,
-                action_conditioned=True,
-                action_dim=action_dim,
-                action_horizon=1,
-                hidden_dims=(256, 256, 256, 256),
-                use_layer_norm=False,
+            model=_value_function.MCValueFunctionConfig(
+                network_config=_mlp_network.MLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=True,
+                    action_dim=action_dim,
+                    action_horizon=1,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                head_config=_heads.RegressionHeadConfig(),
             ),
             data=MinariDataConfig(
                 minari_dataset_id="D4RL/antmaze/large-diverse-v1",
@@ -750,21 +755,77 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
             batch_size=256,
             lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
         ),
-        # Q-function with HL-Gauss categorical loss - using MinariDataConfig for fast in-memory loading
+        # MC Q-function with HL-Gauss categorical loss - using MinariDataConfig for fast in-memory loading
         TrainConfig(
             name="antmaze_large_diverse_v1_q_hl_gauss",
-            model=value_mlp.ValueMLPConfig(
-                state_dim=state_dim,
-                action_conditioned=True,
-                action_dim=action_dim,
-                action_horizon=1,
-                hidden_dims=(256, 256, 256, 256),
-                use_layer_norm=False,
-                use_hl_gauss=True,
-                v_min=-100.0,
-                v_max=0.0,
-                num_bins=128,
-                sigma=0.75,
+            model=_value_function.MCValueFunctionConfig(
+                network_config=_mlp_network.MLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=True,
+                    action_dim=action_dim,
+                    action_horizon=1,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                head_config=_heads.CategoricalHeadConfig(
+                    v_min=-100.0,
+                    v_max=0.0,
+                    num_bins=128,
+                    sigma=0.75,
+                ),
+            ),
+            data=MinariDataConfig(
+                minari_dataset_id="D4RL/antmaze/large-diverse-v1",
+                discount=0.99,
+                reward_bias=-1.0,
+            ),
+            num_train_steps=1_000_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
+        # MLP SARSA Q-function with MSE regression
+        TrainConfig(
+            name="antmaze_large_diverse_v1_sarsa_regression",
+            model=_value_function.SARSAValueFunctionConfig(
+                network_config=_mlp_network.MLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=True,
+                    action_dim=action_dim,
+                    action_horizon=1,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                head_config=_heads.RegressionHeadConfig(),
+                discount=0.99,
+            ),
+            data=MinariDataConfig(
+                minari_dataset_id="D4RL/antmaze/large-diverse-v1",
+                discount=0.99,
+                reward_bias=-1.0,
+            ),
+            num_train_steps=1_000_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
+        # MLP SARSA Q-function with HL-Gauss categorical loss
+        TrainConfig(
+            name="antmaze_large_diverse_v1_sarsa_hl_gauss",
+            model=_value_function.SARSAValueFunctionConfig(
+                network_config=_mlp_network.MLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=True,
+                    action_dim=action_dim,
+                    action_horizon=1,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                head_config=_heads.CategoricalHeadConfig(
+                    v_min=-100.0,
+                    v_max=0.0,
+                    num_bins=128,
+                    sigma=0.75,
+                ),
+                discount=0.99,
             ),
             data=MinariDataConfig(
                 minari_dataset_id="D4RL/antmaze/large-diverse-v1",
