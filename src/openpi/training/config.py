@@ -739,7 +739,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
                 action_dim=action_dim,
                 action_horizon=1,
                 hidden_dims=(256, 256, 256, 256),
-                use_layer_norm=False,  # Layer norm with small init causes output collapse
+                use_layer_norm=True,
                 orthogonal_init_scale=1e-2,
             ),
             data=MinariDataConfig(
@@ -760,7 +760,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
                 action_dim=action_dim,
                 action_horizon=1,
                 hidden_dims=(256, 256, 256, 256),
-                use_layer_norm=False,  # Layer norm with small init causes output collapse
+                use_layer_norm=True,
                 orthogonal_init_scale=1e-2,
                 use_hl_gauss=True,
                 v_min=-100.0,
