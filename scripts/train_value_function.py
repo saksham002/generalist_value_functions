@@ -475,7 +475,8 @@ def main(config: _config.TrainConfig):
         num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
     ).tolist()
     logging.info(f"Selected validation episodes: {val_episode_indices}")
-    action_conditioned = getattr(config.model, "action_conditioned", False)
+    network_config = getattr(config.model, "network_config", None)
+    action_conditioned = getattr(network_config, "action_conditioned", False)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
