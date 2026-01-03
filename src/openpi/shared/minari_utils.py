@@ -15,16 +15,10 @@ def get_minari_dims(dataset_id: str) -> tuple[int, int, np.ndarray, np.ndarray]:
     """
     dataset = minari.load_dataset(dataset_id, download=True)
 
-    # Handle observation space
-    # Note: We only use the 'observation' key from Dict spaces, ignoring goal components
+    # Handle observation space - concatenate all spaces sorted by key
     obs_space = dataset.observation_space
-    if hasattr(obs_space, "spaces"):  # Dict space (e.g., antmaze with achieved_goal, desired_goal)
-        # Only use 'observation' key to match LeRobot conversion
-        if "observation" not in obs_space.spaces:
-            raise ValueError(
-                f"Dict observation space must have an 'observation' key, got: {list(obs_space.spaces.keys())}"
-            )
-        obs_dim = int(np.prod(obs_space.spaces["observation"].shape))
+    if hasattr(obs_space, "spaces"):  # Dict space
+        obs_dim = sum(int(np.prod(obs_space.spaces[k].shape)) for k in sorted(obs_space.spaces.keys()))
     elif hasattr(obs_space, "shape"):  # Box space
         obs_dim = int(np.prod(obs_space.shape))
     else:

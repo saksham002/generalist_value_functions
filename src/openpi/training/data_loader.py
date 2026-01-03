@@ -229,12 +229,9 @@ def create_numpy_dataset_from_minari(
         terminations = episode.terminations
         truncations = episode.truncations
 
-        # Handle dict observations - only use 'observation' key
         if isinstance(observations, dict):
-            if "observation" in observations:
-                observations = observations["observation"]
-            else:
-                raise ValueError(f"Dict observations must have 'observation' key, got: {list(observations.keys())}")
+            obs_arrays = [observations[k] for k in sorted(observations.keys())]
+            observations = np.concatenate(obs_arrays, axis=-1)
 
         if is_antmaze:
             # For antmaze: truncate episode after first positive reward
