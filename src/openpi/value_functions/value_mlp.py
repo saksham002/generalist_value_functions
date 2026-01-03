@@ -167,12 +167,12 @@ class ValueMLP(BaseValueFunction):
         else:
             x = state
 
-        # Hidden layers with ReLU activation
+        # Hidden layers with Swish activation
         for i, layer in enumerate(self.layers[:-1]):
             x = layer(x)
             if self.use_layer_norm and self.layer_norms[i] is not None:
                 x = self.layer_norms[i](x)
-            x = nnx.relu(x)
+            x = nnx.swish(x)
 
         # Output layer (no activation)
         return self.layers[-1](x)
