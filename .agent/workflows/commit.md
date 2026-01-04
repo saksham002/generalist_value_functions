@@ -62,6 +62,7 @@ Optional longer description explaining:
 - **Config changes**: Separate from code changes unless tightly coupled
 - **Refactoring**: Separate from new features
 - **Infrastructure**: Build/tooling changes separate from application code
+- **Small fixes together**: Don't make individual commits for small fixes (lint fixes, docstring updates, etc.) - group them into meaningful commits
 
 ## 5. Verify Commits
 // turbo
