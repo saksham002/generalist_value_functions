@@ -28,24 +28,19 @@ class ValueFunctionInputs(transforms.DataTransformFn):
     """
 
     def __call__(self, data: dict) -> dict:
-        # Helper to extract scalar from potentially shaped tensor
-        def to_scalar(x):
+        # Helper to convert to float32 array, handling pytorch tensors and scalars
+        def to_float_array(x):
             if hasattr(x, "numpy"):
                 x = x.numpy()
-            x = np.asarray(x, dtype=np.float32)
-            if x.ndim > 0 and x.size == 1:
-                return x.item()
-            return x
+            return np.asarray(x, dtype=np.float32)
 
-        def to_bool(x):
+        # Helper to convert to bool array, handling pytorch tensors and scalars
+        def to_bool_array(x):
             if hasattr(x, "numpy"):
                 x = x.numpy()
-            x = np.asarray(x)
-            if x.ndim > 0 and x.size == 1:
-                return bool(x.item())
-            return bool(x)
+            return np.asarray(x, dtype=np.bool_)
 
-        mc_return = to_scalar(data["mc_return"])
+        mc_return = to_float_array(data["mc_return"])
 
         # Support both actions (LeRobot convention) and action (legacy)
         action = data.get("actions", data.get("action"))
@@ -54,12 +49,12 @@ class ValueFunctionInputs(transforms.DataTransformFn):
         result = {
             "state": data["state"],
             "actions": action,  # Keep as 'actions' for normalization compatibility
-            "reward": to_scalar(data["reward"]),
+            "reward": to_float_array(data["reward"]),
             "next_state": data["next_state"],
             "next_actions": next_action,  # Keep as 'next_actions' for consistency
-            "mc_return": np.float32(mc_return),
-            "termination": np.array(to_bool(data["termination"]), dtype=np.bool_),
-            "truncation": np.array(to_bool(data["truncation"]), dtype=np.bool_),
+            "mc_return": mc_return,
+            "termination": to_bool_array(data["termination"]),
+            "truncation": to_bool_array(data["truncation"]),
         }
 
         # Pass through prompt if available
