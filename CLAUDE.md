@@ -254,6 +254,8 @@ Standardized data format using typed dataclasses:
 - **Import style**: Force single-line imports (enforced by isort), except for `collections.abc`, `typing`, and `typing_extensions`
 - **Type hints**: Use type hints extensively, especially with `array_typing` module for array shapes
 - **Dataclasses**: Prefer frozen dataclasses for configuration objects
+- **Variable names**: Use descriptive variable names that clearly convey purpose (e.g., `num_transitions_per_sample` instead of `n` or `num_transitions`), don't worry about variable names being too long (up to reasonable length).
+- **Avoid reshape with -1**: Don't use `reshape(..., -1)` as it can lead to silent bugs. Instead, explicitly compute and specify all dimensions.
 
 ### Comments and Documentation
 **CRITICAL**: Do not add comments that only make sense in the context of the current prompt or that simply restate what the code does.
