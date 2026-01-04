@@ -30,6 +30,7 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 import openpi.transforms as _transforms
 import openpi.value_functions.base as _value_fn
+from openpi.value_functions.value_function import MultiValueFunctionConfig
 
 
 def init_logging():
@@ -175,8 +176,10 @@ def train_step(
     """
     model = nnx.merge(state.model_def, state.params)
 
-    # Create transition once for both loss computation and batch stats
-    transition = _value_fn.Transition.from_batch(batch)
+    if isinstance(config.model, MultiValueFunctionConfig):
+        transition = _value_fn.MultiTransition.from_batch(batch)
+    else:
+        transition = _value_fn.Transition.from_batch(batch)
 
     def loss_fn(model: _value_fn.BaseValueFunction):
         # compute_loss returns (per_sample_loss, info_dict)

@@ -115,6 +115,12 @@ class DataConfig:
     # If set, load data directly from Minari dataset (fastest option for in-memory datasets)
     minari_dataset_id: str | None = None
 
+    # Multi-transition training options
+    # Number of transitions per sample (for multi-state value functions)
+    num_transitions_per_sample: int | None = None
+    # Sampler type: "uniform", "trajectory_uniform", or "trajectory_ordered"
+    multi_transition_sampler_type: Literal["uniform", "trajectory_uniform", "trajectory_ordered"] = "trajectory_uniform"
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -604,6 +610,32 @@ class MinariDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class MultiTransitionMinariDataConfig(MinariDataConfig):
+    """Data config for multi-transition value function training.
+
+    Extends MinariDataConfig to sample multiple transitions per sample,
+    enabling training of multi-state value functions.
+    """
+
+    # Number of transitions per sample
+    num_transitions_per_sample: int = tyro.MISSING
+    # Sampler type: uniform across dataset, uniform within trajectory, or ordered within trajectory
+    multi_transition_sampler_type: Literal["uniform", "trajectory_uniform", "trajectory_ordered"] = "trajectory_uniform"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Get base config from parent
+        base_config = super().create(assets_dirs, model_config)
+
+        # Add multi-transition settings
+        return dataclasses.replace(
+            base_config,
+            num_transitions_per_sample=self.num_transitions_per_sample,
+            multi_transition_sampler_type=self.multi_transition_sampler_type,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -831,6 +863,32 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
                 minari_dataset_id="D4RL/antmaze/large-diverse-v1",
                 discount=0.99,
                 reward_bias=-1.0,
+            ),
+            num_train_steps=1_000_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
+        # Multi-Transition MC Q-function (8 transitions per sample)
+        TrainConfig(
+            name="antmaze_large_diverse_v1_multi_mc",
+            model=_value_function.MultiMCValueFunctionConfig(
+                network_config=_mlp_network.MultiMLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=True,
+                    action_dim=action_dim,
+                    action_horizon=1,
+                    num_transitions_per_sample=8,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                head_config=_heads.RegressionHeadConfig(),
+            ),
+            data=MultiTransitionMinariDataConfig(
+                minari_dataset_id="D4RL/antmaze/large-diverse-v1",
+                discount=0.99,
+                reward_bias=-1.0,
+                num_transitions_per_sample=8,
+                multi_transition_sampler_type="trajectory_uniform",
             ),
             num_train_steps=1_000_000,
             batch_size=256,
