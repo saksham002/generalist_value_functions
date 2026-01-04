@@ -77,6 +77,55 @@ class Transition:
 
 
 @dataclasses.dataclass(frozen=True)
+class MultiTransition:
+    """A sequence of transitions for multi-state value functions.
+
+    All arrays have shape [batch, num_transitions_per_sample, ...].
+    This enables value functions that jointly predict values for multiple states.
+    """
+
+    observation: _model.Observation
+    action: at.Float[at.Array, "*b n action_dim"]
+    reward: at.Float[at.Array, "*b n"]
+    next_observation: _model.Observation
+    next_action: at.Float[at.Array, "*b n action_dim"]
+    mc_return: at.Float[at.Array, "*b n"]
+    termination: at.Bool[at.Array, "*b n"]
+    truncation: at.Bool[at.Array, "*b n"]
+
+    @classmethod
+    def from_batch(cls, batch: dict) -> "MultiTransition":
+        """Create a MultiTransition from a batch dictionary.
+
+        Expects batch arrays to have shape [batch, num_transitions_per_sample, ...].
+        """
+        observation = _model.Observation(
+            images={},
+            image_masks={},
+            state=jnp.asarray(batch["state"]),
+            tokenized_prompt=None,
+            tokenized_prompt_mask=None,
+        )
+        next_observation = _model.Observation(
+            images={},
+            image_masks={},
+            state=jnp.asarray(batch["next_state"]),
+            tokenized_prompt=None,
+            tokenized_prompt_mask=None,
+        )
+        return cls(
+            observation=observation,
+            action=jnp.asarray(batch["actions"]),
+            reward=jnp.asarray(batch["reward"]),
+            next_observation=next_observation,
+            next_action=jnp.asarray(batch["next_actions"]),
+            mc_return=jnp.asarray(batch["mc_return"]),
+            termination=jnp.asarray(batch["termination"]),
+            truncation=jnp.asarray(batch["truncation"]),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class BaseValueFunctionConfig(abc.ABC):
     """Configuration shared by all value functions.
 

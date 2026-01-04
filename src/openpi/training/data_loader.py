@@ -17,6 +17,7 @@ import openpi.models.model as _model
 import openpi.shared.rl_utils as rl_utils
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+import openpi.training.samplers as samplers
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -170,6 +171,45 @@ class NumpyDataset(Dataset):
         start = self.episode_starts[episode_idx]
         end = self.episode_ends[episode_idx]
         return [self[i] for i in range(start, end)]
+
+    def get_items_by_indices(self, indices: np.ndarray) -> dict:
+        """Get multiple items by indices, returning stacked arrays."""
+        return {
+            "state": self.states[indices],
+            "actions": self.actions[indices],
+            "next_state": self.next_states[indices],
+            "next_actions": self.next_actions[indices],
+            "reward": self.rewards[indices].astype(np.float32),
+            "mc_return": self.mc_returns[indices].astype(np.float32),
+            "termination": self.terminations[indices],
+            "truncation": self.truncations[indices],
+        }
+
+
+class MultiTransitionDataset(Dataset):
+    """Dataset that returns multiple transitions per sample using a sampler.
+
+    Each sample contains num_transitions_per_sample transitions.
+    The output shape is [num_transitions_per_sample, ...] for each field.
+    """
+
+    def __init__(
+        self,
+        dataset: NumpyDataset,
+        sampler: samplers.Sampler,
+        num_samples: int | None = None,
+    ):
+        self._dataset = dataset
+        self._sampler = sampler
+        self._num_samples = num_samples if num_samples is not None else len(dataset)
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        # Sample indices using the sampler (index is ignored since sampling is random)
+        indices = self._sampler.sample()
+        return self._dataset.get_items_by_indices(indices)
+
+    def __len__(self) -> int:
+        return self._num_samples
 
 
 def create_numpy_dataset_from_minari(
@@ -603,12 +643,33 @@ def create_numpy_data_loader(
         raise ValueError("minari_dataset_id must be set to use numpy data loader")
 
     # Create the in-memory dataset
-    dataset = create_numpy_dataset_from_minari(
+    base_dataset = create_numpy_dataset_from_minari(
         data_config.minari_dataset_id,
         discount=data_config.discount,
         reward_scale=data_config.reward_scale,
         reward_bias=data_config.reward_bias,
     )
+
+    # Wrap with multi-transition sampler if configured
+    if data_config.num_transitions_per_sample is not None:
+        num_transitions = data_config.num_transitions_per_sample
+        rng = np.random.default_rng(seed)
+
+        # Create appropriate sampler
+        if data_config.multi_transition_sampler_type == "uniform":
+            sampler_config = samplers.UniformRandomSamplerConfig(num_transitions_per_sample=num_transitions)
+        elif data_config.multi_transition_sampler_type == "trajectory_uniform":
+            sampler_config = samplers.TrajectoryUniformSamplerConfig(num_transitions_per_sample=num_transitions)
+        elif data_config.multi_transition_sampler_type == "trajectory_ordered":
+            sampler_config = samplers.TrajectoryOrderedSamplerConfig(num_transitions_per_sample=num_transitions)
+        else:
+            raise ValueError(f"Unknown multi_transition_sampler_type: {data_config.multi_transition_sampler_type}")
+
+        sampler = sampler_config.create(base_dataset, rng)
+        dataset = MultiTransitionDataset(base_dataset, sampler)
+        logging.info(f"Multi-transition mode: n={num_transitions}, sampler={data_config.multi_transition_sampler_type}")
+    else:
+        dataset = base_dataset
 
     # Apply transforms.
     # We apply repack transforms (usually empty for numpy loader), data transforms, and normalization.
