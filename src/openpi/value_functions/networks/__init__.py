@@ -3,5 +3,13 @@
 from openpi.value_functions.networks.base import BaseValueNetwork
 from openpi.value_functions.networks.mlp import MLPNetwork
 from openpi.value_functions.networks.mlp import MLPNetworkConfig
+from openpi.value_functions.networks.mlp import MultiMLPNetwork
+from openpi.value_functions.networks.mlp import MultiMLPNetworkConfig
 
-__all__ = ["BaseValueNetwork", "MLPNetwork", "MLPNetworkConfig"]
+__all__ = [
+    "BaseValueNetwork",
+    "MLPNetwork",
+    "MLPNetworkConfig",
+    "MultiMLPNetwork",
+    "MultiMLPNetworkConfig",
+]
