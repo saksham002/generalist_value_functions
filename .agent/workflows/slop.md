@@ -22,8 +22,9 @@ git diff main -- <file>
 
 3. Review each file and remove the following types of AI slop:
    - **Unnecessary comments**: Extra comments that a human wouldn't add or that are inconsistent with the rest of the file's commenting style
-   - **Defensive over-engineering**: Extra defensive checks, try/catch blocks, or error handling that is abnormal for that area of the codebase (especially if called by trusted/validated codepaths)
-   - **Type escape hatches**: Casts to `any` (TypeScript) or `# type: ignore` (Python) added to work around type issues instead of fixing them properly
+    - **Defensive over-engineering**: Extra defensive checks, or abnormal error handling (especially if called by trusted/validated codepaths)
+    - **Try/Except Blocks**: Almost all `try/except` blocks are slop, especially `try/except ImportError`. They should only be used if strictly necessary.
+    - **Type escape hatches**: Casts to `any` (TypeScript) or `# type: ignore` (Python) added to work around type issues instead of fixing them properly
    - **Style inconsistencies**: Any other code style that is inconsistent with the surrounding file
 
 4. For each issue found:
