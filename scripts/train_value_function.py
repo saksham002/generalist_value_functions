@@ -298,9 +298,15 @@ def generate_validation_plots(
 ) -> dict:
     """Generate validation plots comparing predicted values vs MC returns.
 
+    For multi-transition models, generates two types of plots:
+    - random_trajectory_transitions: n-1 random frames + current frame, use only current output
+    - continuous_chunks: process n consecutive frames, use all n outputs
+
+    If the environment is PointMaze, also plots the ground-truth Q-values from the oracle.
+
     Args:
         model: The value function model
-        dataset: The LeRobot dataset
+        dataset: The dataset
         val_episode_indices: List of episode indices to plot
         step: Current training step
         action_conditioned: Whether the model is action-conditioned (Q vs V)
@@ -311,7 +317,20 @@ def generate_validation_plots(
     """
     from openpi.models import model as _model
 
-    # Create normalization transform matching training data
+    # Check for PointMaze oracle
+    oracle = None
+    if data_config.minari_dataset_id and "pointmaze" in data_config.minari_dataset_id.lower():
+        from openpi.point_maze_utils.point_maze_oracle import PointMazeOracle
+
+        oracle = PointMazeOracle()
+
+    # Detect multi-transition model
+    is_multi_transition = hasattr(model.network, "num_transitions_per_sample")
+    num_transitions = None
+    if is_multi_transition:
+        num_transitions = model.network.num_transitions_per_sample
+
+    # Create normalization transform
     normalize = _transforms.Normalize(
         data_config.norm_stats,
         use_quantiles=data_config.use_quantile_norm,
@@ -330,12 +349,9 @@ def generate_validation_plots(
         if len(frames) == 0:
             continue
 
-        # Collect mc_returns and predicted values
+        # Collect mc_returns for ground truth
         mc_returns = []
-        predicted_values = []
-
         for frame in frames:
-            # Extract MC return
             mc_return = frame.get("mc_return")
             if mc_return is None:
                 continue
@@ -344,69 +360,259 @@ def generate_validation_plots(
             mc_return = np.asarray(mc_return).item() if np.asarray(mc_return).size == 1 else np.asarray(mc_return)
             mc_returns.append(float(mc_return))
 
-            # Build observation for prediction
-            state = frame.get("state")
-            if hasattr(state, "numpy"):
-                state = state.numpy()
-            state = np.asarray(state, dtype=np.float32)
-
-            # Apply normalization to state (matching training data)
-            normalized_data = normalize({"state": state})
-            normalized_state = normalized_data["state"]
-
-            obs = _model.Observation(
-                images={},
-                image_masks={},
-                state=jnp.asarray(normalized_state[None, ...]),  # Add batch dim
-                tokenized_prompt=None,
-                tokenized_prompt_mask=None,
-            )
-
-            # Get action if needed
-            action = None
-            if action_conditioned:
-                act = frame.get("actions", frame.get("action"))
-                if hasattr(act, "numpy"):
-                    act = act.numpy()
-                act = np.asarray(act, dtype=np.float32)
-
-                # Apply normalization to action (matching training data)
-                normalized_act_data = normalize({"actions": act})
-                normalized_act = normalized_act_data["actions"]
-                action = jnp.asarray(normalized_act[None, ...])
-
-            # Compute predicted value
-            pred_value = model.compute_value(obs, action)
-            predicted_values.append(float(jax.device_get(pred_value[0])))
-
         if len(mc_returns) == 0:
             continue
 
-        # Create plot
-        fig, ax = plt.subplots(figsize=(10, 6))
-        timesteps = np.arange(len(mc_returns))
+        # Compute oracle values if available
+        oracle_values = None
+        if oracle:
+            oracle_values = []
+            # Fixed goal for PointMaze consistency.
+            sample_state = np.array(frames[-1]["state"])
+            fixed_goal = sample_state[2:4]
 
-        ax.plot(timesteps, mc_returns, label="MC Returns", color="blue", linewidth=2)
-        ax.plot(
-            timesteps,
-            predicted_values,
-            label="Predicted Value",
-            color="orange",
-            linewidth=2,
-            linestyle="--",
-        )
+            for frame in frames:
+                if frame.get("mc_return") is None:
+                    continue
+                # Extract PointMaze state/goal/action from flattened observation
+                # Config: [achieved_goal(2), desired_goal(2), observation(4)]
+                # observation is (x, y, vx, vy)
+                state_vec = np.array(frame["state"])
+                action_vec = np.array(frame["actions"])
 
-        ax.set_xlabel("Timestep", fontsize=12)
-        ax.set_ylabel("Value", fontsize=12)
-        ax.set_title(f"Episode {ep_idx} - Step {step}", fontsize=14)
-        ax.legend(fontsize=11)
-        ax.grid(visible=True, alpha=0.3)
+                if state_vec.shape[-1] != 8:
+                    raise ValueError(f"Oracle expects PointMaze observation with 8 dimensions, got {state_vec.shape}")
 
-        plt.tight_layout()
-        images[f"val/episode_{ep_idx}"] = wandb.Image(fig)
-        plt.close(fig)
+                goal = fixed_goal
+                state = state_vec[4:8]
+                q = oracle.compute_dense_distance(state, goal, action_vec)
+                oracle_values.append(q)
+
+                # Check constraint: Oracle (Optimal) >= MC (Suboptimal)
+                # Allow a small margin (0.5) for discrete/continuous approx errors
+                if frame.get("mc_return") is not None:
+                    mc = float(frame["mc_return"])
+                    if q < mc - 0.5:
+                        logging.warning(
+                            f"Oracle Value Constraint Violated! Episode {ep_idx}, Step {step}, "
+                            f"Oracle={q:.4f}, MC={mc:.4f}, Diff={q - mc:.4f}. "
+                            f"State={state}, Goal={goal}. "
+                            "Oracle should be >= MC (Optimal >= Policy)."
+                        )
+
+        if is_multi_transition:
+            # Generate plots for multi-transition models
+            images.update(
+                _generate_multi_transition_plots(
+                    model,
+                    frames,
+                    mc_returns,
+                    ep_idx,
+                    step,
+                    num_transitions,
+                    normalize,
+                    action_conditioned,
+                    _model,
+                    oracle_values,
+                )
+            )
+        else:
+            # Standard single-transition plot
+            predicted_values = _compute_single_transition_values(model, frames, normalize, action_conditioned, _model)
+            images[f"val/episode_{ep_idx}"] = _create_value_plot(
+                mc_returns, predicted_values, ep_idx, step, "", oracle_values
+            )
 
     return images
+
+
+def _normalize_frame(frame: dict, normalize, _model) -> tuple:
+    """Extract and normalize state/action from a frame."""
+    state = frame.get("state")
+    if hasattr(state, "numpy"):
+        state = state.numpy()
+    state = np.asarray(state, dtype=np.float32)
+    normalized_data = normalize({"state": state})
+    normalized_state = normalized_data["state"]
+
+    action = frame.get("actions", frame.get("action"))
+    if action is not None:
+        action = np.asarray(action, dtype=np.float32)
+        normalized_act_data = normalize({"actions": action})
+        action = normalized_act_data["actions"]
+
+    return normalized_state, action
+
+
+def _compute_single_transition_values(model, frames, normalize, action_conditioned, _model) -> list[float]:
+    """Compute predicted values for single-transition models."""
+    predicted_values = []
+    for frame in frames:
+        if frame.get("mc_return") is None:
+            continue
+        normalized_state, action = _normalize_frame(frame, normalize, _model)
+        obs = _model.Observation(
+            images={},
+            image_masks={},
+            state=jnp.asarray(normalized_state[None, ...]),
+            tokenized_prompt=None,
+            tokenized_prompt_mask=None,
+        )
+        act = jnp.asarray(action[None, ...]) if action_conditioned and action is not None else None
+        pred_value = model.compute_value(obs, act)
+        predicted_values.append(float(jax.device_get(pred_value[0])))
+    return predicted_values
+
+
+def _generate_multi_transition_plots(
+    model, frames, mc_returns, ep_idx, step, num_transitions, normalize, action_conditioned, _model, oracle_values=None
+) -> dict:
+    """Generate plots for multi-transition models.
+
+    Returns two plots:
+    1. random_trajectory_transitions: For each frame, sample n-1 random other frames
+       from the trajectory, predict jointly, use only the current frame's output.
+    2. continuous_chunks: Process consecutive chunks of n frames, use all outputs.
+    """
+    images = {}
+    rng = np.random.default_rng(42)
+
+    # Precompute normalized states and actions
+    normalized_frames = []
+    for frame in frames:
+        if frame.get("mc_return") is None:
+            continue
+        state, action = _normalize_frame(frame, normalize, _model)
+        normalized_frames.append((state, action))
+
+    if len(normalized_frames) < num_transitions:
+        return {}
+
+    # Strategy 1: random_trajectory_transitions
+    # For each frame, sample n-1 random frames + current frame, predict, use current output
+    pred_random = []
+    for i in range(len(normalized_frames)):
+        # Sample n-1 other indices (can repeat for short trajectories)
+        other_indices = [j for j in range(len(normalized_frames)) if j != i]
+        if len(other_indices) < num_transitions - 1:
+            sampled = rng.choice(other_indices, size=num_transitions - 1, replace=True)
+        else:
+            sampled = rng.choice(other_indices, size=num_transitions - 1, replace=False)
+
+        # Current frame goes last so its output is at index n-1
+        all_indices = [*sampled, i]
+        current_output_idx = num_transitions - 1
+
+        # Build multi-transition input
+        states = np.stack([normalized_frames[j][0] for j in all_indices], axis=0)
+        obs = _model.Observation(
+            images={},
+            image_masks={},
+            state=jnp.asarray(states[None, ...]),  # [1, n, state_dim]
+            tokenized_prompt=None,
+            tokenized_prompt_mask=None,
+        )
+        action = None
+        if action_conditioned:
+            actions = np.stack([normalized_frames[j][1] for j in all_indices], axis=0)
+            action = jnp.asarray(actions[None, ...])  # [1, n, action_dim]
+
+        pred_values = model.compute_value(obs, action)  # [1, n]
+        pred_random.append(float(jax.device_get(pred_values[0, current_output_idx])))
+
+    images[f"val/episode_{ep_idx}_random"] = _create_value_plot(
+        mc_returns, pred_random, ep_idx, step, " (random context)", oracle_values
+    )
+
+    # Strategy 2: continuous_chunks
+    # Process n consecutive frames at a time, use all outputs
+    pred_chunks = [None] * len(normalized_frames)
+    for start in range(0, len(normalized_frames) - num_transitions + 1, num_transitions):
+        chunk_indices = list(range(start, start + num_transitions))
+        states = np.stack([normalized_frames[j][0] for j in chunk_indices], axis=0)
+        obs = _model.Observation(
+            images={},
+            image_masks={},
+            state=jnp.asarray(states[None, ...]),
+            tokenized_prompt=None,
+            tokenized_prompt_mask=None,
+        )
+        action = None
+        if action_conditioned:
+            actions = np.stack([normalized_frames[j][1] for j in chunk_indices], axis=0)
+            action = jnp.asarray(actions[None, ...])
+
+        pred_values = model.compute_value(obs, action)  # [1, n]
+        for local_idx, global_idx in enumerate(chunk_indices):
+            pred_chunks[global_idx] = float(jax.device_get(pred_values[0, local_idx]))
+
+    # Handle remaining frames if trajectory length not divisible by n
+    remaining = [i for i, v in enumerate(pred_chunks) if v is None]
+    if remaining:
+        # Fill with last n frames
+        start = len(normalized_frames) - num_transitions
+        chunk_indices = list(range(start, start + num_transitions))
+        states = np.stack([normalized_frames[j][0] for j in chunk_indices], axis=0)
+        obs = _model.Observation(
+            images={},
+            image_masks={},
+            state=jnp.asarray(states[None, ...]),
+            tokenized_prompt=None,
+            tokenized_prompt_mask=None,
+        )
+        action = None
+        if action_conditioned:
+            actions = np.stack([normalized_frames[j][1] for j in chunk_indices], axis=0)
+            action = jnp.asarray(actions[None, ...])
+
+        pred_values = model.compute_value(obs, action)
+        for local_idx, global_idx in enumerate(chunk_indices):
+            if pred_chunks[global_idx] is None:
+                pred_chunks[global_idx] = float(jax.device_get(pred_values[0, local_idx]))
+
+    images[f"val/episode_{ep_idx}_chunks"] = _create_value_plot(
+        mc_returns, pred_chunks, ep_idx, step, " (continuous chunks)", oracle_values
+    )
+
+    return images
+
+
+def _create_value_plot(mc_returns, predicted_values, ep_idx, step, suffix, oracle_values=None) -> "wandb.Image":
+    """Create a matplotlib plot comparing MC returns vs predicted values."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    timesteps = np.arange(len(mc_returns))
+
+    ax.plot(timesteps, mc_returns, label="MC Returns", color="blue", linewidth=2)
+    ax.plot(
+        timesteps,
+        predicted_values,
+        label="Predicted Value",
+        color="orange",
+        linewidth=2,
+        linestyle="--",
+    )
+
+    if oracle_values is not None:
+        ax.plot(
+            timesteps,
+            oracle_values,
+            label="Oracle Q-Value",
+            color="green",
+            linewidth=2,
+            linestyle="-.",
+            alpha=0.7,
+        )
+
+    ax.set_xlabel("Timestep", fontsize=12)
+    ax.set_ylabel("Value", fontsize=12)
+    ax.set_title(f"Episode {ep_idx} - Step {step}{suffix}", fontsize=14)
+    ax.legend(fontsize=11)
+    ax.grid(visible=True, alpha=0.3)
+
+    plt.tight_layout()
+    img = wandb.Image(fig)
+    plt.close(fig)
+    return img
 
 
 def main(config: _config.TrainConfig):

@@ -897,6 +897,88 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
     ]
 
 
+def _make_pointmaze_large_configs() -> list[TrainConfig]:
+    """Create pointmaze-large-v2 configs."""
+    # Get dimensions from Minari dataset environment spec
+    state_dim, action_dim, action_low, action_high = minari_utils.get_minari_dims("D4RL/pointmaze/large-v2")
+
+    return [
+        # MC Q-function with MSE regression
+        TrainConfig(
+            name="pointmaze_large_v2_q_regression",
+            model=_value_function.MCValueFunctionConfig(
+                network_config=_mlp_network.MLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=True,
+                    action_dim=action_dim,
+                    action_horizon=1,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                head_config=_heads.RegressionHeadConfig(),
+            ),
+            data=MinariDataConfig(
+                minari_dataset_id="D4RL/pointmaze/large-v2",
+                discount=0.99,
+                reward_bias=-1.0,
+            ),
+            num_train_steps=100_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
+        # MLP SARSA Q-function with MSE regression
+        TrainConfig(
+            name="pointmaze_large_v2_q_sarsa",
+            model=_value_function.SARSAValueFunctionConfig(
+                network_config=_mlp_network.MLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=True,
+                    action_dim=action_dim,
+                    action_horizon=1,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                head_config=_heads.RegressionHeadConfig(),
+                discount=0.99,
+            ),
+            data=MinariDataConfig(
+                minari_dataset_id="D4RL/pointmaze/large-v2",
+                discount=0.99,
+                reward_bias=-1.0,
+            ),
+            num_train_steps=100_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
+        # Multi-MC Q-function (8 transitions per sample)
+        TrainConfig(
+            name="pointmaze_large_v2_q_multi_mc",
+            model=_value_function.MultiMCValueFunctionConfig(
+                network_config=_mlp_network.MultiMLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=True,
+                    action_dim=action_dim,
+                    action_horizon=1,
+                    num_transitions_per_sample=8,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                head_config=_heads.RegressionHeadConfig(),
+            ),
+            data=MultiTransitionMinariDataConfig(
+                minari_dataset_id="D4RL/pointmaze/large-v2",
+                discount=0.99,
+                reward_bias=-1.0,
+                num_transitions_per_sample=8,
+                multi_transition_sampler_type="trajectory_uniform",
+            ),
+            num_train_steps=100_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
+    ]
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -1311,6 +1393,7 @@ _CONFIGS = [
     # Auto-detect state_dim and action_dim from Minari dataset.
     #
     *_make_antmaze_large_diverse_configs(),
+    *_make_pointmaze_large_configs(),
     TrainConfig(
         name="debug_mlp",
         model=mlp_config.MLPConfig(
