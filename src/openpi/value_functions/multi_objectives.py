@@ -227,12 +227,10 @@ def sac_multi_objective(
 
     rng, sample_rng = jax.random.split(rng)
 
-    # Get shapes explicitly
     batch_size = transition.next_observation.state.shape[0]
     num_transitions = transition.next_observation.state.shape[1]
     state_dim = transition.next_observation.state.shape[2]
 
-    # Flatten [batch, n, state_dim] to [batch * n, state_dim] for policy sampling
     flat_state = transition.next_observation.state.reshape(batch_size * num_transitions, state_dim)
     flat_next_obs = _model.Observation(
         images={},
@@ -246,13 +244,11 @@ def sac_multi_objective(
     next_actions_flat = next_dist.sample(seed=sample_rng)
     next_log_prob = next_dist.log_prob(next_actions_flat)
 
-    # Reshape back to [batch, n, action_horizon, action_dim]
     action_horizon = next_actions_flat.shape[1]
     action_dim = next_actions_flat.shape[2]
     next_actions = next_actions_flat.reshape(batch_size, num_transitions, action_horizon, action_dim)
     next_log_prob = next_log_prob.reshape(batch_size, num_transitions)
 
-    # Create observation for target network
     target_next_obs = _model.Observation(
         images={},
         image_masks={},
