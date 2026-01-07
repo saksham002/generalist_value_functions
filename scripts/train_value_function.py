@@ -15,9 +15,11 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
+import scipy.stats
 import tqdm_loggable.auto as tqdm
 import wandb
 
+from openpi.models import model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
@@ -75,8 +77,9 @@ def init_wandb(
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
         wandb.init(id=run_id, resume="must", project=config.project_name)
     else:
+        run_name = config.exp_name if config.exp_name else config.name
         wandb.init(
-            name=config.exp_name,
+            name=run_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
         )
@@ -302,7 +305,8 @@ def generate_validation_plots(
     - random_trajectory_transitions: n-1 random frames + current frame, use only current output
     - continuous_chunks: process n consecutive frames, use all n outputs
 
-    If the environment is PointMaze, also plots the ground-truth Q-values from the oracle.
+    If the environment is PointMaze, also plots the ground-truth Q-values from the oracle
+    and computes oracle ranking metrics.
 
     Args:
         model: The value function model
@@ -313,9 +317,8 @@ def generate_validation_plots(
         data_config: Data configuration containing norm_stats for normalization
 
     Returns:
-        Dictionary of wandb images keyed by trajectory index
+        Dictionary of wandb images keyed by trajectory index, plus oracle ranking metrics
     """
-    from openpi.models import model as _model
 
     # Check for PointMaze oracle
     oracle = None
@@ -338,6 +341,7 @@ def generate_validation_plots(
     )
 
     images = {}
+    all_ranking_metrics: list[dict[str, float]] = []
 
     for ep_idx in val_episode_indices:
         try:
@@ -365,6 +369,7 @@ def generate_validation_plots(
 
         # Compute oracle values if available
         oracle_values = None
+        fixed_goal = None
         if oracle:
             oracle_values = []
             # Fixed goal for PointMaze consistency.
@@ -400,6 +405,19 @@ def generate_validation_plots(
                             "Oracle should be >= MC (Optimal >= Policy)."
                         )
 
+            # Compute oracle ranking metrics for this episode
+            ep_ranking_metrics = _compute_oracle_ranking_metrics(
+                model,
+                oracle,
+                frames,
+                num_transitions,
+                normalize,
+                fixed_goal,
+                action_conditioned=action_conditioned,
+            )
+            if ep_ranking_metrics:
+                all_ranking_metrics.append(ep_ranking_metrics)
+
         if is_multi_transition:
             # Generate plots for multi-transition models
             images.update(
@@ -422,6 +440,13 @@ def generate_validation_plots(
             images[f"val/episode_{ep_idx}"] = _create_value_plot(
                 mc_returns, predicted_values, ep_idx, step, "", oracle_values
             )
+
+    # Aggregate ranking metrics across episodes
+    if all_ranking_metrics:
+        for key in all_ranking_metrics[0]:
+            values = [m[key] for m in all_ranking_metrics if key in m]
+            if values:
+                images[key] = float(np.mean(values))
 
     return images
 
@@ -613,6 +638,215 @@ def _create_value_plot(mc_returns, predicted_values, ep_idx, step, suffix, oracl
     img = wandb.Image(fig)
     plt.close(fig)
     return img
+
+
+# Fixed action grid for PointMaze (2D action space [-1, 1] x [-1, 1])
+FIXED_ACTION_GRID = np.array(
+    [
+        [-1.0, -1.0],
+        [-1.0, 0.0],
+        [-1.0, 1.0],
+        [0.0, -1.0],
+        [0.0, 0.0],
+        [0.0, 1.0],
+        [1.0, -1.0],
+        [1.0, 0.0],
+        [1.0, 1.0],
+    ],
+    dtype=np.float32,
+)
+
+
+def _compute_oracle_ranking_metrics(
+    model,
+    oracle,
+    frames,
+    num_transitions: int | None,
+    normalize,
+    fixed_goal: np.ndarray,
+    *,
+    action_conditioned: bool,
+) -> dict[str, float]:
+    """Compute ranking correlation between predicted and oracle Q-values.
+
+    Returns two metrics using Kendall's tau:
+    - trajectory_patch_rank: Avg tau for continuous patches of n transitions
+    - fixed_action_rank: Avg tau for fixed action set across all states
+    """
+    metrics = {}
+    n = num_transitions if num_transitions is not None else 1
+
+    # Precompute normalized frames with raw state/action for oracle
+    normalized_frames = []
+    for frame in frames:
+        if frame.get("mc_return") is None:
+            continue
+        norm_state, norm_action = _normalize_frame(frame, normalize, _model)
+        raw_state = np.array(frame["state"])
+        raw_action = np.array(frame.get("actions", frame.get("action")))
+        mc_return = frame["mc_return"]
+        if hasattr(mc_return, "numpy"):
+            mc_return = mc_return.numpy()
+        mc_return = float(np.asarray(mc_return).item() if np.asarray(mc_return).size == 1 else np.asarray(mc_return))
+        normalized_frames.append(
+            {
+                "norm_state": norm_state,
+                "norm_action": norm_action,
+                "raw_state": raw_state,
+                "raw_action": raw_action,
+                "mc_return": mc_return,
+            }
+        )
+
+    if len(normalized_frames) < n:
+        return {}
+
+    # =============================================================================
+    # Metric 1: Trajectory Patch Ranking
+    # For continuous chunks of n transitions, compare predicted vs oracle/MC ordering
+    # =============================================================================
+    is_multi_transition = n > 1
+    # Use consistent chunk size for fair comparison between model types
+    chunk_size = 8
+    oracle_patch_taus = []
+    mc_patch_taus = []
+    for start in range(0, len(normalized_frames) - chunk_size + 1, chunk_size):
+        chunk = normalized_frames[start : start + chunk_size]
+
+        # Compute predicted values
+        if is_multi_transition:
+            # Multi-transition: batch all n transitions together
+            states = np.stack([f["norm_state"] for f in chunk], axis=0)
+            obs = _model.Observation(
+                images={},
+                image_masks={},
+                state=jnp.asarray(states[None, ...]),  # [1, n, state_dim]
+                tokenized_prompt=None,
+                tokenized_prompt_mask=None,
+            )
+            action = None
+            if action_conditioned:
+                actions = np.stack([f["norm_action"] for f in chunk], axis=0)
+                action = jnp.asarray(actions[None, ...])  # [1, n, action_dim]
+
+            pred_values = jax.device_get(model.compute_value(obs, action))
+            if pred_values.ndim == 2:
+                pred_values = pred_values[0]  # [n]
+        else:
+            # Single-transition: call Q-function separately for each state/action
+            pred_values = []
+            for f in chunk:
+                obs = _model.Observation(
+                    images={},
+                    image_masks={},
+                    state=jnp.asarray(f["norm_state"][None, ...]),  # [1, state_dim]
+                    tokenized_prompt=None,
+                    tokenized_prompt_mask=None,
+                )
+                action = None
+                if action_conditioned:
+                    action = jnp.asarray(f["norm_action"][None, ...])  # [1, action_dim]
+                pred_value = jax.device_get(model.compute_value(obs, action))
+                pred_values.append(float(pred_value[0]))
+            pred_values = np.array(pred_values)
+
+        oracle_values = []
+        for f in chunk:
+            raw_state = f["raw_state"]
+            assert raw_state.shape[-1] == 8, f"Expected state dim 8, got {raw_state.shape[-1]}"
+            state = raw_state[4:8]
+            q = oracle.compute_dense_distance(state, fixed_goal, f["raw_action"])
+            oracle_values.append(q)
+
+        # Compute MC return ranking
+        mc_values = np.array([f["mc_return"] for f in chunk])
+
+        assert len(oracle_values) == chunk_size, f"Expected {chunk_size} oracle values, got {len(oracle_values)}"
+        assert len(pred_values) == chunk_size, f"Expected {chunk_size} predictions, got {len(pred_values)}"
+        assert len(mc_values) == chunk_size, f"Expected {chunk_size} MC values, got {len(mc_values)}"
+
+        tau, _ = scipy.stats.kendalltau(pred_values, oracle_values)
+        if not np.isnan(tau):
+            oracle_patch_taus.append(tau)
+
+        tau, _ = scipy.stats.kendalltau(pred_values, mc_values)
+        if not np.isnan(tau):
+            mc_patch_taus.append(tau)
+
+    if oracle_patch_taus:
+        metrics["val/oracle_rank_trajectory_patches"] = float(np.mean(oracle_patch_taus))
+    if mc_patch_taus:
+        metrics["val/mc_rank_trajectory_patches"] = float(np.mean(mc_patch_taus))
+
+    # =============================================================================
+    # Metric 2: Fixed Action Set Ranking
+    # For each state, compare ordering of Q(s, a) across fixed actions
+    # =============================================================================
+    if not action_conditioned:
+        return metrics
+
+    action_taus = []
+    for frame_data in normalized_frames:
+        raw_state = frame_data["raw_state"]
+        assert raw_state.shape[-1] == 8, f"Expected state dim 8, got {raw_state.shape[-1]}"
+        state_4d = raw_state[4:8]
+        norm_state = frame_data["norm_state"]
+
+        # Compute oracle Q-values for all fixed actions
+        oracle_qs = []
+        for a in FIXED_ACTION_GRID:
+            q = oracle.compute_dense_distance(state_4d, fixed_goal, a)
+            oracle_qs.append(q)
+        oracle_qs = np.array(oracle_qs)
+
+        # Compute predicted Q-values for all fixed actions
+        # Normalize actions using the same transform
+        norm_actions = []
+        for a in FIXED_ACTION_GRID:
+            norm_a_data = normalize({"actions": a})
+            norm_actions.append(norm_a_data["actions"])
+        norm_actions = np.stack(norm_actions, axis=0)
+
+        if is_multi_transition:
+            # Multi-transition: use only first n actions from grid
+            actions_to_use = min(n, len(FIXED_ACTION_GRID))
+            batch_states = np.tile(norm_state[None, ...], (actions_to_use, 1))
+            obs = _model.Observation(
+                images={},
+                image_masks={},
+                state=jnp.asarray(batch_states[None, ...]),  # [1, n, state_dim]
+                tokenized_prompt=None,
+                tokenized_prompt_mask=None,
+            )
+            action = jnp.asarray(norm_actions[:actions_to_use][None, ...])  # [1, n, action_dim]
+            pred_qs = jax.device_get(model.compute_value(obs, action))
+            if pred_qs.ndim == 2:
+                pred_qs = pred_qs[0]  # [n]
+            oracle_qs = oracle_qs[:actions_to_use]
+        else:
+            # Single-transition: call Q-function separately for each action
+            pred_qs = []
+            for norm_a in norm_actions:
+                obs = _model.Observation(
+                    images={},
+                    image_masks={},
+                    state=jnp.asarray(norm_state[None, ...]),  # [1, state_dim]
+                    tokenized_prompt=None,
+                    tokenized_prompt_mask=None,
+                )
+                action = jnp.asarray(norm_a[None, ...])  # [1, action_dim]
+                pred_q = jax.device_get(model.compute_value(obs, action))
+                pred_qs.append(float(pred_q[0]))
+            pred_qs = np.array(pred_qs)
+
+        tau, _ = scipy.stats.kendalltau(pred_qs, oracle_qs)
+        if not np.isnan(tau):
+            action_taus.append(tau)
+
+    if action_taus:
+        metrics["val/oracle_rank_fixed_actions"] = float(np.mean(action_taus))
+
+    return metrics
 
 
 def main(config: _config.TrainConfig):
