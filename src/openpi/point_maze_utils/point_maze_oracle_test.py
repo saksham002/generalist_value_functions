@@ -32,7 +32,7 @@ class TestPointMazeOracle(unittest.TestCase):
         start = np.array([-1.0, 1.0])
         goal = np.array([1.0, 1.0])
         dist = self.simple_oracle.compute_geodesic_distance(start, goal)
-        self.assertAlmostEqual(dist, 2.0, places=4)
+        assert abs(dist - 2.0) < 1e-4
 
     def test_corner_cutting(self):
         # Test going around the center block (1,1).
@@ -55,7 +55,7 @@ class TestPointMazeOracle(unittest.TestCase):
         goal = np.array([-0.1, 0.9])
 
         # Check blockage
-        self.assertFalse(self.simple_oracle._line_of_sight(start, goal))
+        assert not self.simple_oracle._line_of_sight(start, goal)  # noqa: SLF001
 
         dist = self.simple_oracle.compute_geodesic_distance(start, goal)
         # Shortest path goes via corner (-0.5, 0.5) (Top-left of center block)?
@@ -96,8 +96,8 @@ class TestPointMazeOracle(unittest.TestCase):
         # However, for 12x12 maze, sticking to centers is a vast improvement over Manhattan counting.
         # Let's verify it works and is robust first.
 
-        self.assertTrue(dist < 2.5)  # Manhattan roughly |dx|+|dy| = 0.8+0.8 = 1.6
-        self.assertTrue(dist > 1.0)  # Direct line
+        assert dist < 2.5  # Manhattan roughly |dx|+|dy| = 0.8+0.8 = 1.6
+        assert dist > 1.0  # Direct line
 
     def test_large_maze_reachable(self):
         # Test on the actual maze

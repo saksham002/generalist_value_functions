@@ -37,18 +37,22 @@ def _assert_multi_transition_shapes(transition: MultiTransition) -> None:
     batch_size = state.shape[0]
     num_transitions = state.shape[1]
 
-    assert transition.action.shape[:2] == (batch_size, num_transitions), (
-        f"action shape {transition.action.shape} doesn't match state shape {state.shape}"
-    )
-    assert transition.reward.shape == (batch_size, num_transitions), (
-        f"reward shape {transition.reward.shape} doesn't match (batch={batch_size}, n={num_transitions})"
-    )
-    assert transition.mc_return.shape == (batch_size, num_transitions), (
-        f"mc_return shape {transition.mc_return.shape} doesn't match (batch={batch_size}, n={num_transitions})"
-    )
-    assert transition.termination.shape == (batch_size, num_transitions), (
-        f"termination shape {transition.termination.shape} doesn't match (batch={batch_size}, n={num_transitions})"
-    )
+    assert transition.action.shape[:2] == (
+        batch_size,
+        num_transitions,
+    ), f"action shape {transition.action.shape} doesn't match state shape {state.shape}"
+    assert transition.reward.shape == (
+        batch_size,
+        num_transitions,
+    ), f"reward shape {transition.reward.shape} doesn't match (batch={batch_size}, n={num_transitions})"
+    assert transition.mc_return.shape == (
+        batch_size,
+        num_transitions,
+    ), f"mc_return shape {transition.mc_return.shape} doesn't match (batch={batch_size}, n={num_transitions})"
+    assert transition.termination.shape == (
+        batch_size,
+        num_transitions,
+    ), f"termination shape {transition.termination.shape} doesn't match (batch={batch_size}, n={num_transitions})"
 
 
 def mc_multi_objective(
@@ -74,9 +78,10 @@ def mc_multi_objective(
 
     batch_size = transition.observation.state.shape[0]
     num_transitions = transition.observation.state.shape[1]
-    assert loss.shape == (batch_size, num_transitions), (
-        f"Expected loss shape ({batch_size}, {num_transitions}), got {loss.shape}"
-    )
+    assert loss.shape == (
+        batch_size,
+        num_transitions,
+    ), f"Expected loss shape ({batch_size}, {num_transitions}), got {loss.shape}"
 
     pred = head(features)
     td_error = pred - transition.mc_return
@@ -129,9 +134,10 @@ def sarsa_multi_objective(
 
     batch_size = transition.observation.state.shape[0]
     num_transitions = transition.observation.state.shape[1]
-    assert loss.shape == (batch_size, num_transitions), (
-        f"Expected loss shape ({batch_size}, {num_transitions}), got {loss.shape}"
-    )
+    assert loss.shape == (
+        batch_size,
+        num_transitions,
+    ), f"Expected loss shape ({batch_size}, {num_transitions}), got {loss.shape}"
 
     pred = head(features)
     td_error = pred - target
@@ -179,9 +185,10 @@ def iql_multi_objective(
 
     batch_size = transition.observation.state.shape[0]
     num_transitions = transition.observation.state.shape[1]
-    assert loss.shape == (batch_size, num_transitions), (
-        f"Expected loss shape ({batch_size}, {num_transitions}), got {loss.shape}"
-    )
+    assert loss.shape == (
+        batch_size,
+        num_transitions,
+    ), f"Expected loss shape ({batch_size}, {num_transitions}), got {loss.shape}"
 
     info = {
         "predicted_value_mean": jnp.mean(pred),
@@ -267,9 +274,10 @@ def sac_multi_objective(
     features = network.compute_features(transition.observation, transition.action)
     loss = _compute_value_loss(head, features, target)
 
-    assert loss.shape == (batch_size, num_transitions), (
-        f"Expected loss shape ({batch_size}, {num_transitions}), got {loss.shape}"
-    )
+    assert loss.shape == (
+        batch_size,
+        num_transitions,
+    ), f"Expected loss shape ({batch_size}, {num_transitions}), got {loss.shape}"
 
     pred = head(features)
     td_error = pred - target
