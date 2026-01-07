@@ -317,6 +317,7 @@ def compute_value(
 - Use appropriate exception types (ValueError, TypeError, FileNotFoundError, etc.)
 - Validate inputs early in functions
 - Provide context in error messages to aid debugging
+- **Prefer fail-fast over silent failures**: Use assertions or raise exceptions rather than silently skipping with `continue` or `return`. Silent failures hide bugs and make debugging harder. This includes defensive conditionals like `if len(x) == expected:` that skip processing instead of asserting correctness.
 
 ### Testing
 - Write tests for new functionality in corresponding `*_test.py` files
