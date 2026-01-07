@@ -118,8 +118,10 @@ class DataConfig:
     # Multi-transition training options
     # Number of transitions per sample (for multi-state value functions)
     num_transitions_per_sample: int | None = None
-    # Sampler type: "uniform", "trajectory_uniform", or "trajectory_ordered"
-    multi_transition_sampler_type: Literal["uniform", "trajectory_uniform", "trajectory_ordered"] = "trajectory_uniform"
+    # Sampler type: "uniform", "trajectory_uniform", "trajectory_ordered", or "trajectory_consecutive"
+    multi_transition_sampler_type: Literal[
+        "uniform", "trajectory_uniform", "trajectory_ordered", "trajectory_consecutive"
+    ] = "trajectory_uniform"
 
 
 class GroupFactory(Protocol):
@@ -619,8 +621,10 @@ class MultiTransitionMinariDataConfig(MinariDataConfig):
 
     # Number of transitions per sample
     num_transitions_per_sample: int = tyro.MISSING
-    # Sampler type: uniform across dataset, uniform within trajectory, or ordered within trajectory
-    multi_transition_sampler_type: Literal["uniform", "trajectory_uniform", "trajectory_ordered"] = "trajectory_uniform"
+    # Sampler type: uniform, trajectory_uniform, trajectory_ordered, or trajectory_consecutive
+    multi_transition_sampler_type: Literal[
+        "uniform", "trajectory_uniform", "trajectory_ordered", "trajectory_consecutive"
+    ] = "trajectory_uniform"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -642,7 +646,8 @@ class TrainConfig:
     # Project name.
     project_name: str = "openpi"
     # Experiment name. Will be used to name the metadata and checkpoint directories.
-    exp_name: str = tyro.MISSING
+    # Defaults to the config name if not provided.
+    exp_name: str | None = None
 
     # Defines the model config. Accepts either a policy model config (BaseModelConfig)
     # or a value function config (BaseValueFunctionConfig).
@@ -720,9 +725,8 @@ class TrainConfig:
     @property
     def checkpoint_dir(self) -> pathlib.Path:
         """Get the checkpoint directory for this config."""
-        if not self.exp_name:
-            raise ValueError("--exp_name must be set")
-        return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
+        exp_name = self.exp_name if self.exp_name else self.name
+        return (pathlib.Path(self.checkpoint_base_dir) / self.name / exp_name).resolve()
 
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
@@ -894,6 +898,32 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
             batch_size=256,
             lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
         ),
+        # Multi-Transition MC Q-function with consecutive sampling (8 transitions per sample)
+        TrainConfig(
+            name="antmaze_large_diverse_v1_multi_mc_consecutive",
+            model=_value_function.MultiMCValueFunctionConfig(
+                network_config=_mlp_network.MultiMLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=True,
+                    action_dim=action_dim,
+                    action_horizon=1,
+                    num_transitions_per_sample=8,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                head_config=_heads.RegressionHeadConfig(),
+            ),
+            data=MultiTransitionMinariDataConfig(
+                minari_dataset_id="D4RL/antmaze/large-diverse-v1",
+                discount=0.99,
+                reward_bias=-1.0,
+                num_transitions_per_sample=8,
+                multi_transition_sampler_type="trajectory_consecutive",
+            ),
+            num_train_steps=1_000_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
     ]
 
 
@@ -971,6 +1001,91 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 reward_bias=-1.0,
                 num_transitions_per_sample=8,
                 multi_transition_sampler_type="trajectory_uniform",
+            ),
+            num_train_steps=100_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
+        # Multi-MC Q-function with consecutive sampling (8 transitions per sample)
+        TrainConfig(
+            name="pointmaze_large_v2_q_multi_mc_consecutive",
+            model=_value_function.MultiMCValueFunctionConfig(
+                network_config=_mlp_network.MultiMLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=True,
+                    action_dim=action_dim,
+                    action_horizon=1,
+                    num_transitions_per_sample=8,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                head_config=_heads.RegressionHeadConfig(),
+            ),
+            data=MultiTransitionMinariDataConfig(
+                minari_dataset_id="D4RL/pointmaze/large-v2",
+                discount=0.99,
+                reward_bias=-1.0,
+                num_transitions_per_sample=8,
+                multi_transition_sampler_type="trajectory_consecutive",
+            ),
+            num_train_steps=100_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
+        # Multi-SARSA Q-function with consecutive sampling (regression)
+        TrainConfig(
+            name="pointmaze_large_v2_q_multi_sarsa_consecutive",
+            model=_value_function.MultiSARSAValueFunctionConfig(
+                network_config=_mlp_network.MultiMLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=True,
+                    action_dim=action_dim,
+                    action_horizon=1,
+                    num_transitions_per_sample=8,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                head_config=_heads.RegressionHeadConfig(),
+                discount=0.99,
+            ),
+            data=MultiTransitionMinariDataConfig(
+                minari_dataset_id="D4RL/pointmaze/large-v2",
+                discount=0.99,
+                reward_bias=-1.0,
+                num_transitions_per_sample=8,
+                multi_transition_sampler_type="trajectory_consecutive",
+            ),
+            num_train_steps=100_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
+        # Multi-SARSA Q-function with consecutive sampling (HL-Gauss)
+        TrainConfig(
+            name="pointmaze_large_v2_q_multi_sarsa_hl_gauss_consecutive",
+            model=_value_function.MultiSARSAValueFunctionConfig(
+                network_config=_mlp_network.MultiMLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=True,
+                    action_dim=action_dim,
+                    action_horizon=1,
+                    num_transitions_per_sample=8,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                head_config=_heads.CategoricalHeadConfig(
+                    v_min=-100.0,
+                    v_max=0.0,
+                    num_bins=128,
+                    sigma=0.75,
+                ),
+                discount=0.99,
+            ),
+            data=MultiTransitionMinariDataConfig(
+                minari_dataset_id="D4RL/pointmaze/large-v2",
+                discount=0.99,
+                reward_bias=-1.0,
+                num_transitions_per_sample=8,
+                multi_transition_sampler_type="trajectory_consecutive",
             ),
             num_train_steps=100_000,
             batch_size=256,
