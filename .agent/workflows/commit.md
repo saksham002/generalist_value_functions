@@ -12,13 +12,13 @@ When asked to commit changes, follow these steps to create clean, atomic commits
 git status
 ```
 
-## 2. Run Ruff Checks
+## 2. Run Pre-commit Checks
 // turbo
 ```bash
-uv run ruff check .
+uv run pre-commit run --all-files
 ```
 
-If ruff reports any errors, fix them before proceeding. Use `ruff check --fix .` for auto-fixable issues.
+If pre-commit reformats files or reports errors, fix them before proceeding. Re-run until all checks pass.
 
 ## 3. Review All Diffs
 // turbo
