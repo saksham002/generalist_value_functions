@@ -156,3 +156,45 @@ class TrajectoryOrderedSamplerConfig(SamplerConfig):
 
     def create(self, dataset: NumpyDataset, rng: np.random.Generator) -> TrajectoryOrderedSampler:
         return TrajectoryOrderedSampler(dataset, self.num_transitions_per_sample, rng)
+
+
+class TrajectoryConsecutiveSampler(Sampler):
+    """Sample n consecutive transitions from a single randomly-chosen episode."""
+
+    def __init__(
+        self,
+        dataset: NumpyDataset,
+        num_transitions_per_sample: int,
+        rng: np.random.Generator,
+    ):
+        self._dataset = dataset
+        self._num_transitions_per_sample = num_transitions_per_sample
+        self._rng = rng
+
+        # Pre-compute episode lengths for rejection sampling
+        self._episode_lengths = dataset.episode_ends - dataset.episode_starts
+        self._valid_episodes = np.where(self._episode_lengths >= num_transitions_per_sample)[0]
+        if len(self._valid_episodes) == 0:
+            raise ValueError(
+                f"No episodes have at least {num_transitions_per_sample} transitions. "
+                f"Max episode length: {self._episode_lengths.max()}"
+            )
+
+    def sample(self) -> np.ndarray:
+        # Sample a valid episode
+        episode_idx = self._rng.choice(self._valid_episodes)
+        start = self._dataset.episode_starts[episode_idx]
+        end = self._dataset.episode_ends[episode_idx]
+
+        # Sample a random starting position allowing for n consecutive transitions
+        max_start = end - self._num_transitions_per_sample
+        chunk_start = self._rng.integers(start, max_start + 1)
+        return np.arange(chunk_start, chunk_start + self._num_transitions_per_sample)
+
+
+@dataclasses.dataclass(frozen=True)
+class TrajectoryConsecutiveSamplerConfig(SamplerConfig):
+    """Sample n consecutive transitions from a single episode."""
+
+    def create(self, dataset: NumpyDataset, rng: np.random.Generator) -> TrajectoryConsecutiveSampler:
+        return TrajectoryConsecutiveSampler(dataset, self.num_transitions_per_sample, rng)

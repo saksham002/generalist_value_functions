@@ -662,6 +662,8 @@ def create_numpy_data_loader(
             sampler_config = samplers.TrajectoryUniformSamplerConfig(num_transitions_per_sample=num_transitions)
         elif data_config.multi_transition_sampler_type == "trajectory_ordered":
             sampler_config = samplers.TrajectoryOrderedSamplerConfig(num_transitions_per_sample=num_transitions)
+        elif data_config.multi_transition_sampler_type == "trajectory_consecutive":
+            sampler_config = samplers.TrajectoryConsecutiveSamplerConfig(num_transitions_per_sample=num_transitions)
         else:
             raise ValueError(f"Unknown multi_transition_sampler_type: {data_config.multi_transition_sampler_type}")
 
