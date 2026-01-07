@@ -44,7 +44,7 @@ def compute_hl_gauss_targets(
     v_max: float,
     num_bins: int,
     sigma: float,
-) -> at.Float[at.Array, "b num_bins"]:
+) -> at.Float[at.Array, "*b num_bins"]:
     """Convert scalar targets to soft categorical labels using Gaussian smoothing.
 
     The HL-Gauss method distributes probability mass across bins using a Gaussian
@@ -52,14 +52,14 @@ def compute_hl_gauss_targets(
     regression task.
 
     Args:
-        target_values: Target values of shape [batch].
+        target_values: Target values of shape [*batch].
         v_min: Minimum value of the support.
         v_max: Maximum value of the support.
         num_bins: Number of bins.
         sigma: Standard deviation of the Gaussian smoothing.
 
     Returns:
-        Soft categorical targets of shape [batch, num_bins], normalized to sum to 1.
+        Soft categorical targets of shape [*batch, num_bins], normalized to sum to 1.
     """
     # Compute bin centers
     bin_centers = compute_bin_centers(v_min, v_max, num_bins)  # [num_bins]
@@ -67,21 +67,19 @@ def compute_hl_gauss_targets(
     # Clip target values to the support range
     target_values = jnp.clip(target_values, v_min, v_max)
 
-    # Compute Gaussian probabilities for each bin
-    # target_values: [batch] -> [batch, 1]
-    # bin_centers: [num_bins] -> [1, num_bins]
-    target_values = target_values[:, None]  # [batch, 1]
-    bin_centers = bin_centers[None, :]  # [1, num_bins]
+    # Expand dims for broadcasting: target_values[..., None] -> [*batch, 1]
+    # bin_centers: [num_bins] broadcasts with [*batch, 1]
+    target_values = jnp.expand_dims(target_values, axis=-1)  # [*batch, 1]
 
     # Gaussian PDF (unnormalized)
-    log_probs = -0.5 * jnp.square((bin_centers - target_values) / sigma)  # [batch, num_bins]
+    log_probs = -0.5 * jnp.square((bin_centers - target_values) / sigma)  # [*batch, num_bins]
 
     # Normalize to get probabilities (softmax over bins)
-    return jax.nn.softmax(log_probs, axis=-1)  # [batch, num_bins]
+    return jax.nn.softmax(log_probs, axis=-1)  # [*batch, num_bins]
 
 
 def hl_gauss_loss(
-    logits: at.Float[at.Array, "b num_bins"],
+    logits: at.Float[at.Array, "*b num_bins"],
     target_values: at.Float[at.Array, "*b"],
     v_min: float,
     v_max: float,
@@ -90,14 +88,14 @@ def hl_gauss_loss(
     """Compute HL-Gauss cross-entropy loss.
 
     Args:
-        logits: Predicted logits of shape [batch, num_bins].
-        target_values: Target values of shape [batch].
+        logits: Predicted logits of shape [*batch, num_bins].
+        target_values: Target values of shape [*batch].
         v_min: Minimum value of the support.
         v_max: Maximum value of the support.
         sigma: Standard deviation of the Gaussian smoothing.
 
     Returns:
-        Per-sample cross-entropy loss of shape [batch].
+        Per-sample cross-entropy loss of shape [*batch].
     """
     num_bins = logits.shape[-1]
 
@@ -105,30 +103,31 @@ def hl_gauss_loss(
     targets = compute_hl_gauss_targets(target_values, v_min, v_max, num_bins, sigma)
 
     # Compute cross-entropy loss: -sum(targets * log_softmax(logits))
-    log_probs = jax.nn.log_softmax(logits, axis=-1)  # [batch, num_bins]
-    return -jnp.sum(targets * log_probs, axis=-1)  # [batch]
+    log_probs = jax.nn.log_softmax(logits, axis=-1)  # [*batch, num_bins]
+    return -jnp.sum(targets * log_probs, axis=-1)  # [*batch]
 
 
 def logits_to_expected_value(
-    logits: at.Float[at.Array, "b num_bins"],
+    logits: at.Float[at.Array, "*b num_bins"],
     v_min: float,
     v_max: float,
 ) -> at.Float[at.Array, "*b"]:
     """Convert logits to expected value.
 
     Args:
-        logits: Predicted logits of shape [batch, num_bins].
+        logits: Predicted logits of shape [*batch, num_bins].
         v_min: Minimum value of the support.
         v_max: Maximum value of the support.
 
     Returns:
-        Expected values of shape [batch].
+        Expected values of shape [*batch].
     """
     num_bins = logits.shape[-1]
     bin_centers = compute_bin_centers(v_min, v_max, num_bins)  # [num_bins]
 
     # Softmax to get probabilities
-    probs = jax.nn.softmax(logits, axis=-1)  # [batch, num_bins]
+    probs = jax.nn.softmax(logits, axis=-1)  # [*batch, num_bins]
 
     # Expected value: sum(probs * bin_centers)
-    return jnp.sum(probs * bin_centers[None, :], axis=-1)  # [batch]
+    # bin_centers [num_bins] broadcasts with [*batch, num_bins]
+    return jnp.sum(probs * bin_centers, axis=-1)  # [*batch]
