@@ -688,12 +688,36 @@ def create_numpy_data_loader(
 
     logging.info(f"numpy data loader: local_batch_size={local_batch_size}, total_samples={len(dataset)}")
 
+    # Create weighted sampler if reward_1_upsample_weight > 1.0
+    sampler = None
+    if data_config.reward_1_upsample_weight > 1.0:
+        # Compute sample weights based on reward (original reward=1 transitions get higher weight)
+        # After transformation: r' = scale * r + bias, so original r=1 becomes scale * 1 + bias
+        transformed_reward_1 = data_config.reward_scale * 1.0 + data_config.reward_bias
+        reward_1_mask = np.isclose(base_dataset.rewards, transformed_reward_1)
+        num_reward_1 = np.sum(reward_1_mask)
+        num_other = len(base_dataset) - num_reward_1
+        logging.info(
+            f"Creating weighted sampler: {num_reward_1} reward=1 samples (transformed to {transformed_reward_1}), "
+            f"{num_other} other samples, weight={data_config.reward_1_upsample_weight}"
+        )
+
+        # Weights: reward=1 transitions get higher weight
+        weights = np.where(reward_1_mask, data_config.reward_1_upsample_weight, 1.0)
+        weights_tensor = torch.as_tensor(weights, dtype=torch.double)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights_tensor,
+            num_samples=len(dataset),
+            replacement=True,
+        )
+
     # Use TorchDataLoader for batching (reuses existing infrastructure)
     data_loader = TorchDataLoader(
         dataset,
         local_batch_size=local_batch_size,
         sharding=None if framework == "pytorch" else sharding,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,  # Don't shuffle if using sampler
+        sampler=sampler,
         num_batches=num_batches,
         num_workers=0,  # No workers needed for in-memory data
         seed=seed,

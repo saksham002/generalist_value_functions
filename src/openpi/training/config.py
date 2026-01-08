@@ -123,6 +123,11 @@ class DataConfig:
         "uniform", "trajectory_uniform", "trajectory_ordered", "trajectory_consecutive"
     ] = "trajectory_uniform"
 
+    # Upsampling weight for transitions with reward=1. If > 1.0, these transitions
+    # will be sampled more frequently. A value of 2.0 means reward=1 transitions
+    # are sampled twice as often as other transitions.
+    reward_1_upsample_weight: float = 1.0
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -568,6 +573,8 @@ class MinariDataConfig(DataConfigFactory):
     # Reward transformation: r' = reward_scale * r + reward_bias
     reward_scale: float = 1.0
     reward_bias: float = 0.0
+    # Upsampling weight for transitions with reward=1 (see DataConfig.reward_1_upsample_weight)
+    reward_1_upsample_weight: float = 1.0
 
     # Override repo_id from parent - not used for minari loading
     repo_id: str = "minari"  # Dummy value, not used
@@ -608,6 +615,7 @@ class MinariDataConfig(DataConfigFactory):
             reward_scale=self.reward_scale,
             reward_bias=self.reward_bias,
             minari_dataset_id=self.minari_dataset_id,
+            reward_1_upsample_weight=self.reward_1_upsample_weight,
         )
 
 
@@ -951,6 +959,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 minari_dataset_id="D4RL/pointmaze/large-v2",
                 discount=0.99,
                 reward_bias=-1.0,
+                reward_1_upsample_weight=10.0,
             ),
             num_train_steps=100_000,
             batch_size=256,
@@ -975,6 +984,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 minari_dataset_id="D4RL/pointmaze/large-v2",
                 discount=0.99,
                 reward_bias=-1.0,
+                reward_1_upsample_weight=10.0,
             ),
             num_train_steps=100_000,
             batch_size=256,
@@ -1001,6 +1011,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 reward_bias=-1.0,
                 num_transitions_per_sample=8,
                 multi_transition_sampler_type="trajectory_uniform",
+                reward_1_upsample_weight=10.0,
             ),
             num_train_steps=100_000,
             batch_size=256,
@@ -1027,6 +1038,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 reward_bias=-1.0,
                 num_transitions_per_sample=8,
                 multi_transition_sampler_type="trajectory_consecutive",
+                reward_1_upsample_weight=10.0,
             ),
             num_train_steps=100_000,
             batch_size=256,
@@ -1054,6 +1066,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 reward_bias=-1.0,
                 num_transitions_per_sample=8,
                 multi_transition_sampler_type="trajectory_consecutive",
+                reward_1_upsample_weight=10.0,
             ),
             num_train_steps=100_000,
             batch_size=256,
@@ -1086,6 +1099,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 reward_bias=-1.0,
                 num_transitions_per_sample=8,
                 multi_transition_sampler_type="trajectory_consecutive",
+                reward_1_upsample_weight=10.0,
             ),
             num_train_steps=100_000,
             batch_size=256,
