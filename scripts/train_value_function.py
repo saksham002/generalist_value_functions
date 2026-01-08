@@ -8,7 +8,6 @@ from typing import Any
 
 import etils.epath as epath
 import flax.nnx as nnx
-from flax.training import common_utils
 import flax.traverse_util as traverse_util
 import jax
 import jax.numpy as jnp
@@ -944,7 +943,6 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
-    infos = []
     timer = Timer()
 
     # Log initial timing info
@@ -963,21 +961,18 @@ def main(config: _config.TrainConfig):
             jax.block_until_ready(train_state)
             jax.block_until_ready(info)
 
-        infos.append(info)
         if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            info = jax.device_get(info)
             # Add timing info to logged metrics (average and total)
             total_times = timer.get_total_times(reset=False)
             avg_times = timer.get_average_times(reset=True)
             timing_info = {f"average_times/{k}": v for k, v in avg_times.items()}
             timing_info.update({f"total_times/{k}": v for k, v in total_times.items()})
-            reduced_info.update(timing_info)
+            info.update(timing_info)
 
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            info_str = ", ".join(f"{k}={v:.4f}" for k, v in info.items())
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
+            wandb.log(info, step=step)
 
         # Break down data loading into components
         with timer.context("data_fetch"):
