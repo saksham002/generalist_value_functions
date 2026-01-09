@@ -4,21 +4,21 @@ This module provides value function implementations:
 
 - Base classes: BaseValueFunction, BaseValueFunctionConfig, Transition, MultiTransition
 - Networks: MLPNetwork, MLPNetworkConfig, MultiMLPNetwork, MultiMLPNetworkConfig
-- Heads: RegressionHead, CategoricalHead
+- Ensemble Networks: EnsembleNetwork, EnsembleNetworkConfig
+- Heads: RegressionHead, CategoricalHead, EnsembleHead
 - Objectives: mc_objective, sarsa_objective, iql_objective, sac_objective
 - Value Functions: MCValueFunction, SARSAValueFunction, IQLValueFunction, SACValueFunction
 - Multi-Transition Value Functions: MultiMCValueFunction, MultiSARSAValueFunction, MultiIQLValueFunction
-- Ensemble: EnsembleValueFunction for Q-function ensembles
 """
 
 from openpi.value_functions.base import BaseValueFunction
 from openpi.value_functions.base import BaseValueFunctionConfig
 from openpi.value_functions.base import MultiTransition
 from openpi.value_functions.base import Transition
-from openpi.value_functions.ensemble import EnsembleValueFunction
-from openpi.value_functions.ensemble import EnsembleValueFunctionConfig
 from openpi.value_functions.heads import CategoricalHead
 from openpi.value_functions.heads import CategoricalHeadConfig
+from openpi.value_functions.heads import EnsembleHead
+from openpi.value_functions.heads import EnsembleHeadConfig
 from openpi.value_functions.heads import RegressionHead
 from openpi.value_functions.heads import RegressionHeadConfig
 from openpi.value_functions.networks import BaseValueNetwork
@@ -26,6 +26,9 @@ from openpi.value_functions.networks import MLPNetwork
 from openpi.value_functions.networks import MLPNetworkConfig
 from openpi.value_functions.networks import MultiMLPNetwork
 from openpi.value_functions.networks import MultiMLPNetworkConfig
+from openpi.value_functions.networks.ensemble import EnsembleMultiNetworkConfig
+from openpi.value_functions.networks.ensemble import EnsembleNetwork
+from openpi.value_functions.networks.ensemble import EnsembleNetworkConfig
 from openpi.value_functions.value_function import IQLValueFunction
 from openpi.value_functions.value_function import IQLValueFunctionConfig
 from openpi.value_functions.value_function import MCValueFunction
@@ -48,8 +51,11 @@ __all__ = [
     "BaseValueNetwork",
     "CategoricalHead",
     "CategoricalHeadConfig",
-    "EnsembleValueFunction",
-    "EnsembleValueFunctionConfig",
+    "EnsembleHead",
+    "EnsembleHeadConfig",
+    "EnsembleMultiNetworkConfig",
+    "EnsembleNetwork",
+    "EnsembleNetworkConfig",
     "IQLValueFunction",
     "IQLValueFunctionConfig",
     "MCValueFunction",

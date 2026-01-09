@@ -1,5 +1,6 @@
 """Tests for new value function architecture."""
 
+import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -135,17 +136,156 @@ class TestSARSAValueFunction:
 class TestIQLValueFunction:
     def test_expectile_regression(self):
         config = IQLValueFunctionConfig(
-            network_config=MLPNetworkConfig(state_dim=10, hidden_dims=(32,)),
-            head_config=RegressionHeadConfig(),
+            q_network_config=MLPNetworkConfig(
+                state_dim=10, action_conditioned=True, action_dim=4, action_horizon=1, hidden_dims=(32,)
+            ),
+            v_network_config=MLPNetworkConfig(state_dim=10, action_conditioned=False, hidden_dims=(32,)),
+            q_head_config=RegressionHeadConfig(),
+            v_head_config=RegressionHeadConfig(),
             expectile=0.7,
+            discount=0.99,
+            tau=0.005,
         )
         model = config.create(jax.random.key(0))
 
-        transition = make_transition(4, 10)
+        transition = make_transition(4, 10, action_dim=4)
         loss, info = model.compute_loss(transition)
 
         assert loss.shape == (4,)
-        assert "positive_error_frac" in info
+        assert "positive_advantage_frac" in info
+        assert "q_mean" in info
+        assert "v_mean" in info
+
+        # Test target network update
+        model.post_step_update()
+
+
+class TestEnsembleNetwork:
+    def test_ensemble_has_different_weights(self):
+        """Verify each ensemble member has different weights."""
+
+        from openpi.value_functions.networks.ensemble import EnsembleNetworkConfig
+
+        config = EnsembleNetworkConfig(
+            base_config=MLPNetworkConfig(
+                state_dim=10, action_conditioned=True, action_dim=4, action_horizon=1, hidden_dims=(32,)
+            ),
+            ensemble_size=3,
+        )
+        network = config.create(jax.random.key(0))
+
+        # Get all parameters from vectorized network
+        state = nnx.state(network.vectorized_network)
+
+        # Check that parameters have ensemble dimension and are different
+        for _, param in jax.tree_util.tree_leaves_with_path(state):
+            if hasattr(param, "value") and param.value.ndim >= 2:
+                # First dimension should be ensemble_size
+                assert param.value.shape[0] == 3, f"Expected ensemble dim 3, got {param.value.shape[0]}"
+                # Each member should have different weights
+                member_0 = param.value[0]
+                member_1 = param.value[1]
+                member_2 = param.value[2]
+                assert not jnp.allclose(member_0, member_1), "Members 0 and 1 should have different weights"
+                assert not jnp.allclose(member_1, member_2), "Members 1 and 2 should have different weights"
+
+    def test_ensemble_network_output_shape(self):
+        """Verify ensemble network output has correct shape [ensemble, batch, feature_dim]."""
+        from openpi.value_functions.networks.ensemble import EnsembleNetworkConfig
+
+        config = EnsembleNetworkConfig(
+            base_config=MLPNetworkConfig(
+                state_dim=10, action_conditioned=True, action_dim=4, action_horizon=1, hidden_dims=(32,)
+            ),
+            ensemble_size=2,
+        )
+        network = config.create(jax.random.key(0))
+
+        obs = make_observation(jnp.ones((8, 10)))
+        action = jnp.ones((8, 1, 4))
+        features = network.compute_features(obs, action)
+
+        # Shape should be [ensemble_size, batch_size, feature_dim]
+        assert features.shape == (2, 8, 32), f"Expected (2, 8, 32), got {features.shape}"
+        assert network.feature_dim == 32
+
+    def test_ensemble_head_output_shape(self):
+        """Verify ensemble head output has correct shape [ensemble, batch]."""
+        from openpi.value_functions.heads import EnsembleHeadConfig
+
+        head_config = EnsembleHeadConfig(base_config=RegressionHeadConfig(), ensemble_size=2)
+        head = head_config.create(feature_dim=32, rng=jax.random.key(0))
+
+        # Ensemble features: [ensemble, batch, feature_dim]
+        features = jnp.ones((2, 8, 32))
+        values = head(features)
+
+        assert values.shape == (2, 8), f"Expected (2, 8), got {values.shape}"
+
+    def test_ensemble_head_compute_min(self):
+        """Verify compute_min returns minimum across ensemble."""
+        from openpi.value_functions.heads import EnsembleHeadConfig
+
+        head_config = EnsembleHeadConfig(base_config=RegressionHeadConfig(), ensemble_size=3)
+        head = head_config.create(feature_dim=32, rng=jax.random.key(0))
+
+        # Different features for each ensemble member to get different values
+        features = jnp.stack(
+            [
+                jnp.ones((4, 32)) * 1.0,
+                jnp.ones((4, 32)) * 2.0,
+                jnp.ones((4, 32)) * 3.0,
+            ]
+        )  # [3, 4, 32]
+
+        all_values = head(features)  # [3, 4]
+        min_values = head.compute_min(features)  # [4]
+
+        assert min_values.shape == (4,), f"Expected (4,), got {min_values.shape}"
+        # Min should be less than or equal to all members
+        assert jnp.all(min_values <= all_values[0])
+        assert jnp.all(min_values <= all_values[1])
+        assert jnp.all(min_values <= all_values[2])
+
+    def test_ensemble_head_has_different_weights(self):
+        """Verify each ensemble head member has different weights."""
+
+        from openpi.value_functions.heads import EnsembleHeadConfig
+
+        head_config = EnsembleHeadConfig(base_config=RegressionHeadConfig(), ensemble_size=3)
+        head = head_config.create(feature_dim=32, rng=jax.random.key(0))
+
+        state = nnx.state(head.vectorized_head)
+
+        for _, param in jax.tree_util.tree_leaves_with_path(state):
+            if hasattr(param, "value") and param.value.ndim >= 2:
+                assert param.value.shape[0] == 3, f"Expected ensemble dim 3, got {param.value.shape[0]}"
+                member_0 = param.value[0]
+                member_1 = param.value[1]
+                assert not jnp.allclose(member_0, member_1), "Members should have different weights"
+
+    def test_ensemble_hl_gauss_loss(self):
+        """Verify HL-Gauss loss computation for ensemble."""
+        from openpi.value_functions.heads import EnsembleHeadConfig
+        from openpi.value_functions.value_function_objectives import _compute_value_loss
+
+        # Create ensemble of CategoricalHeads
+        head_config = EnsembleHeadConfig(
+            base_config=CategoricalHeadConfig(v_min=-1.0, v_max=1.0, num_bins=10, sigma=0.1),
+            ensemble_size=2,
+        )
+        head = head_config.create(feature_dim=32, rng=jax.random.key(0))
+
+        # Features: [ensemble, batch, feature_dim]
+        # Target: [batch]
+        features = jnp.zeros((2, 4, 32))
+        target = jnp.zeros((4,))
+
+        loss = _compute_value_loss(head, features, target)
+
+        assert loss.shape == (4,)
+        assert jnp.all(loss > 0)
+        assert not jnp.isnan(loss).any()
 
 
 # =============================================================================
@@ -486,6 +626,45 @@ class TestMultiSARSAValueFunction:
 
         assert loss.shape == (2, 4)
         assert "next_value_mean" in info
+
+        # Test target network update
+        model.post_step_update()
+
+
+class TestMultiIQLValueFunction:
+    def test_expectile_regression(self):
+        from openpi.value_functions.networks.mlp import MultiMLPNetworkConfig
+        from openpi.value_functions.value_function import MultiIQLValueFunctionConfig
+
+        config = MultiIQLValueFunctionConfig(
+            q_network_config=MultiMLPNetworkConfig(
+                state_dim=10,
+                num_transitions_per_sample=4,
+                action_conditioned=True,
+                action_dim=4,
+                hidden_dims=(32,),
+            ),
+            v_network_config=MultiMLPNetworkConfig(
+                state_dim=10,
+                num_transitions_per_sample=4,
+                action_conditioned=False,
+                hidden_dims=(32,),
+            ),
+            q_head_config=RegressionHeadConfig(),
+            v_head_config=RegressionHeadConfig(),
+            expectile=0.7,
+            discount=0.99,
+            tau=0.005,
+        )
+        model = config.create(jax.random.key(0))
+
+        transition = make_multi_transition(2, 4, 10, action_dim=4)
+        loss, info = model.compute_loss(transition)
+
+        assert loss.shape == (2, 4)
+        assert "positive_advantage_frac" in info
+        assert "q_mean" in info
+        assert "v_mean" in info
 
         # Test target network update
         model.post_step_update()
