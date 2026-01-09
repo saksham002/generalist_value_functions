@@ -319,9 +319,9 @@ def generate_validation_plots(
         Dictionary of wandb images keyed by trajectory index, plus oracle ranking metrics
     """
 
-    # Check for PointMaze oracle
+    is_pointmaze = data_config.minari_dataset_id and "pointmaze" in data_config.minari_dataset_id.lower()
     oracle = None
-    if data_config.minari_dataset_id and "pointmaze" in data_config.minari_dataset_id.lower():
+    if is_pointmaze:
         from openpi.point_maze_utils.point_maze_oracle import PointMazeOracle
 
         oracle = PointMazeOracle()
@@ -351,6 +351,11 @@ def generate_validation_plots(
 
         if len(frames) == 0:
             continue
+
+        # Skip the first frame for PointMaze to avoid artifacts from goal changes
+        # (first frame may have a different goal than the rest of the trajectory)
+        if is_pointmaze:
+            frames = frames[1:]
 
         # Collect mc_returns for ground truth
         mc_returns = []

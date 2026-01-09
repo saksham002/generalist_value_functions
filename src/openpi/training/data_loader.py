@@ -240,6 +240,7 @@ def create_numpy_dataset_from_minari(
     dataset = minari.load_dataset(minari_dataset_id, download=True)
 
     is_antmaze = "antmaze" in minari_dataset_id.lower()
+    is_pointmaze = "pointmaze" in minari_dataset_id.lower()
 
     # Collect all transitions
     all_states = []
@@ -287,6 +288,10 @@ def create_numpy_dataset_from_minari(
             # For antmaze: termination = (reward == 1), truncation = False
             terminations = rewards > 0
             truncations = np.zeros_like(truncations, dtype=bool)
+
+        if is_pointmaze:
+            # For pointmaze: termination = (reward == 1), same as antmaze
+            terminations = rewards > 0
 
         # Apply reward transformation before MC return computation
         transformed_rewards = rewards * reward_scale + reward_bias
