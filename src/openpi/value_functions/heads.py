@@ -3,6 +3,7 @@
 import dataclasses
 
 import flax.nnx as nnx
+import jax.numpy as jnp
 
 from openpi.shared import array_typing as at
 from openpi.value_functions import hl_gauss as _hl_gauss
@@ -109,3 +110,96 @@ class CategoricalHead(nnx.Module):
 # Type alias for value heads
 ValueHead = RegressionHead | CategoricalHead
 HeadConfig = RegressionHeadConfig | CategoricalHeadConfig
+
+
+# =============================================================================
+# Ensemble Heads
+# =============================================================================
+
+
+@dataclasses.dataclass(frozen=True)
+class EnsembleHeadConfig:
+    """Config for an ensemble of heads using vmap.
+
+    Creates vectorized heads with parameters of shape (ensemble_size, ...).
+    """
+
+    base_config: HeadConfig
+    ensemble_size: int = 2
+
+    def create(self, feature_dim: int, rng: at.KeyArrayLike) -> "EnsembleHead":
+        rngs = nnx.Rngs(rng)
+
+        @nnx.split_rngs(splits=self.ensemble_size)
+        @nnx.vmap
+        def create_member(rngs: nnx.Rngs) -> ValueHead:
+            return self.base_config.create(feature_dim, rngs.params())
+
+        vectorized_head = create_member(rngs)
+        return EnsembleHead(
+            vectorized_head=vectorized_head,
+            ensemble_size=self.ensemble_size,
+        )
+
+
+class EnsembleHead(nnx.Module):
+    """Ensemble of heads with vectorized parameters.
+
+    Uses nnx.vmap for efficient parallel computation over ensemble members.
+    Expects features from EnsembleNetwork with shape [ensemble, batch, feature_dim].
+    """
+
+    vectorized_head: ValueHead
+    ensemble_size: int
+
+    def __init__(self, vectorized_head: ValueHead, ensemble_size: int):
+        super().__init__()
+        self.vectorized_head = vectorized_head
+        self.ensemble_size = ensemble_size
+
+    def __call__(self, features: at.Array) -> at.Array:
+        """Compute values for all ensemble members.
+
+        Args:
+            features: [ensemble, batch, feature_dim] from EnsembleNetwork.
+
+        Returns:
+            Values of shape [ensemble, batch] or [ensemble, batch, n].
+        """
+
+        @nnx.vmap(in_axes=(0, 0), out_axes=0)
+        def compute_single(head: ValueHead, feats: at.Array) -> at.Array:
+            return head(feats)
+
+        return compute_single(self.vectorized_head, features)
+
+    def compute_min(self, features: at.Array) -> at.Array:
+        """Compute min value across ensemble (pessimistic estimate).
+
+        Used in IQL/SAC/TD3 to prevent overestimation bias.
+
+        Args:
+            features: [ensemble, batch, feature_dim] from EnsembleNetwork.
+
+        Returns:
+            Min values of shape [batch] or [batch, n].
+        """
+        all_values = self(features)
+        return jnp.min(all_values, axis=0)
+
+    def compute_mean(self, features: at.Array) -> at.Array:
+        """Compute mean value across ensemble.
+
+        Args:
+            features: [ensemble, batch, feature_dim] from EnsembleNetwork.
+
+        Returns:
+            Mean values of shape [batch] or [batch, n].
+        """
+        all_values = self(features)
+        return jnp.mean(all_values, axis=0)
+
+
+# Extended type aliases including ensemble types
+AnyValueHead = ValueHead | EnsembleHead
+AnyHeadConfig = HeadConfig | EnsembleHeadConfig
