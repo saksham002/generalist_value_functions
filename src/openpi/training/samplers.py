@@ -159,7 +159,11 @@ class TrajectoryOrderedSamplerConfig(SamplerConfig):
 
 
 class TrajectoryConsecutiveSampler(Sampler):
-    """Sample n consecutive transitions from a single randomly-chosen episode."""
+    """Sample n consecutive transitions from a single randomly-chosen episode.
+
+    When starting near the end of an episode, pads with repeated last transitions.
+    This ensures uniform coverage of all transitions, important for sparse rewards.
+    """
 
     def __init__(
         self,
@@ -170,26 +174,19 @@ class TrajectoryConsecutiveSampler(Sampler):
         self._dataset = dataset
         self._num_transitions_per_sample = num_transitions_per_sample
         self._rng = rng
-
-        # Pre-compute episode lengths for rejection sampling
-        self._episode_lengths = dataset.episode_ends - dataset.episode_starts
-        self._valid_episodes = np.where(self._episode_lengths >= num_transitions_per_sample)[0]
-        if len(self._valid_episodes) == 0:
-            raise ValueError(
-                f"No episodes have at least {num_transitions_per_sample} transitions. "
-                f"Max episode length: {self._episode_lengths.max()}"
-            )
+        self._num_episodes = dataset.num_episodes
 
     def sample(self) -> np.ndarray:
-        # Sample a valid episode
-        episode_idx = self._rng.choice(self._valid_episodes)
+        episode_idx = self._rng.integers(self._num_episodes)
         start = self._dataset.episode_starts[episode_idx]
         end = self._dataset.episode_ends[episode_idx]
 
-        # Sample a random starting position allowing for n consecutive transitions
-        max_start = end - self._num_transitions_per_sample
-        chunk_start = self._rng.integers(start, max_start + 1)
-        return np.arange(chunk_start, chunk_start + self._num_transitions_per_sample)
+        # Sample any starting position within the episode
+        chunk_start = self._rng.integers(start, end)
+
+        # Build indices, clamping to episode end and repeating last transition
+        indices = np.arange(chunk_start, chunk_start + self._num_transitions_per_sample)
+        return np.minimum(indices, end - 1)
 
 
 @dataclasses.dataclass(frozen=True)
