@@ -326,11 +326,13 @@ def generate_validation_plots(
 
         oracle = PointMazeOracle()
 
-    # Detect multi-transition model
-    is_multi_transition = hasattr(model.network, "num_transitions_per_sample")
+    # Detect multi-transition model - check network or q_network (for IQL models)
+    primary_network = getattr(model, "network", None) or getattr(model, "q_network", None)
+    assert primary_network is not None, f"Model {type(model).__name__} has no network or q_network attribute"
+    is_multi_transition = hasattr(primary_network, "num_transitions_per_sample")
     num_transitions = None
     if is_multi_transition:
-        num_transitions = model.network.num_transitions_per_sample
+        num_transitions = primary_network.num_transitions_per_sample
 
     # Create normalization transform
     normalize = _transforms.Normalize(
