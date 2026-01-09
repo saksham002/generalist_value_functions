@@ -33,6 +33,7 @@ import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 import openpi.value_functions.base as _value_functions_base
 import openpi.value_functions.heads as _heads
+import openpi.value_functions.networks.ensemble as _ensemble_network
 import openpi.value_functions.networks.mlp as _mlp_network
 import openpi.value_functions.value_function as _value_function
 
@@ -932,6 +933,45 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
             batch_size=256,
             lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
         ),
+        # IQL with Q-ensemble of size 2
+        TrainConfig(
+            name="antmaze_large_diverse_v1_iql",
+            model=_value_function.IQLValueFunctionConfig(
+                q_network_config=_ensemble_network.EnsembleNetworkConfig(
+                    base_config=_mlp_network.MLPNetworkConfig(
+                        state_dim=state_dim,
+                        action_conditioned=True,
+                        action_dim=action_dim,
+                        action_horizon=1,
+                        hidden_dims=(256, 256, 256, 256),
+                        use_layer_norm=False,
+                    ),
+                    ensemble_size=2,
+                ),
+                v_network_config=_mlp_network.MLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=False,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                q_head_config=_heads.EnsembleHeadConfig(
+                    base_config=_heads.RegressionHeadConfig(),
+                    ensemble_size=2,
+                ),
+                v_head_config=_heads.RegressionHeadConfig(),
+                expectile=0.9,
+                discount=0.99,
+                tau=0.005,
+            ),
+            data=MinariDataConfig(
+                minari_dataset_id="D4RL/antmaze/large-diverse-v1",
+                discount=0.99,
+                reward_bias=-1.0,
+            ),
+            num_train_steps=1_000_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
     ]
 
 
@@ -959,7 +999,6 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 minari_dataset_id="D4RL/pointmaze/large-v2",
                 discount=0.99,
                 reward_bias=-1.0,
-                reward_1_upsample_weight=10.0,
             ),
             num_train_steps=100_000,
             batch_size=256,
@@ -984,7 +1023,6 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 minari_dataset_id="D4RL/pointmaze/large-v2",
                 discount=0.99,
                 reward_bias=-1.0,
-                reward_1_upsample_weight=10.0,
             ),
             num_train_steps=100_000,
             batch_size=256,
@@ -1011,7 +1049,6 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 reward_bias=-1.0,
                 num_transitions_per_sample=8,
                 multi_transition_sampler_type="trajectory_uniform",
-                reward_1_upsample_weight=10.0,
             ),
             num_train_steps=100_000,
             batch_size=256,
@@ -1038,7 +1075,6 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 reward_bias=-1.0,
                 num_transitions_per_sample=8,
                 multi_transition_sampler_type="trajectory_consecutive",
-                reward_1_upsample_weight=10.0,
             ),
             num_train_steps=100_000,
             batch_size=256,
@@ -1066,7 +1102,6 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 reward_bias=-1.0,
                 num_transitions_per_sample=8,
                 multi_transition_sampler_type="trajectory_consecutive",
-                reward_1_upsample_weight=10.0,
             ),
             num_train_steps=100_000,
             batch_size=256,
@@ -1099,7 +1134,45 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 reward_bias=-1.0,
                 num_transitions_per_sample=8,
                 multi_transition_sampler_type="trajectory_consecutive",
-                reward_1_upsample_weight=10.0,
+            ),
+            num_train_steps=100_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
+        # IQL with Q-ensemble of size 2
+        TrainConfig(
+            name="pointmaze_large_v2_iql",
+            model=_value_function.IQLValueFunctionConfig(
+                q_network_config=_ensemble_network.EnsembleNetworkConfig(
+                    base_config=_mlp_network.MLPNetworkConfig(
+                        state_dim=state_dim,
+                        action_conditioned=True,
+                        action_dim=action_dim,
+                        action_horizon=1,
+                        hidden_dims=(256, 256, 256, 256),
+                        use_layer_norm=False,
+                    ),
+                    ensemble_size=2,
+                ),
+                v_network_config=_mlp_network.MLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=False,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                q_head_config=_heads.EnsembleHeadConfig(
+                    base_config=_heads.RegressionHeadConfig(),
+                    ensemble_size=2,
+                ),
+                v_head_config=_heads.RegressionHeadConfig(),
+                expectile=0.9,
+                discount=0.99,
+                tau=0.005,
+            ),
+            data=MinariDataConfig(
+                minari_dataset_id="D4RL/pointmaze/large-v2",
+                discount=0.99,
+                reward_bias=-1.0,
             ),
             num_train_steps=100_000,
             batch_size=256,
