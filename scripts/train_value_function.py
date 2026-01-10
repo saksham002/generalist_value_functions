@@ -1197,16 +1197,21 @@ def main(config: _config.TrainConfig):
             with timer.context("policy_eval"):
                 policy_model = nnx.merge(policy_state.model_def, policy_state.params)
 
-                # Create normalization transform
+                # Create normalization and unnormalization transforms
                 normalize = _transforms.Normalize(
                     data_config.norm_stats,
                     use_quantiles=data_config.use_quantile_norm,
                     strict=False,
                 )
+                unnormalize = _transforms.Unnormalize(
+                    data_config.norm_stats,
+                    use_quantiles=data_config.use_quantile_norm,
+                )
 
                 def policy_fn(
                     obs_batch: np.ndarray,
                     normalize=normalize,
+                    unnormalize=unnormalize,
                     policy_model=policy_model,
                     step=step,
                 ) -> np.ndarray:
@@ -1225,11 +1230,17 @@ def main(config: _config.TrainConfig):
                         tokenized_prompt_mask=None,
                     )
 
-                    # Sample actions from policy for all envs
-                    actions = policy_model.sample_actions(rng=jax.random.key(step), observation=model_obs)
-                    # Take the first action in the horizon and convert to numpy
+                    # Sample actions from policy for all envs (in normalized space)
+                    normalized_actions = policy_model.sample_actions(rng=jax.random.key(step), observation=model_obs)
+                    # Take the first action in the horizon
                     # Shape: [num_envs, action_horizon, action_dim] -> [num_envs, action_dim]
-                    return np.asarray(jax.device_get(actions[:, 0, :]))
+                    normalized_actions = np.asarray(jax.device_get(normalized_actions[:, 0, :]))
+
+                    # Unnormalize actions before sending to environment
+                    return np.stack(
+                        [unnormalize({"actions": a})["actions"] for a in normalized_actions],
+                        axis=0,
+                    )
 
                 eval_results = _evaluation.evaluate_policy_vectorized(
                     policy_fn=policy_fn,
