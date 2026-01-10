@@ -170,6 +170,8 @@ class BaseValueFunction(nnx.Module, abc.ABC):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
     ) -> at.Float[at.Array, "*b"]:
         """Compute the value for each observation (and optionally action) in the batch.
 
@@ -177,6 +179,8 @@ class BaseValueFunction(nnx.Module, abc.ABC):
             observation: Observation containing state (and optionally images, prompt).
             action: Actions of shape [batch, action_horizon, action_dim].
                     Required for action-conditioned value functions.
+            take_min_over_ensemble: If True and the model is an ensemble, return the
+                                    minimum value over the ensemble dimension.
 
         Returns:
             Estimated values of shape [batch].

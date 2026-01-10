@@ -229,9 +229,12 @@ class ValueFunction(BaseValueFunction):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
     ) -> at.Float[at.Array, "*b"]:
         features = self.network.compute_features(observation, action)
-        return self.head(features)
+        val = self.head(features)
+        return self._aggregate_ensemble(val, take_min_over_ensemble)
 
 
 class MCValueFunction(ValueFunction):
@@ -353,11 +356,16 @@ class IQLValueFunction(BaseValueFunction):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
     ) -> at.Float[at.Array, "*b"]:
         """Compute Q(s, a) if action provided, else V(s)."""
         if action is not None:
             features = self.q_network.compute_features(observation, action)
-            return self.q_head(features)
+            val = self.q_head(features)
+            if take_min_over_ensemble and val.ndim > 1:
+                val = jnp.min(val, axis=0)
+            return val
         features = self.v_network.compute_features(observation, None)
         return self.v_head(features)
 
@@ -628,10 +636,16 @@ class MultiValueFunction(BaseValueFunction):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
     ) -> at.Float[at.Array, "*b n"]:
         """Compute values for all n transitions in the batch."""
         features = self.network.compute_features(observation, action)
-        return self.head(features)
+        val = self.head(features)
+        if take_min_over_ensemble and val.ndim > 2:
+            # Expected shape [batch, n], ensemble shape [ensemble, batch, n]
+            val = jnp.min(val, axis=0)
+        return val
 
 
 class MultiMCValueFunction(MultiValueFunction):
@@ -747,11 +761,17 @@ class MultiIQLValueFunction(BaseValueFunction):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
     ) -> at.Float[at.Array, "*b n"]:
         """Compute Q(s, a) if action provided, else V(s)."""
         if action is not None:
             features = self.q_network.compute_features(observation, action)
-            return self.q_head(features)
+            val = self.q_head(features)
+            if take_min_over_ensemble and val.ndim > 2:
+                # Check for ensemble dimension [ensemble, batch, n]
+                val = jnp.min(val, axis=0)
+            return val
         features = self.v_network.compute_features(observation, None)
         return self.v_head(features)
 
