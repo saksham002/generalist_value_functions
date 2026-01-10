@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "dm-control"
-version = "1.0.14"
+version = "1.0.20"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -690,9 +690,9 @@ dependencies = [
     { name = "setuptools", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "tqdm", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a7/02/55f275ffbf63ce4cb5c2d5d0474aa47a706396be69919d880cb91aa00a55/dm_control-1.0.14.tar.gz", hash = "sha256:def1ece747b6f175c581150826b50f1a6134086dab34f8f3fd2d088ea035cf3d", size = 38993145, upload-time = "2023-07-20T12:03:25.012Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ea/1b/d8c3a2e94b8234768462e8fcc5c580118d15ed4c0a2cd14b7ff59fbd8060/dm_control-1.0.20.tar.gz", hash = "sha256:72e93d5b9f372773e01d23c69459366808e073b1644682c40f94f87ed945b664", size = 56147798, upload-time = "2024-06-04T17:34:25.922Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2b/83/13d62168962d38ba70257d1fe13f8a4b0d259c9a17c44b73befda8461ef5/dm_control-1.0.14-py3-none-any.whl", hash = "sha256:883c63244a7ebf598700a97564ed19fffd3479ca79efd090aed881609cdb9fc6", size = 39291529, upload-time = "2023-07-20T12:03:16.063Z" },
+    { url = "https://files.pythonhosted.org/packages/f6/eb/8d3b42d77f2b60d3be01c9efcbd13f58e4c597755366c00b65de6cd7b49e/dm_control-1.0.20-py3-none-any.whl", hash = "sha256:5419750a8f1ddebee6695730dbb75d3dc78d0ecc78a40734e237a93a0342eae7", size = 56321836, upload-time = "2024-06-04T17:34:20.475Z" },
 ]
 
 [[package]]
@@ -1277,7 +1277,7 @@ wheels = [
 
 [[package]]
 name = "gym-aloha"
-version = "0.1.1"
+version = "0.1.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "dm-control", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -1285,9 +1285,9 @@ dependencies = [
     { name = "imageio", extra = ["ffmpeg"], marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "mujoco", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5b/54/0d386001505d0e64cb52c4ec4f4ac29c2259a6dda7032f2854c8b2bac9c9/gym_aloha-0.1.1.tar.gz", hash = "sha256:614ae1cf116323e7b5ae2f0e9bd282c4f052aee15e839e5587ddce45995359bc", size = 443256, upload-time = "2024-05-07T10:02:31.565Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b5/5e/4bb7204730501c2f645e0532a2df4339206948b2882f77cbf0eaf75bc5fe/gym_aloha-0.1.3.tar.gz", hash = "sha256:b794b246a2e6da6ce5f75e152f553fbd4412704bc217fe6311d0ede3bb72a75e", size = 443468, upload-time = "2025-10-09T14:02:35.024Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d7/ac/8df1fe5462c068132688897a3f3d62fbede48c674026baecb1012c585cfc/gym_aloha-0.1.1-py3-none-any.whl", hash = "sha256:2698037246dbb106828f0bc229b61007b0a21d5967c72cc373f7bc1083203584", size = 446935, upload-time = "2024-05-07T10:02:29.539Z" },
+    { url = "https://files.pythonhosted.org/packages/57/6c/10da397177c48ce360efa66ec21b10b10ef5fa2766256fcd8d7d9b5fa6fc/gym_aloha-0.1.3-py3-none-any.whl", hash = "sha256:a94e5747e71307897ded7ae17ed97fab05e814dcb714a16d320f110444f9d0c3", size = 447908, upload-time = "2025-10-09T14:02:33.253Z" },
 ]
 
 [[package]]
@@ -1303,6 +1303,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/0d/f8/5699ddb3e1c4f6d97b8930e573074849b921da8374fccd141f0f3a9bd713/gymnasium-0.29.1.tar.gz", hash = "sha256:1a532752efcb7590478b1cc7aa04f608eb7a2fdad5570cd217b66b6a35274bb1", size = 820485, upload-time = "2023-08-21T13:07:32.024Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a8/4d/3cbfd81ed84db450dbe73a89afcd8bc405273918415649ac6683356afe92/gymnasium-0.29.1-py3-none-any.whl", hash = "sha256:61c3384b5575985bb7f85e43213bcb40f36fcdff388cae6bc229304c71f2843e", size = 953939, upload-time = "2023-08-21T13:07:29.934Z" },
+]
+
+[[package]]
+name = "gymnasium-robotics"
+version = "1.2.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "gymnasium", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "imageio", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "jinja2", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "mujoco", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "pettingzoo", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e2/ea/5439c6ed50b1f5e87e607f92363bfab10aae1e6a8c7d9790413c34823ba6/gymnasium-robotics-1.2.3.tar.gz", hash = "sha256:b01eb9df74c0041e559e1251442ba1a59174bfc71a1c58519724d76df803c0b6", size = 26064779, upload-time = "2023-09-18T15:15:43.739Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/40/7b/9761c1c07bd5b3f4bb20f79e8f52879805943506040ffed1aa363158dbcb/gymnasium_robotics-1.2.3-py3-none-any.whl", hash = "sha256:9c3cd7bcc7ac7a0efca03d5685a01686661c7fa678e34adfe4e15044580e7180", size = 26139315, upload-time = "2023-09-18T15:15:39.048Z" },
 ]
 
 [[package]]
@@ -2131,6 +2148,16 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/66/a7/59f64ca35a089bad904c60a138bbf4f392de0b29d79e7751a8f1fbe0b4f2/minari-0.5.3-py3-none-any.whl", hash = "sha256:fc9587ddc3e7b1877185ace33f530b355cd1ec7e072f8df833654cb48d2435c4", size = 56087, upload-time = "2025-04-17T18:16:30.568Z" },
 ]
 
+[package.optional-dependencies]
+all = [
+    { name = "google-cloud-storage", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "h5py", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "huggingface-hub", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "jax", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "pyarrow", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "tqdm", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+]
+
 [[package]]
 name = "ml-collections"
 version = "1.0.0"
@@ -2208,21 +2235,25 @@ wheels = [
 
 [[package]]
 name = "mujoco"
-version = "2.3.7"
+version = "3.1.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "etils", extra = ["epath"], marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "glfw", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "pyopengl", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/51/57/083bcb22c6b1d6ad06ac2e0d751b4113f8fcd1ed4adaf369bf4365db703c/mujoco-2.3.7.tar.gz", hash = "sha256:422041f1ce37c6d151fbced1048df626837e94fe3cd9f813585907046336a7d0", size = 593293, upload-time = "2023-07-20T09:56:53.728Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3a/e3/3ceaf70bb3ac799b5bbbe5ba676f15c5b7191cf05105ce99ecbba417265c/mujoco-3.1.6.tar.gz", hash = "sha256:7cf8887526f071e7411dc02ce1cd665e39b4b6083fdff49fe1348a82d2314651", size = 670596, upload-time = "2024-06-03T21:09:35.367Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/58/92/e9ff86733133ea97aeb5ba3babfb8bcbdf3d0b6e580f55d1261d6c2d2809/mujoco-2.3.7-cp311-cp311-macosx_10_16_x86_64.whl", hash = "sha256:779520216f72a8e370e3f0cdd71b45c3b7384c63331a3189194c930a3e7cff5c", size = 4418190, upload-time = "2023-12-19T11:16:14.548Z" },
-    { url = "https://files.pythonhosted.org/packages/4e/bc/0af8bd535e7c80b081f1b9ea5426b0592a7122443215e0e1f5228081620f/mujoco-2.3.7-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:9d4018053879016282d27ab7a91e292c72d44efb5a88553feacfe5b843dde103", size = 4360833, upload-time = "2023-07-20T09:56:14.323Z" },
-    { url = "https://files.pythonhosted.org/packages/3e/23/f609446dde9bb1cf30ea2cfd7765c9a658675e7910e522a09497fbf3b096/mujoco-2.3.7-cp311-cp311-macosx_11_0_x86_64.whl", hash = "sha256:3149b16b8122ee62642474bfd2871064e8edc40235471cf5d84be3569afc0312", size = 4418137, upload-time = "2023-07-20T09:56:16.953Z" },
-    { url = "https://files.pythonhosted.org/packages/63/4e/62739d9d96a05331a1d39133b567bb7beea793a2112f6d312f6d1f74578c/mujoco-2.3.7-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c08660a8d52ef3efde76095f0991e807703a950c1e882d2bcd984b9a846626f7", size = 4297111, upload-time = "2023-07-20T09:56:19.898Z" },
-    { url = "https://files.pythonhosted.org/packages/be/c8/183dee0066e64da88b50df6a72e96dc662ae1bc2c422a2d35605ff19e154/mujoco-2.3.7-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:426af8965f8636d94a0f75740c3024a62b3e585020ee817ef5208ec844a1ad94", size = 4588037, upload-time = "2023-07-20T09:56:22.608Z" },
+    { url = "https://files.pythonhosted.org/packages/db/34/ca45c466f5082c71b63394101fb6dd8bdfb59241989cab1bcdad723e2821/mujoco-3.1.6-cp311-cp311-macosx_10_16_x86_64.whl", hash = "sha256:2bf0c46fdcdc1cd1e76037fbf0509556444434aea6e4e5633fd624ecf5c41b0c", size = 5779762, upload-time = "2024-06-03T21:08:23.887Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/23/827f0e1acbf9531ddc40f6a7f79bb61f844d03519e679796ddf7708b146f/mujoco-3.1.6-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:e257106347a78d6cce61ad2a06f68caff49d1b61bb6de9573a8ffdd295294fbb", size = 5624730, upload-time = "2024-06-03T21:08:26.223Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/95/b9a10950b3b84e47b18baf1b9e391244badf0de944c7a9d8688c4535c7ce/mujoco-3.1.6-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c6e5724bf6c4ce880b0644ab18a2868812763d2e075ddc5da90d432d6819e699", size = 5369857, upload-time = "2024-06-03T21:08:31.603Z" },
+    { url = "https://files.pythonhosted.org/packages/29/42/55af59c4a83d657dcca0f382f893baf7de2921793a3c4866a7336da3428b/mujoco-3.1.6-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:8bff14511ec5924b457dcae8c4bf403a7fbaa6fcecee0f3d2e92b83af2c2d5c3", size = 5531085, upload-time = "2024-06-03T21:08:34.037Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/a7/3c7da543d4ffb55b5ac72d82187da657d40a4da75c6344d4a506e794139d/mujoco-3.1.6-cp312-cp312-macosx_10_16_x86_64.whl", hash = "sha256:dc0ab85bcda35b2d87df91b7a13152e970a7108d87ef811f28dc32b2dbfb6754", size = 5775368, upload-time = "2024-06-03T21:08:42.627Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/e1/ec65a36045cfd597d5c38b52ecfba4f83e0b3f5400ddf2d018e0c7a5da30/mujoco-3.1.6-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:37a41c5558bd8823da8b2822d2dd941a4c57ee11bf56be5e77ee157c0e5552a1", size = 5598295, upload-time = "2024-06-03T21:08:44.472Z" },
+    { url = "https://files.pythonhosted.org/packages/cd/f5/369a65aac8f86b4dd1ab696030a170767c2aa883565bd4453723b50d3b25/mujoco-3.1.6-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:92e839b3a3758a0010673ec954a1728ce076be923f868d37739040b029489544", size = 5374724, upload-time = "2024-06-03T21:08:51.995Z" },
+    { url = "https://files.pythonhosted.org/packages/3b/18/c8e99020c8e10a680be91ec254f5290cb1bbe88353682843854208acadc5/mujoco-3.1.6-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:07d3b8c270ba9ae5c87e8e37061277ccc0d46767959b68f2a5c5c1e065213021", size = 5572181, upload-time = "2024-06-03T21:08:54.564Z" },
 ]
 
 [[package]]
@@ -2666,14 +2697,16 @@ dependencies = [
     { name = "fsspec", extra = ["gcs"], marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "gym-aloha", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "gymnasium", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "gymnasium-robotics", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "imageio", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "ipdb", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "jax", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "jax", extra = ["cuda12"], marker = "sys_platform == 'linux'" },
     { name = "jaxtyping", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "lerobot", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
-    { name = "minari", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "minari", extra = ["all"], marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "ml-collections", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "mujoco", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "numpydantic", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "opencv-python", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
@@ -2722,14 +2755,16 @@ requires-dist = [
     { name = "fsspec", extras = ["gcs"], specifier = ">=2024.6.0" },
     { name = "gym-aloha", specifier = ">=0.1.1" },
     { name = "gymnasium" },
+    { name = "gymnasium-robotics", specifier = ">=1.2.3" },
     { name = "imageio", specifier = ">=2.36.1" },
     { name = "ipdb", specifier = ">=0.13.13" },
     { name = "jax", marker = "sys_platform == 'darwin'", specifier = "==0.5.3" },
     { name = "jax", extras = ["cuda12"], marker = "sys_platform == 'linux'", specifier = "==0.5.3" },
     { name = "jaxtyping", specifier = "==0.2.36" },
     { name = "lerobot", git = "https://github.com/huggingface/lerobot?rev=0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" },
-    { name = "minari", specifier = ">=0.5.2" },
+    { name = "minari", extras = ["all", "mujoco"], specifier = ">=0.5.2" },
     { name = "ml-collections", specifier = "==1.0.0" },
+    { name = "mujoco", specifier = "==3.1.6" },
     { name = "numpy", specifier = ">=1.22.4,<2.0.0" },
     { name = "numpydantic", specifier = ">=1.6.6" },
     { name = "opencv-python", specifier = ">=4.10.0.84" },
@@ -2907,6 +2942,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/66/94/68e2e17afaa9169cf6412ab0f28623903be73d1b32e208d9e8e541bb086d/parso-0.8.4.tar.gz", hash = "sha256:eb3a7b58240fb99099a345571deecc0f9540ea5f4dd2fe14c2a99d6b281ab92d", size = 400609, upload-time = "2024-04-05T09:43:55.897Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c6/ac/dac4a63f978e4dcb3c6d3a78c4d8e0192a113d288502a1216950c41b1027/parso-0.8.4-py2.py3-none-any.whl", hash = "sha256:a418670a20291dacd2dddc80c377c5c3791378ee1e8d12bffc35420643d43f18", size = 103650, upload-time = "2024-04-05T09:43:53.299Z" },
+]
+
+[[package]]
+name = "pettingzoo"
+version = "1.24.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "gymnasium", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1c/9f/0158a60109ba43e343e16b257ffa5690607b0bccbcdd0feb7b4f07903d85/pettingzoo-1.24.3.tar.gz", hash = "sha256:91f9094f18e06fb74b98f4099cd22e8ae4396125e51719d50b30c9f1c7ab07e6", size = 720284, upload-time = "2024-01-18T17:38:28.007Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c8/4e/eae7b6ecb801573fbec0c76b0fd1dd95bfd1a7fd8770bdd20242044e91f0/pettingzoo-1.24.3-py3-none-any.whl", hash = "sha256:23ed90517d2e8a7098bdaf5e31234b3a7f7b73ca578d70d1ca7b9d0cb0e37982", size = 847753, upload-time = "2024-01-18T17:38:25.555Z" },
 ]
 
 [[package]]
