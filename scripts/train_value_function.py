@@ -1,4 +1,10 @@
-"""Training script for value functions."""
+"""Training script for value functions with optional policy training.
+
+Supports:
+- Critic-only training (default)
+- Joint critic + policy training with configurable update ratio
+- Policy extraction with frozen critic (critic_steps_per_policy_step=0)
+"""
 
 import dataclasses
 import functools
@@ -24,6 +30,7 @@ import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.evaluation as _evaluation
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 from openpi.training.time_utils import Timer
@@ -104,15 +111,15 @@ def init_train_state(
     mesh: jax.sharding.Mesh,
     *,
     resume: bool,
-) -> tuple[training_utils.TrainState, Any]:
-    """Initialize training state for a value function model."""
-    tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
+) -> tuple[training_utils.ActorCriticTrainState, Any]:
+    """Initialize training state for a value function model (and optional policy)."""
+    critic_tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
 
     if not isinstance(config.model, _value_fn.BaseValueFunctionConfig):
         raise TypeError(f"Expected BaseValueFunctionConfig, got {type(config.model)}")
     model_config: _value_fn.BaseValueFunctionConfig = config.model
 
-    def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
+    def init_critic(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)
         model = model_config.create(model_rng)
 
@@ -132,23 +139,59 @@ def init_train_state(
             step=0,
             params=params,
             model_def=nnx.graphdef(model),
-            tx=tx,
-            opt_state=tx.init(params.filter(config.trainable_filter)),
+            tx=critic_tx,
+            opt_state=critic_tx.init(params.filter(config.trainable_filter)),
             ema_decay=config.ema_decay,
             ema_params=None if config.ema_decay is None else params,
         )
 
-    train_state_shape = jax.eval_shape(init, init_rng)
+    policy_tx = None
+    if config.policy is not None:
+        policy_tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
+
+    def init_policy(rng: at.KeyArrayLike) -> training_utils.TrainState:
+        if config.policy is None or policy_tx is None:
+            raise ValueError("Config does not specify a policy")
+        policy_model = config.policy.create(rng)
+        policy_params = nnx.state(policy_model)
+        policy_params = nnx_utils.state_map(
+            policy_params,
+            config.freeze_filter,
+            lambda p: p.replace(p.value.astype(jnp.bfloat16)),
+        )
+        return training_utils.TrainState(
+            step=0,
+            params=policy_params,
+            model_def=nnx.graphdef(policy_model),
+            tx=policy_tx,
+            opt_state=policy_tx.init(policy_params.filter(config.trainable_filter)),
+            ema_decay=None,
+            ema_params=None,
+        )
+
+    def init_actor_critic(
+        rng: at.KeyArrayLike, partial_params: at.Params | None = None
+    ) -> training_utils.ActorCriticTrainState:
+        rng, critic_rng, policy_rng = jax.random.split(rng, 3)
+        critic_state = init_critic(critic_rng, partial_params)
+
+        policy_state = None
+        if config.policy is not None:
+            policy_state = init_policy(policy_rng)
+
+        return training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
+
+    train_state_shape = jax.eval_shape(init_actor_critic, init_rng)
     state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
 
     if resume:
         return train_state_shape, state_sharding
 
-    partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
+    partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.critic.params.to_pure_dict())
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     train_state = jax.jit(
-        init,
+        init_actor_critic,
         donate_argnums=(1,),
         in_shardings=replicated_sharding,
         out_shardings=state_sharding,
@@ -158,7 +201,7 @@ def init_train_state(
 
 
 @at.typecheck
-def train_step(
+def value_function_train_step(
     config: _config.TrainConfig,
     lr_schedule: optax.Schedule,
     state: training_utils.TrainState,
@@ -266,6 +309,79 @@ def train_step(
         **batch_stats,
     }
     return new_state, info
+
+
+@at.typecheck
+def policy_train_step(
+    config: _config.TrainConfig,
+    lr_schedule: optax.Schedule,
+    critic_state: training_utils.TrainState,
+    policy_state: training_utils.TrainState,
+    batch: dict[str, Any],
+    rng: at.KeyArrayLike,
+) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    """Single training step for policy.
+
+    Args:
+        config: Training configuration.
+        lr_schedule: Learning rate schedule.
+        critic_state: Critic (value function) train state (frozen during policy update).
+        policy_state: Policy train state to update.
+        batch: Batch of data.
+        rng: Random key.
+
+    Returns:
+        Tuple of (new_policy_state, info_dict).
+    """
+    policy = nnx.merge(policy_state.model_def, policy_state.params)
+    critic = nnx.merge(critic_state.model_def, critic_state.params)
+
+    # Build observation from batch - single transition only
+    observation = _model.Observation(
+        images={},
+        image_masks={},
+        state=jnp.asarray(batch["state"]),
+        tokenized_prompt=None,
+        tokenized_prompt_mask=None,
+    )
+
+    # Extract data action for BC-based objectives
+    data_action = jnp.asarray(batch["actions"])
+
+    def loss_fn(policy):
+        loss, info = config.policy_extraction.compute_loss(
+            policy=policy,
+            observation=observation,
+            rng=rng,
+            data_action=data_action,
+            value_function=critic,
+        )
+        return jnp.mean(loss), info
+
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    (loss, policy_info), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(policy)
+
+    params = policy_state.params.filter(config.trainable_filter)
+    updates, new_opt_state = policy_state.tx.update(grads, policy_state.opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+
+    nnx.update(policy, new_params)
+    new_params = nnx.state(policy)
+
+    new_policy_state = dataclasses.replace(
+        policy_state,
+        step=policy_state.step + 1,
+        params=new_params,
+        opt_state=new_opt_state,
+    )
+
+    info = {
+        "policy/loss": loss,
+        "policy/grad_norm": optax.global_norm(grads),
+        "policy/learning_rate": lr_schedule(policy_state.step),
+        **{f"policy/{k}": v for k, v in policy_info.items()},
+    }
+    return new_policy_state, info
 
 
 def get_trajectory_frames(dataset, episode_idx: int) -> list[dict]:
@@ -870,6 +986,25 @@ def main(config: _config.TrainConfig):
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
+    # Validate policy training settings
+    policy_training_enabled = config.policy is not None and config.policy_extraction is not None
+    if policy_training_enabled:
+        logging.info(f"Policy training enabled with {type(config.policy_extraction).__name__}")
+        logging.info(f"critic_steps_per_policy_step = {config.critic_steps_per_policy_step}")
+
+    # Frozen critic mode (critic_steps_per_policy_step=0) requires a checkpoint
+    if config.critic_steps_per_policy_step == 0:
+        if not policy_training_enabled:
+            raise ValueError(
+                "critic_steps_per_policy_step=0 only makes sense with policy training. "
+                "Set config.policy and config.policy_extraction."
+            )
+        if isinstance(config.weight_loader, _weight_loaders.NoOpWeightLoader):
+            raise ValueError(
+                "critic_steps_per_policy_step=0 (frozen critic) requires loading a critic checkpoint. "
+                "Set weight_loader in config to load a pre-trained critic."
+            )
+
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
     rng = jax.random.key(config.seed)
@@ -927,22 +1062,54 @@ def main(config: _config.TrainConfig):
     network_config = getattr(config.model, "network_config", None)
     action_conditioned = getattr(network_config, "action_conditioned", False)
 
+    # Set up evaluation environment if enabled
+    eval_env = None
+    eval_enabled = config.eval_interval > 0 and config.eval_env is not None and policy_training_enabled
+    if eval_enabled:
+        # Use vectorized environments for parallel evaluation
+        num_eval_envs = min(config.eval_env.num_eval_episodes, 8)
+        eval_env = _evaluation.create_vector_eval_env(config.eval_env, data_config, num_envs=num_eval_envs)
+        logging.info(
+            f"Evaluation enabled: {config.eval_env.num_eval_episodes} episodes every {config.eval_interval} steps "
+            f"({num_eval_envs} parallel envs)"
+        )
+
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
-    jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
+    # Unpack state and sharding
+    if not isinstance(train_state, training_utils.ActorCriticTrainState):
+        raise TypeError(f"Expected ActorCriticTrainState, got {type(train_state)}")
+
+    critic_state = train_state.critic
+    policy_state = train_state.policy
+    critic_sharding = train_state_sharding.critic
+    policy_sharding = train_state_sharding.policy
+    logging.info(f"Initialized combined state:\nCritic: {training_utils.array_tree_to_info(critic_state.params)}")
+    if policy_state:
+        logging.info(f"Policy: {training_utils.array_tree_to_info(policy_state.params)}")
+
+    jax.block_until_ready(critic_state)
+
     lr_schedule = config.lr_schedule.create()
     ptrain_step = jax.jit(
-        functools.partial(train_step, config, lr_schedule),
-        in_shardings=(train_state_sharding, data_sharding, replicated_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
+        functools.partial(value_function_train_step, config, lr_schedule),
+        in_shardings=(critic_sharding, data_sharding, replicated_sharding),
+        out_shardings=(critic_sharding, replicated_sharding),
         donate_argnums=(0,),
     )
 
-    start_step = int(train_state.step)
+    ppolicy_step = None
+    if policy_state is not None:
+        ppolicy_step = jax.jit(
+            functools.partial(policy_train_step, config, lr_schedule),
+            in_shardings=(critic_sharding, policy_sharding, data_sharding, replicated_sharding),
+            out_shardings=(policy_sharding, replicated_sharding),
+        )
+
+    start_step = int(critic_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
@@ -959,14 +1126,26 @@ def main(config: _config.TrainConfig):
         # Split rng for this step
         rng, step_rng = jax.random.split(rng)
 
-        # Time train step, including device sync
         with timer.context("train_step_compute"), sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_state, batch, step_rng)
+            critic_state, info = ptrain_step(critic_state, batch, step_rng)
 
-        # Time blocking on train step completion
         with timer.context("train_step_sync"):
-            jax.block_until_ready(train_state)
+            jax.block_until_ready(critic_state)
             jax.block_until_ready(info)
+
+        # Policy training step (if enabled)
+        if policy_training_enabled:
+            ratio = config.critic_steps_per_policy_step
+            should_update_policy = ratio == 0 or (step + 1) % ratio == 0
+            if should_update_policy:
+                rng, policy_rng = jax.random.split(rng)
+                with timer.context("policy_step_compute"), sharding.set_mesh(mesh):
+                    policy_state, policy_info = ppolicy_step(critic_state, policy_state, batch, policy_rng)
+                with timer.context("policy_step_sync"):
+                    jax.block_until_ready(policy_state)
+                    jax.block_until_ready(policy_info)
+                policy_info = jax.device_get(policy_info)
+                info.update(policy_info)
 
         if step % config.log_interval == 0:
             info = jax.device_get(info)
@@ -994,12 +1173,14 @@ def main(config: _config.TrainConfig):
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             with timer.context("checkpoint_save"):
-                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+                state_to_save = training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
+                _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step)
 
         # Generate validation plots
         if step % config.plot_interval == 0 and step > 0:
             with timer.context("validation_plot"):
-                model = nnx.merge(train_state.model_def, train_state.params)
+                model = nnx.merge(critic_state.model_def, critic_state.params)
+
                 plot_images = generate_validation_plots(
                     model=model,
                     dataset=val_dataset,
@@ -1010,6 +1191,58 @@ def main(config: _config.TrainConfig):
                 )
                 if plot_images:
                     wandb.log(plot_images, step=step)
+
+        # Policy evaluation
+        if eval_enabled and step % config.eval_interval == 0 and step > 0:
+            with timer.context("policy_eval"):
+                policy_model = nnx.merge(policy_state.model_def, policy_state.params)
+
+                # Create normalization transform
+                normalize = _transforms.Normalize(
+                    data_config.norm_stats,
+                    use_quantiles=data_config.use_quantile_norm,
+                    strict=False,
+                )
+
+                def policy_fn(
+                    obs_batch: np.ndarray,
+                    normalize=normalize,
+                    policy_model=policy_model,
+                    step=step,
+                ) -> np.ndarray:
+                    # Normalize batch of observations: [num_envs, obs_dim]
+                    normalized_obs = np.stack(
+                        [normalize({"state": obs})["state"] for obs in obs_batch],
+                        axis=0,
+                    )
+
+                    # Build model observation for batch
+                    model_obs = _model.Observation(
+                        images={},
+                        image_masks={},
+                        state=jnp.asarray(normalized_obs),  # [num_envs, obs_dim]
+                        tokenized_prompt=None,
+                        tokenized_prompt_mask=None,
+                    )
+
+                    # Sample actions from policy for all envs
+                    actions = policy_model.sample_actions(rng=jax.random.key(step), observation=model_obs)
+                    # Take the first action in the horizon and convert to numpy
+                    # Shape: [num_envs, action_horizon, action_dim] -> [num_envs, action_dim]
+                    return np.asarray(jax.device_get(actions[:, 0, :]))
+
+                eval_results = _evaluation.evaluate_policy_vectorized(
+                    policy_fn=policy_fn,
+                    vec_env=eval_env,
+                    num_episodes=config.eval_env.num_eval_episodes,
+                    seed=config.eval_env.seed + step,
+                )
+                eval_metrics = eval_results.to_dict()
+                wandb.log(eval_metrics, step=step)
+                logging.info(
+                    f"Step {step} eval: mean_return={eval_results.mean_return:.2f}, "
+                    f"std_return={eval_results.std_return:.2f}"
+                )
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
