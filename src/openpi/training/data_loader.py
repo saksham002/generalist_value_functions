@@ -275,15 +275,15 @@ def create_numpy_dataset_from_minari(
             observations = np.concatenate(obs_arrays, axis=-1)
 
         if is_antmaze:
-            # For antmaze: truncate episode after first positive reward
-            positive_reward_idx = np.where(rewards > 0)[0]
-            if len(positive_reward_idx) > 0:
-                end_idx = positive_reward_idx[0] + 1
-                observations = observations[: end_idx + 1]
-                actions = actions[:end_idx]
-                rewards = rewards[:end_idx]
-                terminations = terminations[:end_idx]
-                truncations = truncations[:end_idx]
+            # # For antmaze: truncate episode after first positive reward
+            # positive_reward_idx = np.where(rewards > 0)[0]
+            # if len(positive_reward_idx) > 0:
+            #     end_idx = positive_reward_idx[0] + 1
+            #     observations = observations[: end_idx + 1]
+            #     actions = actions[:end_idx]
+            #     rewards = rewards[:end_idx]
+            #     terminations = terminations[:end_idx]
+            #     truncations = truncations[:end_idx]
 
             # For antmaze: termination = (reward == 1), truncation = False
             terminations = rewards > 0
