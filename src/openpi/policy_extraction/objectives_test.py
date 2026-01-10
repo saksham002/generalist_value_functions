@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models.tanh_gaussian import TanhGaussianConfig
@@ -41,8 +42,11 @@ class FakeQFunction(BaseValueFunction):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
     ) -> at.Float[at.Array, "*b"]:
         """Return sum(state) + sum(action) * weight."""
+        del take_min_over_ensemble
         state_sum = jnp.sum(observation.state, axis=-1)
         if action is not None:
             action_sum = jnp.sum(action, axis=(-2, -1))
@@ -60,22 +64,19 @@ class FakeEnsembleQFunction(FakeQFunction):
         super().__init__(action_weight)
         self.ensemble_spread = ensemble_spread
 
-    def compute_min_value(
+    @override
+    def compute_value(
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
     ) -> at.Float[at.Array, "*b"]:
-        """Return base value - spread (simulating min over ensemble)."""
-        base = self.compute_value(observation, action)
-        return base - self.ensemble_spread
-
-    def compute_mean_value(
-        self,
-        observation: _model.Observation,
-        action: _model.Actions | None = None,
-    ) -> at.Float[at.Array, "*b"]:
-        """Return base value (simulating mean over ensemble)."""
-        return self.compute_value(observation, action)
+        """Return base value - spread if take_min_over_ensemble else base value."""
+        base = super().compute_value(observation, action)
+        if take_min_over_ensemble:
+            return base - self.ensemble_spread
+        return base
 
 
 class FakePolicy(_model.BaseModel):
@@ -408,6 +409,199 @@ class TestWeightedSumObjective:
         direct_loss, _ = objectives.ddpg_objective(policy, obs, rng, q_fn)
 
         np.testing.assert_allclose(weighted_loss, direct_loss, rtol=1e-5)
+
+
+class TestNoopObjective:
+    """Tests for noop_objective."""
+
+    def test_returns_zero_loss(self):
+        """Test that noop objective returns zero loss."""
+        batch_size = 4
+        state_dim = 10
+        action_dim = 4
+        action_horizon = 1
+
+        policy = FakePolicy(action_dim, action_horizon)
+        obs = make_observation(jnp.ones((batch_size, state_dim)))
+        rng = jax.random.key(0)
+
+        loss, info = objectives.noop_objective(policy, obs, rng)
+
+        assert loss.shape == (batch_size,)
+        np.testing.assert_allclose(loss, jnp.zeros(batch_size), atol=1e-6)
+        assert info == {}
+
+    def test_different_batch_sizes(self):
+        """Test noop objective with various batch sizes."""
+        for batch_size in [1, 8, 32]:
+            policy = FakePolicy(3, 1)
+            obs = make_observation(jnp.ones((batch_size, 5)))
+            rng = jax.random.key(0)
+
+            loss, _ = objectives.noop_objective(policy, obs, rng)
+
+            assert loss.shape == (batch_size,)
+            np.testing.assert_allclose(loss, jnp.zeros(batch_size), atol=1e-6)
+
+
+class FakeVFunction(BaseValueFunction):
+    """Fake V-function that returns state sum."""
+
+    def compute_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b"]:
+        """Return sum(state)."""
+        del action, take_min_over_ensemble
+        return jnp.sum(observation.state, axis=-1)
+
+    def compute_loss(self, transition, *, train=False, rng=None):
+        raise NotImplementedError("FakeVFunction doesn't support training")
+
+
+class TestAWRObjective:
+    """Tests for awr_objective."""
+
+    def test_basic_loss_shape(self):
+        """Test that AWR objective returns correct shape."""
+        batch_size = 4
+        state_dim = 10
+        action_dim = 4
+        action_horizon = 1
+
+        config = TanhGaussianConfig(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_horizon=action_horizon,
+            std_parameterization="fixed",
+            fixed_std=0.1,
+        )
+        rng = jax.random.key(0)
+        policy = config.create(rng)
+
+        q_fn = FakeQFunction(action_weight=1.0)
+        v_fn = FakeVFunction()
+        obs = make_observation(jnp.ones((batch_size, state_dim)))
+        data_action = jnp.zeros((batch_size, action_horizon, action_dim))
+        rng = jax.random.key(1)
+
+        loss, info = objectives.awr_objective(policy, obs, rng, data_action, q_fn, v_fn, temperature=1.0)
+
+        assert loss.shape == (batch_size,)
+        assert "advantage_mean" in info
+        assert "weight_mean" in info
+        assert "log_prob_mean" in info
+        assert "q_value_mean" in info
+        assert "v_value_mean" in info
+
+    def test_advantage_computation(self):
+        """Test that advantage A = Q(s,a) - V(s) is computed correctly."""
+        batch_size = 2
+        state_dim = 5
+        action_dim = 3
+        action_horizon = 1
+
+        config = TanhGaussianConfig(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_horizon=action_horizon,
+            std_parameterization="fixed",
+            fixed_std=0.1,
+        )
+        rng = jax.random.key(0)
+        policy = config.create(rng)
+
+        # Q = sum(state) + action_weight * sum(action)
+        # V = sum(state)
+        # A = action_weight * sum(action)
+        q_fn = FakeQFunction(action_weight=2.0)
+        v_fn = FakeVFunction()
+
+        state = jnp.ones((batch_size, state_dim))
+        obs = make_observation(state)
+        # Actions: first sample all 1s, second sample all 0s
+        data_action = jnp.array([[[1.0, 1.0, 1.0]], [[0.0, 0.0, 0.0]]])
+        rng = jax.random.key(1)
+
+        _, info = objectives.awr_objective(policy, obs, rng, data_action, q_fn, v_fn, temperature=1.0)
+
+        # Expected advantages: [2.0 * 3 = 6.0, 2.0 * 0 = 0.0]
+        expected_advantages = jnp.array([6.0, 0.0])
+        np.testing.assert_allclose(info["advantage_mean"], jnp.mean(expected_advantages), rtol=1e-5)
+
+    def test_temperature_affects_weights(self):
+        """Test that lower temperature increases weight variance."""
+        batch_size = 4
+        state_dim = 5
+        action_dim = 3
+        action_horizon = 1
+
+        config = TanhGaussianConfig(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_horizon=action_horizon,
+            std_parameterization="fixed",
+            fixed_std=0.1,
+        )
+        rng = jax.random.key(0)
+        policy = config.create(rng)
+
+        q_fn = FakeQFunction(action_weight=1.0)
+        v_fn = FakeVFunction()
+
+        obs = make_observation(jnp.ones((batch_size, state_dim)))
+        # Varying actions to create different advantages
+        data_action = jnp.array(
+            [
+                [[0.0, 0.0, 0.0]],
+                [[1.0, 0.0, 0.0]],
+                [[1.0, 1.0, 0.0]],
+                [[1.0, 1.0, 1.0]],
+            ]
+        )
+        rng = jax.random.key(1)
+
+        _, info_high_temp = objectives.awr_objective(policy, obs, rng, data_action, q_fn, v_fn, temperature=10.0)
+        _, info_low_temp = objectives.awr_objective(policy, obs, rng, data_action, q_fn, v_fn, temperature=0.1)
+
+        # Lower temperature should give higher weight variance
+        assert info_low_temp["weight_std"] > info_high_temp["weight_std"]
+
+    def test_clip_exp_prevents_explosion(self):
+        """Test that clip_exp prevents weight explosion."""
+        batch_size = 2
+        state_dim = 5
+        action_dim = 3
+        action_horizon = 1
+
+        config = TanhGaussianConfig(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_horizon=action_horizon,
+            std_parameterization="fixed",
+            fixed_std=0.1,
+        )
+        rng = jax.random.key(0)
+        policy = config.create(rng)
+
+        # High action weight to create large advantages
+        q_fn = FakeQFunction(action_weight=100.0)
+        v_fn = FakeVFunction()
+
+        obs = make_observation(jnp.ones((batch_size, state_dim)))
+        data_action = jnp.ones((batch_size, action_horizon, action_dim))
+        rng = jax.random.key(1)
+
+        clip_value = 50.0
+        _, info = objectives.awr_objective(
+            policy, obs, rng, data_action, q_fn, v_fn, temperature=0.01, clip_exp=clip_value
+        )
+
+        # Weight max should be clipped
+        assert info["weight_max"] <= clip_value + 1e-5
 
 
 if __name__ == "__main__":

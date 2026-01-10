@@ -26,18 +26,33 @@ Example usage for SAC-style policy extraction:
     loss, info = weighted_sum_objective(policy, observation, rng, objectives)
 """
 
+from openpi.policy_extraction.objectives import AWRPolicyConfig
+from openpi.policy_extraction.objectives import BasePolicyExtractionConfig
+from openpi.policy_extraction.objectives import DDPGPolicyConfig
+from openpi.policy_extraction.objectives import NoopPolicyConfig
+from openpi.policy_extraction.objectives import awr_objective
 from openpi.policy_extraction.objectives import bc_regularization_objective
 from openpi.policy_extraction.objectives import ddpg_objective
 from openpi.policy_extraction.objectives import entropy_objective
+from openpi.policy_extraction.objectives import noop_objective
 from openpi.policy_extraction.objectives import weighted_sum_objective
 from openpi.policy_extraction.temperature import Temperature
 from openpi.policy_extraction.temperature import TemperatureConfig
 
 __all__ = [
+    # Policy Extraction Configs
+    "AWRPolicyConfig",
+    "BasePolicyExtractionConfig",
+    "DDPGPolicyConfig",
+    "NoopPolicyConfig",
+    # Temperature
     "Temperature",
     "TemperatureConfig",
+    # Objectives
+    "awr_objective",
     "bc_regularization_objective",
     "ddpg_objective",
     "entropy_objective",
+    "noop_objective",
     "weighted_sum_objective",
 ]
