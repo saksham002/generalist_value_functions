@@ -1025,7 +1025,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
                         action_conditioned=True,
                         action_dim=action_dim,
                         action_horizon=1,
-                        hidden_dims=(256, 256, 256, 256),
+                        hidden_dims=(256, 256),
                         use_layer_norm=False,
                     ),
                     ensemble_size=2,
@@ -1052,7 +1052,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
                 hidden_dims=(256, 256),
             ),
             policy_extraction=_policy_extraction.AWRPolicyConfig(
-                temperature=3.0,
+                temperature=10.0,
                 clip_exp=100.0,
             ),
             data=MinariDataConfig(
