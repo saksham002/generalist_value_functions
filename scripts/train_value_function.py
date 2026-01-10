@@ -1203,8 +1203,10 @@ def main(config: _config.TrainConfig):
                     use_quantiles=data_config.use_quantile_norm,
                     strict=False,
                 )
+                # Create unnormalize with only actions stats (avoids requiring all keys)
+                actions_norm_stats = {"actions": data_config.norm_stats["actions"]}
                 unnormalize = _transforms.Unnormalize(
-                    data_config.norm_stats,
+                    actions_norm_stats,
                     use_quantiles=data_config.use_quantile_norm,
                 )
 
