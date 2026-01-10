@@ -234,7 +234,9 @@ class ValueFunction(BaseValueFunction):
     ) -> at.Float[at.Array, "*b"]:
         features = self.network.compute_features(observation, action)
         val = self.head(features)
-        return self._aggregate_ensemble(val, take_min_over_ensemble)
+        if take_min_over_ensemble and val.ndim > 1:
+            val = jnp.min(val, axis=0)
+        return val
 
 
 class MCValueFunction(ValueFunction):
