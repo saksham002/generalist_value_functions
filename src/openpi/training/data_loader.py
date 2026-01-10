@@ -239,6 +239,14 @@ def create_numpy_dataset_from_minari(
         logging.info(f"Applying reward transformation: r' = {reward_scale} * r + {reward_bias}")
     dataset = minari.load_dataset(minari_dataset_id, download=True)
 
+    # Get action bounds for clipping (avoid boundary values that cause NaN in log_prob)
+    action_space = dataset.action_space
+    action_low = action_space.low.astype(np.float32)
+    action_high = action_space.high.astype(np.float32)
+    clip_margin = 1e-4 * (action_high - action_low)
+    action_low_clipped = action_low + clip_margin
+    action_high_clipped = action_high - clip_margin
+
     is_antmaze = "antmaze" in minari_dataset_id.lower()
     is_pointmaze = "pointmaze" in minari_dataset_id.lower()
 
@@ -311,8 +319,12 @@ def create_numpy_dataset_from_minari(
                 if t + 1 < len(observations)
                 else observations[-1].astype(np.float32)
             )
-            action = actions[t].astype(np.float32)
-            next_action = actions[t + 1].astype(np.float32) if t + 1 < len(actions) else actions[-1].astype(np.float32)
+            action = np.clip(actions[t].astype(np.float32), action_low_clipped, action_high_clipped)
+            next_action = np.clip(
+                actions[t + 1].astype(np.float32) if t + 1 < len(actions) else actions[-1].astype(np.float32),
+                action_low_clipped,
+                action_high_clipped,
+            )
 
             all_states.append(obs)
             all_actions.append(action)

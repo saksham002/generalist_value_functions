@@ -142,8 +142,7 @@ def entropy_objective(
         The loss is log_prob, so minimizing -loss maximizes entropy.
     """
     dist = policy.action_distribution(rng, observation)
-    actions = dist.sample(seed=rng)
-    log_prob = dist.log_prob(actions)
+    actions, log_prob = dist.sample_and_log_prob(seed=rng)
     batch_size = observation.state.shape[0]
     assert log_prob.shape == (batch_size,), f"Expected log_prob shape ({batch_size},), got {log_prob.shape}"
 
