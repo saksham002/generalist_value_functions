@@ -28,6 +28,16 @@ class EvalResults:
 
     episode_returns: list[float]
     episode_lengths: list[int]
+    # Observation statistics from all evaluation steps
+    obs_min: float = 0.0
+    obs_max: float = 0.0
+    obs_mean: float = 0.0
+    obs_std: float = 0.0
+    # Action statistics from all evaluation steps
+    action_min: float = 0.0
+    action_max: float = 0.0
+    action_mean: float = 0.0
+    action_std: float = 0.0
 
     @property
     def mean_return(self) -> float:
@@ -49,6 +59,14 @@ class EvalResults:
             f"{prefix}/mean_length": self.mean_length,
             f"{prefix}/min_return": float(np.min(self.episode_returns)),
             f"{prefix}/max_return": float(np.max(self.episode_returns)),
+            f"{prefix}/obs_min": self.obs_min,
+            f"{prefix}/obs_max": self.obs_max,
+            f"{prefix}/obs_mean": self.obs_mean,
+            f"{prefix}/obs_std": self.obs_std,
+            f"{prefix}/action_min": self.action_min,
+            f"{prefix}/action_max": self.action_max,
+            f"{prefix}/action_mean": self.action_mean,
+            f"{prefix}/action_std": self.action_std,
         }
 
 
@@ -146,7 +164,7 @@ def evaluate_policy_vectorized(
         seed: Random seed for environment resets.
 
     Returns:
-        EvalResults containing episode returns and lengths.
+        EvalResults containing episode returns, lengths, and observation/action statistics.
     """
     num_envs = vec_env.num_envs
     episode_returns: list[float] = []
@@ -156,6 +174,10 @@ def evaluate_policy_vectorized(
     current_returns = np.zeros(num_envs, dtype=np.float32)
     current_lengths = np.zeros(num_envs, dtype=np.int32)
 
+    # Track observation and action statistics
+    all_obs = []
+    all_actions = []
+
     # Reset all environments
     obs, _ = vec_env.reset(seed=seed)
     obs_flat = _flatten_obs_batch(obs)
@@ -163,6 +185,9 @@ def evaluate_policy_vectorized(
     while len(episode_returns) < num_episodes:
         # Get actions for all environments
         actions = policy_fn(obs_flat)
+
+        all_obs.append(obs_flat)
+        all_actions.append(actions)
 
         # Step all environments
         obs, rewards, terminateds, truncateds, infos = vec_env.step(actions)
@@ -183,11 +208,26 @@ def evaluate_policy_vectorized(
             current_returns[i] = 0.0
             current_lengths[i] = 0
 
+    # Compute final statistics
+    all_obs_arr = np.concatenate(all_obs)
+    all_actions_arr = np.concatenate(all_actions)
+
     logging.debug(
         f"Vectorized eval complete: {len(episode_returns)} episodes, mean_return={np.mean(episode_returns):.2f}"
     )
 
-    return EvalResults(episode_returns=episode_returns, episode_lengths=episode_lengths)
+    return EvalResults(
+        episode_returns=episode_returns,
+        episode_lengths=episode_lengths,
+        obs_min=float(np.min(all_obs_arr)),
+        obs_max=float(np.max(all_obs_arr)),
+        obs_mean=float(np.mean(all_obs_arr)),
+        obs_std=float(np.std(all_obs_arr)),
+        action_min=float(np.min(all_actions_arr)),
+        action_max=float(np.max(all_actions_arr)),
+        action_mean=float(np.mean(all_actions_arr)),
+        action_std=float(np.std(all_actions_arr)),
+    )
 
 
 def _flatten_obs(obs: dict | np.ndarray) -> np.ndarray:
