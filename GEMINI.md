@@ -258,7 +258,7 @@ Standardized data format using typed dataclasses:
 - **Avoid reshape with -1**: Don't use `reshape(..., -1)` as it can lead to silent bugs. Instead, explicitly compute and specify all dimensions.
 
 ### Comments and Documentation
-**CRITICAL**: Do not add comments that only make sense in the context of the current prompt or that simply restate what the code does.
+**CRITICAL**: Do not add comments that only make sense in the context of the current prompt or that simply restate what the code does. Do not leave "thinking" comments or internal monologues in the code.
 
 **Good comments**:
 - Module-level docstrings explaining the purpose and high-level architecture
