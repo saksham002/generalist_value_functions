@@ -131,6 +131,9 @@ class DataConfig:
     # are sampled twice as often as other transitions.
     reward_1_upsample_weight: float = 1.0
 
+    # Keys to skip during normalization/unnormalization
+    skip_normalize_keys: tuple[str, ...] = ()
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -578,6 +581,8 @@ class MinariDataConfig(DataConfigFactory):
     reward_bias: float = 0.0
     # Upsampling weight for transitions with reward=1 (see DataConfig.reward_1_upsample_weight)
     reward_1_upsample_weight: float = 1.0
+    # Keys to skip during normalization
+    skip_normalize_keys: tuple[str, ...] = ("actions", "next_actions")
 
     # Override repo_id from parent - not used for minari loading
     repo_id: str = "minari"  # Dummy value, not used
@@ -605,6 +610,10 @@ class MinariDataConfig(DataConfigFactory):
             if "actions" in norm_stats:
                 norm_stats["next_actions"] = norm_stats["actions"]
 
+            # Filter out keys that should be skipped during normalization
+            if self.skip_normalize_keys:
+                norm_stats = {k: v for k, v in norm_stats.items() if k not in self.skip_normalize_keys}
+
         return DataConfig(
             repo_id=None,  # Not using LeRobot
             asset_id=asset_id,
@@ -619,6 +628,7 @@ class MinariDataConfig(DataConfigFactory):
             reward_bias=self.reward_bias,
             minari_dataset_id=self.minari_dataset_id,
             reward_1_upsample_weight=self.reward_1_upsample_weight,
+            skip_normalize_keys=self.skip_normalize_keys,
         )
 
 

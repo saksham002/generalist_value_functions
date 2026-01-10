@@ -1203,12 +1203,16 @@ def main(config: _config.TrainConfig):
                     use_quantiles=data_config.use_quantile_norm,
                     strict=False,
                 )
-                # Create unnormalize with only actions stats (avoids requiring all keys)
-                actions_norm_stats = {"actions": data_config.norm_stats["actions"]}
-                unnormalize = _transforms.Unnormalize(
-                    actions_norm_stats,
-                    use_quantiles=data_config.use_quantile_norm,
-                )
+                # Only create unnormalize if actions were normalized
+                should_unnormalize_actions = "actions" not in data_config.skip_normalize_keys
+                if should_unnormalize_actions:
+                    actions_norm_stats = {"actions": data_config.norm_stats["actions"]}
+                    unnormalize = _transforms.Unnormalize(
+                        actions_norm_stats,
+                        use_quantiles=data_config.use_quantile_norm,
+                    )
+                else:
+                    unnormalize = None
 
                 def policy_fn(
                     obs_batch: np.ndarray,
@@ -1232,17 +1236,19 @@ def main(config: _config.TrainConfig):
                         tokenized_prompt_mask=None,
                     )
 
-                    # Sample actions from policy for all envs (in normalized space)
-                    normalized_actions = policy_model.sample_actions(rng=jax.random.key(step), observation=model_obs)
+                    # Sample actions from policy
+                    actions = policy_model.sample_actions(rng=jax.random.key(step), observation=model_obs)
                     # Take the first action in the horizon
                     # Shape: [num_envs, action_horizon, action_dim] -> [num_envs, action_dim]
-                    normalized_actions = np.asarray(jax.device_get(normalized_actions[:, 0, :]))
+                    actions = np.asarray(jax.device_get(actions[:, 0, :]))
 
-                    # Unnormalize actions before sending to environment
-                    return np.stack(
-                        [unnormalize({"actions": a})["actions"] for a in normalized_actions],
-                        axis=0,
-                    )
+                    # Unnormalize actions if they were normalized during training
+                    if unnormalize is not None:
+                        actions = np.stack(
+                            [unnormalize({"actions": a})["actions"] for a in actions],
+                            axis=0,
+                        )
+                    return actions
 
                 eval_results = _evaluation.evaluate_policy_vectorized(
                     policy_fn=policy_fn,
