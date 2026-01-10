@@ -17,11 +17,13 @@ import openpi.models.mlp_config as mlp_config
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.tanh_gaussian as _tanh_gaussian
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.d4rl_policy as d4rl_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+from openpi.policy_extraction import objectives as _policy_extraction
 import openpi.shared.download as _download
 import openpi.shared.minari_utils as minari_utils
 import openpi.shared.normalize as _normalize
@@ -649,17 +651,37 @@ class MultiTransitionMinariDataConfig(MinariDataConfig):
 
 
 @dataclasses.dataclass(frozen=True)
+class EvalEnvConfig:
+    """Base configuration for evaluation environments."""
+
+    # Number of evaluation episodes per eval run
+    num_eval_episodes: int = 10
+    # Maximum steps per episode (0 = use environment default)
+    max_episode_steps: int = 0
+    # Seed for environment initialization
+    seed: int = 42
+
+
+@dataclasses.dataclass(frozen=True)
+class MinariEvalEnvConfig(EvalEnvConfig):
+    """Evaluation environment recovered from a Minari dataset.
+
+    If minari_dataset_id is None, will be inferred from DataConfig.minari_dataset_id.
+    """
+
+    minari_dataset_id: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
     # Project name.
     project_name: str = "openpi"
-    # Experiment name. Will be used to name the metadata and checkpoint directories.
-    # Defaults to the config name if not provided.
+    # Experiment name (defaults to config name).
     exp_name: str | None = None
 
-    # Defines the model config. Accepts either a policy model config (BaseModelConfig)
-    # or a value function config (BaseValueFunctionConfig).
+    # Model or value function config.
     model: _model.BaseModelConfig | _value_functions_base.BaseValueFunctionConfig = dataclasses.field(
         default_factory=pi0_config.Pi0Config
     )
@@ -706,7 +728,7 @@ class TrainConfig:
     plot_interval: int = 5000
     # Number of validation trajectories to use for plotting.
     num_val_trajectories: int = 3
-    # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
+    # Checkpoints matching step % keep_period == 0 will be preserved.
     keep_period: int | None = 5000
 
     # If true, will overwrite the checkpoint directory if it already exists.
@@ -725,6 +747,27 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+
+    # === Policy Training (Actor-Critic) ===
+    # Optional policy model for actor-critic training. When set, the training script
+    # can train both a value function (critic) and a policy (actor).
+    policy: _model.BaseModelConfig | None = None
+
+    # Policy extraction objective config. Determines how the policy is trained.
+    # Use NoopPolicyConfig for critic-only training, AWRPolicyConfig for IQL-style
+    # policy extraction, or DDPGPolicyConfig for DDPG-style policy improvement.
+    policy_extraction: _policy_extraction.BasePolicyExtractionConfig | None = None
+
+    # Critic steps per policy step. Controls the ratio of critic to policy updates.
+    # - N > 0: Update policy every N critic steps
+    # - 0: Frozen critic mode (requires weight_loader to load critic checkpoint)
+    critic_steps_per_policy_step: int = 1
+
+    # === Policy Evaluation ===
+    # How often (in training steps) to run policy evaluation. 0 = disabled.
+    eval_interval: int = 0
+    # Evaluation environment config. If None, no evaluation is performed.
+    eval_env: EvalEnvConfig | None = None
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -971,6 +1014,57 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
             num_train_steps=1_000_000,
             batch_size=256,
             lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
+        # IQL with AWR policy training
+        TrainConfig(
+            name="antmaze_large_diverse_v1_iql_awr",
+            model=_value_function.IQLValueFunctionConfig(
+                q_network_config=_ensemble_network.EnsembleNetworkConfig(
+                    base_config=_mlp_network.MLPNetworkConfig(
+                        state_dim=state_dim,
+                        action_conditioned=True,
+                        action_dim=action_dim,
+                        action_horizon=1,
+                        hidden_dims=(256, 256, 256, 256),
+                        use_layer_norm=False,
+                    ),
+                    ensemble_size=2,
+                ),
+                v_network_config=_mlp_network.MLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=False,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                q_head_config=_heads.EnsembleHeadConfig(
+                    base_config=_heads.RegressionHeadConfig(),
+                    ensemble_size=2,
+                ),
+                v_head_config=_heads.RegressionHeadConfig(),
+                expectile=0.9,
+                discount=0.99,
+                tau=0.005,
+            ),
+            policy=_tanh_gaussian.TanhGaussianConfig(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                action_horizon=1,
+                hidden_dims=(256, 256),
+            ),
+            policy_extraction=_policy_extraction.AWRPolicyConfig(
+                temperature=3.0,
+                clip_exp=100.0,
+            ),
+            data=MinariDataConfig(
+                minari_dataset_id="D4RL/antmaze/large-diverse-v1",
+                discount=0.99,
+                reward_bias=-1.0,
+            ),
+            num_train_steps=1_000_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+            eval_interval=5000,
+            eval_env=MinariEvalEnvConfig(num_eval_episodes=32),
         ),
         # Multi-IQL with Q-ensemble (consecutive sampling)
         TrainConfig(
