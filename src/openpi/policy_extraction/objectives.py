@@ -272,7 +272,7 @@ def awr_objective(
     v_value = v_function.compute_value(observation)
     advantage = q_value - v_value
 
-    weights = jnp.exp(advantage / temperature)
+    weights = jnp.exp(advantage * temperature)
     weights = jnp.minimum(weights, clip_exp)
     weights = jax.lax.stop_gradient(weights)
 
