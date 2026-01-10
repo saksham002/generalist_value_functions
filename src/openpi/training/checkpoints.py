@@ -64,7 +64,7 @@ def initialize_checkpoint_dir(
 
 def save_state(
     checkpoint_manager: ocp.CheckpointManager,
-    state: training_utils.TrainState,
+    state: training_utils.TrainState | training_utils.ActorCriticTrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
 ):
@@ -88,10 +88,10 @@ def save_state(
 
 def restore_state(
     checkpoint_manager: ocp.CheckpointManager,
-    state: training_utils.TrainState,
+    state: training_utils.TrainState | training_utils.ActorCriticTrainState,
     data_loader: _data_loader.DataLoader,
     step: int | None = None,
-) -> training_utils.TrainState:
+) -> training_utils.TrainState | training_utils.ActorCriticTrainState:
     del data_loader
 
     with at.disable_typechecking():
@@ -142,7 +142,21 @@ class CallbackSave(ocp.args.CheckpointArgs):
 class CallbackRestore(ocp.args.CheckpointArgs): ...
 
 
-def _split_params(state: training_utils.TrainState) -> tuple[training_utils.TrainState, at.Params]:
+def _split_params(
+    state: training_utils.TrainState | training_utils.ActorCriticTrainState,
+) -> tuple[training_utils.TrainState | training_utils.ActorCriticTrainState, at.Params | dict[str, at.Params]]:
+    if isinstance(state, training_utils.ActorCriticTrainState):
+        critic_state, critic_params = _split_params(state.critic)
+        params = {"critic": critic_params if isinstance(critic_params, dict) else {"params": critic_params}}
+
+        new_policy = None
+        if state.policy is not None:
+            policy_state, policy_params = _split_params(state.policy)
+            new_policy = policy_state
+            params["policy"] = policy_params if isinstance(policy_params, dict) else {"params": policy_params}
+
+        return training_utils.ActorCriticTrainState(critic=critic_state, policy=new_policy), params
+
     if state.ema_params is not None:
         params = state.ema_params
         train_state = dataclasses.replace(state, ema_params=None)
@@ -152,7 +166,21 @@ def _split_params(state: training_utils.TrainState) -> tuple[training_utils.Trai
     return train_state, params
 
 
-def _merge_params(train_state: training_utils.TrainState, params: dict[str, at.Params]) -> training_utils.TrainState:
+def _merge_params(
+    train_state: training_utils.TrainState | training_utils.ActorCriticTrainState,
+    params: dict[str, at.Params],
+) -> training_utils.TrainState | training_utils.ActorCriticTrainState:
+    if isinstance(train_state, training_utils.ActorCriticTrainState):
+        # Unwrap if needed
+        if "params" in params and "critic" not in params:
+            params = params["params"]
+
+        new_critic = _merge_params(train_state.critic, params["critic"])
+        new_policy = (
+            _merge_params(train_state.policy, params["policy"]) if train_state.policy and "policy" in params else None
+        )
+        return training_utils.ActorCriticTrainState(critic=new_critic, policy=new_policy)
+
     # Revert the logic inside `_split_params`. Assumes that existence of `params` means that EMA params were used during the split.
     if train_state.params:
         return dataclasses.replace(train_state, ema_params=params["params"])

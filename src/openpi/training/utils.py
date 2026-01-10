@@ -24,6 +24,15 @@ class TrainState:
 
 
 @at.typecheck
+@struct.dataclass
+class ActorCriticTrainState:
+    """Combined train state for actor-critic models."""
+
+    critic: TrainState
+    policy: TrainState | None = None
+
+
+@at.typecheck
 def tree_to_info(tree: at.PyTree, interp_func: Callable[[Any], str] = str) -> str:
     """Converts a PyTree into a human-readable string for logging. Optionally, `interp_func` can be provided to convert
     the leaf values to more meaningful strings.
