@@ -38,6 +38,9 @@ class EvalResults:
     action_max: float = 0.0
     action_mean: float = 0.0
     action_std: float = 0.0
+    # Video frames from first episode (if recorded)
+    # Shape: [num_frames, height, width, channels] or None
+    video_frames: np.ndarray | None = None
 
     @property
     def mean_return(self) -> float:
@@ -111,6 +114,8 @@ def create_vector_eval_env(
     eval_config: "_config.EvalEnvConfig",
     data_config: "_config.DataConfig",
     num_envs: int,
+    *,
+    render_mode: str | None = None,
 ) -> gymnasium.vector.VectorEnv:
     """Create a vectorized Gymnasium environment for parallel evaluation.
 
@@ -118,6 +123,7 @@ def create_vector_eval_env(
         eval_config: Evaluation environment configuration.
         data_config: Data configuration (used for fallback dataset ID).
         num_envs: Number of parallel environments.
+        render_mode: Render mode for environments (e.g., "rgb_array" for video recording).
 
     Returns:
         A vectorized Gymnasium environment.
@@ -134,7 +140,7 @@ def create_vector_eval_env(
         dataset = minari.load_dataset(dataset_id, download=True)
 
         def make_env():
-            env = dataset.recover_environment()
+            env = dataset.recover_environment(render_mode=render_mode)
             if eval_config.max_episode_steps > 0:
                 env = gymnasium.wrappers.TimeLimit(env, max_episode_steps=eval_config.max_episode_steps)
             return env
@@ -151,6 +157,8 @@ def evaluate_policy_vectorized(
     vec_env: gymnasium.vector.VectorEnv,
     num_episodes: int,
     seed: int = 42,
+    *,
+    record_video: bool = False,
 ) -> EvalResults:
     """Run policy in vectorized environment and collect episode returns.
 
@@ -162,9 +170,11 @@ def evaluate_policy_vectorized(
         vec_env: Vectorized Gymnasium environment.
         num_episodes: Total number of episodes to collect.
         seed: Random seed for environment resets.
+        record_video: If True, record frames from the first completed episode.
 
     Returns:
-        EvalResults containing episode returns, lengths, and observation/action statistics.
+        EvalResults containing episode returns, lengths, observation/action statistics,
+        and optionally video frames.
     """
     num_envs = vec_env.num_envs
     episode_returns: list[float] = []
@@ -178,9 +188,17 @@ def evaluate_policy_vectorized(
     all_obs = []
     all_actions = []
 
+    video_frames: list[np.ndarray] = []
+    first_episode_done = False
+
     # Reset all environments
     obs, _ = vec_env.reset(seed=seed)
     obs_flat = _flatten_obs_batch(obs)
+
+    if record_video:
+        frames = vec_env.call("render")
+        if frames[0] is not None:
+            video_frames.append(np.asarray(frames[0], dtype=np.uint8))
 
     while len(episode_returns) < num_episodes:
         # Get actions for all environments
@@ -193,6 +211,11 @@ def evaluate_policy_vectorized(
         obs, rewards, terminateds, truncateds, infos = vec_env.step(actions)
         obs_flat = _flatten_obs_batch(obs)
 
+        if record_video and not first_episode_done:
+            frames = vec_env.call("render")
+            if frames[0] is not None:
+                video_frames.append(np.asarray(frames[0], dtype=np.uint8))
+
         # Update running statistics
         current_returns += rewards
         current_lengths += 1
@@ -204,7 +227,9 @@ def evaluate_policy_vectorized(
                 episode_returns.append(float(current_returns[i]))
                 episode_lengths.append(int(current_lengths[i]))
 
-            # Reset tracking for this environment
+            if i == 0 and not first_episode_done:
+                first_episode_done = True
+
             current_returns[i] = 0.0
             current_lengths[i] = 0
 
@@ -215,6 +240,11 @@ def evaluate_policy_vectorized(
     logging.debug(
         f"Vectorized eval complete: {len(episode_returns)} episodes, mean_return={np.mean(episode_returns):.2f}"
     )
+
+    video_array = None
+    if video_frames:
+        video_array = np.stack(video_frames, axis=0)  # [T, H, W, C]
+        logging.info(f"Recorded video with {len(video_frames)} frames, shape: {video_array.shape}")
 
     return EvalResults(
         episode_returns=episode_returns,
@@ -227,6 +257,7 @@ def evaluate_policy_vectorized(
         action_max=float(np.max(all_actions_arr)),
         action_mean=float(np.mean(all_actions_arr)),
         action_std=float(np.std(all_actions_arr)),
+        video_frames=video_array,
     )
 
 
