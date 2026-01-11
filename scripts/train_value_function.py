@@ -1066,9 +1066,10 @@ def main(config: _config.TrainConfig):
     eval_env = None
     eval_enabled = config.eval_interval > 0 and config.eval_env is not None and policy_training_enabled
     if eval_enabled:
-        # Use vectorized environments for parallel evaluation
         num_eval_envs = min(config.eval_env.num_eval_episodes, 8)
-        eval_env = _evaluation.create_vector_eval_env(config.eval_env, data_config, num_envs=num_eval_envs)
+        eval_env = _evaluation.create_vector_eval_env(
+            config.eval_env, data_config, num_envs=num_eval_envs, render_mode="rgb_array"
+        )
         logging.info(
             f"Evaluation enabled: {config.eval_env.num_eval_episodes} episodes every {config.eval_interval} steps "
             f"({num_eval_envs} parallel envs)"
@@ -1226,8 +1227,8 @@ def main(config: _config.TrainConfig):
                         [normalize({"state": obs})["state"] for obs in obs_batch],
                         axis=0,
                     )
+                    assert not np.any(np.isnan(normalized_obs)), f"NaN in normalized_obs: {normalized_obs}"
 
-                    # Build model observation for batch
                     model_obs = _model.Observation(
                         images={},
                         image_masks={},
@@ -1241,13 +1242,14 @@ def main(config: _config.TrainConfig):
                     # Take the first action in the horizon
                     # Shape: [num_envs, action_horizon, action_dim] -> [num_envs, action_dim]
                     actions = np.asarray(jax.device_get(actions[:, 0, :]))
+                    assert not np.any(np.isnan(actions)), f"NaN in actions: {actions}"
 
-                    # Unnormalize actions if they were normalized during training
                     if unnormalize is not None:
                         actions = np.stack(
                             [unnormalize({"actions": a})["actions"] for a in actions],
                             axis=0,
                         )
+                        assert not np.any(np.isnan(actions)), f"NaN in unnormalized_actions: {actions}"
                     return actions
 
                 eval_results = _evaluation.evaluate_policy_vectorized(
@@ -1255,8 +1257,16 @@ def main(config: _config.TrainConfig):
                     vec_env=eval_env,
                     num_episodes=config.eval_env.num_eval_episodes,
                     seed=config.eval_env.seed + step,
+                    record_video=True,
                 )
                 eval_metrics = eval_results.to_dict()
+
+                # Log video (1 episode per evaluation round)
+                if eval_results.video_frames is not None:
+                    # wandb.Video expects shape [T, C, H, W] for numpy arrays
+                    video_frames = np.transpose(eval_results.video_frames, (0, 3, 1, 2))
+                    eval_metrics["eval/video"] = wandb.Video(video_frames, fps=30, format="mp4")
+
                 wandb.log(eval_metrics, step=step)
                 logging.info(
                     f"Step {step} eval: mean_return={eval_results.mean_return:.2f}, "
