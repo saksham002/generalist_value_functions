@@ -146,8 +146,8 @@ def create_vector_eval_env(
                 env = gymnasium.wrappers.TimeLimit(env, max_episode_steps=eval_config.max_episode_steps)
             return env
 
-        logging.info(f"Creating {num_envs} async vectorized eval environments from: {dataset_id}")
-        return gymnasium.vector.AsyncVectorEnv([make_env for _ in range(num_envs)])
+        logging.info(f"Creating {num_envs} sync vectorized eval environments from: {dataset_id}")
+        return gymnasium.vector.SyncVectorEnv([make_env for _ in range(num_envs)])
 
     raise NotImplementedError(f"Unsupported eval config type: {type(eval_config)}")
 
@@ -201,7 +201,7 @@ def evaluate_policy_vectorized(
             frames = vec_env.call("render")
         except mujoco.FatalError as e:
             logging.warning(
-                f"Failed to render frame for video: {e}. Try adding MUJOCO_GL=EGL to your environment variables."
+                f"Failed to render frame for video: {e}. Try adding MUJOCO_GL=egl to your environment variables."
             )
             raise
         if frames[0] is not None:

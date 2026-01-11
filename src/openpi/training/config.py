@@ -1074,7 +1074,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
             batch_size=256,
             lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
             eval_interval=10000,
-            eval_env=MinariEvalEnvConfig(num_eval_episodes=32),
+            eval_env=MinariEvalEnvConfig(num_eval_episodes=16),
         ),
         # Multi-IQL with Q-ensemble (consecutive sampling)
         TrainConfig(
