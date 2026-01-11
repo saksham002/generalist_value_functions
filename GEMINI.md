@@ -255,7 +255,7 @@ Standardized data format using typed dataclasses:
 - **Type hints**: Use type hints extensively, especially with `array_typing` module for array shapes
 - **Dataclasses**: Prefer frozen dataclasses for configuration objects
 - **Variable names**: Use descriptive variable names that clearly convey purpose (e.g., `num_transitions_per_sample` instead of `n` or `num_transitions`), don't worry about variable names being too long (up to reasonable length).
-- **Avoid reshape with -1**: Don't use `reshape(..., -1)` as it can lead to silent bugs. Instead, explicitly compute and specify all dimensions.
+- **Avoid reshape with -1**: Don't use `reshape(..., -1)` as it can lead to silent bugs. Instead, explicitly compute and specify all dimensions. EXCEPTIONS: using `-1` is acceptable when the intent is to flatten all remaining dimensions regardless of their specific size.
 
 ### Comments and Documentation
 **CRITICAL**: Do not add comments that only make sense in the context of the current prompt or that simply restate what the code does. Do not leave "thinking" comments or internal monologues in the code.
