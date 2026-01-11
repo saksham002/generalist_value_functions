@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 import gymnasium
 import minari
+import mujoco
 import numpy as np
 
 import openpi.shared.array_typing as at
@@ -196,7 +197,13 @@ def evaluate_policy_vectorized(
     obs_flat = _flatten_obs_batch(obs)
 
     if record_video:
-        frames = vec_env.call("render")
+        try:
+            frames = vec_env.call("render")
+        except mujoco.FatalError as e:
+            logging.warning(
+                f"Failed to render frame for video: {e}. Try adding MUJOCO_GL=EGL to your environment variables."
+            )
+            raise
         if frames[0] is not None:
             video_frames.append(np.asarray(frames[0], dtype=np.uint8))
 
@@ -259,18 +266,6 @@ def evaluate_policy_vectorized(
         action_std=float(np.std(all_actions_arr)),
         video_frames=video_array,
     )
-
-
-def _flatten_obs(obs: dict | np.ndarray) -> np.ndarray:
-    """Flatten a single observation to a 1D array.
-
-    Handles both dict observations (concatenates all values sorted by key)
-    and array observations.
-    """
-    if isinstance(obs, dict):
-        arrays = [np.asarray(obs[k]).flatten() for k in sorted(obs.keys())]
-        return np.concatenate(arrays).astype(np.float32)
-    return np.asarray(obs).flatten().astype(np.float32)
 
 
 def _flatten_obs_batch(obs: dict | np.ndarray) -> np.ndarray:
