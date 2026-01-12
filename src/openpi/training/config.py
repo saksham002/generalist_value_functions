@@ -775,7 +775,7 @@ class TrainConfig:
 
     # === Policy Evaluation ===
     # How often (in training steps) to run policy evaluation. 0 = disabled.
-    eval_interval: int = 10000
+    eval_interval: int = 100000
     # Evaluation environment config. If None, no evaluation is performed.
     eval_env: EvalEnvConfig | None = None
 
@@ -1084,7 +1084,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
             num_train_steps=1_000_000,
             batch_size=256,
             lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
-            eval_interval=10000,
+            eval_interval=100000,
             eval_env=MinariEvalEnvConfig(num_eval_episodes=16),
             num_workers=0,
         ),
