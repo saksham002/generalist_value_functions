@@ -147,7 +147,8 @@ def init_train_state(
 
     policy_tx = None
     if config.policy is not None:
-        policy_tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
+        policy_schedule = config.policy_lr_schedule if config.policy_lr_schedule is not None else config.lr_schedule
+        policy_tx = _optimizer.create_optimizer(config.optimizer, policy_schedule, weight_decay_mask=None)
 
     def init_policy(rng: at.KeyArrayLike) -> training_utils.TrainState:
         if config.policy is None or policy_tx is None:

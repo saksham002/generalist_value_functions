@@ -704,6 +704,7 @@ class TrainConfig:
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
+    policy_lr_schedule: _optimizer.LRScheduleConfig | None = None
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
 
@@ -1082,6 +1083,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
             num_train_steps=1_000_000,
             batch_size=256,
             lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+            policy_lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=3e-4, decay_steps=None, decay_lr=0.0),
             eval_interval=100000,
             eval_env=MinariEvalEnvConfig(num_eval_episodes=16),
             num_workers=0,
