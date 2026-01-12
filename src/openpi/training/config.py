@@ -1083,7 +1083,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
             num_train_steps=1_000_000,
             batch_size=256,
             lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
-            policy_lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=3e-4, decay_steps=None, decay_lr=0.0),
+            policy_lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=3e-4, decay_steps=1_000_000, decay_lr=0.0),
             eval_interval=100000,
             eval_env=MinariEvalEnvConfig(num_eval_episodes=16),
             num_workers=0,
