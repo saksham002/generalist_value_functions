@@ -3,7 +3,6 @@ import dataclasses
 import logging
 import multiprocessing
 import os
-import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
@@ -146,18 +145,20 @@ class NumpyDataset(Dataset):
     episode_starts: np.ndarray  # [num_episodes] - start index of each episode
     episode_ends: np.ndarray  # [num_episodes] - end index of each episode (exclusive)
 
-    def __getitem__(self, index: SupportsIndex) -> dict:
-        idx = index.__index__()
-        return {
-            "state": self.states[idx],
-            "actions": self.actions[idx],
-            "next_state": self.next_states[idx],
-            "next_actions": self.next_actions[idx],
-            "reward": np.float32(self.rewards[idx]),
-            "mc_return": np.float32(self.mc_returns[idx]),
-            "termination": self.terminations[idx],
-            "truncation": self.truncations[idx],
-        }
+    def __getitem__(self, index: SupportsIndex | Sequence[int] | np.ndarray | slice) -> dict:
+        if isinstance(index, int | np.integer):
+            idx = index
+            return {
+                "state": self.states[idx],
+                "actions": self.actions[idx],
+                "next_state": self.next_states[idx],
+                "next_actions": self.next_actions[idx],
+                "reward": np.float32(self.rewards[idx]),
+                "mc_return": np.float32(self.mc_returns[idx]),
+                "termination": self.terminations[idx],
+                "truncation": self.truncations[idx],
+            }
+        return self.get_items_by_indices(index)
 
     def __len__(self) -> int:
         return len(self.states)
@@ -728,13 +729,26 @@ def create_numpy_data_loader(
             replacement=True,
         )
 
+    # Create default sampler if no specific sampler was created
+    if sampler is None:
+        if shuffle:
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+            sampler = torch.utils.data.RandomSampler(dataset, generator=generator)
+        else:
+            sampler = torch.utils.data.SequentialSampler(dataset)
+
+    # Wrap in BatchSampler for vectorized loading
+    batch_sampler = torch.utils.data.BatchSampler(sampler, batch_size=local_batch_size, drop_last=True)
+
     # Use TorchDataLoader for batching (reuses existing infrastructure)
     data_loader = TorchDataLoader(
         dataset,
-        local_batch_size=local_batch_size,
+        local_batch_size=None,
         sharding=None if framework == "pytorch" else sharding,
-        shuffle=shuffle if sampler is None else False,  # Don't shuffle if using sampler
-        sampler=sampler,
+        shuffle=False,  # Handled by sampler
+        sampler=batch_sampler,  # Pass BatchSampler as sampler to disable auto-collation
+        batch_sampler=None,
         num_batches=num_batches,
         num_workers=0,  # No workers needed for in-memory data
         seed=seed,
@@ -750,11 +764,12 @@ class TorchDataLoader:
     def __init__(
         self,
         dataset,
-        local_batch_size: int,
+        local_batch_size: int | None,
         *,
         sharding: jax.sharding.Sharding | None = None,
         shuffle: bool = False,
         sampler: torch.utils.data.Sampler | None = None,
+        batch_sampler: torch.utils.data.Sampler | None = None,
         num_batches: int | None = None,
         num_workers: int = 0,
         seed: int = 0,
@@ -764,7 +779,7 @@ class TorchDataLoader:
 
         Args:
             dataset: The dataset to load.
-            local_batch_size: The local batch size for each process.
+            local_batch_size: The local batch size for each process. Can be None if using custom sampler/batching.
             sharding: The sharding to use for the data loader.
             shuffle: Whether to shuffle the data.
             num_batches: If provided, determines the number of returned batches. If the
@@ -778,7 +793,7 @@ class TorchDataLoader:
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
-        if len(dataset) < local_batch_size:
+        if local_batch_size is not None and len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
@@ -797,19 +812,32 @@ class TorchDataLoader:
 
         generator = torch.Generator()
         generator.manual_seed(seed)
-        self._data_loader = torch.utils.data.DataLoader(
-            typing.cast(torch.utils.data.Dataset, dataset),
-            batch_size=local_batch_size,
-            shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
-            sampler=sampler,
-            num_workers=num_workers,
-            multiprocessing_context=mp_context,
-            persistent_workers=num_workers > 0,
-            collate_fn=_collate_fn,
-            worker_init_fn=_worker_init_fn,
-            drop_last=True,
-            generator=generator,
-        )
+
+        # Select collate_fn based on batching mode
+        # If we are batching (via batch_size > 0 or batch_sampler), we use _collate_fn to stack samples.
+        # If batching is disabled (local_batch_size is None), we use identity (pass through what dataset returns).
+        # This supports both standard loading (batching enabled) and vectorized loading (batching handled by dataset).
+        should_collate = (local_batch_size is not None) or (batch_sampler is not None)
+
+        loader_kwargs = {
+            "dataset": dataset,
+            "num_workers": num_workers,
+            "persistent_workers": num_workers > 0,
+            "multiprocessing_context": mp_context,
+            "generator": generator,
+            "collate_fn": _collate_fn if should_collate else lambda x: x,
+            "worker_init_fn": _worker_init_fn,
+        }
+
+        if batch_sampler is not None:
+            loader_kwargs["batch_sampler"] = batch_sampler
+        else:
+            loader_kwargs["batch_size"] = local_batch_size
+            loader_kwargs["shuffle"] = shuffle if sampler is None else False
+            loader_kwargs["sampler"] = sampler
+            loader_kwargs["drop_last"] = sampler is None
+
+        self._data_loader = torch.utils.data.DataLoader(**loader_kwargs)
 
     @property
     def torch_loader(self) -> torch.utils.data.DataLoader:
