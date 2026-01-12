@@ -46,7 +46,14 @@ class TanhGaussianConfig(_model.BaseModelConfig):
     action_low: tuple[float, ...] | None = None
     action_high: tuple[float, ...] | None = None
 
+    # Whether log_std is computed from state (True) or is a learned parameter (False).
+    # When False, log_std is a state-independent learned parameter (matching IQL).
+    # Ignored when std_parameterization="fixed".
+    state_dependent_std: bool = True
+
     # Std parameterization: "exp", "softplus", or "fixed"
+    #   - "exp"/"softplus": std computed via Dense layer (state_dependent_std controls state-dependence)
+    #   - "fixed": constant std value (always state-independent, ignores state_dependent_std)
     std_parameterization: str = "exp"
 
     # Fixed std value (only used if std_parameterization == "fixed")
@@ -94,6 +101,7 @@ class TanhGaussian(_model.BaseModel):
 
         self.state_dim = config.state_dim
         self.hidden_dims = config.hidden_dims
+        self.state_dependent_std = config.state_dependent_std
         self.std_parameterization = config.std_parameterization
         self.fixed_std = config.fixed_std
         self.log_std_min = config.log_std_min
@@ -122,10 +130,19 @@ class TanhGaussian(_model.BaseModel):
         output_dim = config.action_horizon * config.action_dim
         self.mean_head = nnx.Linear(in_dim, output_dim, rngs=rngs)
 
-        if config.std_parameterization != "fixed":
+        # Log std setup:
+        #   - "fixed": no learnable parameters, constant std
+        #   - state_dependent_std=True: Dense layer outputs log_std
+        #   - state_dependent_std=False: learned parameter (matching IQL)
+        if config.std_parameterization == "fixed":
+            self.log_std_head = None
+            self.log_std_param = None
+        elif config.state_dependent_std:
             self.log_std_head = nnx.Linear(in_dim, output_dim, rngs=rngs)
+            self.log_std_param = None
         else:
             self.log_std_head = None
+            self.log_std_param = nnx.Param(jnp.zeros((output_dim,)))
 
     def _forward(
         self,
@@ -147,18 +164,25 @@ class TanhGaussian(_model.BaseModel):
         mean = self.mean_head(x).reshape(batch_size, self.action_horizon, self.action_dim)
 
         if self.std_parameterization == "fixed":
+            # Constant std (state-independent, not learned)
             log_std = jnp.full_like(mean, jnp.log(self.fixed_std))
-        elif self.std_parameterization == "exp":
-            log_std = self.log_std_head(x).reshape(batch_size, self.action_horizon, self.action_dim)
-            log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
-        elif self.std_parameterization == "softplus":
-            # Output is passed through softplus, then take log
-            raw = self.log_std_head(x).reshape(batch_size, self.action_horizon, self.action_dim)
-            std = jax.nn.softplus(raw)
-            log_std = jnp.log(std + 1e-8)
-            log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
+        elif self.state_dependent_std:
+            # State-dependent log_std from Dense layer
+            if self.std_parameterization == "exp":
+                log_std = self.log_std_head(x).reshape(batch_size, self.action_horizon, self.action_dim)
+                log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
+            elif self.std_parameterization == "softplus":
+                raw = self.log_std_head(x).reshape(batch_size, self.action_horizon, self.action_dim)
+                std = jax.nn.softplus(raw)
+                log_std = jnp.log(std + 1e-8)
+                log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
+            else:
+                raise ValueError(f"Unknown std_parameterization: {self.std_parameterization}")
         else:
-            raise ValueError(f"Unknown std_parameterization: {self.std_parameterization}")
+            # State-independent learned param
+            log_std = self.log_std_param.value.reshape(self.action_horizon, self.action_dim)
+            log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
+            log_std = jnp.broadcast_to(log_std, (batch_size, self.action_horizon, self.action_dim))
 
         return mean, log_std
 
