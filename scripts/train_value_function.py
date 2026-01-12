@@ -1214,6 +1214,7 @@ def main(config: _config.TrainConfig):
                 else:
                     unnormalize = None
 
+                should_normalize_state = "state" not in data_config.skip_normalize_keys
                 eval_rng = jax.random.key(step)
 
                 def policy_fn(
@@ -1222,21 +1223,25 @@ def main(config: _config.TrainConfig):
                     unnormalize=unnormalize,
                     policy_model=policy_model,
                     step=step,
+                    should_normalize_state=should_normalize_state,
                 ) -> np.ndarray:
                     nonlocal eval_rng
                     step_rng, eval_rng = jax.random.split(eval_rng)
 
-                    # Normalize batch of observations: [num_envs, obs_dim]
-                    normalized_obs = np.stack(
-                        [normalize({"state": obs})["state"] for obs in obs_batch],
-                        axis=0,
-                    )
-                    assert not np.any(np.isnan(normalized_obs)), f"NaN in normalized_obs: {normalized_obs}"
+                    # Conditionally normalize batch of observations: [num_envs, obs_dim]
+                    if should_normalize_state:
+                        processed_obs = np.stack(
+                            [normalize({"state": obs})["state"] for obs in obs_batch],
+                            axis=0,
+                        )
+                    else:
+                        processed_obs = np.asarray(obs_batch, dtype=np.float32)
+                    assert not np.any(np.isnan(processed_obs)), f"NaN in processed_obs: {processed_obs}"
 
                     model_obs = _model.Observation(
                         images={},
                         image_masks={},
-                        state=jnp.asarray(normalized_obs),  # [num_envs, obs_dim]
+                        state=jnp.asarray(processed_obs),  # [num_envs, obs_dim]
                         tokenized_prompt=None,
                         tokenized_prompt_mask=None,
                     )

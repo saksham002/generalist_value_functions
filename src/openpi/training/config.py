@@ -581,8 +581,8 @@ class MinariDataConfig(DataConfigFactory):
     reward_bias: float = 0.0
     # Upsampling weight for transitions with reward=1 (see DataConfig.reward_1_upsample_weight)
     reward_1_upsample_weight: float = 1.0
-    # Keys to skip during normalization
-    skip_normalize_keys: tuple[str, ...] = ("actions", "next_actions")
+    # Keys to skip during normalization (default: skip all to disable normalization)
+    skip_normalize_keys: tuple[str, ...] = ("state", "actions", "next_state", "next_actions")
 
     # Override repo_id from parent - not used for minari loading
     repo_id: str = "minari"  # Dummy value, not used
@@ -598,12 +598,10 @@ class MinariDataConfig(DataConfigFactory):
         )
         model_transforms = _transforms.Group(inputs=[], outputs=[])
 
-        # Load norm stats using sanitized minari_dataset_id
         asset_id = self.minari_dataset_id.replace("/", "_")
         norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
 
         # Add next_state and next_actions with same normalization as their current counterparts
-        # This ensures TD/SARSA targets use consistent normalization
         if norm_stats is not None:
             if "state" in norm_stats:
                 norm_stats["next_state"] = norm_stats["state"]
