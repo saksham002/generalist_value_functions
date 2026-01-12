@@ -63,6 +63,9 @@ class TanhGaussianConfig(_model.BaseModelConfig):
     log_std_min: float = -20.0
     log_std_max: float = 2.0
 
+    # Dropout rate for the policy network
+    dropout_rate: float = 0.0
+
     @property
     @override
     def model_type(self) -> _model.ModelType:
@@ -144,14 +147,20 @@ class TanhGaussian(_model.BaseModel):
             self.log_std_head = None
             self.log_std_param = nnx.Param(jnp.zeros((output_dim,)))
 
+        self.dropout_rate = config.dropout_rate
+        self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
+
     def _forward(
         self,
         state: at.Float[at.Array, "b s"],
+        *,
+        train: bool = False,
     ) -> tuple[at.Float[at.Array, "b ah ad"], at.Float[at.Array, "b ah ad"]]:
         """Forward pass returning (mean, log_std) before tanh.
 
         Args:
             state: State observations of shape [batch, state_dim].
+            train: Whether to use dropout.
 
         Returns:
             Tuple of (mean, log_std), each of shape [batch, action_horizon, action_dim].
@@ -159,6 +168,7 @@ class TanhGaussian(_model.BaseModel):
         x = state
         for layer in self.layers:
             x = nnx.relu(layer(x))
+            x = self.dropout(x, deterministic=not train)
 
         batch_size = state.shape[0]
         mean = self.mean_head(x).reshape(batch_size, self.action_horizon, self.action_dim)
@@ -191,18 +201,21 @@ class TanhGaussian(_model.BaseModel):
         self,
         rng: at.KeyArrayLike,
         observation: _model.Observation,
+        *,
+        train: bool = False,
     ) -> distrax.Distribution:
         """Return the tanh-squashed Gaussian distribution over actions.
 
         Args:
             rng: Random key (unused, but required by interface).
             observation: Observation containing state.
+            train: Whether to use dropout.
 
         Returns:
             A distrax.Transformed distribution with MultivariateNormalDiag base
             and Tanh (+ optional affine scaling) bijectors.
         """
-        mean, log_std = self._forward(observation.state)
+        mean, log_std = self._forward(observation.state, train=train)
         std = jnp.exp(log_std)
 
         # Flatten action_horizon and action_dim for distribution
@@ -275,12 +288,12 @@ class TanhGaussian(_model.BaseModel):
             rng: Random key (unused for loss computation).
             observation: Observation containing state.
             actions: Ground truth actions of shape [batch, action_horizon, action_dim].
-            train: Whether in training mode (unused for this model).
+            train: Whether in training mode.
 
         Returns:
             Per-timestep NLL loss of shape [batch, action_horizon].
         """
-        dist = self.action_distribution(rng, observation)
+        dist = self.action_distribution(rng, observation, train=train)
 
         batch_size = actions.shape[0]
         actions_flat = actions.reshape(batch_size, -1)
