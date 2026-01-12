@@ -1214,6 +1214,8 @@ def main(config: _config.TrainConfig):
                 else:
                     unnormalize = None
 
+                eval_rng = jax.random.key(step)
+
                 def policy_fn(
                     obs_batch: np.ndarray,
                     normalize=normalize,
@@ -1221,6 +1223,9 @@ def main(config: _config.TrainConfig):
                     policy_model=policy_model,
                     step=step,
                 ) -> np.ndarray:
+                    nonlocal eval_rng
+                    step_rng, eval_rng = jax.random.split(eval_rng)
+
                     # Normalize batch of observations: [num_envs, obs_dim]
                     normalized_obs = np.stack(
                         [normalize({"state": obs})["state"] for obs in obs_batch],
@@ -1236,8 +1241,7 @@ def main(config: _config.TrainConfig):
                         tokenized_prompt_mask=None,
                     )
 
-                    # Sample actions from policy
-                    actions = policy_model.sample_actions(rng=jax.random.key(step), observation=model_obs)
+                    actions = policy_model.sample_actions(rng=step_rng, observation=model_obs)
                     # Take the first action in the horizon
                     # Shape: [num_envs, action_horizon, action_dim] -> [num_envs, action_dim]
                     actions = np.asarray(jax.device_get(actions[:, 0, :]))
