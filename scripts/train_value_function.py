@@ -1248,10 +1248,7 @@ def main(config: _config.TrainConfig):
                     )
 
                     # Deterministic evaluation: use the mode of the action distribution.
-                    dist = policy_model.action_distribution(step_rng, model_obs)
-                    actions = dist.mode().reshape(
-                        processed_obs.shape[0], policy_model.action_horizon, policy_model.action_dim
-                    )
+                    actions = policy_model.sample_actions(step_rng, model_obs, deterministic=True)
                     # Take the first action in the horizon
                     # Shape: [num_envs, action_horizon, action_dim] -> [num_envs, action_dim]
                     actions = np.asarray(jax.device_get(actions[:, 0, :]))

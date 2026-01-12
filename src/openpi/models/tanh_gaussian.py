@@ -110,7 +110,6 @@ class TanhGaussian(_model.BaseModel):
         self.log_std_min = config.log_std_min
         self.log_std_max = config.log_std_max
 
-        # Store action bounds as arrays (or None)
         if config.action_low is not None:
             self._action_low = jnp.array(config.action_low)
         else:
@@ -268,7 +267,7 @@ class TanhGaussian(_model.BaseModel):
         deterministic = kwargs.get("deterministic", False)
         dist = self.action_distribution(rng, observation)
 
-        actions_flat = dist.mode() if deterministic else dist.sample(seed=rng)
+        actions_flat = dist.bijector.forward(dist.distribution.loc) if deterministic else dist.sample(seed=rng)
 
         batch_size = observation.state.shape[0]
         return actions_flat.reshape(batch_size, self.action_horizon, self.action_dim)
