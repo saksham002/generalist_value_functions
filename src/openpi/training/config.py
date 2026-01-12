@@ -733,13 +733,13 @@ class TrainConfig:
     # How often (in steps) to log training metrics.
     log_interval: int = 1000
     # How often (in steps) to save checkpoints.
-    save_interval: int = 1000
+    save_interval: int = 10000
     # How often (in steps) to generate validation plots.
     plot_interval: int = 50000
     # Number of validation trajectories to use for plotting.
     num_val_trajectories: int = 3
     # Checkpoints matching step % keep_period == 0 will be preserved.
-    keep_period: int | None = 5000
+    keep_period: int | None = 100000
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -1051,7 +1051,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
                 v_network_config=_mlp_network.MLPNetworkConfig(
                     state_dim=state_dim,
                     action_conditioned=False,
-                    hidden_dims=(256, 256, 256, 256),
+                    hidden_dims=(256, 256),
                     use_layer_norm=False,
                 ),
                 q_head_config=_heads.EnsembleHeadConfig(
@@ -1068,6 +1068,9 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
                 action_dim=action_dim,
                 action_horizon=1,
                 hidden_dims=(256, 256),
+                state_dependent_std=False,
+                log_std_min=-5.0,
+                log_std_max=2.0,
             ),
             policy_extraction=_policy_extraction.AWRPolicyConfig(
                 temperature=10.0,
@@ -1644,7 +1647,10 @@ _CONFIGS = [
         # Here is an example of loading a pi0-FAST model for LoRA finetuning.
         # For setting action_dim, action_horizon, and max_token_len, see the comments above.
         model=pi0_fast.Pi0FASTConfig(
-            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180,
+            paligemma_variant="gemma_2b_lora",
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
@@ -1656,7 +1662,10 @@ _CONFIGS = [
         # Again, make sure to match the model config above when extracting the freeze filter
         # that specifies which parameters should be frozen during LoRA finetuning.
         freeze_filter=pi0_fast.Pi0FASTConfig(
-            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180,
+            paligemma_variant="gemma_2b_lora",
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
