@@ -81,7 +81,11 @@ Show the user the commits that will be pushed:
 git log --oneline origin/HEAD..HEAD
 ```
 
-Ask the user for permission to push, displaying the commit messages. Only push after explicit approval:
+Ask the user for permission to push, displaying the commit messages.
+You must NEVER run this command without explicit user confirmation.
+Ask the user "Do you want to push these commits?" and wait for a "yes".
+
+Only if the user explicitly agrees, run:
 ```bash
 git push
 ```
