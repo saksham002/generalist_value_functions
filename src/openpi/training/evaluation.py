@@ -205,7 +205,7 @@ def evaluate_policy_vectorized(
             )
             raise
         if frames[0] is not None:
-            video_frames.append(np.array(frames[0], dtype=np.uint8, copy=True))
+            video_frames.append(np.asarray(frames[0], dtype=np.uint8))
 
     while len(episode_returns) < num_episodes:
         # Get actions for all environments
@@ -221,7 +221,7 @@ def evaluate_policy_vectorized(
         if record_video and not first_episode_done:
             frames = vec_env.call("render")
             if frames[0] is not None:
-                video_frames.append(np.array(frames[0], dtype=np.uint8, copy=True))
+                video_frames.append(np.asarray(frames[0], dtype=np.uint8))
 
         # Update running statistics
         current_returns += rewards

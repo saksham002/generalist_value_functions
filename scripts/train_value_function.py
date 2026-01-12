@@ -1145,7 +1145,6 @@ def main(config: _config.TrainConfig):
                 with timer.context("policy_step_sync"):
                     jax.block_until_ready(policy_state)
                     jax.block_until_ready(policy_info)
-                policy_info = jax.device_get(policy_info)
                 info.update(policy_info)
 
         if step % config.log_interval == 0:

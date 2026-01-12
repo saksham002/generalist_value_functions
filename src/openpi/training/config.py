@@ -829,10 +829,12 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
                 decay_steps=50_000,
                 decay_lr=1e-5,
             ),
+            num_workers=0,
         ),
         # MC Q-function with MSE regression - using MinariDataConfig for fast in-memory loading
         TrainConfig(
             name="antmaze_large_diverse_v1_q_regression",
+            num_workers=0,
             model=_value_function.MCValueFunctionConfig(
                 network_config=_mlp_network.MLPNetworkConfig(
                     state_dim=state_dim,
@@ -856,6 +858,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
         # MC Q-function with HL-Gauss categorical loss - using MinariDataConfig for fast in-memory loading
         TrainConfig(
             name="antmaze_large_diverse_v1_q_hl_gauss",
+            num_workers=0,
             model=_value_function.MCValueFunctionConfig(
                 network_config=_mlp_network.MLPNetworkConfig(
                     state_dim=state_dim,
@@ -884,6 +887,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
         # MLP SARSA Q-function with MSE regression
         TrainConfig(
             name="antmaze_large_diverse_v1_sarsa_regression",
+            num_workers=0,
             model=_value_function.SARSAValueFunctionConfig(
                 network_config=_mlp_network.MLPNetworkConfig(
                     state_dim=state_dim,
@@ -908,6 +912,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
         # MLP SARSA Q-function with HL-Gauss categorical loss
         TrainConfig(
             name="antmaze_large_diverse_v1_sarsa_hl_gauss",
+            num_workers=0,
             model=_value_function.SARSAValueFunctionConfig(
                 network_config=_mlp_network.MLPNetworkConfig(
                     state_dim=state_dim,
@@ -937,6 +942,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
         # Multi-Transition MC Q-function (8 transitions per sample)
         TrainConfig(
             name="antmaze_large_diverse_v1_multi_mc",
+            num_workers=0,
             model=_value_function.MultiMCValueFunctionConfig(
                 network_config=_mlp_network.MultiMLPNetworkConfig(
                     state_dim=state_dim,
@@ -963,6 +969,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
         # Multi-Transition MC Q-function with consecutive sampling (8 transitions per sample)
         TrainConfig(
             name="antmaze_large_diverse_v1_multi_mc_consecutive",
+            num_workers=0,
             model=_value_function.MultiMCValueFunctionConfig(
                 network_config=_mlp_network.MultiMLPNetworkConfig(
                     state_dim=state_dim,
@@ -989,6 +996,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
         # IQL with Q-ensemble of size 2
         TrainConfig(
             name="antmaze_large_diverse_v1_iql",
+            num_workers=0,
             model=_value_function.IQLValueFunctionConfig(
                 q_network_config=_ensemble_network.EnsembleNetworkConfig(
                     base_config=_mlp_network.MLPNetworkConfig(
@@ -1075,10 +1083,12 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
             lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
             eval_interval=10000,
             eval_env=MinariEvalEnvConfig(num_eval_episodes=16),
+            num_workers=0,
         ),
         # Multi-IQL with Q-ensemble (consecutive sampling)
         TrainConfig(
             name="antmaze_large_diverse_v1_multi_iql_consecutive",
+            num_workers=0,
             model=_value_function.MultiIQLValueFunctionConfig(
                 q_network_config=_ensemble_network.EnsembleMultiNetworkConfig(
                     base_config=_mlp_network.MultiMLPNetworkConfig(
@@ -1122,6 +1132,7 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
         # Multi-IQL with Q-ensemble (random sampling)
         TrainConfig(
             name="antmaze_large_diverse_v1_multi_iql_random",
+            num_workers=0,
             model=_value_function.MultiIQLValueFunctionConfig(
                 q_network_config=_ensemble_network.EnsembleMultiNetworkConfig(
                     base_config=_mlp_network.MultiMLPNetworkConfig(
@@ -1174,6 +1185,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
         # MC Q-function with MSE regression
         TrainConfig(
             name="pointmaze_large_v2_q_regression",
+            num_workers=0,
             model=_value_function.MCValueFunctionConfig(
                 network_config=_mlp_network.MLPNetworkConfig(
                     state_dim=state_dim,
@@ -1197,6 +1209,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
         # MLP SARSA Q-function with MSE regression
         TrainConfig(
             name="pointmaze_large_v2_q_sarsa",
+            num_workers=0,
             model=_value_function.SARSAValueFunctionConfig(
                 network_config=_mlp_network.MLPNetworkConfig(
                     state_dim=state_dim,
@@ -1221,6 +1234,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
         # Multi-MC Q-function (8 transitions per sample)
         TrainConfig(
             name="pointmaze_large_v2_q_multi_mc",
+            num_workers=0,
             model=_value_function.MultiMCValueFunctionConfig(
                 network_config=_mlp_network.MultiMLPNetworkConfig(
                     state_dim=state_dim,
@@ -1247,6 +1261,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
         # Multi-MC Q-function with consecutive sampling (8 transitions per sample)
         TrainConfig(
             name="pointmaze_large_v2_q_multi_mc_consecutive",
+            num_workers=0,
             model=_value_function.MultiMCValueFunctionConfig(
                 network_config=_mlp_network.MultiMLPNetworkConfig(
                     state_dim=state_dim,
@@ -1273,6 +1288,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
         # Multi-SARSA Q-function with consecutive sampling (regression)
         TrainConfig(
             name="pointmaze_large_v2_q_multi_sarsa_consecutive",
+            num_workers=0,
             model=_value_function.MultiSARSAValueFunctionConfig(
                 network_config=_mlp_network.MultiMLPNetworkConfig(
                     state_dim=state_dim,
@@ -1300,6 +1316,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
         # Multi-SARSA Q-function with consecutive sampling (HL-Gauss)
         TrainConfig(
             name="pointmaze_large_v2_q_multi_sarsa_hl_gauss_consecutive",
+            num_workers=0,
             model=_value_function.MultiSARSAValueFunctionConfig(
                 network_config=_mlp_network.MultiMLPNetworkConfig(
                     state_dim=state_dim,
@@ -1332,6 +1349,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
         # IQL with Q-ensemble of size 2
         TrainConfig(
             name="pointmaze_large_v2_iql",
+            num_workers=0,
             model=_value_function.IQLValueFunctionConfig(
                 q_network_config=_ensemble_network.EnsembleNetworkConfig(
                     base_config=_mlp_network.MLPNetworkConfig(
@@ -1371,6 +1389,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
         # Multi-IQL with Q-ensemble (consecutive sampling)
         TrainConfig(
             name="pointmaze_large_v2_multi_iql_consecutive",
+            num_workers=0,
             model=_value_function.MultiIQLValueFunctionConfig(
                 q_network_config=_ensemble_network.EnsembleMultiNetworkConfig(
                     base_config=_mlp_network.MultiMLPNetworkConfig(
@@ -1414,6 +1433,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
         # Multi-IQL with Q-ensemble (random sampling)
         TrainConfig(
             name="pointmaze_large_v2_multi_iql_random",
+            num_workers=0,
             model=_value_function.MultiIQLValueFunctionConfig(
                 q_network_config=_ensemble_network.EnsembleMultiNetworkConfig(
                     base_config=_mlp_network.MultiMLPNetworkConfig(
