@@ -18,9 +18,8 @@ import logging
 
 import d4rl
 import gym
-import numpy as np
 from gym import Wrapper
-
+import numpy as np
 
 LEGACY_D4RL_ENV_CONFIG = {
     "antmaze": {
@@ -55,6 +54,7 @@ def calc_return_to_go_sparse(
     gamma: float,
     reward_scale: float,
     reward_bias: float,
+    *,
     is_sparse_reward: bool,
 ) -> np.ndarray:
     """Compute MC returns with special handling for sparse reward environments.
@@ -79,9 +79,7 @@ def calc_return_to_go_sparse(
         return np.array([], dtype=np.float32)
 
     if "antmaze" in env_name:
-        reward_neg = (
-            LEGACY_D4RL_ENV_CONFIG["antmaze"]["reward_neg"] * reward_scale + reward_bias
-        )
+        reward_neg = LEGACY_D4RL_ENV_CONFIG["antmaze"]["reward_neg"] * reward_scale + reward_bias
     else:
         assert not is_sparse_reward, (
             "If you want to try on a sparse reward env, "
@@ -135,9 +133,7 @@ def load_legacy_d4rl_dataset(
     """
     logging.info(f"Loading legacy D4RL dataset: {env_name}")
     if reward_scale != 1.0 or reward_bias != 0.0:
-        logging.info(
-            f"Applying reward transformation: r' = {reward_scale} * r + {reward_bias}"
-        )
+        logging.info(f"Applying reward transformation: r' = {reward_scale} * r + {reward_bias}")
 
     # Determine if this is a sparse reward environment
     is_sparse_reward = "antmaze" in env_name or "maze2d" in env_name
@@ -150,9 +146,7 @@ def load_legacy_d4rl_dataset(
     # Detect timeouts via observation discontinuity
     timeouts = np.zeros(len(dataset["rewards"]), dtype=bool)
     for i in range(len(dataset["terminals"]) - 1):
-        obs_diff = np.linalg.norm(
-            dataset["observations"][i + 1] - dataset["next_observations"][i]
-        )
+        obs_diff = np.linalg.norm(dataset["observations"][i + 1] - dataset["next_observations"][i])
         if obs_diff > 1e-6 or dataset["terminals"][i] == 1.0:
             timeouts[i] = True
     timeouts[-1] = True
@@ -187,9 +181,7 @@ def load_legacy_d4rl_dataset(
             episode_data = {k: np.array(v) for k, v in data_.items()}
 
             # Apply reward transformation
-            episode_data["rewards"] = (
-                episode_data["rewards"] * reward_scale + reward_bias
-            )
+            episode_data["rewards"] = episode_data["rewards"] * reward_scale + reward_bias
 
             # Compute MC returns with sparse reward handling
             masks = 1 - episode_data["terminals"].astype(np.float32)
@@ -200,13 +192,11 @@ def load_legacy_d4rl_dataset(
                 discount,
                 reward_scale,
                 reward_bias,
-                is_sparse_reward,
+                is_sparse_reward=is_sparse_reward,
             )
 
             # Clip actions
-            episode_data["actions"] = np.clip(
-                episode_data["actions"], -clip_action, clip_action
-            )
+            episode_data["actions"] = np.clip(episode_data["actions"], -clip_action, clip_action)
 
             episodes_dict_list.append(episode_data)
             data_ = collections.defaultdict(list)
@@ -233,19 +223,11 @@ def load_legacy_d4rl_dataset(
         for t in range(num_transitions):
             all_observations.append(episode["observations"][t].astype(np.float32))
             all_actions.append(episode["actions"][t].astype(np.float32))
-            all_next_observations.append(
-                episode["next_observations"][t].astype(np.float32)
-            )
+            all_next_observations.append(episode["next_observations"][t].astype(np.float32))
 
             # next_action: use next timestep's action, or last action for final step
-            next_action = (
-                episode["actions"][t + 1]
-                if t + 1 < num_transitions
-                else episode["actions"][-1]
-            )
-            all_next_actions.append(
-                np.clip(next_action.astype(np.float32), -clip_action, clip_action)
-            )
+            next_action = episode["actions"][t + 1] if t + 1 < num_transitions else episode["actions"][-1]
+            all_next_actions.append(np.clip(next_action.astype(np.float32), -clip_action, clip_action))
 
             all_rewards.append(episode["rewards"][t])
             all_mc_returns.append(episode["mc_returns"][t])
@@ -254,9 +236,7 @@ def load_legacy_d4rl_dataset(
         current_idx += num_transitions
         episode_ends.append(current_idx)
 
-    logging.info(
-        f"Loaded {len(episodes_dict_list)} episodes, {current_idx} transitions"
-    )
+    logging.info(f"Loaded {len(episodes_dict_list)} episodes, {current_idx} transitions")
 
     return {
         "observations": np.stack(all_observations),
