@@ -25,6 +25,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 from openpi.policy_extraction import objectives as _policy_extraction
 import openpi.shared.download as _download
+import openpi.shared.legacy_d4rl_utils as legacy_d4rl_utils
 import openpi.shared.minari_utils as minari_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -38,6 +39,7 @@ import openpi.value_functions.heads as _heads
 import openpi.value_functions.networks.ensemble as _ensemble_network
 import openpi.value_functions.networks.mlp as _mlp_network
 import openpi.value_functions.value_function as _value_function
+import openpi.value_functions.value_transforms as _value_transforms
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -117,6 +119,9 @@ class DataConfig:
 
     # If set, load data directly from Minari dataset (fastest option for in-memory datasets)
     minari_dataset_id: str | None = None
+
+    # If set, load data directly from legacy D4RL dataset (alternative to Minari)
+    legacy_d4rl_env_name: str | None = None
 
     # Multi-transition training options
     # Number of transitions per sample (for multi-state value functions)
@@ -534,10 +539,8 @@ class D4RLDataConfig(DataConfigFactory):
         if self.rl_mode:
             # RL mode: use value function transforms
             # All RL fields are stored in the dataset (computed at conversion time)
-            from openpi.value_functions import value_transforms
-
             data_transforms = _transforms.Group(
-                inputs=[value_transforms.ValueFunctionInputs()],
+                inputs=[_value_transforms.ValueFunctionInputs()],
                 outputs=[],
             )
             # Value function configs don't have model_type, skip model transforms
@@ -582,7 +585,12 @@ class MinariDataConfig(DataConfigFactory):
     # Upsampling weight for transitions with reward=1 (see DataConfig.reward_1_upsample_weight)
     reward_1_upsample_weight: float = 1.0
     # Keys to skip during normalization (default: skip all to disable normalization)
-    skip_normalize_keys: tuple[str, ...] = ("state", "actions", "next_state", "next_actions")
+    skip_normalize_keys: tuple[str, ...] = (
+        "state",
+        "actions",
+        "next_state",
+        "next_actions",
+    )
 
     # Override repo_id from parent - not used for minari loading
     repo_id: str = "minari"  # Dummy value, not used
@@ -590,10 +598,8 @@ class MinariDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # Value function transforms for RL training
-        from openpi.value_functions import value_transforms
-
         data_transforms = _transforms.Group(
-            inputs=[value_transforms.ValueFunctionInputs()],
+            inputs=[_value_transforms.ValueFunctionInputs()],
             outputs=[],
         )
         model_transforms = _transforms.Group(inputs=[], outputs=[])
@@ -659,6 +665,110 @@ class MultiTransitionMinariDataConfig(MinariDataConfig):
 
 
 @dataclasses.dataclass(frozen=True)
+class LegacyD4RLDataConfig(DataConfigFactory):
+    """Data config for direct legacy D4RL dataset loading (fast, in-memory).
+
+    This config enables loading datasets from the d4rl library directly,
+    providing an alternative to Minari for users who prefer the original
+    D4RL interface or need access to older dataset versions.
+
+    Supports special handling for sparse reward environments (antmaze)
+    where failed trajectories use reward_neg / (1-gamma) as MC returns.
+    """
+
+    # D4RL environment name (e.g., 'antmaze-large-diverse-v2')
+    legacy_d4rl_env_name: str = tyro.MISSING
+    # Discount factor for MC return computation
+    discount: float = 0.99
+    # Reward transformation: r' = reward_scale * r + reward_bias
+    reward_scale: float = 1.0
+    reward_bias: float = 0.0
+    # Action clipping margin (clips to [-clip_action, clip_action])
+    clip_action: float = 0.999
+    # Upsampling weight for transitions with reward=1
+    reward_1_upsample_weight: float = 1.0
+    # Keys to skip during normalization (default: skip all to disable normalization)
+    skip_normalize_keys: tuple[str, ...] = (
+        "state",
+        "actions",
+        "next_state",
+        "next_actions",
+    )
+
+    # Override repo_id from parent - not used for d4rl loading
+    repo_id: str = "legacy_d4rl"  # Dummy value, not used
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Value function transforms for RL training
+        data_transforms = _transforms.Group(
+            inputs=[_value_transforms.ValueFunctionInputs()],
+            outputs=[],
+        )
+        model_transforms = _transforms.Group(inputs=[], outputs=[])
+
+        # Use env name as asset_id (replace hyphens with underscores)
+        asset_id = self.legacy_d4rl_env_name.replace("-", "_")
+        norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
+
+        # Add next_state and next_actions with same normalization as their current counterparts
+        if norm_stats is not None:
+            if "state" in norm_stats:
+                norm_stats["next_state"] = norm_stats["state"]
+            if "actions" in norm_stats:
+                norm_stats["next_actions"] = norm_stats["actions"]
+
+            # Filter out keys that should be skipped during normalization
+            if self.skip_normalize_keys:
+                norm_stats = {k: v for k, v in norm_stats.items() if k not in self.skip_normalize_keys}
+
+        return DataConfig(
+            repo_id=None,  # Not using LeRobot
+            asset_id=asset_id,
+            norm_stats=norm_stats,
+            repack_transforms=_transforms.Group(inputs=[]),
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            use_quantile_norm=False,
+            rl_mode=True,
+            discount=self.discount,
+            reward_scale=self.reward_scale,
+            reward_bias=self.reward_bias,
+            legacy_d4rl_env_name=self.legacy_d4rl_env_name,
+            reward_1_upsample_weight=self.reward_1_upsample_weight,
+            skip_normalize_keys=self.skip_normalize_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class MultiTransitionLegacyD4RLDataConfig(LegacyD4RLDataConfig):
+    """Data config for multi-transition value function training with legacy D4RL.
+
+    Extends LegacyD4RLDataConfig to sample multiple transitions per sample,
+    enabling training of multi-state value functions.
+    """
+
+    # Number of transitions per sample
+    num_transitions_per_sample: int = tyro.MISSING
+    # Sampler type: uniform, trajectory_uniform, trajectory_ordered, or trajectory_consecutive
+    multi_transition_sampler_type: Literal[
+        "uniform", "trajectory_uniform", "trajectory_ordered", "trajectory_consecutive"
+    ] = "trajectory_uniform"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Get base config from parent
+        base_config = super().create(assets_dirs, model_config)
+
+        # Add multi-transition settings
+        return dataclasses.replace(
+            base_config,
+            num_transitions_per_sample=self.num_transitions_per_sample,
+            multi_transition_sampler_type=self.multi_transition_sampler_type,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class EvalEnvConfig:
     """Base configuration for evaluation environments."""
 
@@ -678,6 +788,16 @@ class MinariEvalEnvConfig(EvalEnvConfig):
     """
 
     minari_dataset_id: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class LegacyD4RLEvalEnvConfig(EvalEnvConfig):
+    """Evaluation environment created from legacy D4RL.
+
+    If legacy_d4rl_env_name is None, will be inferred from DataConfig.legacy_d4rl_env_name.
+    """
+
+    legacy_d4rl_env_name: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1480,6 +1600,71 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
     ]
 
 
+def _make_antmaze_large_diverse_v2_legacy_configs() -> list[TrainConfig]:
+    """Create antmaze-large-diverse-v2 configs using legacy D4RL dataset."""
+    # Get dimensions from legacy D4RL environment
+    state_dim, action_dim, _, _ = legacy_d4rl_utils.get_legacy_d4rl_dims("antmaze-large-diverse-v2")
+
+    return [
+        # IQL with AWR policy training (legacy D4RL)
+        TrainConfig(
+            name="antmaze_large_diverse_v2_iql_awr",
+            model=_value_function.IQLValueFunctionConfig(
+                q_network_config=_ensemble_network.EnsembleNetworkConfig(
+                    base_config=_mlp_network.MLPNetworkConfig(
+                        state_dim=state_dim,
+                        action_conditioned=True,
+                        action_dim=action_dim,
+                        action_horizon=1,
+                        hidden_dims=(256, 256),
+                        use_layer_norm=False,
+                    ),
+                    ensemble_size=2,
+                ),
+                v_network_config=_mlp_network.MLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=False,
+                    hidden_dims=(256, 256),
+                    use_layer_norm=False,
+                ),
+                q_head_config=_heads.EnsembleHeadConfig(
+                    base_config=_heads.RegressionHeadConfig(),
+                    ensemble_size=2,
+                ),
+                v_head_config=_heads.RegressionHeadConfig(),
+                expectile=0.9,
+                discount=0.99,
+                tau=0.005,
+            ),
+            policy=_tanh_gaussian.TanhGaussianConfig(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                action_horizon=1,
+                hidden_dims=(256, 256),
+                state_dependent_std=False,
+                log_std_min=-5.0,
+                log_std_max=2.0,
+            ),
+            policy_extraction=_policy_extraction.AWRPolicyConfig(
+                temperature=10.0,
+                clip_exp=100.0,
+            ),
+            data=LegacyD4RLDataConfig(
+                legacy_d4rl_env_name="antmaze-large-diverse-v2",
+                discount=0.99,
+                reward_bias=-1.0,
+            ),
+            num_train_steps=1_000_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+            policy_lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=3e-4, decay_steps=1_000_000, decay_lr=0.0),
+            eval_interval=100000,
+            eval_env=LegacyD4RLEvalEnvConfig(num_eval_episodes=16),
+            num_workers=0,
+        ),
+    ]
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -1900,6 +2085,7 @@ _CONFIGS = [
     # Auto-detect state_dim and action_dim from Minari dataset.
     #
     *_make_antmaze_large_diverse_configs(),
+    *_make_antmaze_large_diverse_v2_legacy_configs(),
     *_make_pointmaze_large_configs(),
     TrainConfig(
         name="debug_mlp",

@@ -26,14 +26,21 @@ def create_numpy_dataloader(
     batch_size: int,
     max_frames: int | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
-    """Create dataloader for NumpyDataset from Minari."""
-    if data_config.minari_dataset_id is None:
-        raise ValueError("Data config must have a minari_dataset_id")
-
-    dataset = _data_loader.create_numpy_dataset_from_minari(
-        data_config.minari_dataset_id,
-        discount=data_config.discount,
-    )
+    """Create dataloader for NumpyDataset from Minari or legacy D4RL."""
+    if data_config.minari_dataset_id is not None:
+        dataset = _data_loader.create_numpy_dataset_from_minari(
+            data_config.minari_dataset_id,
+            discount=data_config.discount,
+        )
+    elif data_config.legacy_d4rl_env_name is not None:
+        dataset = _data_loader.create_numpy_dataset_from_legacy_d4rl(
+            data_config.legacy_d4rl_env_name,
+            discount=data_config.discount,
+            reward_scale=data_config.reward_scale,
+            reward_bias=data_config.reward_bias,
+        )
+    else:
+        raise ValueError("Data config must have minari_dataset_id or legacy_d4rl_env_name")
 
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
@@ -135,6 +142,9 @@ def main(config_name: str, max_frames: int | None = None):
     if data_config.minari_dataset_id is not None:
         data_loader, num_batches = create_numpy_dataloader(data_config, config.batch_size, max_frames)
         output_id = data_config.minari_dataset_id.replace("/", "_")
+    elif data_config.legacy_d4rl_env_name is not None:
+        data_loader, num_batches = create_numpy_dataloader(data_config, config.batch_size, max_frames)
+        output_id = data_config.asset_id
     elif data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
             data_config, config.model.action_horizon, config.batch_size, max_frames

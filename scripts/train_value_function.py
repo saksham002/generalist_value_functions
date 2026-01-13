@@ -613,7 +613,16 @@ def _compute_single_transition_values(model, frames, normalize, action_condition
 
 
 def _generate_multi_transition_plots(
-    model, frames, mc_returns, ep_idx, step, num_transitions, normalize, action_conditioned, _model, oracle_values=None
+    model,
+    frames,
+    mc_returns,
+    ep_idx,
+    step,
+    num_transitions,
+    normalize,
+    action_conditioned,
+    _model,
+    oracle_values=None,
 ) -> dict:
     """Generate plots for multi-transition models.
 
@@ -1040,11 +1049,18 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized data loader. Batch keys: {list(batch.keys()) if isinstance(batch, dict) else 'tuple'}")
 
     # Select fixed validation trajectories for plotting
-    # Create validation dataset - use NumpyDataset for minari, LeRobotDataset otherwise
+    # Create validation dataset - use NumpyDataset for minari/legacy D4RL, LeRobotDataset otherwise
     data_config = config.data.create(config.assets_dirs, config.model)
     if data_config.minari_dataset_id is not None:
         val_dataset = _data_loader.create_numpy_dataset_from_minari(
             data_config.minari_dataset_id,
+            discount=data_config.discount,
+            reward_scale=data_config.reward_scale,
+            reward_bias=data_config.reward_bias,
+        )
+    elif data_config.legacy_d4rl_env_name is not None:
+        val_dataset = _data_loader.create_numpy_dataset_from_legacy_d4rl(
+            data_config.legacy_d4rl_env_name,
             discount=data_config.discount,
             reward_scale=data_config.reward_scale,
             reward_bias=data_config.reward_bias,
@@ -1069,7 +1085,10 @@ def main(config: _config.TrainConfig):
     if eval_enabled:
         num_eval_envs = min(config.eval_env.num_eval_episodes, 8)
         eval_env = _evaluation.create_vector_eval_env(
-            config.eval_env, data_config, num_envs=num_eval_envs, render_mode="rgb_array"
+            config.eval_env,
+            data_config,
+            num_envs=num_eval_envs,
+            render_mode="rgb_array",
         )
         logging.info(
             f"Evaluation enabled: {config.eval_env.num_eval_episodes} episodes every {config.eval_interval} steps "
@@ -1107,7 +1126,12 @@ def main(config: _config.TrainConfig):
     if policy_state is not None:
         ppolicy_step = jax.jit(
             functools.partial(policy_train_step, config, lr_schedule),
-            in_shardings=(critic_sharding, policy_sharding, data_sharding, replicated_sharding),
+            in_shardings=(
+                critic_sharding,
+                policy_sharding,
+                data_sharding,
+                replicated_sharding,
+            ),
             out_shardings=(policy_sharding, replicated_sharding),
         )
 

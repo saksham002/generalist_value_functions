@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+import openpi.shared.legacy_d4rl_utils as legacy_d4rl_utils
 import openpi.shared.rl_utils as rl_utils
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
@@ -355,6 +356,56 @@ def create_numpy_dataset_from_minari(
     )
 
 
+def create_numpy_dataset_from_legacy_d4rl(
+    env_name: str,
+    discount: float = 0.99,
+    reward_scale: float = 1.0,
+    reward_bias: float = 0.0,
+    clip_action: float = 0.999,
+) -> NumpyDataset:
+    """Create a NumpyDataset by loading data from legacy D4RL.
+
+    This function uses the d4rl library directly and includes special handling
+    for sparse reward environments (antmaze) where failed trajectories use
+    reward_neg / (1 - gamma) as return-to-go.
+
+    Args:
+        env_name: D4RL environment name (e.g., 'antmaze-large-diverse-v2')
+        discount: Discount factor for MC return computation
+        reward_scale: Scale factor for reward transformation (r' = scale * r + bias)
+        reward_bias: Bias for reward transformation
+        clip_action: Action clipping margin
+
+    Returns:
+        NumpyDataset with all data in memory
+    """
+    # Load the dataset using legacy D4RL utilities
+    data = legacy_d4rl_utils.load_legacy_d4rl_dataset(
+        env_name=env_name,
+        discount=discount,
+        reward_scale=reward_scale,
+        reward_bias=reward_bias,
+        clip_action=clip_action,
+    )
+
+    # Convert to NumpyDataset format
+    # Legacy D4RL doesn't have truncations separate from terminals
+    truncations = np.zeros_like(data["terminals"], dtype=bool)
+
+    return NumpyDataset(
+        states=data["observations"],
+        actions=data["actions"],
+        next_states=data["next_observations"],
+        next_actions=data["next_actions"],
+        rewards=data["rewards"],
+        mc_returns=data["mc_returns"],
+        terminations=data["terminals"],
+        truncations=truncations,
+        episode_starts=data["episode_starts"],
+        episode_ends=data["episode_ends"],
+    )
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -481,6 +532,19 @@ def create_data_loader(
 
     # Check for minari dataset first (fastest option for in-memory datasets)
     if data_config.minari_dataset_id is not None:
+        return create_numpy_data_loader(
+            data_config,
+            batch_size=config.batch_size,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            skip_norm_stats=skip_norm_stats,
+            seed=config.seed,
+            framework=framework,
+        )
+
+    # Check for legacy D4RL dataset (alternative to Minari)
+    if data_config.legacy_d4rl_env_name is not None:
         return create_numpy_data_loader(
             data_config,
             batch_size=config.batch_size,
@@ -645,7 +709,7 @@ def create_numpy_data_loader(
     It bypasses disk I/O by loading all data into numpy arrays upfront.
 
     Args:
-        data_config: The data configuration (must have minari_dataset_id set).
+        data_config: The data configuration (must have minari_dataset_id or legacy_d4rl_env_name set).
         batch_size: The batch size.
         sharding: The sharding to use for the data loader.
         skip_norm_stats: Whether to skip data normalization.
@@ -657,16 +721,23 @@ def create_numpy_data_loader(
     Returns:
         DataLoader wrapping the in-memory numpy dataset.
     """
-    if data_config.minari_dataset_id is None:
-        raise ValueError("minari_dataset_id must be set to use numpy data loader")
-
-    # Create the in-memory dataset
-    base_dataset = create_numpy_dataset_from_minari(
-        data_config.minari_dataset_id,
-        discount=data_config.discount,
-        reward_scale=data_config.reward_scale,
-        reward_bias=data_config.reward_bias,
-    )
+    # Create the in-memory dataset from either Minari or legacy D4RL
+    if data_config.minari_dataset_id is not None:
+        base_dataset = create_numpy_dataset_from_minari(
+            data_config.minari_dataset_id,
+            discount=data_config.discount,
+            reward_scale=data_config.reward_scale,
+            reward_bias=data_config.reward_bias,
+        )
+    elif data_config.legacy_d4rl_env_name is not None:
+        base_dataset = create_numpy_dataset_from_legacy_d4rl(
+            data_config.legacy_d4rl_env_name,
+            discount=data_config.discount,
+            reward_scale=data_config.reward_scale,
+            reward_bias=data_config.reward_bias,
+        )
+    else:
+        raise ValueError("Either minari_dataset_id or legacy_d4rl_env_name must be set to use numpy data loader")
 
     # Wrap with multi-transition sampler if configured
     if data_config.num_transitions_per_sample is not None:

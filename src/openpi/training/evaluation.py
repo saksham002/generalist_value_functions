@@ -2,7 +2,7 @@
 
 This module provides utilities for evaluating learned policies in Gymnasium
 environments during training. Supports recovering environments from Minari
-datasets for seamless integration with offline RL training.
+datasets or legacy D4RL for seamless integration with offline RL training.
 
 Uses vectorized environments for efficient parallel evaluation.
 """
@@ -18,6 +18,7 @@ import mujoco
 import numpy as np
 
 import openpi.shared.array_typing as at
+import openpi.shared.legacy_d4rl_utils as legacy_d4rl_utils
 
 if TYPE_CHECKING:
     from openpi.training import config as _config
@@ -108,6 +109,20 @@ def create_eval_env(
 
         return env
 
+    if isinstance(eval_config, _config.LegacyD4RLEvalEnvConfig):
+        env_name = eval_config.legacy_d4rl_env_name or data_config.legacy_d4rl_env_name
+        if env_name is None:
+            raise ValueError(
+                "LegacyD4RLEvalEnvConfig requires legacy_d4rl_env_name to be set, either in eval_config or data_config."
+            )
+        logging.info(f"Creating evaluation environment from legacy D4RL: {env_name}")
+        max_steps = eval_config.max_episode_steps if eval_config.max_episode_steps > 0 else 1000
+        return legacy_d4rl_utils.make_legacy_d4rl_env(
+            env_name,
+            max_episode_steps=max_steps,
+            seed=eval_config.seed,
+        )
+
     raise NotImplementedError(f"Unsupported eval config type: {type(eval_config)}")
 
 
@@ -147,6 +162,24 @@ def create_vector_eval_env(
             return env
 
         logging.info(f"Creating {num_envs} sync vectorized eval environments from: {dataset_id}")
+        return gymnasium.vector.SyncVectorEnv([make_env for _ in range(num_envs)])
+
+    if isinstance(eval_config, _config.LegacyD4RLEvalEnvConfig):
+        env_name = eval_config.legacy_d4rl_env_name or data_config.legacy_d4rl_env_name
+        if env_name is None:
+            raise ValueError(
+                "LegacyD4RLEvalEnvConfig requires legacy_d4rl_env_name to be set, either in eval_config or data_config."
+            )
+        max_steps = eval_config.max_episode_steps if eval_config.max_episode_steps > 0 else 1000
+
+        def make_env():
+            return legacy_d4rl_utils.make_legacy_d4rl_env(
+                env_name,
+                max_episode_steps=max_steps,
+                seed=eval_config.seed,
+            )
+
+        logging.info(f"Creating {num_envs} sync vectorized eval environments from legacy D4RL: {env_name}")
         return gymnasium.vector.SyncVectorEnv([make_env for _ in range(num_envs)])
 
     raise NotImplementedError(f"Unsupported eval config type: {type(eval_config)}")
