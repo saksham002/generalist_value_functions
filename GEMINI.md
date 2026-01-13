@@ -376,3 +376,25 @@ When working with PyTorch models:
 - WandB integration for experiment tracking
 - Run IDs stored in `<checkpoint_dir>/wandb_id.txt` for resume
 - Set project name via `TrainConfig.project_name`
+
+### Running on Cluster
+If the user asks to run on the cluster (e.g., for GPU access, legacy D4RL with mujoco-py, etc.):
+
+1. **Sync local changes to the cluster** (run this locally first):
+   ```bash
+   rsync -avz --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' --exclude '.git' --exclude 'wandb' \
+       /Users/maxsobolmark/dev/batch_value_learning/ babel:~/dev/batch_value_learning/
+   ```
+
+2. **Run training via srun** (directly from local machine):
+   ```bash
+   ssh babel "srun -p debug --mem=64GB --gres=gpu:L40S:1 --time=2:00:00 bash -c 'source /home/jsobolma/bashrc_max && export PATH=\$HOME/.local/bin:\$PATH && export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/home/jsobolma/.mujoco/mujoco210/bin:/usr/lib/nvidia && cd ~/dev/batch_value_learning && uv run python scripts/train_value_function.py YOUR_CONFIG --num_train_steps 100 --no-wandb_enabled'"
+   ```
+
+3. **The code is located at**: `~/dev/batch_value_learning`
+
+4. **Legacy D4RL Setup**:
+   - The cluster has MuJoCo 2.1 installed at `~/.mujoco/mujoco210`
+   - Need to install `cython<3` for mujoco-py compatibility: `uv pip install "cython<3"`
+   - Install d4rl dependencies: `uv pip install gym==0.23.1 && uv pip install "d4rl @ git+https://github.com/Farama-Foundation/D4RL.git" --no-deps && uv pip install "mujoco-py<2.2,>=2.1"`
+   - A pre-compiled mujoco_py .so file exists in the `parl` conda env and can be copied if build fails
