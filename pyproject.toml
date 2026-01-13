@@ -46,6 +46,12 @@ dependencies = [
     "gymnasium-robotics>=1.2.3",
 ]
 
+[project.optional-dependencies]
+# Legacy D4RL support - may conflict with gymnasium, use with caution
+legacy_d4rl = [
+    "gym==0.23.1",
+    "d4rl @ git+https://github.com/Farama-Foundation/D4RL.git",
+]
 
 [project.urls]
 Repository = "https://github.com/Physical-Intelligence/openpi"
@@ -143,6 +149,9 @@ known-third-party = ["wandb"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 markers = ["manual: should be run manually."]
