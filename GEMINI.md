@@ -325,6 +325,11 @@ def compute_value(
 - Follow existing test patterns in the codebase
 - Tests should be in `src/`, `scripts/`, or `packages/` directories
 
+### Git Workflow
+**CRITICAL**: You must NEVER push changes to the remote repository without explicit user approval.
+- Always ask the user for permission to push, displaying the commit messages.
+- Wait for an explicit "yes" or "push" from the user before running any `git push` command.
+
 ## Important Development Notes
 
 ### Pre-commit Hooks
