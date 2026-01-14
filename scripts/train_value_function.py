@@ -606,7 +606,7 @@ def _compute_single_transition_values(model, frames, normalize, action_condition
             tokenized_prompt_mask=None,
         )
         act = jnp.asarray(action[None, ...]) if action_conditioned and action is not None else None
-        pred_value = model.compute_value(obs, act)
+        pred_value = model.compute_value(obs, act, take_min_over_ensemble=True)
         predicted_values.append(float(jax.device_get(pred_value[0])))
     return predicted_values
 
@@ -673,7 +673,7 @@ def _generate_multi_transition_plots(
             actions = np.stack([normalized_frames[j][1] for j in all_indices], axis=0)
             action = jnp.asarray(actions[None, ...])  # [1, n, action_dim]
 
-        pred_values = model.compute_value(obs, action)  # [1, n]
+        pred_values = model.compute_value(obs, action, take_min_over_ensemble=True)  # [1, n]
         pred_random.append(float(jax.device_get(pred_values[0, current_output_idx])))
 
     images[f"val/episode_{ep_idx}_random"] = _create_value_plot(
@@ -698,7 +698,7 @@ def _generate_multi_transition_plots(
             actions = np.stack([normalized_frames[j][1] for j in chunk_indices], axis=0)
             action = jnp.asarray(actions[None, ...])
 
-        pred_values = model.compute_value(obs, action)  # [1, n]
+        pred_values = model.compute_value(obs, action, take_min_over_ensemble=True)  # [1, n]
         for local_idx, global_idx in enumerate(chunk_indices):
             pred_chunks[global_idx] = float(jax.device_get(pred_values[0, local_idx]))
 
@@ -721,7 +721,7 @@ def _generate_multi_transition_plots(
             actions = np.stack([normalized_frames[j][1] for j in chunk_indices], axis=0)
             action = jnp.asarray(actions[None, ...])
 
-        pred_values = model.compute_value(obs, action)
+        pred_values = model.compute_value(obs, action, take_min_over_ensemble=True)
         for local_idx, global_idx in enumerate(chunk_indices):
             if pred_chunks[global_idx] is None:
                 pred_chunks[global_idx] = float(jax.device_get(pred_values[0, local_idx]))
@@ -861,7 +861,7 @@ def _compute_oracle_ranking_metrics(
                 actions = np.stack([f["norm_action"] for f in chunk], axis=0)
                 action = jnp.asarray(actions[None, ...])  # [1, n, action_dim]
 
-            pred_values = jax.device_get(model.compute_value(obs, action))
+            pred_values = jax.device_get(model.compute_value(obs, action, take_min_over_ensemble=True))
             if pred_values.ndim == 2:
                 pred_values = pred_values[0]  # [n]
         else:
@@ -878,7 +878,7 @@ def _compute_oracle_ranking_metrics(
                 action = None
                 if action_conditioned:
                     action = jnp.asarray(f["norm_action"][None, ...])  # [1, action_dim]
-                pred_value = jax.device_get(model.compute_value(obs, action))
+                pred_value = jax.device_get(model.compute_value(obs, action, take_min_over_ensemble=True))
                 pred_values.append(float(pred_value[0]))
             pred_values = np.array(pred_values)
 
@@ -951,7 +951,7 @@ def _compute_oracle_ranking_metrics(
                 tokenized_prompt_mask=None,
             )
             action = jnp.asarray(norm_actions[:actions_to_use][None, ...])  # [1, n, action_dim]
-            pred_qs = jax.device_get(model.compute_value(obs, action))
+            pred_qs = jax.device_get(model.compute_value(obs, action, take_min_over_ensemble=True))
             if pred_qs.ndim == 2:
                 pred_qs = pred_qs[0]  # [n]
             oracle_qs = oracle_qs[:actions_to_use]
@@ -967,7 +967,7 @@ def _compute_oracle_ranking_metrics(
                     tokenized_prompt_mask=None,
                 )
                 action = jnp.asarray(norm_a[None, ...])  # [1, action_dim]
-                pred_q = jax.device_get(model.compute_value(obs, action))
+                pred_q = jax.device_get(model.compute_value(obs, action, take_min_over_ensemble=True))
                 pred_qs.append(float(pred_q[0]))
             pred_qs = np.array(pred_qs)
 
