@@ -81,6 +81,10 @@ class EnsembleNetwork(_base.BaseValueNetwork):
         return self._action_conditioned
 
     @property
+    def num_transitions_per_sample(self) -> int | None:
+        return getattr(self.vectorized_network, "num_transitions_per_sample", None)
+
+    @property
     @override
     def feature_dim(self) -> int:
         return self.vectorized_network.feature_dim

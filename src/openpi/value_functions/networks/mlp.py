@@ -233,8 +233,15 @@ class MultiMLPNetwork(BaseValueNetwork):
         else:
             per_transition = state
 
+        if per_transition.ndim != 3:
+            raise ValueError(
+                f"MultiMLPNetwork expects 3D input (batch, n, dim), got {per_transition.ndim}D "
+                f"with shape {per_transition.shape}"
+            )
+
         # Flatten all n transitions into single input: [batch, n * single_dim]
         _, num_transitions, single_dim = per_transition.shape
+
         x = per_transition.reshape(batch_size, num_transitions * single_dim)
 
         # Process through MLP
