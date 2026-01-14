@@ -8,7 +8,7 @@ import jax.numpy as jnp
 
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
-from openpi.value_functions.networks.base import BaseValueNetwork
+from openpi.value_functions.networks.base_networks import BaseValueNetwork
 
 
 @functools.cache

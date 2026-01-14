@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 
 from openpi.models.model import Observation
-from openpi.value_functions.base import MultiTransition
-from openpi.value_functions.base import Transition
+from openpi.value_functions.base_value_functions import MultiTransition
+from openpi.value_functions.base_value_functions import Transition
 from openpi.value_functions.heads import CategoricalHeadConfig
 from openpi.value_functions.heads import RegressionHeadConfig
 from openpi.value_functions.networks.mlp import MLPNetworkConfig

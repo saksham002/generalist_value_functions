@@ -12,6 +12,7 @@ import dataclasses
 
 import flax.nnx as nnx
 import jax.numpy as jnp
+from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
@@ -154,6 +155,35 @@ class BaseValueFunctionConfig(abc.ABC):
         """
 
 
+@dataclasses.dataclass(frozen=True)
+class BaseMultiValueFunctionConfig(BaseValueFunctionConfig):
+    """Abstract base config for multi-transition value functions.
+
+    Subclasses define their own network configurations.
+    Inherits from BaseValueFunctionConfig but overrides type annotations
+    to reflect multi-transition shapes [*b, n] instead of [*b].
+    """
+
+    @abc.abstractmethod
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "BaseMultiValueFunction":
+        """Create a new multi-transition value function, initializing parameters."""
+
+    @abc.abstractmethod
+    @override
+    def inputs_spec(
+        self, *, batch_size: int = 1
+    ) -> (
+        tuple[_model.Observation, at.Float[at.Array, "*b n"]]
+        | tuple[_model.Observation, _model.Actions, at.Float[at.Array, "*b n"]]
+    ):
+        """Returns the input specification for the multi-transition value function.
+
+        For V(s): returns (observation_spec, target_spec) where target has shape [batch, n]
+        For Q(s,a): returns (observation_spec, action_spec, target_spec)
+        """
+
+
 @dataclasses.dataclass
 class BaseValueFunction(nnx.Module, abc.ABC):
     """Base class for value function implementations.
@@ -211,6 +241,68 @@ class BaseValueFunction(nnx.Module, abc.ABC):
             Tuple of:
             - Per-sample loss of shape [batch]
             - Dict of additional info to log (e.g., predicted values, TD errors)
+        """
+
+    def post_step_update(self) -> None:
+        """Called after each training step.
+
+        Override this method for operations that should happen after each
+        gradient update, such as target network updates (Polyak averaging).
+
+        Default implementation does nothing.
+        """
+
+
+@dataclasses.dataclass
+class BaseMultiValueFunction(nnx.Module, abc.ABC):
+    """Base class for multi-transition value function implementations.
+
+    Multi-transition value functions estimate expected returns for multiple
+    transitions jointly. They can be:
+    - V(s): State-only value functions returning shape [batch, n]
+    - Q(s,a): Action-conditioned value functions returning shape [batch, n]
+    """
+
+    @abc.abstractmethod
+    def compute_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b n"]:
+        """Compute the value for each observation (and optionally action) in the batch.
+
+        Args:
+            observation: Observation with state of shape [batch, n, state_dim].
+            action: Actions of shape [batch, n, action_horizon, action_dim].
+                    Required for action-conditioned value functions.
+            take_min_over_ensemble: If True and the model is an ensemble, return the
+                                    minimum value over the ensemble dimension.
+
+        Returns:
+            Estimated values of shape [batch, n].
+        """
+
+    @abc.abstractmethod
+    def compute_loss(
+        self,
+        transition: MultiTransition,
+        *,
+        train: bool = False,
+        rng: at.KeyArrayLike | None = None,
+    ) -> tuple[at.Float[at.Array, "*b n"], dict[str, at.Array]]:
+        """Compute the loss for value function training.
+
+        Args:
+            transition: Multi-transition with arrays of shape [batch, n, ...].
+            train: Whether in training mode.
+            rng: Random key for algorithms that need stochasticity.
+
+        Returns:
+            Tuple of:
+            - Per-sample loss of shape [batch, n]
+            - Dict of additional info to log
         """
 
     def post_step_update(self) -> None:

@@ -18,14 +18,16 @@ from openpi.models import model as _model
 from openpi.policy_extraction.temperature import Temperature
 from openpi.shared import array_typing as at
 from openpi.value_functions import value_function_objectives as _objectives
-from openpi.value_functions.base import BaseValueFunction
-from openpi.value_functions.base import BaseValueFunctionConfig
-from openpi.value_functions.base import MultiTransition
-from openpi.value_functions.base import Transition
+from openpi.value_functions.base_value_functions import BaseMultiValueFunction
+from openpi.value_functions.base_value_functions import BaseMultiValueFunctionConfig
+from openpi.value_functions.base_value_functions import BaseValueFunction
+from openpi.value_functions.base_value_functions import BaseValueFunctionConfig
+from openpi.value_functions.base_value_functions import MultiTransition
+from openpi.value_functions.base_value_functions import Transition
 from openpi.value_functions.heads import EnsembleHeadConfig
 from openpi.value_functions.heads import HeadConfig
 from openpi.value_functions.heads import ValueHead
-from openpi.value_functions.networks.base import BaseValueNetwork
+from openpi.value_functions.networks.base_networks import BaseValueNetwork
 from openpi.value_functions.networks.ensemble import EnsembleMultiNetworkConfig
 from openpi.value_functions.networks.ensemble import EnsembleNetworkConfig
 from openpi.value_functions.networks.mlp import MLPNetworkConfig
@@ -479,18 +481,21 @@ class SACValueFunction(ValueFunction):
 
 
 @dataclasses.dataclass(frozen=True)
-class MultiValueFunctionConfig(BaseValueFunctionConfig):
-    """Base config for multi-transition value functions.
-
-    Uses MultiMLPNetworkConfig that processes n (state, action) pairs jointly.
-    """
+class MultiMCValueFunctionConfig(BaseMultiValueFunctionConfig):
+    """Multi-transition Monte-Carlo value function config."""
 
     network_config: MultiMLPNetworkConfig
     head_config: HeadConfig
 
     @override
-    def create(self, rng: at.KeyArrayLike) -> MultiValueFunction:
-        raise NotImplementedError("Use a specific config subclass (MultiMCValueFunctionConfig, etc.)")
+    def create(self, rng: at.KeyArrayLike) -> MultiMCValueFunction:
+        rng = jax.random.key(rng) if isinstance(rng, int) else rng
+        net_rng, head_rng = jax.random.split(rng)
+
+        network = self.network_config.create(net_rng)
+        head = self.head_config.create(network.feature_dim, head_rng)
+
+        return MultiMCValueFunction(network=network, head=head)
 
     @override
     def inputs_spec(
@@ -515,24 +520,11 @@ class MultiValueFunctionConfig(BaseValueFunctionConfig):
 
 
 @dataclasses.dataclass(frozen=True)
-class MultiMCValueFunctionConfig(MultiValueFunctionConfig):
-    """Multi-transition Monte-Carlo value function config."""
-
-    @override
-    def create(self, rng: at.KeyArrayLike) -> MultiMCValueFunction:
-        rng = jax.random.key(rng) if isinstance(rng, int) else rng
-        net_rng, head_rng = jax.random.split(rng)
-
-        network = self.network_config.create(net_rng)
-        head = self.head_config.create(network.feature_dim, head_rng)
-
-        return MultiMCValueFunction(network=network, head=head)
-
-
-@dataclasses.dataclass(frozen=True)
-class MultiSARSAValueFunctionConfig(MultiValueFunctionConfig):
+class MultiSARSAValueFunctionConfig(BaseMultiValueFunctionConfig):
     """Multi-transition SARSA value function config with target network."""
 
+    network_config: MultiMLPNetworkConfig
+    head_config: HeadConfig
     discount: float = 0.99
     tau: float = 0.005
 
@@ -555,9 +547,30 @@ class MultiSARSAValueFunctionConfig(MultiValueFunctionConfig):
             tau=self.tau,
         )
 
+    @override
+    def inputs_spec(
+        self, *, batch_size: int = 1
+    ) -> (
+        tuple[_model.Observation, at.Float[at.Array, "*b n"]]
+        | tuple[_model.Observation, _model.Actions, at.Float[at.Array, "*b n"]]
+    ):
+        nc = self.network_config
+        n = nc.num_transitions_per_sample
+        with at.disable_typechecking():
+            obs = _model.Observation(
+                images={},
+                image_masks={},
+                state=jax.ShapeDtypeStruct([batch_size, n, nc.state_dim], jnp.float32),
+            )
+        target = jax.ShapeDtypeStruct([batch_size, n], jnp.float32)
+        if nc.action_conditioned:
+            actions = jax.ShapeDtypeStruct([batch_size, n, nc.action_horizon, nc.action_dim], jnp.float32)
+            return obs, actions, target
+        return obs, target
+
 
 @dataclasses.dataclass(frozen=True)
-class MultiIQLValueFunctionConfig(BaseValueFunctionConfig):
+class MultiIQLValueFunctionConfig(BaseMultiValueFunctionConfig):
     """Multi-transition IQL config with separate Q and V networks.
 
     Uses joint multi-transition networks for cross-state information sharing.
@@ -622,7 +635,7 @@ class MultiIQLValueFunctionConfig(BaseValueFunctionConfig):
         return obs, actions, target
 
 
-class MultiValueFunction(BaseValueFunction):
+class MultiValueFunction(BaseMultiValueFunction):
     """Base multi-transition value function class."""
 
     network: BaseValueNetwork
@@ -712,7 +725,7 @@ class MultiSARSAValueFunction(MultiValueFunction):
         _polyak_update(self.target_head, self.head, self.tau)
 
 
-class MultiIQLValueFunction(BaseValueFunction):
+class MultiIQLValueFunction(BaseMultiValueFunction):
     """Multi-transition IQL with separate Q and V networks.
 
     Uses joint multi-transition networks for cross-state information sharing.

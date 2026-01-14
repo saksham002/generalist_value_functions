@@ -15,7 +15,7 @@ from openpi.models import model as _model
 from openpi.models.tanh_gaussian import TanhGaussianConfig
 from openpi.policy_extraction import objectives
 from openpi.shared import array_typing as at
-from openpi.value_functions.base import BaseValueFunction
+from openpi.value_functions.base_value_functions import BaseValueFunction
 
 
 def make_observation(state: jnp.ndarray) -> _model.Observation:
@@ -602,6 +602,173 @@ class TestAWRObjective:
 
         # Weight max should be clipped
         assert info["weight_max"] <= clip_value + 1e-5
+
+
+class FakeMultiQFunction(BaseValueFunction):
+    """Fake Q-function for multi-transition input.
+
+    Returns Q = sum over last dim of state + action_weight * sum over last dim of action.
+    Input: state [batch, n, state_dim], action [batch, n, ah, ad]
+    Output: [batch, n]
+    """
+
+    def __init__(self, action_weight: float = 1.0):
+        self.action_weight = action_weight
+
+    def compute_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b n"]:
+        """Return sum(state, axis=-1) + sum(action) * weight."""
+        del take_min_over_ensemble
+        state_sum = jnp.sum(observation.state, axis=-1)  # [batch, n]
+        if action is not None:
+            action_sum = jnp.sum(action, axis=(-2, -1))  # [batch, n]
+            return state_sum + self.action_weight * action_sum
+        return state_sum
+
+    def compute_loss(self, transition, *, train=False, rng=None):
+        raise NotImplementedError("FakeMultiQFunction doesn't support training")
+
+
+class FakeMultiVFunction(BaseValueFunction):
+    """Fake V-function for multi-transition input.
+
+    Returns V = sum over last dim of state.
+    Input: state [batch, n, state_dim]
+    Output: [batch, n]
+    """
+
+    def compute_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b n"]:
+        """Return sum(state, axis=-1)."""
+        del action, take_min_over_ensemble
+        return jnp.sum(observation.state, axis=-1)  # [batch, n]
+
+    def compute_loss(self, transition, *, train=False, rng=None):
+        raise NotImplementedError("FakeMultiVFunction doesn't support training")
+
+
+class TestMultiAWRObjective:
+    """Tests for awr_multi_objective."""
+
+    def test_basic_loss_shape(self):
+        """Test that multi-transition AWR returns flattened shape [batch*n]."""
+        batch_size = 4
+        n = 8
+        state_dim = 10
+        action_dim = 4
+        action_horizon = 1
+
+        config = TanhGaussianConfig(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_horizon=action_horizon,
+            std_parameterization="fixed",
+            fixed_std=0.1,
+        )
+        rng = jax.random.key(0)
+        policy = config.create(rng)
+
+        q_fn = FakeMultiQFunction(action_weight=1.0)
+        v_fn = FakeMultiVFunction()
+
+        obs = make_observation(jnp.ones((batch_size, n, state_dim)))
+        data_action = jnp.zeros((batch_size, n, action_horizon, action_dim))
+        rng = jax.random.key(1)
+
+        loss, info = objectives.awr_multi_objective(policy, obs, rng, data_action, q_fn, v_fn, temperature=1.0)
+
+        assert loss.shape == (batch_size * n,), f"Expected shape ({batch_size * n},), got {loss.shape}"
+        assert "advantage_mean" in info
+        assert "weight_mean" in info
+        assert "log_prob_mean" in info
+
+    def test_flattening_gives_correct_values(self):
+        """Test that each of the batch*n transitions gets processed independently."""
+        batch_size = 2
+        n = 3
+        state_dim = 5
+        action_dim = 2
+        action_horizon = 1
+
+        config = TanhGaussianConfig(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_horizon=action_horizon,
+            std_parameterization="fixed",
+            fixed_std=0.1,
+        )
+        rng = jax.random.key(0)
+        policy = config.create(rng)
+
+        # Q = sum(state) + 2 * sum(action), V = sum(state)
+        # So A = 2 * sum(action)
+        q_fn = FakeMultiQFunction(action_weight=2.0)
+        v_fn = FakeMultiVFunction()
+
+        obs = make_observation(jnp.ones((batch_size, n, state_dim)))
+        # Actions: vary across n to get different advantages
+        actions = jnp.zeros((batch_size, n, action_horizon, action_dim))
+        # Set first transition's action to 1s for distinct advantage
+        actions = actions.at[:, 0, :, :].set(1.0)
+
+        rng = jax.random.key(1)
+        _, info = objectives.awr_multi_objective(policy, obs, rng, actions, q_fn, v_fn, temperature=1.0)
+
+        # Transition 0: action sum = 2, advantage = 2*2 = 4
+        # Transitions 1,2: action sum = 0, advantage = 0
+        expected_advantages = jnp.array([4.0, 0.0, 0.0, 4.0, 0.0, 0.0])
+        # Mean should be (4+0+0+4+0+0)/6 = 8/6 = 1.333...
+        np.testing.assert_allclose(info["advantage_mean"], jnp.mean(expected_advantages), rtol=1e-5)
+
+
+class TestMultiAWRPolicyConfig:
+    """Tests for MultiAWRPolicyConfig.compute_loss."""
+
+    def test_compute_loss_shape(self):
+        """Test that MultiAWRPolicyConfig.compute_loss returns flattened loss."""
+        batch_size = 4
+        n = 8
+        state_dim = 10
+        action_dim = 4
+        action_horizon = 1
+
+        config = TanhGaussianConfig(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_horizon=action_horizon,
+            std_parameterization="fixed",
+            fixed_std=0.1,
+        )
+        rng = jax.random.key(0)
+        policy = config.create(rng)
+
+        q_fn = FakeMultiQFunction(action_weight=1.0)
+
+        obs = make_observation(jnp.ones((batch_size, n, state_dim)))
+        data_action = jnp.zeros((batch_size, n, action_horizon, action_dim))
+        rng = jax.random.key(1)
+
+        extraction_config = objectives.MultiAWRPolicyConfig(temperature=10.0, clip_exp=100.0)
+        loss, info = extraction_config.compute_loss(
+            policy=policy,
+            observation=obs,
+            rng=rng,
+            data_action=data_action,
+            value_function=q_fn,
+        )
+
+        assert loss.shape == (batch_size * n,), f"Expected shape ({batch_size * n},), got {loss.shape}"
+        assert "advantage_mean" in info
 
 
 if __name__ == "__main__":

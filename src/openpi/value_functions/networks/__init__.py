@@ -1,6 +1,6 @@
 """Networks subpackage for value function architectures."""
 
-from openpi.value_functions.networks.base import BaseValueNetwork
+from openpi.value_functions.networks.base_networks import BaseValueNetwork
 from openpi.value_functions.networks.mlp import MLPNetwork
 from openpi.value_functions.networks.mlp import MLPNetworkConfig
 from openpi.value_functions.networks.mlp import MultiMLPNetwork

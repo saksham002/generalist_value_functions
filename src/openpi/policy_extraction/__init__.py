@@ -29,7 +29,9 @@ Example usage for SAC-style policy extraction:
 from openpi.policy_extraction.objectives import AWRPolicyConfig
 from openpi.policy_extraction.objectives import BasePolicyExtractionConfig
 from openpi.policy_extraction.objectives import DDPGPolicyConfig
+from openpi.policy_extraction.objectives import MultiAWRPolicyConfig
 from openpi.policy_extraction.objectives import NoopPolicyConfig
+from openpi.policy_extraction.objectives import awr_multi_objective
 from openpi.policy_extraction.objectives import awr_objective
 from openpi.policy_extraction.objectives import bc_regularization_objective
 from openpi.policy_extraction.objectives import ddpg_objective
@@ -44,11 +46,13 @@ __all__ = [
     "AWRPolicyConfig",
     "BasePolicyExtractionConfig",
     "DDPGPolicyConfig",
+    "MultiAWRPolicyConfig",
     "NoopPolicyConfig",
     # Temperature
     "Temperature",
     "TemperatureConfig",
     # Objectives
+    "awr_multi_objective",
     "awr_objective",
     "bc_regularization_objective",
     "ddpg_objective",

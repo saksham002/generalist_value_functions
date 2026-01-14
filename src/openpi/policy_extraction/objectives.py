@@ -22,7 +22,7 @@ import jax.numpy as jnp
 
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
-from openpi.value_functions.base import BaseValueFunction
+from openpi.value_functions.base_value_functions import BaseValueFunction
 
 # Type alias for objective functions
 PolicyObjective = Callable[..., tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]]
@@ -443,6 +443,137 @@ class AWRPolicyConfig(BasePolicyExtractionConfig):
 
         if self.bc_weight > 0:
             bc_loss, bc_info = bc_regularization_objective(policy, observation, rng, data_action)
+            loss = loss + self.bc_weight * bc_loss
+            info.update({f"bc/{k}": v for k, v in bc_info.items()})
+            info["bc/weight"] = self.bc_weight
+
+        return loss, info
+
+
+def awr_multi_objective(
+    policy: _model.BaseModel,
+    observation: _model.Observation,
+    rng: at.KeyArrayLike,
+    data_action: _model.Actions,
+    q_function: BaseValueFunction,
+    v_function: BaseValueFunction,
+    *,
+    temperature: float = 1.0,
+    clip_exp: float = 100.0,
+) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
+    """AWR objective for multi-transition value functions.
+
+    Flattens [batch, n, ...] to [batch*n, ...] so each transition independently
+    contributes to policy training with its own advantage.
+
+    Args:
+        policy: Policy model with action_distribution method.
+        observation: Multi-transition observations with state shape [batch, n, state_dim].
+        rng: Random key for action distribution.
+        data_action: Actions from dataset, shape [batch, n, action_horizon, action_dim].
+        q_function: Multi-transition Q-function returning [batch, n].
+        v_function: Multi-transition V-function returning [batch, n].
+        temperature: Temperature β for advantage weighting. Lower = more greedy.
+        clip_exp: Maximum value for exp(A/β) to prevent explosion.
+
+    Returns:
+        Tuple of (per_sample_loss with shape [batch*n], info_dict).
+    """
+    batch_size, n = observation.state.shape[:2]
+    state_dim = observation.state.shape[2]
+    flat_size = batch_size * n
+
+    q_value = q_function.compute_value(observation, data_action, take_min_over_ensemble=True)
+    v_value = v_function.compute_value(observation)
+    advantage = q_value - v_value  # [batch, n]
+
+    flat_advantage = advantage.reshape(flat_size)
+    weights = jnp.exp(flat_advantage * temperature)
+    weights = jnp.minimum(weights, clip_exp)
+    weights = jax.lax.stop_gradient(weights)
+
+    flat_state = observation.state.reshape(flat_size, state_dim)
+    flat_obs = _model.Observation(
+        images={},
+        image_masks={},
+        state=flat_state,
+        tokenized_prompt=None,
+        tokenized_prompt_mask=None,
+    )
+
+    flat_action = data_action.reshape(flat_size, policy.action_horizon, policy.action_dim)
+
+    dist = policy.action_distribution(rng, flat_obs)
+    actions_flat = flat_action.reshape(flat_size, -1)
+    log_prob = dist.log_prob(actions_flat)
+
+    loss = -weights * log_prob
+
+    info = {
+        "advantage_mean": jnp.mean(advantage),
+        "advantage_std": jnp.std(advantage),
+        "advantage_min": jnp.min(advantage),
+        "advantage_max": jnp.max(advantage),
+        "weight_mean": jnp.mean(weights),
+        "weight_std": jnp.std(weights),
+        "weight_max": jnp.max(weights),
+        "log_prob_mean": jnp.mean(log_prob),
+        "log_prob_std": jnp.std(log_prob),
+        "q_value_mean": jnp.mean(q_value),
+        "v_value_mean": jnp.mean(v_value),
+    }
+    return loss, info
+
+
+@dataclasses.dataclass(frozen=True)
+class MultiAWRPolicyConfig(BasePolicyExtractionConfig):
+    """AWR objective for multi-transition value functions.
+
+    Flattens [batch, n, ...] to [batch*n, ...] so each transition independently
+    contributes to policy training. Use with MultiIQLValueFunction.
+    """
+
+    temperature: float = 1.0
+    clip_exp: float = 100.0
+    bc_weight: float = 0.0
+
+    def compute_loss(
+        self,
+        policy: _model.BaseModel,
+        observation: _model.Observation,
+        rng: at.KeyArrayLike,
+        data_action: _model.Actions | None = None,
+        value_function: BaseValueFunction | None = None,
+    ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
+        if data_action is None:
+            raise ValueError("MultiAWRPolicyConfig requires data_action.")
+        if value_function is None:
+            raise ValueError("MultiAWRPolicyConfig requires a value function with Q and V.")
+
+        loss, info = awr_multi_objective(
+            policy,
+            observation,
+            rng,
+            data_action,
+            q_function=value_function,
+            v_function=value_function,
+            temperature=self.temperature,
+            clip_exp=self.clip_exp,
+        )
+
+        if self.bc_weight > 0:
+            batch_size, n = observation.state.shape[:2]
+            flat_size = batch_size * n
+            state_dim = observation.state.shape[2]
+            flat_obs = _model.Observation(
+                images={},
+                image_masks={},
+                state=observation.state.reshape(flat_size, state_dim),
+                tokenized_prompt=None,
+                tokenized_prompt_mask=None,
+            )
+            flat_action = data_action.reshape(flat_size, policy.action_horizon, policy.action_dim)
+            bc_loss, bc_info = bc_regularization_objective(policy, flat_obs, rng, flat_action)
             loss = loss + self.bc_weight * bc_loss
             info.update({f"bc/{k}": v for k, v in bc_info.items()})
             info["bc/weight"] = self.bc_weight

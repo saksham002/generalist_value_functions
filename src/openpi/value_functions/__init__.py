@@ -11,10 +11,12 @@ This module provides value function implementations:
 - Multi-Transition Value Functions: MultiMCValueFunction, MultiSARSAValueFunction, MultiIQLValueFunction
 """
 
-from openpi.value_functions.base import BaseValueFunction
-from openpi.value_functions.base import BaseValueFunctionConfig
-from openpi.value_functions.base import MultiTransition
-from openpi.value_functions.base import Transition
+from openpi.value_functions.base_value_functions import BaseMultiValueFunction
+from openpi.value_functions.base_value_functions import BaseMultiValueFunctionConfig
+from openpi.value_functions.base_value_functions import BaseValueFunction
+from openpi.value_functions.base_value_functions import BaseValueFunctionConfig
+from openpi.value_functions.base_value_functions import MultiTransition
+from openpi.value_functions.base_value_functions import Transition
 from openpi.value_functions.heads import CategoricalHead
 from openpi.value_functions.heads import CategoricalHeadConfig
 from openpi.value_functions.heads import EnsembleHead
@@ -39,13 +41,14 @@ from openpi.value_functions.value_function import MultiMCValueFunction
 from openpi.value_functions.value_function import MultiMCValueFunctionConfig
 from openpi.value_functions.value_function import MultiSARSAValueFunction
 from openpi.value_functions.value_function import MultiSARSAValueFunctionConfig
-from openpi.value_functions.value_function import MultiValueFunctionConfig
 from openpi.value_functions.value_function import SACValueFunction
 from openpi.value_functions.value_function import SACValueFunctionConfig
 from openpi.value_functions.value_function import SARSAValueFunction
 from openpi.value_functions.value_function import SARSAValueFunctionConfig
 
 __all__ = [
+    "BaseMultiValueFunction",
+    "BaseMultiValueFunctionConfig",
     "BaseValueFunction",
     "BaseValueFunctionConfig",
     "BaseValueNetwork",
@@ -71,7 +74,6 @@ __all__ = [
     "MultiSARSAValueFunction",
     "MultiSARSAValueFunctionConfig",
     "MultiTransition",
-    "MultiValueFunctionConfig",
     "RegressionHead",
     "RegressionHeadConfig",
     "SACValueFunction",

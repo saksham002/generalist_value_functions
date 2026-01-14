@@ -11,7 +11,7 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
-from openpi.value_functions.networks import base as _base
+from openpi.value_functions.networks import base_networks as _base
 from openpi.value_functions.networks import mlp as _mlp
 
 

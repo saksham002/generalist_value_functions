@@ -13,12 +13,12 @@ from openpi.models import model as _model
 from openpi.policy_extraction.temperature import Temperature
 from openpi.shared import array_typing as at
 from openpi.value_functions import hl_gauss as _hl_gauss
-from openpi.value_functions.base import MultiTransition
-from openpi.value_functions.base import Transition
+from openpi.value_functions.base_value_functions import MultiTransition
+from openpi.value_functions.base_value_functions import Transition
 from openpi.value_functions.heads import CategoricalHead
 from openpi.value_functions.heads import EnsembleHead
 from openpi.value_functions.heads import ValueHead
-from openpi.value_functions.networks.base import BaseValueNetwork
+from openpi.value_functions.networks.base_networks import BaseValueNetwork
 
 
 def _compute_value_loss(head: ValueHead, features: at.Array, target: at.Array) -> at.Array:
