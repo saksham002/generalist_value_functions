@@ -193,6 +193,9 @@ class MultiTransitionDataset(Dataset):
 
     Each sample contains num_transitions_per_sample transitions.
     The output shape is [num_transitions_per_sample, ...] for each field.
+
+    Supports both single-index access (returns [n, ...]) and batched access
+    when given a list of indices from BatchSampler (returns [batch, n, ...]).
     """
 
     def __init__(
@@ -205,8 +208,17 @@ class MultiTransitionDataset(Dataset):
         self._sampler = sampler
         self._num_samples = num_samples if num_samples is not None else len(dataset)
 
-    def __getitem__(self, index: SupportsIndex) -> dict:
-        # Sample indices using the sampler (index is ignored since sampling is random)
+    def __getitem__(self, index: SupportsIndex | Sequence[int]) -> dict:
+        # Handle batched access (list of indices from BatchSampler)
+        if isinstance(index, list | np.ndarray):
+            batch_size = len(index)
+            samples = [self._sample_transitions() for _ in range(batch_size)]
+            return {k: np.stack([s[k] for s in samples], axis=0) for k in samples[0]}
+        # Single-index access
+        return self._sample_transitions()
+
+    def _sample_transitions(self) -> dict:
+        """Sample a single multi-transition group."""
         indices = self._sampler.sample()
         return self._dataset.get_items_by_indices(indices)
 

@@ -37,8 +37,7 @@ from openpi.training.time_utils import Timer
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 import openpi.transforms as _transforms
-import openpi.value_functions.base as _value_fn
-from openpi.value_functions.value_function import MultiValueFunctionConfig
+import openpi.value_functions.base_value_functions as _value_fn
 
 
 def init_logging():
@@ -222,7 +221,7 @@ def value_function_train_step(
     """
     model = nnx.merge(state.model_def, state.params)
 
-    if isinstance(config.model, MultiValueFunctionConfig):
+    if isinstance(config.model, _value_fn.BaseMultiValueFunctionConfig):
         transition = _value_fn.MultiTransition.from_batch(batch)
     else:
         transition = _value_fn.Transition.from_batch(batch)
@@ -328,7 +327,8 @@ def policy_train_step(
         lr_schedule: Learning rate schedule.
         critic_state: Critic (value function) train state (frozen during policy update).
         policy_state: Policy train state to update.
-        batch: Batch of data.
+        batch: Batch of data. For single-transition: state [batch, state_dim], actions [batch, ah, ad].
+            For multi-transition: state [batch, n, state_dim], actions [batch, n, ah, ad].
         rng: Random key.
 
     Returns:
@@ -337,24 +337,23 @@ def policy_train_step(
     policy = nnx.merge(policy_state.model_def, policy_state.params)
     critic = nnx.merge(critic_state.model_def, critic_state.params)
 
-    # Build observation from batch - single transition only
+    state = jnp.asarray(batch["state"])
+    actions = jnp.asarray(batch["actions"])
+
     observation = _model.Observation(
         images={},
         image_masks={},
-        state=jnp.asarray(batch["state"]),
+        state=state,
         tokenized_prompt=None,
         tokenized_prompt_mask=None,
     )
-
-    # Extract data action for BC-based objectives
-    data_action = jnp.asarray(batch["actions"])
 
     def loss_fn(policy):
         loss, info = config.policy_extraction.compute_loss(
             policy=policy,
             observation=observation,
             rng=rng,
-            data_action=data_action,
+            data_action=actions,
             value_function=critic,
         )
         return jnp.mean(loss), info

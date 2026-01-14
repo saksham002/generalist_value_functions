@@ -34,7 +34,7 @@ import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
-import openpi.value_functions.base as _value_functions_base
+import openpi.value_functions.base_value_functions as _value_functions_base
 import openpi.value_functions.heads as _heads
 import openpi.value_functions.networks.ensemble as _ensemble_network
 import openpi.value_functions.networks.mlp as _mlp_network
@@ -1612,6 +1612,66 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
             num_train_steps=100_000,
             batch_size=256,
             lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+        ),
+        # Multi-IQL with AWR policy training (random sampling)
+        TrainConfig(
+            name="pointmaze_large_v2_multi_iql_awr_random",
+            num_workers=0,
+            model=_value_function.MultiIQLValueFunctionConfig(
+                q_network_config=_ensemble_network.EnsembleMultiNetworkConfig(
+                    base_config=_mlp_network.MultiMLPNetworkConfig(
+                        state_dim=state_dim,
+                        action_conditioned=True,
+                        action_dim=action_dim,
+                        action_horizon=1,
+                        num_transitions_per_sample=8,
+                        hidden_dims=(256, 256, 256, 256),
+                        use_layer_norm=False,
+                    ),
+                    ensemble_size=2,
+                ),
+                v_network_config=_mlp_network.MultiMLPNetworkConfig(
+                    state_dim=state_dim,
+                    action_conditioned=False,
+                    num_transitions_per_sample=8,
+                    hidden_dims=(256, 256, 256, 256),
+                    use_layer_norm=False,
+                ),
+                q_head_config=_heads.EnsembleHeadConfig(
+                    base_config=_heads.RegressionHeadConfig(),
+                    ensemble_size=2,
+                ),
+                v_head_config=_heads.RegressionHeadConfig(),
+                expectile=0.9,
+                discount=0.99,
+                tau=0.005,
+            ),
+            policy=_tanh_gaussian.TanhGaussianConfig(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                action_horizon=1,
+                hidden_dims=(256, 256),
+                state_dependent_std=False,
+                log_std_min=-5.0,
+                log_std_max=2.0,
+            ),
+            policy_extraction=_policy_extraction.MultiAWRPolicyConfig(
+                temperature=10.0,
+                clip_exp=100.0,
+            ),
+            data=MultiTransitionMinariDataConfig(
+                minari_dataset_id="D4RL/pointmaze/large-v2",
+                discount=0.99,
+                reward_bias=-1.0,
+                num_transitions_per_sample=8,
+                multi_transition_sampler_type="trajectory_uniform",
+            ),
+            num_train_steps=100_000,
+            batch_size=256,
+            lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+            policy_lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=3e-4, decay_steps=100_000, decay_lr=0.0),
+            eval_interval=10000,
+            eval_env=MinariEvalEnvConfig(num_eval_episodes=16),
         ),
     ]
 
