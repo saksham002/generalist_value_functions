@@ -273,9 +273,10 @@ class GymnasiumBridgeWrapper(gymnasium.Env):
     Handles differences in space types, reset returns, and step returns.
     """
 
-    def __init__(self, env: gym.Env):
+    def __init__(self, env: gym.Env, render_mode: str | None = None):
         super().__init__()
         self.env = env
+        self.render_mode = render_mode
         self.observation_space = _convert_gym_space(env.observation_space)
         self.action_space = _convert_gym_space(env.action_space)
 
@@ -297,6 +298,8 @@ class GymnasiumBridgeWrapper(gymnasium.Env):
         return obs, reward, terminated, truncated, info
 
     def render(self):
+        if self.render_mode is not None:
+            return self.env.render(mode=self.render_mode)
         return self.env.render()
 
     def close(self):
@@ -310,6 +313,7 @@ def make_legacy_d4rl_env(
     env_name: str,
     max_episode_steps: int = 1000,
     seed: int = 0,
+    render_mode: str | None = None,
 ) -> gymnasium.Env:
     """Create a legacy D4RL environment with proper wrappers for evaluation.
 
@@ -317,6 +321,7 @@ def make_legacy_d4rl_env(
         env_name: D4RL environment name (e.g., 'antmaze-large-diverse-v2')
         max_episode_steps: Maximum steps per episode.
         seed: Random seed for the environment.
+        render_mode: Render mode for the environment.
 
     Returns:
         A wrapped gymnasium environment ready for evaluation.
@@ -328,4 +333,4 @@ def make_legacy_d4rl_env(
 
     env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
     env = gym.wrappers.RecordEpisodeStatistics(env, deque_size=1)
-    return GymnasiumBridgeWrapper(env)
+    return GymnasiumBridgeWrapper(env, render_mode=render_mode)

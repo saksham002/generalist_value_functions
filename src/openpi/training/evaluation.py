@@ -177,6 +177,7 @@ def create_vector_eval_env(
                 env_name,
                 max_episode_steps=max_steps,
                 seed=eval_config.seed,
+                render_mode=render_mode,
             )
 
         logging.info(f"Creating {num_envs} sync vectorized eval environments from legacy D4RL: {env_name}")
