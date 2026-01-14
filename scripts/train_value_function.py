@@ -767,6 +767,7 @@ def _create_value_plot(mc_returns, predicted_values, ep_idx, step, suffix, oracl
     ax.grid(visible=True, alpha=0.3)
 
     plt.tight_layout()
+
     img = wandb.Image(fig)
     plt.close(fig)
     return img
@@ -1072,12 +1073,34 @@ def main(config: _config.TrainConfig):
 
     num_episodes = val_dataset.num_episodes
     val_rng = np.random.default_rng(config.seed)
-    val_episode_indices = val_rng.choice(
-        num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
-    ).tolist()
+
+    # Filter to episodes with at least 10 frames for meaningful validation plots
+    min_episode_length = 10
+    if hasattr(val_dataset, "episode_starts") and hasattr(val_dataset, "episode_ends"):
+        episode_lengths = val_dataset.episode_ends - val_dataset.episode_starts
+        valid_episode_indices = np.where(episode_lengths >= min_episode_length)[0]
+        if len(valid_episode_indices) < config.num_val_trajectories:
+            logging.warning(
+                f"Only {len(valid_episode_indices)} episodes with >= {min_episode_length} frames, "
+                f"using all of them for validation"
+            )
+            val_episode_indices = valid_episode_indices.tolist()
+        else:
+            val_episode_indices = val_rng.choice(
+                valid_episode_indices, size=config.num_val_trajectories, replace=False
+            ).tolist()
+    else:
+        val_episode_indices = val_rng.choice(
+            num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
+        ).tolist()
     logging.info(f"Selected validation episodes: {val_episode_indices}")
-    network_config = getattr(config.model, "network_config", None)
+    # Detect action_conditioned: check network_config (for MC/SARSA) or q_network_config (for IQL)
+    # For ensemble configs, check base_config for the actual network settings
+    network_config = getattr(config.model, "network_config", None) or getattr(config.model, "q_network_config", None)
+    if hasattr(network_config, "base_config"):
+        network_config = network_config.base_config  # Unwrap EnsembleNetworkConfig
     action_conditioned = getattr(network_config, "action_conditioned", False)
+    logging.info(f"Validation plots: action_conditioned={action_conditioned}")
 
     # Set up evaluation environment if enabled
     eval_env = None
@@ -1215,7 +1238,10 @@ def main(config: _config.TrainConfig):
                     data_config=data_config,
                 )
                 if plot_images:
+                    logging.info(f"Generated {len(plot_images)} validation plot items at step {step}")
                     wandb.log(plot_images, step=step)
+                else:
+                    logging.warning(f"No validation plots generated at step {step}")
 
         # Policy evaluation
         if eval_enabled and step % config.eval_interval == 0 and step > 0:
