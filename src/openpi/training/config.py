@@ -778,6 +778,8 @@ class EvalEnvConfig:
     max_episode_steps: int = 0
     # Seed for environment initialization
     seed: int = 42
+    # Whether to record video during evaluation.
+    record_video: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1523,7 +1525,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
             lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
             policy_lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=3e-4, decay_steps=100_000, decay_lr=0.0),
             eval_interval=10000,
-            eval_env=MinariEvalEnvConfig(num_eval_episodes=16),
+            eval_env=MinariEvalEnvConfig(num_eval_episodes=16, record_video=False),
         ),
         # Multi-IQL with Q-ensemble (consecutive sampling)
         TrainConfig(
@@ -1671,7 +1673,7 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
             lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
             policy_lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=3e-4, decay_steps=100_000, decay_lr=0.0),
             eval_interval=10000,
-            eval_env=MinariEvalEnvConfig(num_eval_episodes=16),
+            eval_env=MinariEvalEnvConfig(num_eval_episodes=16, record_video=False),
         ),
     ]
 

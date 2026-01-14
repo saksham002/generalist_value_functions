@@ -1110,7 +1110,7 @@ def main(config: _config.TrainConfig):
             config.eval_env,
             data_config,
             num_envs=num_eval_envs,
-            render_mode="rgb_array",
+            render_mode="rgb_array" if config.eval_env.record_video else None,
         )
         logging.info(
             f"Evaluation enabled: {config.eval_env.num_eval_episodes} episodes every {config.eval_interval} steps "
@@ -1316,7 +1316,7 @@ def main(config: _config.TrainConfig):
                     vec_env=eval_env,
                     num_episodes=config.eval_env.num_eval_episodes,
                     seed=config.eval_env.seed + step,
-                    record_video=True,
+                    record_video=config.eval_env.record_video,
                 )
                 eval_metrics = eval_results.to_dict()
 
