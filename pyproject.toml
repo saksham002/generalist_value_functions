@@ -49,8 +49,10 @@ dependencies = [
 [project.optional-dependencies]
 # Legacy D4RL support - may conflict with gymnasium, use with caution
 legacy_d4rl = [
+    "cython<3",
     "gym==0.23.1",
     "d4rl @ git+https://github.com/Farama-Foundation/D4RL.git",
+    "mujoco-py<2.2,>=2.1",
 ]
 
 [project.urls]
