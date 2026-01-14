@@ -1500,6 +1500,19 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
                 discount=0.99,
                 tau=0.005,
             ),
+            policy=_tanh_gaussian.TanhGaussianConfig(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                action_horizon=1,
+                hidden_dims=(256, 256),
+                state_dependent_std=False,
+                log_std_min=-5.0,
+                log_std_max=2.0,
+            ),
+            policy_extraction=_policy_extraction.AWRPolicyConfig(
+                temperature=10.0,
+                clip_exp=100.0,
+            ),
             data=MinariDataConfig(
                 minari_dataset_id="D4RL/pointmaze/large-v2",
                 discount=0.99,
@@ -1508,6 +1521,9 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
             num_train_steps=100_000,
             batch_size=256,
             lr_schedule=_optimizer.ConstantSchedule(lr=3e-4),
+            policy_lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=3e-4, decay_steps=100_000, decay_lr=0.0),
+            eval_interval=10000,
+            eval_env=MinariEvalEnvConfig(num_eval_episodes=16),
         ),
         # Multi-IQL with Q-ensemble (consecutive sampling)
         TrainConfig(
@@ -1783,6 +1799,14 @@ def _make_antmaze_large_diverse_v2_legacy_configs() -> list[TrainConfig]:
             num_workers=0,
         ),
     ]
+
+
+def _make_antmaze_large_diverse_v2_legacy_configs_safe() -> list[TrainConfig]:
+    try:
+        return _make_antmaze_large_diverse_v2_legacy_configs()
+    except Exception:
+        logging.warning("Failed to initialize legacy Antmaze configs (likely missing mujoco_py). Skipping.")
+        return []
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -2205,7 +2229,7 @@ _CONFIGS = [
     # Auto-detect state_dim and action_dim from Minari dataset.
     #
     *_make_antmaze_large_diverse_configs(),
-    *_make_antmaze_large_diverse_v2_legacy_configs(),
+    *_make_antmaze_large_diverse_v2_legacy_configs_safe(),
     *_make_pointmaze_large_configs(),
     TrainConfig(
         name="debug_mlp",
