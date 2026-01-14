@@ -18,7 +18,7 @@ import logging
 
 import d4rl
 import gym
-from gym import Wrapper
+import gymnasium
 import numpy as np
 
 LEGACY_D4RL_ENV_CONFIG = {
@@ -251,16 +251,43 @@ def load_legacy_d4rl_dataset(
     }
 
 
-class TruncationWrapper(Wrapper):
-    """Convert old gym 4-tuple step API to new 5-tuple with truncation signal.
+def _convert_gym_space(space: gym.Space) -> gymnasium.Space:
+    """Convert a legacy gym Space to a gymnasium Space."""
+    if isinstance(space, gym.spaces.Box):
+        return gymnasium.spaces.Box(
+            low=space.low,
+            high=space.high,
+            shape=space.shape,
+            dtype=space.dtype,
+        )
+    if isinstance(space, gym.spaces.Discrete):
+        return gymnasium.spaces.Discrete(n=space.n)
+    if isinstance(space, gym.spaces.Dict):
+        return gymnasium.spaces.Dict({k: _convert_gym_space(v) for k, v in space.spaces.items()})
+    raise NotImplementedError(f"Unsupported space type for conversion: {type(space)}")
 
-    The legacy D4RL environments use the old gym API where env.step returns
-    (obs, reward, done, info). This wrapper converts to the new API that returns
-    (obs, reward, terminated, truncated, info).
+
+class GymnasiumBridgeWrapper(gymnasium.Env):
+    """Bridge legacy gym env to gymnasium Env.
+
+    Handles differences in space types, reset returns, and step returns.
     """
 
-    def reset(self, **kwargs):
-        obs = self.env.reset(**kwargs)
+    def __init__(self, env: gym.Env):
+        super().__init__()
+        self.env = env
+        self.observation_space = _convert_gym_space(env.observation_space)
+        self.action_space = _convert_gym_space(env.action_space)
+
+    def reset(self, *, seed: int | None = None, options: dict | None = None):
+        super().reset(seed=seed)
+        try:
+            obs = self.env.reset(seed=seed)
+        except TypeError:
+            # Legacy gym envs might not support seed in reset
+            if seed is not None:
+                self.env.seed(seed)
+            obs = self.env.reset()
         return obs, {}
 
     def step(self, action):
@@ -269,12 +296,21 @@ class TruncationWrapper(Wrapper):
         terminated = done and not truncated
         return obs, reward, terminated, truncated, info
 
+    def render(self):
+        return self.env.render()
+
+    def close(self):
+        return self.env.close()
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
 
 def make_legacy_d4rl_env(
     env_name: str,
     max_episode_steps: int = 1000,
     seed: int = 0,
-) -> gym.Env:
+) -> gymnasium.Env:
     """Create a legacy D4RL environment with proper wrappers for evaluation.
 
     Args:
@@ -283,9 +319,8 @@ def make_legacy_d4rl_env(
         seed: Random seed for the environment.
 
     Returns:
-        A wrapped gym environment ready for evaluation.
+        A wrapped gymnasium environment ready for evaluation.
     """
-    # Some envs don't accept seed as an argument
     try:
         env = gym.make(env_name, seed=seed)
     except TypeError:
@@ -293,4 +328,4 @@ def make_legacy_d4rl_env(
 
     env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
     env = gym.wrappers.RecordEpisodeStatistics(env, deque_size=1)
-    return TruncationWrapper(env)
+    return GymnasiumBridgeWrapper(env)
