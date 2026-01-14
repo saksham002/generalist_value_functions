@@ -448,14 +448,14 @@ class TestMultiMLPNetwork:
         # Outputs should be DIFFERENT (not just reordered) because all transitions
         # are concatenated and processed together through the MLP
         features_original_reordered = features_original[:, n_perm]
-        assert not jnp.allclose(
-            features_permuted, features_original_reordered, rtol=1e-5
-        ), "Transition permutation should change feature values, not just reorder them"
+        assert not jnp.allclose(features_permuted, features_original_reordered, rtol=1e-5), (
+            "Transition permutation should change feature values, not just reorder them"
+        )
 
         values_original_reordered = values_original[:, n_perm]
-        assert not jnp.allclose(
-            values_permuted, values_original_reordered, rtol=1e-5
-        ), "Transition permutation should change value predictions, not just reorder them"
+        assert not jnp.allclose(values_permuted, values_original_reordered, rtol=1e-5), (
+            "Transition permutation should change value predictions, not just reorder them"
+        )
 
     def test_loss_batch_permutation_invariance(self):
         """Verify that loss is invariant to batch permutations."""
@@ -572,9 +572,9 @@ class TestMultiMLPNetwork:
 
         # Losses should be DIFFERENT (not just reordered)
         loss_original_reordered = loss_original[:, n_perm]
-        assert not jnp.allclose(
-            loss_permuted, loss_original_reordered, rtol=1e-5
-        ), "Transition permutation should change loss values, not just reorder them"
+        assert not jnp.allclose(loss_permuted, loss_original_reordered, rtol=1e-5), (
+            "Transition permutation should change loss values, not just reorder them"
+        )
 
 
 class TestMultiMCValueFunction:
