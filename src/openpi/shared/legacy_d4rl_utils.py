@@ -143,13 +143,13 @@ def load_legacy_d4rl_dataset(
     dataset = d4rl.qlearning_dataset(env.unwrapped)
     env.close()
 
-    # Detect timeouts via observation discontinuity
-    timeouts = np.zeros(len(dataset["rewards"]), dtype=bool)
+    # Detect episode boundaries via observation discontinuity (timeouts) OR terminals.
+    episode_ends_mask = np.zeros(len(dataset["rewards"]), dtype=bool)
     for i in range(len(dataset["terminals"]) - 1):
         obs_diff = np.linalg.norm(dataset["observations"][i + 1] - dataset["next_observations"][i])
         if obs_diff > 1e-6 or dataset["terminals"][i] == 1.0:
-            timeouts[i] = True
-    timeouts[-1] = True
+            episode_ends_mask[i] = True
+    episode_ends_mask[-1] = True
 
     # Process episodes
     num_total_transitions = len(dataset["rewards"])
@@ -158,25 +158,24 @@ def load_legacy_d4rl_dataset(
 
     episode_step = 0
     for i in range(num_total_transitions):
-        done_bool = bool(dataset["terminals"][i])
-        is_final_timestep = timeouts[i]
+        is_episode_end = episode_ends_mask[i]
 
-        # Skip final timestep transitions (don't include in dataset)
-        if not is_final_timestep or i == num_total_transitions - 1:
-            for k in [
-                "actions",
-                "next_observations",
-                "observations",
-                "rewards",
-                "terminals",
-            ]:
-                if k in dataset:
-                    data_[k].append(dataset[k][i])
-            if "next_observations" not in dataset:
-                data_["next_observations"].append(dataset["observations"][i + 1])
-            episode_step += 1
+        # Include ALL transitions (both terminals and timeouts are valid data points)
+        for k in [
+            "actions",
+            "next_observations",
+            "observations",
+            "rewards",
+            "terminals",
+        ]:
+            if k in dataset:
+                data_[k].append(dataset[k][i])
+        if "next_observations" not in dataset:
+            data_["next_observations"].append(dataset["observations"][i + 1])
+        episode_step += 1
 
-        if (done_bool or is_final_timestep) and episode_step > 0:
+        # Finalize episode at episode boundaries
+        if is_episode_end and episode_step > 0:
             episode_step = 0
             episode_data = {k: np.array(v) for k, v in data_.items()}
 
