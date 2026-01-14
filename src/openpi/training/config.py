@@ -1779,7 +1779,7 @@ def _make_antmaze_large_diverse_v2_legacy_configs() -> list[TrainConfig]:
                 log_std_min=-5.0,
                 log_std_max=2.0,
             ),
-            policy_extraction=_policy_extraction.AWRPolicyConfig(
+            policy_extraction=_policy_extraction.MultiAWRPolicyConfig(
                 temperature=10.0,
                 clip_exp=100.0,
             ),
@@ -1839,7 +1839,7 @@ def _make_antmaze_large_diverse_v2_legacy_configs() -> list[TrainConfig]:
                 log_std_min=-5.0,
                 log_std_max=2.0,
             ),
-            policy_extraction=_policy_extraction.AWRPolicyConfig(
+            policy_extraction=_policy_extraction.MultiAWRPolicyConfig(
                 temperature=10.0,
                 clip_exp=100.0,
             ),
