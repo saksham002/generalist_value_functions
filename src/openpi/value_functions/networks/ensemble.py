@@ -94,27 +94,31 @@ class EnsembleNetwork(_base.BaseValueNetwork):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
+        *,
+        rng: at.KeyArrayLike | None = None,
     ) -> at.Float[at.Array, "ensemble *b feature_dim"]:
         """Compute features for all ensemble members.
 
         Args:
             observation: Observation containing state.
             action: Actions (required if action_conditioned=True).
+            rng: Optional random key for stochastic operations.
 
         Returns:
             Features of shape [ensemble, batch, feature_dim] or
             [ensemble, batch, n, feature_dim] for multi-transition.
         """
 
-        @nnx.vmap(in_axes=(0, None, None), out_axes=0)
+        @nnx.vmap(in_axes=(0, None, None, None), out_axes=0)
         def compute_single(
             network: _base.BaseValueNetwork,
             obs: _model.Observation,
             act: _model.Actions | None,
+            rng_key: at.KeyArrayLike | None,
         ) -> at.Array:
-            return network.compute_features(obs, act)
+            return network.compute_features(obs, act, rng=rng_key)
 
-        return compute_single(self.vectorized_network, observation, action)
+        return compute_single(self.vectorized_network, observation, action, rng)
 
     def compute_features_single(
         self,
@@ -122,6 +126,7 @@ class EnsembleNetwork(_base.BaseValueNetwork):
         action: _model.Actions | None = None,
         *,
         member_idx: int = 0,
+        rng: at.KeyArrayLike | None = None,
     ) -> at.Float[at.Array, "*b feature_dim"]:
         """Compute features for a single ensemble member.
 
@@ -131,20 +136,22 @@ class EnsembleNetwork(_base.BaseValueNetwork):
             observation: Observation containing state.
             action: Actions (required if action_conditioned=True).
             member_idx: Which ensemble member to use.
+            rng: Optional random key for stochastic operations.
 
         Returns:
             Features of shape [batch, feature_dim].
         """
 
-        @nnx.vmap(in_axes=(0, None, None), out_axes=0)
+        @nnx.vmap(in_axes=(0, None, None, None), out_axes=0)
         def compute_single(
             network: _base.BaseValueNetwork,
             obs: _model.Observation,
             act: _model.Actions | None,
+            rng_key: at.KeyArrayLike | None,
         ) -> at.Array:
-            return network.compute_features(obs, act)
+            return network.compute_features(obs, act, rng=rng_key)
 
-        all_features = compute_single(self.vectorized_network, observation, action)
+        all_features = compute_single(self.vectorized_network, observation, action, rng)
         return all_features[member_idx]
 
 

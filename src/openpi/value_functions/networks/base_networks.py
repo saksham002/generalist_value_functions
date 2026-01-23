@@ -22,6 +22,8 @@ class BaseValueNetwork(nnx.Module, abc.ABC):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
+        *,
+        rng: at.KeyArrayLike | None = None,
     ) -> at.Float[at.Array, "*b feature_dim"]:
         """Compute features from observation (and optionally action).
 
@@ -29,6 +31,7 @@ class BaseValueNetwork(nnx.Module, abc.ABC):
             observation: Observation containing state (and optionally images, prompt).
             action: Actions of shape [batch, action_horizon, action_dim].
                     Required if action_conditioned=True.
+            rng: Optional random key for stochastic operations (e.g., image augmentation).
 
         Returns:
             Features of shape [batch, feature_dim].

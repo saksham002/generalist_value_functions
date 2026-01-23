@@ -9,7 +9,8 @@ Supports:
 import dataclasses
 import functools
 import logging
-import platform
+import platform as _platform
+import os
 from typing import Any
 
 import etils.epath as epath
@@ -23,6 +24,7 @@ import optax
 import scipy.stats
 import tqdm_loggable.auto as tqdm
 import wandb
+import pdb
 
 from openpi.models import model as _model
 import openpi.shared.array_typing as at
@@ -38,6 +40,7 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 import openpi.transforms as _transforms
 import openpi.value_functions.base_value_functions as _value_fn
+from openpi.training.robocoin_data_loader import RoboCOINDataLoaderConfig, create_robocoin_data_loader
 
 
 def init_logging():
@@ -71,7 +74,8 @@ def init_wandb(
     log_code: bool = False,
     enabled: bool = True,
 ):
-    if not enabled:
+    # Only worker 0 should initialize wandb to avoid file conflicts and duplicate runs
+    if not enabled or jax.process_index() != 0:
         wandb.init(mode="disabled")
         return
 
@@ -219,6 +223,7 @@ def value_function_train_step(
     Returns:
         Tuple of (new_state, info_dict).
     """
+    # pdb.set_trace()
     model = nnx.merge(state.model_def, state.params)
 
     if isinstance(config.model, _value_fn.BaseMultiValueFunctionConfig):
@@ -226,10 +231,22 @@ def value_function_train_step(
     else:
         transition = _value_fn.Transition.from_batch(batch)
 
+    # Extract loss_mask if present (True = include, False = mask out)
+    loss_mask = batch.get("loss_mask", None)
+    if loss_mask is not None:
+        loss_mask = jnp.asarray(loss_mask)
+
     def loss_fn(model: _value_fn.BaseValueFunction):
         # compute_loss returns (per_sample_loss, info_dict)
         per_sample_loss, value_info = model.compute_loss(transition, train=True, rng=rng)
-        return jnp.mean(per_sample_loss), value_info
+        if loss_mask is not None:
+            # Masked mean: only average over examples with loss_mask=True
+            masked_loss = per_sample_loss * loss_mask
+            num_valid = jnp.maximum(jnp.sum(loss_mask), 1.0)  # Avoid div by zero
+            mean_loss = jnp.sum(masked_loss) / num_valid
+        else:
+            mean_loss = jnp.mean(per_sample_loss)
+        return mean_loss, value_info
 
     diff_state = nnx.DiffState(0, config.trainable_filter)
     (loss, value_info), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(model)
@@ -308,6 +325,10 @@ def value_function_train_step(
         **value_info,
         **batch_stats,
     }
+    
+    # Add loss mask stats if present
+    if loss_mask is not None:
+        info["batch/loss_mask_valid_fraction"] = jnp.mean(loss_mask.astype(jnp.float32))
     return new_state, info
 
 
@@ -981,9 +1002,233 @@ def _compute_oracle_ranking_metrics(
     return metrics
 
 
+def generate_validation_plots_dlimp(
+    model: _value_fn.BaseValueFunction,
+    val_dataloader,
+    val_episode_indices: list[int],
+    step: int,
+    *,
+    action_conditioned: bool,
+    data_config: _config.DataConfig,
+    cache_dir: str | None = None,
+    save_only: bool = False,
+) -> dict:
+    """Generate validation plots for RoboCOIN using a dlimp dataloader.
+    
+    This function supports caching validation episodes to disk for faster
+    subsequent calls. On first call with save_only=True, it collects episodes
+    from the dataloader and saves them to .npy files. On subsequent calls,
+    it loads from cache instead of from the dataloader.
+    
+    Args:
+        model: The value function model
+        val_dataloader: RoboCOIN dataloader with repeat=False, shuffle=False
+        val_episode_indices: List of episode indices to plot (used for count only)
+        step: Current training step
+        action_conditioned: Whether the model is action-conditioned (Q vs V)
+        data_config: Data configuration
+        cache_dir: Directory to save/load cached validation episodes
+        save_only: If True, only save episodes to disk and return empty dict
+        
+    Returns:
+        Dictionary of wandb images keyed by trajectory index (empty if save_only=True)
+    """
+    import os
+    import pickle
+    
+    num_val_trajectories = len(val_episode_indices)
+    episode_frames: dict[int, list[dict]] = {}
+    
+    # Check if cache exists
+    cache_file = os.path.join(cache_dir, "val_episodes.pkl") if cache_dir else None
+    cache_exists = cache_file and os.path.exists(cache_file)
+    
+    if cache_exists and not save_only:
+        # Load from cache
+        logging.info(f"Loading cached validation episodes from {cache_file}")
+        with open(cache_file, "rb") as f:
+            episode_frames = pickle.load(f)
+        logging.info(f"Loaded {len(episode_frames)} episodes from cache")
+    else:
+        # Collect from dataloader
+        collected_episodes: set[int] = set()
+        logging.info(f"Collecting validation frames for first {num_val_trajectories} episodes encountered")
+        
+        # Iterate through the dataloader
+        for batch in val_dataloader:
+            # Get trajectory indices for this batch
+            traj_indices = batch.get("_traj_index", None)
+            if traj_indices is None:
+                logging.warning("Batch missing _traj_index, cannot identify episodes")
+                continue
+            
+            # Convert JAX arrays to numpy if needed
+            traj_indices = np.asarray(traj_indices)
+            
+            # Check if we should break: we have enough episodes and none of the current
+            # batch's episodes are in our collected set (meaning we've moved past them)
+            unique_batch_episodes = set(int(t) for t in traj_indices)
+            if len(collected_episodes) >= num_val_trajectories:
+                # Check if any current batch episodes are still being collected
+                if not unique_batch_episodes.intersection(collected_episodes):
+                    logging.info(f"Collected {len(collected_episodes)} episodes, breaking early")
+                    break
+            
+            # Process each sample in the batch
+            batch_size = traj_indices.shape[0]
+            for i in range(batch_size):
+                ep_idx = int(traj_indices[i])
+                
+                # If we haven't seen this episode yet, start collecting if we have room
+                if ep_idx not in episode_frames:
+                    if len(collected_episodes) >= num_val_trajectories:
+                        # Already have enough episodes, skip new ones
+                        continue
+                    # Start collecting this new episode
+                    episode_frames[ep_idx] = []
+                    collected_episodes.add(ep_idx)
+                
+                # Skip if this episode is not in our collection set
+                if ep_idx not in collected_episodes:
+                    continue
+                
+                # Extract all frame data for this sample
+                frame = {}
+                for key, value in batch.items():
+                    if key == "_traj_index":
+                        continue  # Already processed
+                    
+                    # Handle nested dicts (e.g., "image", "image_mask")
+                    if isinstance(value, dict):
+                        frame[key] = {}
+                        for sub_key, sub_value in value.items():
+                            if hasattr(sub_value, "device"):
+                                tmp = np.asarray(sub_value[i])
+                            frame[key][sub_key] = tmp
+                    else:
+                        # Convert JAX arrays to numpy
+                        if hasattr(value, "device"):
+                            tmp = np.asarray(value[i])
+                        frame[key] = tmp
+                
+                episode_frames[ep_idx].append(frame)
+        
+        # Sort frames within each episode by frame index
+        # pdb.set_trace()
+        for ep_idx in episode_frames:
+            if episode_frames[ep_idx] and "_frame_index" in episode_frames[ep_idx][0]:
+                episode_frames[ep_idx].sort(key=lambda f: f["_frame_index"])
+        
+        logging.info(f"Collected frames per episode: {[(ep, len(frames)) for ep, frames in episode_frames.items()]}")
+        
+        # Save to cache if cache_dir is specified
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            logging.info(f"Saving {len(episode_frames)} validation episodes to {cache_file}")
+            with open(cache_file, "wb") as f:
+                pickle.dump(episode_frames, f)
+            logging.info(f"Saved validation episodes to cache")
+    
+    # If save_only mode, return early without generating plots
+    if save_only:
+        return {}
+    
+    # Generate plots for each episode
+    images = {}
+    
+    # Iterate over collected episodes (dynamically discovered with shuffle=True)
+    for ep_idx, frames in episode_frames.items():
+        if len(frames) == 0:
+            logging.warning(f"No frames collected for episode {ep_idx}")
+            continue
+        
+        # Extract MC returns
+        mc_returns = [f["mc_return"] for f in frames if "mc_return" in f]
+        if len(mc_returns) == 0:
+            logging.warning(f"No mc_return values for episode {ep_idx}")
+            continue
+        
+        # Compute predicted values (data is already normalized by dataloader)
+        predicted_values = []
+        for frame in frames:
+            if "mc_return" not in frame:
+                continue
+            
+            state = frame.get("state")
+            if state is None:
+                continue
+            
+            # Build observation for model
+            obs_state = jnp.asarray(state[None, ...])  # [1, state_dim]
+            
+            # Handle images if available
+            images_dict = {}
+            image_masks_dict = {}
+            if "image" in frame:
+                for cam_key, img in frame["image"].items():
+                    if hasattr(img, "device"):
+                        img = np.asarray(img)
+                    # Convert uint8 [0, 255] to float32 [-1, 1] (matches Observation.from_dict)
+                    if img.dtype == np.uint8:
+                        img = img.astype(np.float32) / 127.5 - 1.0
+                    images_dict[cam_key] = img[None, ...]  # [1, H, W, C]
+                    image_masks_dict[cam_key] = np.ones((1,), dtype=np.bool_)
+            
+            # Handle tokenized prompt
+            tokenized_prompt = None
+            tokenized_prompt_mask = None
+            if "tokenized_prompt" in frame:
+                tp = frame["tokenized_prompt"]
+                if hasattr(tp, "device"):
+                    tp = np.asarray(tp)
+                tokenized_prompt = jnp.asarray(tp[None, ...])
+            if "tokenized_prompt_mask" in frame:
+                tpm = frame["tokenized_prompt_mask"]
+                if hasattr(tpm, "device"):
+                    tpm = np.asarray(tpm)
+                tokenized_prompt_mask = jnp.asarray(tpm[None, ...])
+            
+            obs = _model.Observation(
+                images=images_dict if images_dict else {},
+                image_masks=image_masks_dict if image_masks_dict else {},
+                state=obs_state,
+                tokenized_prompt=tokenized_prompt,
+                tokenized_prompt_mask=tokenized_prompt_mask,
+            )
+            
+            # Action for Q(s, a) if action-conditioned
+            act = None
+            if action_conditioned and "actions" in frame:
+                action = frame["actions"]
+                if hasattr(action, "device"):
+                    action = np.asarray(action)
+                act = jnp.asarray(action[None, ...])
+            
+            pred_value = model.compute_value(obs, act, take_min_over_ensemble=True)
+            predicted_values.append(float(jax.device_get(pred_value[0])))
+        
+        if len(predicted_values) == 0:
+            continue
+        
+        # Create plot
+        images[f"val/episode_{ep_idx}"] = _create_value_plot(
+            mc_returns, predicted_values, ep_idx, step, " (RoboCOIN)", oracle_values=None
+        )
+    
+    return images
+
+
 def main(config: _config.TrainConfig):
+    """Train a value function."""
+    # Initialize distributed training for TPU pods
+    # Set PLATFORM=tpu environment variable to enable
+    platform = os.environ.get("PLATFORM", "gpu")
+    if platform == "tpu":
+        jax.distributed.initialize()
+        logging.info(f"Initialized JAX distributed: process {jax.process_index()} of {jax.process_count()}")
+    
     init_logging()
-    logging.info(f"Running on: {platform.node()}")
+    logging.info(f"Running on: {_platform.node()}, platform: {platform}")
 
     if not isinstance(config.model, _value_fn.BaseValueFunctionConfig):
         raise TypeError(
@@ -1051,6 +1296,10 @@ def main(config: _config.TrainConfig):
     # Select fixed validation trajectories for plotting
     # Create validation dataset - use NumpyDataset for minari/legacy D4RL, LeRobotDataset otherwise
     data_config = config.data.create(config.assets_dirs, config.model)
+    # Initialize variables for all branches
+    num_episodes = None
+    val_dataloader = None
+    
     if data_config.minari_dataset_id is not None:
         val_dataset = _data_loader.create_numpy_dataset_from_minari(
             data_config.minari_dataset_id,
@@ -1058,6 +1307,7 @@ def main(config: _config.TrainConfig):
             reward_scale=data_config.reward_scale,
             reward_bias=data_config.reward_bias,
         )
+        val_dataloader = None
     elif data_config.legacy_d4rl_env_name is not None:
         val_dataset = _data_loader.create_numpy_dataset_from_legacy_d4rl(
             data_config.legacy_d4rl_env_name,
@@ -1065,12 +1315,43 @@ def main(config: _config.TrainConfig):
             reward_scale=data_config.reward_scale,
             reward_bias=data_config.reward_bias,
         )
+        val_dataloader = None
+    elif data_config.robocoin_data_config is not None:
+        # RoboCOIN: get num_episodes from TFDS builder metadata
+        import tensorflow_datasets as tfds
+        
+        robocoin_config = data_config.robocoin_data_config
+        builder = tfds.builder(robocoin_config.dataset_name, data_dir=robocoin_config.data_dir)
+        num_episodes = builder.info.splits["val"].num_examples
+        logging.info(f"RoboCOIN: {num_episodes} episodes in validation set")
+        
+        # Create validation dataloader with repeat=False and shuffle=False
+        # Use same config as training but with validation-specific settings
+        val_loader_config = RoboCOINDataLoaderConfig(
+            data_dir=robocoin_config.data_dir,
+            dataset_name=robocoin_config.dataset_name,
+            split="val",  # Use val split for validation (same data, different ordering)
+            batch_size=256, 
+            shuffle=False,  # Preserve episode order
+            repeat=False,  # Iterate once through the dataset
+            max_cameras=robocoin_config.max_cameras,
+            max_state_dim=robocoin_config.max_state_dim,
+            max_action_dim=robocoin_config.max_action_dim,
+            image_size=robocoin_config.image_size,
+            discount=robocoin_config.discount,
+            td_n=robocoin_config.td_n,
+            state_norm_stats=data_config.norm_stats,
+            use_quantile_norm=data_config.use_quantile_norm,
+        )
+        val_dataloader = create_robocoin_data_loader(val_loader_config)
+        val_dataset = None  # Not used for RoboCOIN
     else:
         from lerobot.common.datasets import lerobot_dataset
 
         val_dataset = lerobot_dataset.LeRobotDataset(config.data.repo_id)
+        val_dataloader = None  # Not used for non-RoboCOIN
 
-    num_episodes = val_dataset.num_episodes
+    num_episodes = val_dataset.num_episodes if val_dataset is not None else num_episodes
     val_rng = np.random.default_rng(config.seed)
 
     # Filter to episodes with at least 10 frames for meaningful validation plots
@@ -1093,6 +1374,28 @@ def main(config: _config.TrainConfig):
             num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
         ).tolist()
     logging.info(f"Selected validation episodes: {val_episode_indices}")
+    
+    # Cache validation episodes to disk for RoboCOIN (only on worker 0)
+    # This avoids needing to re-create the dataloader on each plot generation
+    val_episodes_cache_dir = None
+    if data_config.robocoin_data_config is not None and val_dataloader is not None:
+        val_episodes_cache_dir = str(config.checkpoint_dir / "val_episodes")
+        if jax.process_index() == 0:
+            logging.info(f"Collecting and caching validation episodes to {val_episodes_cache_dir}")
+            generate_validation_plots_dlimp(
+                model=None,  # Not needed for save_only
+                val_dataloader=val_dataloader,
+                val_episode_indices=val_episode_indices,
+                step=0,
+                action_conditioned=False,  # Not used for save_only
+                data_config=data_config,
+                cache_dir=val_episodes_cache_dir,
+                save_only=True,
+            )
+            logging.info("Validation episodes cached successfully")
+        val_dataloader.stop()  # Clean up the dataloader
+        val_dataloader = None  # Mark as consumed
+    
     # Detect action_conditioned: check network_config (for MC/SARSA) or q_network_config (for IQL)
     # For ensemble configs, check base_config for the actual network settings
     network_config = getattr(config.model, "network_config", None) or getattr(config.model, "q_network_config", None)
@@ -1223,27 +1526,40 @@ def main(config: _config.TrainConfig):
                 state_to_save = training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
                 _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step)
 
-        # Generate validation plots
-        if step % config.plot_interval == 0 and step > 0:
+        # Generate validation plots (only on worker 0)
+        if step % config.plot_interval == 0 and step > 0 and jax.process_index() == 0:
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
-                plot_images = generate_validation_plots(
-                    model=model,
-                    dataset=val_dataset,
-                    val_episode_indices=val_episode_indices,
-                    step=step,
-                    action_conditioned=action_conditioned,
-                    data_config=data_config,
-                )
+                # Use dlimp-based validation for RoboCOIN, standard for others
+                if data_config.robocoin_data_config is not None:
+                    # Load validation episodes from cache (created during initialization)
+                    plot_images = generate_validation_plots_dlimp(
+                        model=model,
+                        val_dataloader=None,  # Not needed - load from cache
+                        val_episode_indices=val_episode_indices,
+                        step=step,
+                        action_conditioned=action_conditioned,
+                        data_config=data_config,
+                        cache_dir=val_episodes_cache_dir,
+                    )
+                else:
+                    plot_images = generate_validation_plots(
+                        model=model,
+                        dataset=val_dataset,
+                        val_episode_indices=val_episode_indices,
+                        step=step,
+                        action_conditioned=action_conditioned,
+                        data_config=data_config,
+                    )
                 if plot_images:
                     logging.info(f"Generated {len(plot_images)} validation plot items at step {step}")
                     wandb.log(plot_images, step=step)
                 else:
                     logging.warning(f"No validation plots generated at step {step}")
 
-        # Policy evaluation
-        if eval_enabled and step % config.eval_interval == 0 and step > 0:
+        # Policy evaluation (only on worker 0)
+        if eval_enabled and step % config.eval_interval == 0 and step > 0 and jax.process_index() == 0:
             with timer.context("policy_eval"):
                 policy_model = nnx.merge(policy_state.model_def, policy_state.params)
 

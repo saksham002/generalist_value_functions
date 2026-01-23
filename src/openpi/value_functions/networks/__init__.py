@@ -5,6 +5,8 @@ from openpi.value_functions.networks.mlp import MLPNetwork
 from openpi.value_functions.networks.mlp import MLPNetworkConfig
 from openpi.value_functions.networks.mlp import MultiMLPNetwork
 from openpi.value_functions.networks.mlp import MultiMLPNetworkConfig
+from openpi.value_functions.networks.paligemma import PaliGemmaNetworkConfig
+from openpi.value_functions.networks.paligemma import PaliGemmaValueNetwork
 
 __all__ = [
     "BaseValueNetwork",
@@ -12,4 +14,6 @@ __all__ = [
     "MLPNetworkConfig",
     "MultiMLPNetwork",
     "MultiMLPNetworkConfig",
+    "PaliGemmaNetworkConfig",
+    "PaliGemmaValueNetwork",
 ]

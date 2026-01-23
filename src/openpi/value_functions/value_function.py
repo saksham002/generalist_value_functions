@@ -32,6 +32,7 @@ from openpi.value_functions.networks.ensemble import EnsembleMultiNetworkConfig
 from openpi.value_functions.networks.ensemble import EnsembleNetworkConfig
 from openpi.value_functions.networks.mlp import MLPNetworkConfig
 from openpi.value_functions.networks.mlp import MultiMLPNetworkConfig
+from openpi.value_functions.networks.paligemma import PaliGemmaNetworkConfig
 
 # =============================================================================
 # Single-Transition Value Functions
@@ -46,7 +47,7 @@ class ValueFunctionConfig(BaseValueFunctionConfig):
     the objective and any objective-specific parameters.
     """
 
-    network_config: MLPNetworkConfig
+    network_config: MLPNetworkConfig | PaliGemmaNetworkConfig
     head_config: HeadConfig
 
     @override
@@ -252,7 +253,7 @@ class MCValueFunction(ValueFunction):
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
-        return _objectives.mc_objective(self.network, self.head, transition)
+        return _objectives.mc_objective(self.network, self.head, transition, rng=rng)
 
 
 class SARSAValueFunction(ValueFunction):
@@ -286,7 +287,7 @@ class SARSAValueFunction(ValueFunction):
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
-        del train, rng
+        del train
         return _objectives.sarsa_objective(
             self.network,
             self.head,
@@ -294,6 +295,7 @@ class SARSAValueFunction(ValueFunction):
             self.target_network,
             self.target_head,
             discount=self.discount,
+            rng=rng,
         )
 
     @override
@@ -674,7 +676,7 @@ class MultiMCValueFunction(MultiValueFunction):
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
     ) -> tuple[at.Float[at.Array, "*b n"], dict[str, at.Array]]:
-        return _objectives.mc_objective(self.network, self.head, transition)
+        return _objectives.mc_objective(self.network, self.head, transition, rng=rng)
 
 
 class MultiSARSAValueFunction(MultiValueFunction):
@@ -708,7 +710,7 @@ class MultiSARSAValueFunction(MultiValueFunction):
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
     ) -> tuple[at.Float[at.Array, "*b n"], dict[str, at.Array]]:
-        del train, rng
+        del train
         return _objectives.sarsa_objective(
             self.network,
             self.head,
@@ -716,6 +718,7 @@ class MultiSARSAValueFunction(MultiValueFunction):
             self.target_network,
             self.target_head,
             discount=self.discount,
+            rng=rng,
         )
 
     @override

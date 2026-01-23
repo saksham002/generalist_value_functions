@@ -49,22 +49,25 @@ class Transition:
         - action, next_action: Actions
         - reward, mc_return: Reward signals
         - termination, truncation: Episode boundary flags
+        - tokenized_prompt, tokenized_prompt_mask: Optional text prompts
         """
-        # Build Observation from batch - supports state-only for now
-        observation = _model.Observation(
-            images={},
-            image_masks={},
-            state=jnp.asarray(batch["state"]),
-            tokenized_prompt=None,
-            tokenized_prompt_mask=None,
-        )
-        next_observation = _model.Observation(
-            images={},
-            image_masks={},
-            state=jnp.asarray(batch["next_state"]),
-            tokenized_prompt=None,
-            tokenized_prompt_mask=None,
-        )
+        # Use Observation.from_dict() for standard nested dict format
+        observation = _model.Observation.from_dict(batch)
+
+        # Build next_observation from next_* keys
+        next_batch = {
+            "image": batch.get("next_image", {}),
+            "image_mask": batch.get("next_image_mask", {}),
+            "state": batch["next_state"],
+        }
+        # Use same prompt for next observation (task doesn't change within episode)
+        if "tokenized_prompt" in batch:
+            next_batch["tokenized_prompt"] = batch.get("next_tokenized_prompt", batch["tokenized_prompt"])
+        if "tokenized_prompt_mask" in batch:
+            next_batch["tokenized_prompt_mask"] = batch.get("next_tokenized_prompt_mask", batch["tokenized_prompt_mask"])
+
+        next_observation = _model.Observation.from_dict(next_batch)
+
         return cls(
             observation=observation,
             action=jnp.asarray(batch["actions"]),
@@ -99,21 +102,29 @@ class MultiTransition:
         """Create a MultiTransition from a batch dictionary.
 
         Expects batch arrays to have shape [batch, num_transitions_per_sample, ...].
+        Uses the standard nested dict format from model.py:
+        - image: nested dict of camera_key -> image array [batch, n, H, W, C]
+        - image_mask: nested dict of camera_key -> mask [batch, n]
+        - state: [batch, n, state_dim]
+        - tokenized_prompt, tokenized_prompt_mask: Text prompts [batch, L] (shared across n)
         """
-        observation = _model.Observation(
-            images={},
-            image_masks={},
-            state=jnp.asarray(batch["state"]),
-            tokenized_prompt=None,
-            tokenized_prompt_mask=None,
-        )
-        next_observation = _model.Observation(
-            images={},
-            image_masks={},
-            state=jnp.asarray(batch["next_state"]),
-            tokenized_prompt=None,
-            tokenized_prompt_mask=None,
-        )
+        # Use Observation.from_dict() for standard nested dict format
+        observation = _model.Observation.from_dict(batch)
+
+        # Build next_observation from next_* keys
+        next_batch = {
+            "image": batch.get("next_image", {}),
+            "image_mask": batch.get("next_image_mask", {}),
+            "state": batch["next_state"],
+        }
+        # Use same prompt for next observation (task doesn't change within episode)
+        if "tokenized_prompt" in batch:
+            next_batch["tokenized_prompt"] = batch.get("next_tokenized_prompt", batch["tokenized_prompt"])
+        if "tokenized_prompt_mask" in batch:
+            next_batch["tokenized_prompt_mask"] = batch.get("next_tokenized_prompt_mask", batch["tokenized_prompt_mask"])
+
+        next_observation = _model.Observation.from_dict(next_batch)
+
         return cls(
             observation=observation,
             action=jnp.asarray(batch["actions"]),

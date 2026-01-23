@@ -107,9 +107,75 @@ class CategoricalHead(nnx.Module):
         return _hl_gauss.logits_to_expected_value(logits, self.v_min, self.v_max)
 
 
+@dataclasses.dataclass(frozen=True)
+class CrossEntropyHeadConfig:
+    """Configuration for cross-entropy classification output head.
+    
+    Discretizes the target value range [v_min, v_max] into num_bins bins and 
+    uses standard cross-entropy loss with hard bin assignments (no Gaussian smoothing).
+    """
+
+    v_min: float = 0.0
+    v_max: float = 1.0
+    num_bins: int = 51
+    orthogonal_init_scale: float | None = None
+
+    def create(self, feature_dim: int, rng: at.KeyArrayLike) -> "CrossEntropyHead":
+        return CrossEntropyHead(
+            feature_dim,
+            self.v_min,
+            self.v_max,
+            self.num_bins,
+            self.orthogonal_init_scale,
+            rngs=nnx.Rngs(rng),
+        )
+
+
+class CrossEntropyHead(nnx.Module):
+    """Cross-entropy classification head with hard bin discretization.
+
+    Discretizes target values into bins and uses standard cross-entropy loss.
+    Unlike CategoricalHead (HL-Gauss), this uses hard one-hot targets.
+    """
+
+    v_min: float
+    v_max: float
+    num_bins: int
+
+    def __init__(
+        self,
+        feature_dim: int,
+        v_min: float,
+        v_max: float,
+        num_bins: int,
+        orthogonal_init_scale: float | None = None,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        super().__init__()
+        self.v_min = v_min
+        self.v_max = v_max
+        self.num_bins = num_bins
+
+        if orthogonal_init_scale is not None:
+            kernel_init = nnx.initializers.orthogonal(scale=orthogonal_init_scale)
+            self.linear = nnx.Linear(feature_dim, num_bins, kernel_init=kernel_init, rngs=rngs)
+        else:
+            self.linear = nnx.Linear(feature_dim, num_bins, rngs=rngs)
+
+    def compute_logits(self, features: at.Float[at.Array, "*b feature_dim"]) -> at.Float[at.Array, "*b num_bins"]:
+        """Compute raw logits over bins."""
+        return self.linear(features)
+
+    def __call__(self, features: at.Float[at.Array, "*b feature_dim"]) -> at.Float[at.Array, "*b"]:
+        """Compute expected value from features (same as CategoricalHead)."""
+        logits = self.compute_logits(features)
+        return _hl_gauss.logits_to_expected_value(logits, self.v_min, self.v_max)
+
+
 # Type alias for value heads
-ValueHead = RegressionHead | CategoricalHead
-HeadConfig = RegressionHeadConfig | CategoricalHeadConfig
+ValueHead = RegressionHead | CategoricalHead | CrossEntropyHead
+HeadConfig = RegressionHeadConfig | CategoricalHeadConfig | CrossEntropyHeadConfig
 
 
 # =============================================================================

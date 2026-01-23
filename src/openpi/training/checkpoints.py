@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -20,22 +21,43 @@ import openpi.training.utils as training_utils
 def initialize_checkpoint_dir(
     checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
 ) -> tuple[ocp.CheckpointManager, bool]:
-    checkpoint_dir = epath.Path(checkpoint_dir).resolve()
+    checkpoint_dir = epath.Path(checkpoint_dir)
+    # Only resolve local paths - GCS paths (gs://) should not be resolved
+    if "gs://" not in str(checkpoint_dir):
+        checkpoint_dir = checkpoint_dir.resolve()
+    
     resuming = False
-    if checkpoint_dir.exists():
-        if overwrite:
-            checkpoint_dir.rmtree()
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
-        elif resume:
-            resuming = True
+    
+    # Only worker 0 should perform directory operations to avoid races
+    if jax.process_index() == 0:
+        if checkpoint_dir.exists():
+            if overwrite:
+                checkpoint_dir.rmtree()
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
+            elif resume:
+                resuming = True
+            else:
+                raise FileExistsError(
+                    f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
+                    "to indicate how to handle it."
+                )
         else:
-            raise FileExistsError(
-                f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
-                "to indicate how to handle it."
-            )
-
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Synchronize all workers - wait for worker 0 to complete directory setup
+    # This is a lightweight barrier using JAX's collective operations
+    sync_array = jax.numpy.ones(())
+    sync_array = jax.pmap(lambda x: jax.lax.psum(x, "i"), axis_name="i")(
+        jax.numpy.ones(jax.local_device_count())
+    )
+    sync_array.block_until_ready()
+    
+    # After sync, check if we're resuming (worker 0's decision needs to be broadcast)
+    # For now, all workers re-check the directory state
+    if jax.process_index() != 0:
+        if checkpoint_dir.exists() and resume:
+            resuming = True
 
     mngr = ocp.CheckpointManager(
         checkpoint_dir,

@@ -131,3 +131,68 @@ def logits_to_expected_value(
     # Expected value: sum(probs * bin_centers)
     # bin_centers [num_bins] broadcasts with [*batch, num_bins]
     return jnp.sum(probs * bin_centers, axis=-1)  # [*batch]
+
+
+def value_to_bin_index(
+    target_values: at.Float[at.Array, "*b"],
+    v_min: float,
+    v_max: float,
+    num_bins: int,
+) -> at.Int[at.Array, "*b"]:
+    """Convert scalar values to bin indices (hard discretization).
+
+    Args:
+        target_values: Target values of shape [*batch].
+        v_min: Minimum value of the support.
+        v_max: Maximum value of the support.
+        num_bins: Number of bins.
+
+    Returns:
+        Bin indices of shape [*batch] in [0, num_bins-1].
+    """
+    # Clip target values to the support range
+    target_values = jnp.clip(target_values, v_min, v_max)
+    
+    # Compute bin index: (value - v_min) / (v_max - v_min) * (num_bins - 1)
+    # This maps v_min -> 0 and v_max -> num_bins-1
+    normalized = (target_values - v_min) / (v_max - v_min + 1e-8)
+    bin_indices = jnp.round(normalized * (num_bins - 1)).astype(jnp.int32)
+    
+    # Clamp to valid range
+    return jnp.clip(bin_indices, 0, num_bins - 1)
+
+
+def hard_cross_entropy_loss(
+    logits: at.Float[at.Array, "*b num_bins"],
+    target_values: at.Float[at.Array, "*b"],
+    v_min: float,
+    v_max: float,
+) -> at.Float[at.Array, "*b"]:
+    """Compute standard cross-entropy loss with hard bin discretization.
+
+    Unlike HL-Gauss, this uses hard one-hot targets (no Gaussian smoothing).
+    The target value is discretized to the nearest bin and cross-entropy is
+    computed against that single bin.
+
+    Args:
+        logits: Predicted logits of shape [*batch, num_bins].
+        target_values: Target values of shape [*batch].
+        v_min: Minimum value of the support.
+        v_max: Maximum value of the support.
+
+    Returns:
+        Per-sample cross-entropy loss of shape [*batch].
+    """
+    num_bins = logits.shape[-1]
+    
+    # Get the target bin index
+    target_bins = value_to_bin_index(target_values, v_min, v_max, num_bins)
+    
+    # Compute log softmax
+    log_probs = jax.nn.log_softmax(logits, axis=-1)  # [*batch, num_bins]
+    
+    # One-hot encode the target bins
+    one_hot_targets = jax.nn.one_hot(target_bins, num_bins)  # [*batch, num_bins]
+    
+    # Cross-entropy: -sum(one_hot * log_probs) = -log_probs[target_bin]
+    return -jnp.sum(one_hot_targets * log_probs, axis=-1)  # [*batch]

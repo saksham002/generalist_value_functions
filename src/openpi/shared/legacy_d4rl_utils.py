@@ -333,3 +333,17 @@ def make_legacy_d4rl_env(
     env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
     env = gym.wrappers.RecordEpisodeStatistics(env, deque_size=1)
     return GymnasiumBridgeWrapper(env, render_mode=render_mode)
+
+    Returns:
+        A wrapped gymnasium environment ready for evaluation.
+    """
+    if gym is None:
+        raise ImportError("gym is required for legacy D4RL but is not installed. Install with: pip install gym==0.23.1")
+    try:
+        env = gym.make(env_name, seed=seed)
+    except TypeError:
+        env = gym.make(env_name)
+
+    env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
+    env = gym.wrappers.RecordEpisodeStatistics(env, deque_size=1)
+    return GymnasiumBridgeWrapper(env, render_mode=render_mode)

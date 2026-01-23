@@ -16,6 +16,7 @@ from openpi.value_functions import hl_gauss as _hl_gauss
 from openpi.value_functions.base_value_functions import MultiTransition
 from openpi.value_functions.base_value_functions import Transition
 from openpi.value_functions.heads import CategoricalHead
+from openpi.value_functions.heads import CrossEntropyHead
 from openpi.value_functions.heads import EnsembleHead
 from openpi.value_functions.heads import ValueHead
 from openpi.value_functions.networks.base_networks import BaseValueNetwork
@@ -29,7 +30,7 @@ def _compute_value_loss(head: ValueHead, features: at.Array, target: at.Array) -
     Also supports EnsembleHead with features [ensemble, batch, feature_dim].
 
     Args:
-        head: Value head (RegressionHead, CategoricalHead, or EnsembleHead).
+        head: Value head (RegressionHead, CategoricalHead, CrossEntropyHead, or EnsembleHead).
         features: Network features.
         target: Target values.
 
@@ -44,6 +45,9 @@ def _compute_value_loss(head: ValueHead, features: at.Array, target: at.Array) -
             if isinstance(h, CategoricalHead):
                 logits = h.compute_logits(feats)
                 return _hl_gauss.hl_gauss_loss(logits, tgt, h.v_min, h.v_max, h.sigma)
+            if isinstance(h, CrossEntropyHead):
+                logits = h.compute_logits(feats)
+                return _hl_gauss.hard_cross_entropy_loss(logits, tgt, h.v_min, h.v_max)
             return jnp.square(h(feats) - tgt)
 
         all_losses = compute_single_loss(head.vectorized_head, features, target)
@@ -52,6 +56,9 @@ def _compute_value_loss(head: ValueHead, features: at.Array, target: at.Array) -
     if isinstance(head, CategoricalHead):
         logits = head.compute_logits(features)
         return _hl_gauss.hl_gauss_loss(logits, target, head.v_min, head.v_max, head.sigma)
+    if isinstance(head, CrossEntropyHead):
+        logits = head.compute_logits(features)
+        return _hl_gauss.hard_cross_entropy_loss(logits, target, head.v_min, head.v_max)
     return jnp.square(head(features) - target)
 
 
@@ -59,6 +66,8 @@ def mc_objective(
     network: BaseValueNetwork,
     head: ValueHead,
     transition: Transition | MultiTransition,
+    *,
+    rng: at.KeyArrayLike | None = None,
 ) -> tuple[at.Array, dict[str, at.Array]]:
     """Monte-Carlo regression: target = mc_return.
 
@@ -68,12 +77,13 @@ def mc_objective(
         network: Value network for feature extraction.
         head: Value head for value prediction.
         transition: Transition or MultiTransition.
+        rng: Optional random key for stochastic operations (e.g., image augmentation).
 
     Returns:
         Tuple of (per_sample_loss, info_dict).
     """
     action = transition.action if network.action_conditioned else None
-    features = network.compute_features(transition.observation, action)
+    features = network.compute_features(transition.observation, action, rng=rng)
     loss = _compute_value_loss(head, features, transition.mc_return)
 
     pred = head(features)
@@ -98,6 +108,7 @@ def sarsa_objective(
     target_head: ValueHead,
     *,
     discount: float = 0.99,
+    rng: at.KeyArrayLike | None = None,
 ) -> tuple[at.Array, dict[str, at.Array]]:
     """SARSA: target = r + gamma * Q(s', a').
 
@@ -110,10 +121,12 @@ def sarsa_objective(
         target_network: Target network for stable target computation.
         target_head: Target head.
         discount: Discount factor gamma.
+        rng: Optional random key for stochastic operations (e.g., image augmentation).
 
     Returns:
         Tuple of (per_sample_loss, info_dict).
     """
+    # Target network doesn't need augmentation (no gradient flow)
     target_features = target_network.compute_features(transition.next_observation, transition.next_action)
     target_value = target_head(target_features)
 
@@ -122,7 +135,7 @@ def sarsa_objective(
     target = jax.lax.stop_gradient(target)
 
     action = transition.action if network.action_conditioned else None
-    features = network.compute_features(transition.observation, action)
+    features = network.compute_features(transition.observation, action, rng=rng)
     loss = _compute_value_loss(head, features, target)
 
     pred = head(features)

@@ -25,7 +25,10 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 from openpi.policy_extraction import objectives as _policy_extraction
 import openpi.shared.download as _download
-import openpi.shared.legacy_d4rl_utils as legacy_d4rl_utils
+try:
+    import openpi.shared.legacy_d4rl_utils as legacy_d4rl_utils
+except Exception:
+    legacy_d4rl_utils = None  # type: ignore
 import openpi.shared.minari_utils as minari_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -38,6 +41,7 @@ import openpi.value_functions.base_value_functions as _value_functions_base
 import openpi.value_functions.heads as _heads
 import openpi.value_functions.networks.ensemble as _ensemble_network
 import openpi.value_functions.networks.mlp as _mlp_network
+import openpi.value_functions.networks.paligemma as _paligemma_network
 import openpi.value_functions.value_function as _value_function
 import openpi.value_functions.value_transforms as _value_transforms
 
@@ -138,6 +142,10 @@ class DataConfig:
 
     # Keys to skip during normalization/unnormalization
     skip_normalize_keys: tuple[str, ...] = ()
+
+    # RoboCOIN-specific data loader config (if set, uses DLIMP-based loader)
+    # This is set by RoboCOINDataConfig.create() and detected by create_data_loader()
+    robocoin_data_config: Any | None = None
 
 
 class GroupFactory(Protocol):
@@ -769,6 +777,203 @@ class MultiTransitionLegacyD4RLDataConfig(LegacyD4RLDataConfig):
 
 
 @dataclasses.dataclass(frozen=True)
+class RoboCOINDataConfig(DataConfigFactory):
+    """Data config for RoboCOIN TFDS dataset with images, text, and state.
+
+    This config enables DLIMP-based data loading for the RoboCOIN dataset,
+    which contains robot manipulation trajectories with:
+    - Camera images (up to 3 views)
+    - Proprioceptive state
+    - Task descriptions (text prompts)
+    - Actions
+    - Rewards
+
+    Uses the custom DLIMP data loader for efficient image-heavy data loading.
+    
+    Normalization:
+    - use_quantile_norm=False: z-score using mean/std keys from norm_stats.json
+    - use_quantile_norm=True: min-max using min/max keys from norm_stats.json
+    """
+
+    # Path to TFDS data directory
+    tfds_data_dir: str = "/data/group_data/rl/saksham3/"
+    # Dataset name and version
+    dataset_name: str = "robocoin:1.0.0"
+    # Maximum number of camera views
+    max_cameras: int = 3
+    # Target image size (H, W)
+    image_size: tuple[int, int] = (224, 224)
+    # Maximum state dimension (for padding)
+    max_state_dim: int = 118
+    # Maximum action dimension (for padding)
+    max_action_dim: int = 54
+    # Discount factor for MC return computation
+    discount: float = 0.99
+    # Reward transformation: r' = reward_scale * r + reward_bias
+    reward_scale: float = 1.0
+    reward_bias: float = 0.0
+    # Shuffle buffer size for frame-level shuffling
+    shuffle_buffer_size: int = 250000
+    # TD-n parameter for temporal difference learning
+    # - None: MC (Monte Carlo) learning - uses full episode return
+    # - int: TD-n learning - bootstraps with value at t + td_n
+    td_n: int | None = None
+
+    # Path to norm_stats.json file (RoboCOIN-specific format)
+    # Expected format: {"observation.state": {"mean": [...], "std": [...], "min": [...], "max": [...]}}
+    # Supports both local paths and GCS paths (gs://...)
+    norm_stats_path: str | None = "gs://saksham-euw4/robocoin/norm_stats/norm_stats.json"
+    
+    # Normalization method:
+    # - False: z-score normalization using mean/std keys
+    # - True: min-max normalization using min/max keys (mapped to q01/q99 for quantile transform)
+    use_quantile_norm: bool = False
+
+    # Override repo_id from parent - not used for RoboCOIN
+    repo_id: str = "robocoin"
+
+    def _load_robocoin_norm_stats(self) -> dict[str, _transforms.NormStats] | None:
+        """Load normalization stats from RoboCOIN-specific JSON format.
+        
+        The JSON format uses nested keys like "observation.state" with:
+        - mean, std: for z-score normalization (use_quantile_norm=False)
+        - min, max: for min-max normalization (use_quantile_norm=True)
+        
+        Maps to NormStats:
+        - mean/std -> mean/std (z-score)
+        - min/max -> q01/q99 (quantile transform does min-max)
+        
+        Supports both local paths and GCS paths (gs://...).
+        
+        Raises:
+            FileNotFoundError: If norm_stats_path is set but file doesn't exist.
+            ValueError: If required keys are missing from the JSON.
+        """
+        if self.norm_stats_path is None:
+            return None
+        
+        import json
+        import numpy as np
+        
+        path_str = self.norm_stats_path
+        
+        # Use tf.io.gfile for GCS paths, standard file I/O otherwise
+        if path_str.startswith("gs://"):
+            import tensorflow as tf
+            
+            if not tf.io.gfile.exists(path_str):
+                raise FileNotFoundError(
+                    f"RoboCOIN norm_stats file not found at GCS path: {path_str}\n"
+                    f"Please upload the norm_stats.json file or set norm_stats_path=None to skip normalization."
+                )
+            
+            with tf.io.gfile.GFile(path_str, 'r') as f:
+                data = json.load(f)
+        else:
+            path = pathlib.Path(path_str)
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"RoboCOIN norm_stats file not found at: {path}\n"
+                    f"Please create the norm_stats.json file or set norm_stats_path=None to skip normalization."
+                )
+            
+            with open(path) as f:
+                data = json.load(f)
+        
+        norm_stats = {}
+        
+        # Map "observation.state" -> "state" for the Normalize transform
+        if "observation.state" in data:
+            state_stats = data["observation.state"]
+            
+            if self.use_quantile_norm:
+                # Min-max normalization: use min/max mapped to q01/q99
+                if "min" not in state_stats or "max" not in state_stats:
+                    raise ValueError(
+                        f"use_quantile_norm=True requires 'min' and 'max' keys in norm_stats, "
+                        f"but found: {list(state_stats.keys())}"
+                    )
+                norm_stats["state"] = _transforms.NormStats(
+                    mean=None,  # Not used for quantile
+                    std=None,    # Not used for quantile
+                    q01=np.array(state_stats["min"]),
+                    q99=np.array(state_stats["max"]),
+                )
+            else:
+                # Z-score normalization: use mean/std
+                if "mean" not in state_stats or "std" not in state_stats:
+                    raise ValueError(
+                        f"use_quantile_norm=False requires 'mean' and 'std' keys in norm_stats, "
+                        f"but found: {list(state_stats.keys())}"
+                    )
+                norm_stats["state"] = _transforms.NormStats(
+                    mean=np.array(state_stats["mean"]),
+                    std=np.array(state_stats["std"]),
+                    q01=None,
+                    q99=None,
+                )
+        else:
+            raise ValueError(f"use_quantile_norm={self.use_quantile_norm} requires 'observation.state' key in norm_stats, but found: {list(data.keys())}")
+        
+        logging.info(f"Loaded RoboCOIN norm_stats from {path_str}, keys: {list(norm_stats.keys())}")
+        return norm_stats if norm_stats else None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Value function transforms for RL training
+        data_transforms = _transforms.Group(
+            inputs=[_value_transforms.ValueFunctionInputs()],
+            outputs=[],
+        )
+        model_transforms = _transforms.Group(inputs=[], outputs=[])
+
+        # Use dataset name as asset_id
+        asset_id = self.dataset_name.replace(":", "_").replace("/", "_")
+        
+        # Load RoboCOIN-specific norm stats
+        norm_stats = self._load_robocoin_norm_stats()
+
+        # Create the RoboCOIN data loader config
+        robocoin_loader_config = self.get_data_loader_config()
+
+        # Store RoboCOIN-specific config in a way the data loader can access
+        # The training script will detect robocoin_data_config and use the custom loader
+        return DataConfig(
+            repo_id=None,  # Not using LeRobot
+            asset_id=asset_id,
+            norm_stats=norm_stats,
+            repack_transforms=_transforms.Group(inputs=[]),
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            use_quantile_norm=self.use_quantile_norm,
+            rl_mode=True,
+            discount=self.discount,
+            reward_scale=self.reward_scale,
+            reward_bias=self.reward_bias,
+            # Store RoboCOIN loader config for detection by create_data_loader
+            robocoin_data_config=robocoin_loader_config,
+        )
+
+    def get_data_loader_config(self):
+        """Return the RoboCOINDataLoaderConfig for the custom data loader."""
+        from openpi.training.robocoin_data_loader import RoboCOINDataLoaderConfig
+
+        return RoboCOINDataLoaderConfig(
+            data_dir=self.tfds_data_dir,
+            dataset_name=self.dataset_name,
+            max_cameras=self.max_cameras,
+            max_state_dim=self.max_state_dim,
+            max_action_dim=self.max_action_dim,
+            image_size=self.image_size,
+            discount=self.discount,
+            reward_scale=self.reward_scale,
+            reward_bias=self.reward_bias,
+            shuffle_buffer_size=self.shuffle_buffer_size,
+            td_n=self.td_n,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class EvalEnvConfig:
     """Base configuration for evaluation environments."""
 
@@ -842,7 +1047,7 @@ class TrainConfig:
     checkpoint_base_dir: str = "./checkpoints"
 
     # Random seed that will be used by random generators during training.
-    seed: int = 42
+    seed: int = 86
     # Global batch size.
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
@@ -906,10 +1111,15 @@ class TrainConfig:
         return (pathlib.Path(self.assets_base_dir) / self.name).resolve()
 
     @property
-    def checkpoint_dir(self) -> pathlib.Path:
+    def checkpoint_dir(self) -> epath.Path:
         """Get the checkpoint directory for this config."""
         exp_name = self.exp_name if self.exp_name else self.name
-        return (pathlib.Path(self.checkpoint_base_dir) / self.name / exp_name).resolve()
+        base_path = epath.Path(self.checkpoint_base_dir)
+        full_path = base_path / self.name / exp_name
+        # Only resolve local paths - GCS paths (gs://) should not be resolved
+        if "gs://" not in str(full_path):
+            full_path = full_path.resolve()
+        return full_path
 
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
@@ -924,7 +1134,11 @@ class TrainConfig:
 def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
     """Create antmaze-large-diverse-v1 configs."""
     # Get dimensions from Minari dataset environment spec
-    state_dim, action_dim, action_low, action_high = minari_utils.get_minari_dims("D4RL/antmaze/large-diverse-v1")
+    try:
+        state_dim, action_dim, action_low, action_high = minari_utils.get_minari_dims("D4RL/antmaze/large-diverse-v1")
+    except ImportError:
+        logging.warning("minari not installed, skipping antmaze configs")
+        return []
 
     return [
         # MLP BC config
@@ -1304,7 +1518,11 @@ def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
 def _make_pointmaze_large_configs() -> list[TrainConfig]:
     """Create pointmaze-large-v2 configs."""
     # Get dimensions from Minari dataset environment spec
-    state_dim, action_dim, action_low, action_high = minari_utils.get_minari_dims("D4RL/pointmaze/large-v2")
+    try:
+        state_dim, action_dim, action_low, action_high = minari_utils.get_minari_dims("D4RL/pointmaze/large-v2")
+    except ImportError:
+        logging.warning("minari not installed, skipping pointmaze configs")
+        return []
 
     return [
         # MC Q-function with MSE regression
@@ -1621,6 +1839,9 @@ def _make_pointmaze_large_configs() -> list[TrainConfig]:
 def _make_antmaze_large_diverse_v2_legacy_configs() -> list[TrainConfig]:
     """Create antmaze-large-diverse-v2 configs using legacy D4RL dataset."""
     # Get dimensions from legacy D4RL environment
+    if legacy_d4rl_utils is None:
+        logging.warning("legacy_d4rl_utils not available, skipping legacy D4RL configs")
+        return []
     state_dim, action_dim, _, _ = legacy_d4rl_utils.get_legacy_d4rl_dims("antmaze-large-diverse-v2")
 
     return [
@@ -2251,6 +2472,142 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    #
+    # RoboCOIN PaliGemma V(s) value function configs.
+    #
+    TrainConfig(
+        name="debug_robocoin_paligemma",
+        model=_value_function.MCValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,  # Proprioceptive state dimension for RoboCOIN
+                num_cameras=3,  # cam_0, cam_1, cam_2
+                image_size=(224, 224),
+                freeze_backbone=False,
+                max_token_len=48,  # Max tokens for subtask text
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="/data/group_data/rl/saksham3/",
+            dataset_name="robocoin:1.0.0",
+            discount=0.99,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=30_000,
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,  # DLIMP handles its own parallelism
+        log_interval=100,
+        plot_interval=1,
+        fsdp_devices=1,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="robocoin_paligemma_v_mc",
+        model=_value_function.MCValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,  # Proprioceptive state dimension for RoboCOIN
+                num_cameras=3,  # cam_0, cam_1, cam_2
+                image_size=(224, 224),
+                freeze_backbone=False,
+                max_token_len=48,  # Max tokens for subtask text
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="/data/group_data/rl/saksham3/",
+            dataset_name="robocoin:1.0.0",
+            discount=0.99,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=30_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,  # DLIMP handles its own parallelism
+        log_interval=100,
+        plot_interval=10_000,
+        save_interval=10_000,
+        fsdp_devices=16,
+    ),
+    TrainConfig(
+        name="robocoin_paligemma_v_mc_ce",
+        model=_value_function.MCValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,  # Proprioceptive state dimension for RoboCOIN
+                num_cameras=3,
+                image_size=(224, 224),
+                freeze_backbone=False,
+                max_token_len=48,
+            ),
+            head_config=_heads.CrossEntropyHeadConfig(
+                v_min=0.0,   # MC return = gamma^steps is in [0, 1]
+                v_max=1.0,
+                num_bins=51,  # Discretize [0, 1] into 51 bins
+            ),
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="/data/group_data/rl/saksham3/",
+            dataset_name="robocoin:1.0.0",
+            discount=0.99,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=30_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+    ),
+    # RoboCOIN TD-30 value function config (regression loss).
+    TrainConfig(
+        name="robocoin_paligemma_v_td30",
+        model=_value_function.SARSAValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,  # Proprioceptive state dimension for RoboCOIN
+                num_cameras=3,  # cam_0, cam_1, cam_2
+                image_size=(224, 224),
+                freeze_backbone=False,
+                max_token_len=48,  # Max tokens for subtask text
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+            discount=0.99**30,  # Effective discount for 30-step return
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="/data/group_data/rl/saksham3/",
+            dataset_name="robocoin:1.0.0",
+            discount=0.99,
+            td_n=30,  # TD-30: bootstrap with value at t + 30
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=30_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,  # DLIMP handles its own parallelism
+        log_interval=100,
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

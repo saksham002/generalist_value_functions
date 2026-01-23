@@ -1,6 +1,9 @@
 """Utilities for working with Minari/D4RL datasets."""
 
-import minari
+try:
+    import minari
+except ImportError:
+    minari = None  # type: ignore
 import numpy as np
 
 
@@ -13,6 +16,8 @@ def get_minari_dims(dataset_id: str) -> tuple[int, int, np.ndarray, np.ndarray]:
     Returns:
         Tuple of (observation_dim, action_dim, action_low, action_high)
     """
+    if minari is None:
+        raise ImportError("minari is required for this function but is not installed. Install with: pip install minari")
     dataset = minari.load_dataset(dataset_id, download=True)
 
     # Handle observation space - concatenate all spaces sorted by key

@@ -13,12 +13,21 @@ import logging
 from typing import TYPE_CHECKING
 
 import gymnasium
-import minari
-import mujoco
+try:
+    import minari
+except ImportError:
+    minari = None  # type: ignore
+try:
+    import mujoco
+except ImportError:
+    mujoco = None  # type: ignore
 import numpy as np
 
 import openpi.shared.array_typing as at
-import openpi.shared.legacy_d4rl_utils as legacy_d4rl_utils
+try:
+    import openpi.shared.legacy_d4rl_utils as legacy_d4rl_utils
+except Exception:
+    legacy_d4rl_utils = None  # type: ignore
 
 if TYPE_CHECKING:
     from openpi.training import config as _config
@@ -94,6 +103,8 @@ def create_eval_env(
     from openpi.training import config as _config
 
     if isinstance(eval_config, _config.MinariEvalEnvConfig):
+        if minari is None:
+            raise ImportError("minari is required for MinariEvalEnvConfig but is not installed.")
         dataset_id = eval_config.minari_dataset_id or data_config.minari_dataset_id
         if dataset_id is None:
             raise ValueError(
@@ -110,6 +121,8 @@ def create_eval_env(
         return env
 
     if isinstance(eval_config, _config.LegacyD4RLEvalEnvConfig):
+        if legacy_d4rl_utils is None:
+            raise ImportError("legacy_d4rl_utils is required for LegacyD4RLEvalEnvConfig but is not available.")
         env_name = eval_config.legacy_d4rl_env_name or data_config.legacy_d4rl_env_name
         if env_name is None:
             raise ValueError(
@@ -147,6 +160,8 @@ def create_vector_eval_env(
     from openpi.training import config as _config
 
     if isinstance(eval_config, _config.MinariEvalEnvConfig):
+        if minari is None:
+            raise ImportError("minari is required for MinariEvalEnvConfig but is not installed.")
         dataset_id = eval_config.minari_dataset_id or data_config.minari_dataset_id
         if dataset_id is None:
             raise ValueError(
@@ -165,6 +180,8 @@ def create_vector_eval_env(
         return gymnasium.vector.SyncVectorEnv([make_env for _ in range(num_envs)])
 
     if isinstance(eval_config, _config.LegacyD4RLEvalEnvConfig):
+        if legacy_d4rl_utils is None:
+            raise ImportError("legacy_d4rl_utils is required for LegacyD4RLEvalEnvConfig but is not available.")
         env_name = eval_config.legacy_d4rl_env_name or data_config.legacy_d4rl_env_name
         if env_name is None:
             raise ValueError(
@@ -233,10 +250,11 @@ def evaluate_policy_vectorized(
     if record_video:
         try:
             frames = vec_env.call("render")
-        except mujoco.FatalError as e:
-            logging.warning(
-                f"Failed to render frame for video: {e}. Try adding MUJOCO_GL=egl to your environment variables."
-            )
+        except Exception as e:
+            if mujoco is not None and isinstance(e, mujoco.FatalError):
+                logging.warning(
+                    f"Failed to render frame for video: {e}. Try adding MUJOCO_GL=egl to your environment variables."
+                )
             raise
         if frames[0] is not None:
             video_frames.append(np.asarray(frames[0], dtype=np.uint8))

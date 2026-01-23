@@ -82,6 +82,8 @@ class MLPNetwork(BaseValueNetwork):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
+        *,
+        rng: at.KeyArrayLike | None = None,
     ) -> at.Float[at.Array, "*b feature_dim"]:
         """Forward pass through MLP, returning final hidden layer output.
 
@@ -90,6 +92,7 @@ class MLPNetwork(BaseValueNetwork):
         - [batch, action_horizon, action_dim]: 3D actions
         - [batch, n, action_horizon, action_dim]: 4D multi-transition actions
         """
+        del rng  # MLP does not use stochastic augmentation
         state = observation.state
 
         if self.action_conditioned:
@@ -202,16 +205,20 @@ class MultiMLPNetwork(BaseValueNetwork):
         self,
         observation: _model.Observation,
         action: _model.Actions | None = None,
+        *,
+        rng: at.KeyArrayLike | None = None,
     ) -> at.Float[at.Array, "*b n feature_dim"]:
         """Forward pass: concatenate all transitions, process, output n features.
 
         Args:
             observation: With state shape [batch, n, state_dim].
             action: With shape [batch, n, action_horizon, action_dim] if action_conditioned.
+            rng: Unused in MLP networks.
 
         Returns:
             Features of shape [batch, n, feature_dim].
         """
+        del rng  # MLP does not use stochastic augmentation
         state = observation.state  # [batch, n, state_dim]
         batch_size = state.shape[0]
 
