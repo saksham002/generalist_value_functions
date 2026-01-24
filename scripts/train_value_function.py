@@ -24,7 +24,7 @@ import optax
 import scipy.stats
 import tqdm_loggable.auto as tqdm
 import wandb
-import pdb
+from jax.experimental import multihost_utils
 
 from openpi.models import model as _model
 import openpi.shared.array_typing as at
@@ -1039,23 +1039,59 @@ def generate_validation_plots_dlimp(
     num_val_trajectories = len(val_episode_indices)
     episode_frames: dict[int, list[dict]] = {}
     
-    # Check if cache exists
-    cache_file = os.path.join(cache_dir, "val_episodes.pkl") if cache_dir else None
-    cache_exists = cache_file and os.path.exists(cache_file)
+    # Check if cache directory exists with individual episode files
+    cache_exists = cache_dir and os.path.exists(cache_dir) and any(
+        f.startswith("episode_") and f.endswith(".pkl") for f in os.listdir(cache_dir)
+    ) if cache_dir else False
     
     if cache_exists and not save_only:
-        # Load from cache
-        logging.info(f"Loading cached validation episodes from {cache_file}")
-        with open(cache_file, "rb") as f:
-            episode_frames = pickle.load(f)
+        # Load from cache - each episode is saved as a separate file
+        logging.info(f"Loading cached validation episodes from {cache_dir}")
+        for filename in os.listdir(cache_dir):
+            if filename.startswith("episode_") and filename.endswith(".pkl"):
+                ep_idx = int(filename.replace("episode_", "").replace(".pkl", ""))
+                ep_cache_file = os.path.join(cache_dir, filename)
+                with open(ep_cache_file, "rb") as f:
+                    episode_frames[ep_idx] = pickle.load(f)
         logging.info(f"Loaded {len(episode_frames)} episodes from cache")
     else:
         # Collect from dataloader
-        collected_episodes: set[int] = set()
+        # Track episodes currently being collected (in-memory) and those already saved to disk
+        active_episodes: set[int] = set()  # Episodes currently in episode_frames dict
+        saved_episode_count = 0  # Number of episodes saved to disk
         logging.info(f"Collecting validation frames for first {num_val_trajectories} episodes encountered")
         
+        # Create cache directory early if needed
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok = True)
+        
         # Iterate through the dataloader
+        cnt = 0
         for batch in val_dataloader:
+            # For distributed training, gather batch data from all hosts to worker 0
+            # Each host has its local shard; we need all data for proper caching
+            if jax.process_count() > 1:
+                # Gather all shards from all hosts using process_allgather
+                # This creates a full batch with data from all hosts
+                logging.info(f"Gathering batch data from all hosts for batch {cnt}")
+                gathered_batch = {}
+                for key, value in batch.items():
+                    if isinstance(value, dict):
+                        gathered_batch[key] = {}
+                        for sub_key, sub_value in value.items():
+                            if hasattr(sub_value, "device"):
+                                gathered_batch[key][sub_key] = multihost_utils.process_allgather(sub_value, tiled = True)
+                            else:
+                                gathered_batch[key][sub_key] = sub_value    
+                    else:
+                        if hasattr(value, "device"):
+                            gathered_batch[key] = multihost_utils.process_allgather(value, tiled = True)
+                        else:
+                            gathered_batch[key] = value
+                batch = gathered_batch
+                logging.info(f"Gathered batch data from all hosts for batch {cnt}, shape: {batch['_traj_index'].shape}")
+            cnt += 1
+            
             # Get trajectory indices for this batch
             traj_indices = batch.get("_traj_index", None)
             if traj_indices is None:
@@ -1063,16 +1099,39 @@ def generate_validation_plots_dlimp(
                 continue
             
             # Convert JAX arrays to numpy if needed
-            traj_indices = np.asarray(traj_indices)
+            if hasattr(traj_indices, "device"):
+                traj_indices = np.asarray(traj_indices)
             
-            # Check if we should break: we have enough episodes and none of the current
-            # batch's episodes are in our collected set (meaning we've moved past them)
+            # Get the set of episode indices present in this batch
             unique_batch_episodes = set(int(t) for t in traj_indices)
-            if len(collected_episodes) >= num_val_trajectories:
-                # Check if any current batch episodes are still being collected
-                if not unique_batch_episodes.intersection(collected_episodes):
-                    logging.info(f"Collected {len(collected_episodes)} episodes, breaking early")
-                    break
+            
+            # Check which active episodes are NO LONGER in this batch (i.e., they are complete)
+            completed_episodes = active_episodes - unique_batch_episodes
+            for ep_idx in completed_episodes:
+                if ep_idx in episode_frames:
+                    # Sort frames by frame index before saving
+                    frames = episode_frames[ep_idx]
+                    if frames and "_frame_index" in frames[0]:
+                        frames.sort(key=lambda f: f["_frame_index"])
+                    
+                    # Save this episode to disk individually
+                    if cache_dir:
+                        ep_cache_file = os.path.join(cache_dir, f"episode_{ep_idx}.pkl")
+                        with open(ep_cache_file, "wb") as f:
+                            pickle.dump(frames, f)
+                        logging.info(f"Saved episode {ep_idx} ({len(frames)} frames) to {ep_cache_file}")
+                    
+                    # Remove from memory to save space
+                    del episode_frames[ep_idx]
+                    saved_episode_count += 1
+                    
+                # Remove from active set
+                active_episodes.discard(ep_idx)
+            
+            # Check if we've saved enough episodes
+            if saved_episode_count >= num_val_trajectories:
+                logging.info(f"Saved {saved_episode_count} episodes, breaking early")
+                break
             
             # Process each sample in the batch
             batch_size = traj_indices.shape[0]
@@ -1080,16 +1139,18 @@ def generate_validation_plots_dlimp(
                 ep_idx = int(traj_indices[i])
                 
                 # If we haven't seen this episode yet, start collecting if we have room
-                if ep_idx not in episode_frames:
-                    if len(collected_episodes) >= num_val_trajectories:
+                if ep_idx not in episode_frames and ep_idx not in active_episodes:
+                    # Check if we've already started collecting enough episodes
+                    total_episodes_seen = len(active_episodes) + saved_episode_count
+                    if total_episodes_seen >= num_val_trajectories:
                         # Already have enough episodes, skip new ones
                         continue
                     # Start collecting this new episode
                     episode_frames[ep_idx] = []
-                    collected_episodes.add(ep_idx)
+                    active_episodes.add(ep_idx)
                 
-                # Skip if this episode is not in our collection set
-                if ep_idx not in collected_episodes:
+                # Skip if this episode is not being actively collected
+                if ep_idx not in active_episodes:
                     continue
                 
                 # Extract all frame data for this sample
@@ -1102,32 +1163,13 @@ def generate_validation_plots_dlimp(
                     if isinstance(value, dict):
                         frame[key] = {}
                         for sub_key, sub_value in value.items():
-                            if hasattr(sub_value, "device"):
-                                tmp = np.asarray(sub_value[i])
-                            frame[key][sub_key] = tmp
+                            frame[key][sub_key] = np.asarray(sub_value[i])
                     else:
-                        # Convert JAX arrays to numpy
-                        if hasattr(value, "device"):
-                            tmp = np.asarray(value[i])
-                        frame[key] = tmp
-                
+                        frame[key] = np.asarray(value[i])
+
                 episode_frames[ep_idx].append(frame)
         
-        # Sort frames within each episode by frame index
-        # pdb.set_trace()
-        for ep_idx in episode_frames:
-            if episode_frames[ep_idx] and "_frame_index" in episode_frames[ep_idx][0]:
-                episode_frames[ep_idx].sort(key=lambda f: f["_frame_index"])
-        
-        logging.info(f"Collected frames per episode: {[(ep, len(frames)) for ep, frames in episode_frames.items()]}")
-        
-        # Save to cache if cache_dir is specified
-        if cache_dir:
-            os.makedirs(cache_dir, exist_ok=True)
-            logging.info(f"Saving {len(episode_frames)} validation episodes to {cache_file}")
-            with open(cache_file, "wb") as f:
-                pickle.dump(episode_frames, f)
-            logging.info(f"Saved validation episodes to cache")
+        logging.info(f"Total episodes saved: {saved_episode_count}")
     
     # If save_only mode, return early without generating plots
     if save_only:
@@ -1327,13 +1369,22 @@ def main(config: _config.TrainConfig):
         
         # Create validation dataloader with repeat=False and shuffle=False
         # Use same config as training but with validation-specific settings
+        # For distributed training, divide batch_size by the number of hosts
+        val_batch_size = 256
+        process_count = jax.process_count()
+        local_val_batch_size = val_batch_size // process_count
+        
+        if process_count > 1:
+            logging.info(f"Validation dataloader: local_batch_size={local_val_batch_size} (global={val_batch_size})")
+        
         val_loader_config = RoboCOINDataLoaderConfig(
             data_dir=robocoin_config.data_dir,
             dataset_name=robocoin_config.dataset_name,
             split="val",  # Use val split for validation (same data, different ordering)
-            batch_size=256, 
+            batch_size=local_val_batch_size, 
             shuffle=False,  # Preserve episode order
             repeat=False,  # Iterate once through the dataset
+            seed=config.seed + jax.process_index(),  # Different seed per host for data diversity
             max_cameras=robocoin_config.max_cameras,
             max_state_dim=robocoin_config.max_state_dim,
             max_action_dim=robocoin_config.max_action_dim,
@@ -1375,23 +1426,25 @@ def main(config: _config.TrainConfig):
         ).tolist()
     logging.info(f"Selected validation episodes: {val_episode_indices}")
     
-    # Cache validation episodes to disk for RoboCOIN (only on worker 0)
-    # This avoids needing to re-create the dataloader on each plot generation
+    # Cache validation episodes to disk for RoboCOIN
+    # NOTE: All workers must call generate_validation_plots_dlimp because it contains
+    # process_allgather collectives that require all hosts to participate.
+    # Only worker 0 actually saves the cache to disk.
     val_episodes_cache_dir = None
     if data_config.robocoin_data_config is not None and val_dataloader is not None:
         val_episodes_cache_dir = str(config.checkpoint_dir / "val_episodes")
+        logging.info(f"Collecting validation episodes (worker {jax.process_index()})")
+        generate_validation_plots_dlimp(
+            model=None,  # Not needed for save_only
+            val_dataloader=val_dataloader,
+            val_episode_indices=val_episode_indices,
+            step=0,
+            action_conditioned=False,  # Not used for save_only
+            data_config=data_config,
+            cache_dir=val_episodes_cache_dir if jax.process_index() == 0 else None,  # Only worker 0 saves
+            save_only=True,
+        )
         if jax.process_index() == 0:
-            logging.info(f"Collecting and caching validation episodes to {val_episodes_cache_dir}")
-            generate_validation_plots_dlimp(
-                model=None,  # Not needed for save_only
-                val_dataloader=val_dataloader,
-                val_episode_indices=val_episode_indices,
-                step=0,
-                action_conditioned=False,  # Not used for save_only
-                data_config=data_config,
-                cache_dir=val_episodes_cache_dir,
-                save_only=True,
-            )
             logging.info("Validation episodes cached successfully")
         val_dataloader.stop()  # Clean up the dataloader
         val_dataloader = None  # Mark as consumed
