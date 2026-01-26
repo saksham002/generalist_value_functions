@@ -1450,6 +1450,8 @@ def main(config: _config.TrainConfig):
         from lerobot.common.datasets import lerobot_dataset
         
         val_dataset = lerobot_dataset.LeRobotDataset(config.data.repo_id)
+        
+    if val_dataset is not None:
         num_episodes = val_dataset.num_episodes
         val_rng = np.random.default_rng(config.seed)
         
