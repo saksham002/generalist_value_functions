@@ -94,35 +94,32 @@ echo "[Step 1/3] Syncing from HPC cluster to local..."
 echo "rsync -avzL --exclude .git --exclude .venv --exclude __pycache__ --exclude '*.pyc' --exclude wandb ${HPC_HOST}:${HPC_SRC_DIR}/ ${LOCAL_DIR}"
 rsync -avzL --exclude .git --exclude .venv --exclude __pycache__ --exclude '*.pyc' --exclude wandb ${HPC_HOST}:${HPC_SRC_DIR}/ ${LOCAL_DIR}
 
-# Step 2: Rsync from local to TPU pod NFS
+# Step 2a: Ensure NFS is mounted on all TPU workers (must happen before rsync to NFS)
 echo ""
-echo "[Step 2/3] Syncing from local to TPU NFS..."
-echo "rsync -avzL -e \"ssh -i ~/.ssh/google_compute_engine\" -og --chown=saksham:saksham --exclude .git --exclude .venv --exclude __pycache__ --exclude '*.pyc' --exclude wandb . ${DEST_DIR}"
-rsync -avzL -e "ssh -i ~/.ssh/google_compute_engine" -og --chown=saksham:saksham --exclude .git --exclude .venv --exclude __pycache__ --exclude '*.pyc' --exclude wandb . ${DEST_DIR}
-
-# Step 3: Launch the pod configuration
-echo ""
-echo "[Step 3/3] Launching TPU pod training..."
-export CONFIG_NAME
-export TRAIN_ARGS
-export TRAIN_SCRIPT
+echo "[Step 2a] Checking/mounting NFS on all TPU workers..."
 export POD_NAME=$TPU_VM_NAME
-
-# First, ensure NFS is mounted on all TPU workers
-echo ""
-echo "[Step 3a] Checking/mounting NFS on all TPU workers..."
 MOUNT_CMD="if ! mount | grep -q aidm_nfs; then echo 'NFS not mounted, mounting...'; sudo apt -y update && sudo apt -y install nfs-common && sudo mkdir -p -m 777 /nfs/aidm_nfs && sudo mount -o rw,intr 10.155.154.42:/europe /nfs/aidm_nfs && echo 'NFS mounted successfully'; else echo 'NFS already mounted'; fi"
 tpc run --project=$PROJECT --zone=$ZONE --name=$TPU_VM_NAME --command="$MOUNT_CMD"
 
-# Copy .bashrc from worker 0 to local, then upload to all workers
+# Step 2b: Rsync from local to TPU pod NFS (now that NFS is mounted)
 echo ""
-echo "[Step 3b] Syncing .bashrc from worker 0 to all workers..."
+echo "[Step 2b] Syncing from local to TPU NFS..."
+echo "rsync -avzL -e \"ssh -i ~/.ssh/google_compute_engine\" -og --chown=saksham:saksham --exclude .git --exclude .venv --exclude __pycache__ --exclude '*.pyc' --exclude wandb . ${DEST_DIR}"
+rsync -avzL -e "ssh -i ~/.ssh/google_compute_engine" -og --chown=saksham:saksham --exclude .git --exclude .venv --exclude __pycache__ --exclude '*.pyc' --exclude wandb . ${DEST_DIR}
+
+# Step 3a: Copy .bashrc from worker 0 to local, then upload to all workers
+echo ""
+echo "[Step 3a] Syncing .bashrc from worker 0 to all workers..."
 BASHRC_LOCAL="/tmp/tpu_bashrc_${TPU_VM_NAME}"
 gcloud compute tpus tpu-vm scp --project=$PROJECT --zone=$ZONE ${TPU_VM_NAME}:~/.bashrc ${BASHRC_LOCAL} --worker=0
 tpc upload --project=$PROJECT --zone=$ZONE --name=$TPU_VM_NAME --upload_path="${BASHRC_LOCAL}:~/.bashrc"
 
+# Step 3b: Launch the pod configuration
 echo ""
-echo "[Step 3c] Launching training job..."
+echo "[Step 3b] Launching training job..."
+export CONFIG_NAME
+export TRAIN_ARGS
+export TRAIN_SCRIPT
 POD_NAME=$TPU_VM_NAME tpc launch pod_config.py --project=$PROJECT
 
 # Connect to the pod

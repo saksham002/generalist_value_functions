@@ -1044,6 +1044,14 @@ def generate_validation_plots_dlimp(
         f.startswith("episode_") and f.endswith(".pkl") for f in os.listdir(cache_dir)
     ) if cache_dir else False
     
+    # If save_only mode and cache already exists, remove existing files and recollect
+    if cache_exists and save_only:
+        logging.warning(f"Cache files already exist in {cache_dir} but save_only=True. Removing existing .pkl files.")
+        for filename in os.listdir(cache_dir):
+            if filename.startswith("episode_") and filename.endswith(".pkl"):
+                os.remove(os.path.join(cache_dir, filename))
+        cache_exists = False
+    
     if cache_exists and not save_only:
         # Load from cache - each episode is saved as a separate file
         logging.info(f"Loading cached validation episodes from {cache_dir}")
@@ -1066,31 +1074,8 @@ def generate_validation_plots_dlimp(
             os.makedirs(cache_dir, exist_ok = True)
         
         # Iterate through the dataloader
-        cnt = 0
+        # Note: Only worker 0 calls this function with single_host_batch=True
         for batch in val_dataloader:
-            # For distributed training, gather batch data from all hosts to worker 0
-            # Each host has its local shard; we need all data for proper caching
-            if jax.process_count() > 1:
-                # Gather all shards from all hosts using process_allgather
-                # This creates a full batch with data from all hosts
-                logging.info(f"Gathering batch data from all hosts for batch {cnt}")
-                gathered_batch = {}
-                for key, value in batch.items():
-                    if isinstance(value, dict):
-                        gathered_batch[key] = {}
-                        for sub_key, sub_value in value.items():
-                            if hasattr(sub_value, "device"):
-                                gathered_batch[key][sub_key] = multihost_utils.process_allgather(sub_value, tiled = True)
-                            else:
-                                gathered_batch[key][sub_key] = sub_value    
-                    else:
-                        if hasattr(value, "device"):
-                            gathered_batch[key] = multihost_utils.process_allgather(value, tiled = True)
-                        else:
-                            gathered_batch[key] = value
-                batch = gathered_batch
-                logging.info(f"Gathered batch data from all hosts for batch {cnt}, shape: {batch['_traj_index'].shape}")
-            cnt += 1
             
             # Get trajectory indices for this batch
             traj_indices = batch.get("_traj_index", None)
@@ -1175,6 +1160,14 @@ def generate_validation_plots_dlimp(
     if save_only:
         return {}
     
+    # Debug: log details about loaded episodes before generating plots
+    for ep_idx, frames in episode_frames.items():
+        frame_keys = list(frames[0].keys()) if frames else []
+        logging.info(f"  Episode {ep_idx}: {len(frames)} frames, keys: {frame_keys}")
+    total_frames = sum(len(frames) for frames in episode_frames.values())
+    episode_indices = sorted(episode_frames.keys())
+    logging.info(f"Processing {len(episode_frames)} episodes: indices={episode_indices}, total_frames={total_frames}")
+    
     # Generate plots for each episode
     images = {}
     
@@ -1192,6 +1185,7 @@ def generate_validation_plots_dlimp(
         
         # Compute predicted values (data is already normalized by dataloader)
         predicted_values = []
+        frame_idx = 0
         for frame in frames:
             if "mc_return" not in frame:
                 continue
@@ -1246,16 +1240,50 @@ def generate_validation_plots_dlimp(
                     action = np.asarray(action)
                 act = jnp.asarray(action[None, ...])
             
+            # Debug: check observation shapes, dtypes, and sharding
+            if frame_idx == 0:  # Only log once per episode to avoid spam
+                logging.info(f"  obs.state: shape={obs.state.shape}, dtype={obs.state.dtype}")
+                logging.info(f"  obs.images keys: {list(obs.images.keys()) if obs.images else 'empty'}")
+                for k, v in (obs.images or {}).items():
+                    logging.info(f"    {k}: shape={v.shape}, dtype={v.dtype}")
+                if obs.tokenized_prompt is not None:
+                    logging.info(f"  obs.tokenized_prompt: shape={obs.tokenized_prompt.shape}, dtype={obs.tokenized_prompt.dtype}")
+                if obs.tokenized_prompt_mask is not None:
+                    logging.info(f"  obs.tokenized_prompt_mask: shape={obs.tokenized_prompt_mask.shape}, dtype={obs.tokenized_prompt_mask.dtype}")
+                logging.info(f"  act: {act.shape if act is not None else None}")
+                
+                # Check model param sharding
+                try:
+                    sample_params = nnx.state(model)
+                    sample_leaves = jax.tree_util.tree_leaves(sample_params)
+                    logging.info(f"  Model params: {len(sample_leaves)} leaves")
+                    if sample_leaves:
+                        first_param = sample_leaves[0]
+                        # NNX tree_leaves returns raw arrays, not VariableState wrappers
+                        if hasattr(first_param, 'value'):
+                            val = first_param.value
+                        else:
+                            val = first_param
+                        sharding_info = val.sharding if hasattr(val, 'sharding') else 'no sharding attr'
+                        logging.info(f"  Model param sample: shape={val.shape}, dtype={val.dtype}, sharding={sharding_info}")
+                except Exception as e:
+                    logging.warning(f"  Could not inspect model params: {e}")
+            
             pred_value = model.compute_value(obs, act, take_min_over_ensemble=True)
             predicted_values.append(float(jax.device_get(pred_value[0])))
+            frame_idx += 1
         
         if len(predicted_values) == 0:
             continue
+
+        logging.info(f"Episode {ep_idx}: {len(predicted_values)} predicted values")
         
-        # Create plot
-        images[f"val/episode_{ep_idx}"] = _create_value_plot(
-            mc_returns, predicted_values, ep_idx, step, " (RoboCOIN)", oracle_values=None
-        )
+        # Create plot (only on worker 0 - all workers participated in compute_value for FSDP)
+        if jax.process_index() == 0:
+            images[f"val/episode_{ep_idx}"] = _create_value_plot(
+                mc_returns, predicted_values, ep_idx, step, " (RoboCOIN)", oracle_values=None
+            )
+            logging.info(f"Episode {ep_idx} plot created")
     
     return images
 
@@ -1318,6 +1346,7 @@ def main(config: _config.TrainConfig):
         resume=config.resume,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    logging.info(f"Initialized checkpoint manager with resuming={resuming}, config.resume={config.resume}")
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -1367,87 +1396,85 @@ def main(config: _config.TrainConfig):
         num_episodes = builder.info.splits["val"].num_examples
         logging.info(f"RoboCOIN: {num_episodes} episodes in validation set")
         
-        # Create validation dataloader with repeat=False and shuffle=False
-        # Use same config as training but with validation-specific settings
-        # For distributed training, divide batch_size by the number of hosts
-        val_batch_size = 256
-        process_count = jax.process_count()
-        local_val_batch_size = val_batch_size // process_count
-        
-        if process_count > 1:
-            logging.info(f"Validation dataloader: local_batch_size={local_val_batch_size} (global={val_batch_size})")
-        
-        val_loader_config = RoboCOINDataLoaderConfig(
-            data_dir=robocoin_config.data_dir,
-            dataset_name=robocoin_config.dataset_name,
-            split="val",  # Use val split for validation (same data, different ordering)
-            batch_size=local_val_batch_size, 
-            shuffle=False,  # Preserve episode order
-            repeat=False,  # Iterate once through the dataset
-            seed=config.seed + jax.process_index(),  # Different seed per host for data diversity
-            max_cameras=robocoin_config.max_cameras,
-            max_state_dim=robocoin_config.max_state_dim,
-            max_action_dim=robocoin_config.max_action_dim,
-            image_size=robocoin_config.image_size,
-            discount=robocoin_config.discount,
-            td_n=robocoin_config.td_n,
-            state_norm_stats=data_config.norm_stats,
-            use_quantile_norm=data_config.use_quantile_norm,
-        )
-        val_dataloader = create_robocoin_data_loader(val_loader_config)
-        val_dataset = None  # Not used for RoboCOIN
-    else:
-        from lerobot.common.datasets import lerobot_dataset
-
-        val_dataset = lerobot_dataset.LeRobotDataset(config.data.repo_id)
-        val_dataloader = None  # Not used for non-RoboCOIN
-
-    num_episodes = val_dataset.num_episodes if val_dataset is not None else num_episodes
-    val_rng = np.random.default_rng(config.seed)
-
-    # Filter to episodes with at least 10 frames for meaningful validation plots
-    min_episode_length = 10
-    if hasattr(val_dataset, "episode_starts") and hasattr(val_dataset, "episode_ends"):
-        episode_lengths = val_dataset.episode_ends - val_dataset.episode_starts
-        valid_episode_indices = np.where(episode_lengths >= min_episode_length)[0]
-        if len(valid_episode_indices) < config.num_val_trajectories:
-            logging.warning(
-                f"Only {len(valid_episode_indices)} episodes with >= {min_episode_length} frames, "
-                f"using all of them for validation"
-            )
-            val_episode_indices = valid_episode_indices.tolist()
-        else:
-            val_episode_indices = val_rng.choice(
-                valid_episode_indices, size=config.num_val_trajectories, replace=False
-            ).tolist()
-    else:
+        # Select validation episode indices for RoboCOIN
+        val_rng = np.random.default_rng(config.seed)
         val_episode_indices = val_rng.choice(
             num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
         ).tolist()
-    logging.info(f"Selected validation episodes: {val_episode_indices}")
-    
-    # Cache validation episodes to disk for RoboCOIN
-    # NOTE: All workers must call generate_validation_plots_dlimp because it contains
-    # process_allgather collectives that require all hosts to participate.
-    # Only worker 0 actually saves the cache to disk.
-    val_episodes_cache_dir = None
-    if data_config.robocoin_data_config is not None and val_dataloader is not None:
+        logging.info(f"Selected validation episodes: {val_episode_indices}")
+        
+        # Cache validation episodes to disk - only worker 0 collects and caches
         val_episodes_cache_dir = str(config.checkpoint_dir / "val_episodes")
-        logging.info(f"Collecting validation episodes (worker {jax.process_index()})")
-        generate_validation_plots_dlimp(
-            model=None,  # Not needed for save_only
-            val_dataloader=val_dataloader,
-            val_episode_indices=val_episode_indices,
-            step=0,
-            action_conditioned=False,  # Not used for save_only
-            data_config=data_config,
-            cache_dir=val_episodes_cache_dir if jax.process_index() == 0 else None,  # Only worker 0 saves
-            save_only=True,
-        )
+        
         if jax.process_index() == 0:
+            logging.info("Worker 0: Collecting validation episodes for caching")
+            
+            val_loader_config = RoboCOINDataLoaderConfig(
+                data_dir=robocoin_config.data_dir,
+                dataset_name=robocoin_config.dataset_name,
+                split="val",
+                batch_size=256,  # Full batch size for single host
+                shuffle=False,
+                repeat=False,
+                seed=config.seed,
+                max_cameras=robocoin_config.max_cameras,
+                max_state_dim=robocoin_config.max_state_dim,
+                max_action_dim=robocoin_config.max_action_dim,
+                image_size=robocoin_config.image_size,
+                discount=robocoin_config.discount,
+                td_n=robocoin_config.td_n,
+                state_norm_stats=data_config.norm_stats,
+                use_quantile_norm=data_config.use_quantile_norm,
+                single_host_batch=True,  # Don't split batch across hosts
+            )
+            val_dataloader = create_robocoin_data_loader(val_loader_config)
+            
+            generate_validation_plots_dlimp(
+                model=None,  # Not needed for save_only
+                val_dataloader=val_dataloader,
+                val_episode_indices=val_episode_indices,
+                step=0,
+                action_conditioned=False,  # Not used for save_only
+                data_config=data_config,
+                cache_dir=val_episodes_cache_dir,
+                save_only=True,
+            )
+            val_dataloader.stop()
             logging.info("Validation episodes cached successfully")
-        val_dataloader.stop()  # Clean up the dataloader
-        val_dataloader = None  # Mark as consumed
+        else:
+            logging.info(f"Worker {jax.process_index()}: Skipping validation cache collection (worker 0 handles this)")
+        
+        val_dataset = None
+    else:
+        # Non-RoboCOIN: use LeRobot dataset
+        from lerobot.common.datasets import lerobot_dataset
+        
+        val_dataset = lerobot_dataset.LeRobotDataset(config.data.repo_id)
+        num_episodes = val_dataset.num_episodes
+        val_rng = np.random.default_rng(config.seed)
+        
+        # Filter to episodes with at least 10 frames for meaningful validation plots
+        min_episode_length = 10
+        if hasattr(val_dataset, "episode_starts") and hasattr(val_dataset, "episode_ends"):
+            episode_lengths = val_dataset.episode_ends - val_dataset.episode_starts
+            valid_episode_indices = np.where(episode_lengths >= min_episode_length)[0]
+            if len(valid_episode_indices) < config.num_val_trajectories:
+                logging.warning(
+                    f"Only {len(valid_episode_indices)} episodes with >= {min_episode_length} frames, "
+                    f"using all of them for validation"
+                )
+                val_episode_indices = valid_episode_indices.tolist()
+            else:
+                val_episode_indices = val_rng.choice(
+                    valid_episode_indices, size=config.num_val_trajectories, replace=False
+                ).tolist()
+        else:
+            val_episode_indices = val_rng.choice(
+                num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
+            ).tolist()
+        logging.info(f"Selected validation episodes: {val_episode_indices}")
+        
+        val_episodes_cache_dir = None  # No caching for non-RoboCOIN datasets
     
     # Detect action_conditioned: check network_config (for MC/SARSA) or q_network_config (for IQL)
     # For ensemble configs, check base_config for the actual network settings
@@ -1476,6 +1503,7 @@ def main(config: _config.TrainConfig):
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
 
     if resuming:
+        logging.info("Resuming training from checkpoint")
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
     # Unpack state and sharding
@@ -1579,8 +1607,8 @@ def main(config: _config.TrainConfig):
                 state_to_save = training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
                 _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step)
 
-        # Generate validation plots (only on worker 0)
-        if step % config.plot_interval == 0 and step > 0 and jax.process_index() == 0:
+        # Generate validation plots (all workers participate for FSDP, only worker 0 creates plots/logs)
+        if step % config.plot_interval == 0 and step > 0:
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
@@ -1605,11 +1633,13 @@ def main(config: _config.TrainConfig):
                         action_conditioned=action_conditioned,
                         data_config=data_config,
                     )
-                if plot_images:
-                    logging.info(f"Generated {len(plot_images)} validation plot items at step {step}")
-                    wandb.log(plot_images, step=step)
-                else:
-                    logging.warning(f"No validation plots generated at step {step}")
+                # Only worker 0 logs to wandb
+                if jax.process_index() == 0:
+                    if plot_images:
+                        logging.info(f"Generated {len(plot_images)} validation plot items at step {step}")
+                        wandb.log(plot_images, step=step)
+                    else:
+                        logging.warning(f"No validation plots generated at step {step}")
 
         # Policy evaluation (only on worker 0)
         if eval_enabled and step % config.eval_interval == 0 and step > 0 and jax.process_index() == 0:

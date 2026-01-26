@@ -2505,7 +2505,7 @@ _CONFIGS = [
         num_workers=0,  # DLIMP handles its own parallelism
         log_interval=100,
         plot_interval=1,
-        fsdp_devices=1,
+        fsdp_devices=2,
         wandb_enabled=False,
     ),
     TrainConfig(
@@ -2537,8 +2537,8 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,  # DLIMP handles its own parallelism
         log_interval=100,
-        plot_interval=10_000,
-        save_interval=10_000,
+        plot_interval=5_000,
+        save_interval=5_000,
         fsdp_devices=16,
     ),
     TrainConfig(

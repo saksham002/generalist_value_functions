@@ -64,6 +64,7 @@ TPU_POD_TYPES = {
     "v5e-tpu-128-0": "eu-v5-128",
     "v5e-tpu-128-1": "eu-v5-128",
     "v5e-tpu-64-0": "eu-v5-64",
+    "v5e-tpu-64-1": "eu-v5-64",
 }
 
 
@@ -110,9 +111,9 @@ source {config["src_dir"]}/vla/bin/activate
 # Set platform for TPU distributed training
 export PLATFORM=tpu
 
-echo "Running python {train_script} {config_name} {train_args_str} --overwrite"
+echo "Running python {train_script} {config_name} {train_args_str} --resume"
 python {train_script} {config_name} \\
-    {train_args_str} --overwrite
+    {train_args_str} --resume
 
 read -p "Press any key to continue..."
 """

@@ -122,6 +122,9 @@ class RoboCOINDataLoaderConfig:
     td_n: int | None = None
     # Whether to repeat the dataset infinitely (True for training, False for validation)
     repeat: bool = True
+    # If True, this host uses the full batch_size without splitting across hosts.
+    # Useful for validation cache collection where only worker 0 needs the data.
+    single_host_batch: bool = False
 
 
 class AddBatchKeys:
@@ -321,6 +324,7 @@ class AsyncBatchPrefetcher:
         state_norm_stats: dict[str, Any] | None = None,
         use_quantile_norm: bool = False,
         td_n: int | None = None,
+        single_host_batch: bool = False,
     ):
         self.iterator = iterator
         self.buffer = queue.Queue(maxsize=buffer_size)
@@ -331,6 +335,7 @@ class AsyncBatchPrefetcher:
         self.max_token_len = max_token_len
         self.num_batches = num_batches
         self.sharding = sharding
+        self.single_host_batch = single_host_batch
         self.thread = None
         self.stop_event = threading.Event()
         self.exception = None
@@ -632,7 +637,11 @@ class AsyncBatchPrefetcher:
         
         self._batch_count += 1
         
-        # Apply JAX sharding
+        # Skip JAX sharding if single_host_batch is True (for validation cache collection)
+        if self.single_host_batch:
+            return jax.tree.map(lambda x: jax.numpy.asarray(x), item)
+        
+        # Apply JAX sharding for distributed training
         sharding = self._get_sharding()
         return jax.tree.map(
             lambda x: jax.make_array_from_process_local_data(sharding, x),
@@ -752,6 +761,7 @@ def create_robocoin_data_loader(
         state_norm_stats=config.state_norm_stats,
         use_quantile_norm=config.use_quantile_norm,
         td_n=config.td_n,
+        single_host_batch=config.single_host_batch,
     )
     prefetcher.start()
 
