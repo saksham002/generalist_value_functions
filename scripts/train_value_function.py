@@ -12,6 +12,7 @@ import logging
 import platform as _platform
 import os
 from typing import Any
+import pdb
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -754,8 +755,26 @@ def _generate_multi_transition_plots(
     return images
 
 
-def _create_value_plot(mc_returns, predicted_values, ep_idx, step, suffix, oracle_values=None) -> "wandb.Image":
-    """Create a matplotlib plot comparing MC returns vs predicted values."""
+def _create_value_plot(
+    mc_returns, 
+    predicted_values, 
+    ep_idx, 
+    step, 
+    suffix, 
+    oracle_values=None,
+    subtask_texts: set[str] | None = None,
+) -> "wandb.Image":
+    """Create a matplotlib plot comparing MC returns vs predicted values.
+    
+    Args:
+        mc_returns: List of MC return values.
+        predicted_values: List of predicted values.
+        ep_idx: Episode index (from dataset's episode_index, used as title).
+        step: Training step.
+        suffix: Suffix for the title.
+        oracle_values: Optional list of oracle Q-values.
+        subtask_texts: Optional set of unique subtask texts for caption.
+    """
     fig, ax = plt.subplots(figsize=(10, 6))
     timesteps = np.arange(len(mc_returns))
 
@@ -785,8 +804,28 @@ def _create_value_plot(mc_returns, predicted_values, ep_idx, step, suffix, oracl
     ax.set_title(f"Episode {ep_idx} - Step {step}{suffix}", fontsize=14)
     ax.legend(fontsize=11)
     ax.grid(visible=True, alpha=0.3)
-
-    plt.tight_layout()
+    
+    # Add numbered subtask list below x-axis label if provided
+    if subtask_texts:
+        subtask_list = sorted(subtask_texts)
+        # Number the subtasks and group 3 per line
+        numbered_subtasks = [f"{i+1}. {text}" for i, text in enumerate(subtask_list)]
+        lines = []
+        for i in range(0, len(numbered_subtasks), 3):
+            line = "  ".join(numbered_subtasks[i:i+3])
+            lines.append(line)
+        caption = "Subtasks:\n" + "\n".join(lines)
+        
+        # Calculate bottom margin based on number of lines
+        num_lines = len(lines) + 1  # +1 for "Subtasks:" header
+        bottom_margin = 0.10 + 0.03 * num_lines
+        plt.subplots_adjust(bottom=bottom_margin)
+        
+        # Place text below the x-axis label
+        fig.text(0.5, 0.01, caption, ha='center', va='bottom', fontsize=9, 
+                 family='monospace', linespacing=1.5)
+    else:
+        plt.tight_layout()
 
     img = wandb.Image(fig)
     plt.close(fig)
@@ -1077,18 +1116,18 @@ def generate_validation_plots_dlimp(
         # Note: Only worker 0 calls this function with single_host_batch=True
         for batch in val_dataloader:
             
-            # Get trajectory indices for this batch
-            traj_indices = batch.get("_traj_index", None)
-            if traj_indices is None:
-                logging.warning("Batch missing _traj_index, cannot identify episodes")
+            # Get episode indices for this batch
+            episode_indices = batch.get("episode_index", None)
+            if episode_indices is None:
+                logging.warning("Batch missing episode_index, cannot identify episodes")
                 continue
             
             # Convert JAX arrays to numpy if needed
-            if hasattr(traj_indices, "device"):
-                traj_indices = np.asarray(traj_indices)
+            if hasattr(episode_indices, "device"):
+                episode_indices = np.asarray(episode_indices)
             
             # Get the set of episode indices present in this batch
-            unique_batch_episodes = set(int(t) for t in traj_indices)
+            unique_batch_episodes = set(int(e) for e in episode_indices)
             
             # Check which active episodes are NO LONGER in this batch (i.e., they are complete)
             completed_episodes = active_episodes - unique_batch_episodes
@@ -1119,9 +1158,9 @@ def generate_validation_plots_dlimp(
                 break
             
             # Process each sample in the batch
-            batch_size = traj_indices.shape[0]
+            batch_size = episode_indices.shape[0]
             for i in range(batch_size):
-                ep_idx = int(traj_indices[i])
+                ep_idx = int(episode_indices[i])
                 
                 # If we haven't seen this episode yet, start collecting if we have room
                 if ep_idx not in episode_frames and ep_idx not in active_episodes:
@@ -1168,120 +1207,164 @@ def generate_validation_plots_dlimp(
     episode_indices = sorted(episode_frames.keys())
     logging.info(f"Processing {len(episode_frames)} episodes: indices={episode_indices}, total_frames={total_frames}")
     
-    # Generate plots for each episode
+    # Generate plots for each episode using batched inference
     images = {}
     
-    # Iterate over collected episodes (dynamically discovered with shuffle=True)
+    # Collect all valid frames from all episodes with their episode indices
+    all_frames = []  # List of (ep_idx, frame_idx_in_ep, frame_dict)
+    ep_mc_returns = {}  # ep_idx -> list of mc_returns
+    ep_loss_masks = {}  # ep_idx -> list of loss_mask values
+    ep_subtasks = {}  # ep_idx -> set of unique subtask_1 texts
+    # Note: ep_idx IS the episode_index (from the cached filename)
+    
     for ep_idx, frames in episode_frames.items():
         if len(frames) == 0:
-            logging.warning(f"No frames collected for episode {ep_idx}")
             continue
         
-        # Extract MC returns
-        mc_returns = [f["mc_return"] for f in frames if "mc_return" in f]
-        if len(mc_returns) == 0:
-            logging.warning(f"No mc_return values for episode {ep_idx}")
+        # Filter to frames with mc_return
+        valid_frames = [(i, f) for i, f in enumerate(frames) 
+                        if "mc_return" in f and f.get("state") is not None]
+        if len(valid_frames) == 0:
             continue
         
-        # Compute predicted values (data is already normalized by dataloader)
-        predicted_values = []
-        frame_idx = 0
-        for frame in frames:
-            if "mc_return" not in frame:
-                continue
-            
-            state = frame.get("state")
-            if state is None:
-                continue
-            
-            # Build observation for model
-            obs_state = jnp.asarray(state[None, ...])  # [1, state_dim]
-            
-            # Handle images if available
-            images_dict = {}
-            image_masks_dict = {}
-            if "image" in frame:
-                for cam_key, img in frame["image"].items():
+        # Store MC returns and loss_masks for this episode
+        ep_mc_returns[ep_idx] = [f["mc_return"] for _, f in valid_frames]
+        ep_loss_masks[ep_idx] = [f.get("loss_mask", True) for _, f in valid_frames]
+        
+        # Collect unique subtask_1 texts from all frames in this episode
+        unique_subtasks = set()
+        for _, frame in valid_frames:
+            if "subtask_1_text" in frame:
+                text = frame["subtask_1_text"]
+                # pdb.set_trace()
+                text = text.item()
+                unique_subtasks.add(text)
+        ep_subtasks[ep_idx] = unique_subtasks
+        
+        # Add frames with their episode and frame indices
+        for frame_idx, frame in valid_frames:
+            all_frames.append((ep_idx, frame_idx, frame))
+    
+    if len(all_frames) == 0:
+        logging.warning("No valid frames found across all episodes")
+        return images
+    
+    logging.info(f"Processing {len(all_frames)} total frames across {len(ep_mc_returns)} episodes in batches of 64")
+    
+    # Process all frames in batches of 64
+    BATCH_SIZE = 64
+    all_predictions = {}  # (ep_idx, frame_idx) -> predicted_value
+    
+    for batch_start in range(0, len(all_frames), BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, len(all_frames))
+        batch_frames = all_frames[batch_start:batch_end]
+        batch_size = len(batch_frames)
+        
+        # Extract frame dicts for this batch
+        frame_dicts = [f[2] for f in batch_frames]
+        
+        # Stack states: [batch_size, state_dim]
+        states = np.stack([f["state"] for f in frame_dicts], axis=0)
+        obs_state = jnp.asarray(states)
+        
+        # Stack images if available
+        images_dict = {}
+        image_masks_dict = {}
+        if "image" in frame_dicts[0]:
+            for cam_key in frame_dicts[0]["image"].keys():
+                cam_images = []
+                for f in frame_dicts:
+                    img = f["image"][cam_key]
                     if hasattr(img, "device"):
                         img = np.asarray(img)
-                    # Convert uint8 [0, 255] to float32 [-1, 1] (matches Observation.from_dict)
+                    # Convert uint8 [0, 255] to float32 [-1, 1]
                     if img.dtype == np.uint8:
                         img = img.astype(np.float32) / 127.5 - 1.0
-                    images_dict[cam_key] = img[None, ...]  # [1, H, W, C]
-                    image_masks_dict[cam_key] = np.ones((1,), dtype=np.bool_)
-            
-            # Handle tokenized prompt
-            tokenized_prompt = None
-            tokenized_prompt_mask = None
-            if "tokenized_prompt" in frame:
-                tp = frame["tokenized_prompt"]
-                if hasattr(tp, "device"):
-                    tp = np.asarray(tp)
-                tokenized_prompt = jnp.asarray(tp[None, ...])
-            if "tokenized_prompt_mask" in frame:
-                tpm = frame["tokenized_prompt_mask"]
-                if hasattr(tpm, "device"):
-                    tpm = np.asarray(tpm)
-                tokenized_prompt_mask = jnp.asarray(tpm[None, ...])
-            
-            obs = _model.Observation(
-                images=images_dict if images_dict else {},
-                image_masks=image_masks_dict if image_masks_dict else {},
-                state=obs_state,
-                tokenized_prompt=tokenized_prompt,
-                tokenized_prompt_mask=tokenized_prompt_mask,
-            )
-            
-            # Action for Q(s, a) if action-conditioned
-            act = None
-            if action_conditioned and "actions" in frame:
-                action = frame["actions"]
-                if hasattr(action, "device"):
-                    action = np.asarray(action)
-                act = jnp.asarray(action[None, ...])
-            
-            # Debug: check observation shapes, dtypes, and sharding
-            if frame_idx == 0:  # Only log once per episode to avoid spam
-                logging.info(f"  obs.state: shape={obs.state.shape}, dtype={obs.state.dtype}")
-                logging.info(f"  obs.images keys: {list(obs.images.keys()) if obs.images else 'empty'}")
-                for k, v in (obs.images or {}).items():
-                    logging.info(f"    {k}: shape={v.shape}, dtype={v.dtype}")
-                if obs.tokenized_prompt is not None:
-                    logging.info(f"  obs.tokenized_prompt: shape={obs.tokenized_prompt.shape}, dtype={obs.tokenized_prompt.dtype}")
-                if obs.tokenized_prompt_mask is not None:
-                    logging.info(f"  obs.tokenized_prompt_mask: shape={obs.tokenized_prompt_mask.shape}, dtype={obs.tokenized_prompt_mask.dtype}")
-                logging.info(f"  act: {act.shape if act is not None else None}")
-                
-                # Check model param sharding
-                try:
-                    sample_params = nnx.state(model)
-                    sample_leaves = jax.tree_util.tree_leaves(sample_params)
-                    logging.info(f"  Model params: {len(sample_leaves)} leaves")
-                    if sample_leaves:
-                        first_param = sample_leaves[0]
-                        # NNX tree_leaves returns raw arrays, not VariableState wrappers
-                        if hasattr(first_param, 'value'):
-                            val = first_param.value
-                        else:
-                            val = first_param
-                        sharding_info = val.sharding if hasattr(val, 'sharding') else 'no sharding attr'
-                        logging.info(f"  Model param sample: shape={val.shape}, dtype={val.dtype}, sharding={sharding_info}")
-                except Exception as e:
-                    logging.warning(f"  Could not inspect model params: {e}")
-            
-            pred_value = model.compute_value(obs, act, take_min_over_ensemble=True)
-            predicted_values.append(float(jax.device_get(pred_value[0])))
-            frame_idx += 1
+                    cam_images.append(img)
+                images_dict[cam_key] = jnp.asarray(np.stack(cam_images, axis=0))
+                image_masks_dict[cam_key] = jnp.ones((batch_size,), dtype=jnp.bool_)
         
-        if len(predicted_values) == 0:
+        # Stack tokenized prompts if available
+        tokenized_prompt = None
+        tokenized_prompt_mask = None
+        if "tokenized_prompt" in frame_dicts[0]:
+            prompts = [np.asarray(f["tokenized_prompt"]) if hasattr(f["tokenized_prompt"], "device") 
+                      else f["tokenized_prompt"] for f in frame_dicts]
+            tokenized_prompt = jnp.asarray(np.stack(prompts, axis=0))
+        if "tokenized_prompt_mask" in frame_dicts[0]:
+            masks = [np.asarray(f["tokenized_prompt_mask"]) if hasattr(f["tokenized_prompt_mask"], "device")
+                    else f["tokenized_prompt_mask"] for f in frame_dicts]
+            tokenized_prompt_mask = jnp.asarray(np.stack(masks, axis=0))
+        
+        # Build batched observation
+        obs = _model.Observation(
+            images=images_dict if images_dict else {},
+            image_masks=image_masks_dict if image_masks_dict else {},
+            state=obs_state,
+            tokenized_prompt=tokenized_prompt,
+            tokenized_prompt_mask=tokenized_prompt_mask,
+        )
+        
+        # Stack actions for Q(s, a) if action-conditioned
+        act = None
+        if action_conditioned and "actions" in frame_dicts[0]:
+            actions = [np.asarray(f["actions"]) if hasattr(f["actions"], "device")
+                      else f["actions"] for f in frame_dicts]
+            act = jnp.asarray(np.stack(actions, axis=0))
+        
+        # Log shapes for first batch only
+        if batch_start == 0:
+            logging.info(f"  Batch obs.state: shape={obs.state.shape}, dtype={obs.state.dtype}")
+            if obs.images:
+                for k, v in obs.images.items():
+                    logging.info(f"  Batch obs.images[{k}]: shape={v.shape}, dtype={v.dtype}")
+            if obs.tokenized_prompt is not None:
+                logging.info(f"  Batch obs.tokenized_prompt: shape={obs.tokenized_prompt.shape}")
+        
+        # Batched forward pass
+        pred_values = model.compute_value(obs, act, take_min_over_ensemble=True)
+        pred_values_np = jax.device_get(pred_values)
+        
+        # Store predictions with their episode/frame indices
+        for i, (ep_idx, frame_idx, _) in enumerate(batch_frames):
+            all_predictions[(ep_idx, frame_idx)] = float(pred_values_np[i])
+    
+    logging.info(f"Computed {len(all_predictions)} predictions")
+    
+    # Reassemble predictions by episode and create plots
+    for ep_idx in ep_mc_returns.keys():
+        mc_returns = ep_mc_returns[ep_idx]
+        loss_masks = ep_loss_masks[ep_idx]
+        
+        # Get predictions for this episode in frame order
+        ep_frame_indices = sorted([frame_idx for (eidx, frame_idx) in all_predictions.keys() if eidx == ep_idx])
+        predicted_values = [all_predictions[(ep_idx, frame_idx)] for frame_idx in ep_frame_indices]
+        
+        if len(predicted_values) != len(mc_returns):
+            logging.warning(f"Episode {ep_idx}: mismatch between predictions ({len(predicted_values)}) and mc_returns ({len(mc_returns)})")
             continue
-
-        logging.info(f"Episode {ep_idx}: {len(predicted_values)} predicted values")
         
-        # Create plot (only on worker 0 - all workers participated in compute_value for FSDP)
+        # Filter out frames where loss_mask is False
+        filtered_mc_returns = []
+        filtered_predictions = []
+        for mc, pred, mask in zip(mc_returns, predicted_values, loss_masks):
+            if mask:  # Only include frames with valid loss_mask
+                filtered_mc_returns.append(mc)
+                filtered_predictions.append(pred)
+        
+        if len(filtered_mc_returns) == 0:
+            logging.warning(f"Episode {ep_idx}: no frames with loss_mask=True")
+            continue
+        
+        subtasks = ep_subtasks.get(ep_idx, set())
+        
+        logging.info(f"Episode {ep_idx}: {len(filtered_predictions)}/{len(predicted_values)} frames after loss_mask filter, subtasks={subtasks}")
+        
+        # Create plot (only on worker 0)
         if jax.process_index() == 0:
             images[f"val/episode_{ep_idx}"] = _create_value_plot(
-                mc_returns, predicted_values, ep_idx, step, " (RoboCOIN)", oracle_values=None
+                filtered_mc_returns, filtered_predictions, ep_idx, step, " (RoboCOIN)", 
+                oracle_values=None, subtask_texts=subtasks
             )
             logging.info(f"Episode {ep_idx} plot created")
     

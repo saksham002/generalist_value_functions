@@ -325,6 +325,7 @@ class AsyncBatchPrefetcher:
         use_quantile_norm: bool = False,
         td_n: int | None = None,
         single_host_batch: bool = False,
+        split: str = "train",
     ):
         self.iterator = iterator
         self.buffer = queue.Queue(maxsize=buffer_size)
@@ -336,6 +337,7 @@ class AsyncBatchPrefetcher:
         self.num_batches = num_batches
         self.sharding = sharding
         self.single_host_batch = single_host_batch
+        self.split = split
         self.thread = None
         self.stop_event = threading.Event()
         self.exception = None
@@ -524,8 +526,12 @@ class AsyncBatchPrefetcher:
             # If first_null_index is 0, there are no valid subtasks
             loss_masks = first_null_index > 0  # [B] - True if there's at least one valid subtask
             
-            safe_upper_bound = np.maximum(first_null_index, 1)
-            sampled_indices = (np.random.rand(batch_size) * safe_upper_bound).astype(np.int32)  # [B]
+            # For validation, always use subtask_1 (index 0); for training, sample randomly
+            if self.split == "val":
+                sampled_indices = np.zeros(batch_size, dtype=np.int32)  # Always subtask_1
+            else:
+                safe_upper_bound = np.maximum(first_null_index, 1)
+                sampled_indices = (np.random.rand(batch_size) * safe_upper_bound).astype(np.int32)  # [B]
             
             # Gather the selected subtask text for each batch element
             # Stack texts into shape [num_subtasks, B]
@@ -577,6 +583,16 @@ class AsyncBatchPrefetcher:
                 batch["reward"] = batch["termination"].astype(np.float32)
 
             batch["sampled_indices"] = sampled_indices
+            
+            # For validation, store subtask_1 text for plotting labels
+            if self.split == "val":
+                subtask_1_texts = []
+                for i in range(batch_size):
+                    text = subtask_texts_all[0][i]  # subtask_1 is at index 0
+                    if isinstance(text, bytes):
+                        text = text.decode("utf-8")
+                    subtask_1_texts.append(text)
+                batch["subtask_1_text"] = subtask_1_texts
         
         # Store metadata for debugging/analysis
         if first_null_index is not None:
@@ -584,10 +600,10 @@ class AsyncBatchPrefetcher:
         if steps_to_subtask_end is not None:
             batch["steps_to_subtask_end"] = steps_to_subtask_end.astype(np.int32)
 
-        # Preserve trajectory/frame indices for validation episode identification
-        traj_index = raw_batch.get("_traj_index", None)
-        if traj_index is not None:
-            batch["_traj_index"] = traj_index.astype(np.int32)
+        # Preserve episode_index and frame indices for validation episode identification
+        episode_index = raw_batch.get("episode_index", None)
+        if episode_index is not None:
+            batch["episode_index"] = episode_index.astype(np.int32)
         
         frame_index = raw_batch.get("_frame_index", None)
         if frame_index is not None:
@@ -639,7 +655,17 @@ class AsyncBatchPrefetcher:
         
         # Skip JAX sharding if single_host_batch is True (for validation cache collection)
         if self.single_host_batch:
-            return jax.tree.map(lambda x: jax.numpy.asarray(x), item)
+            # Convert to JAX arrays, but skip text keys that can't be converted
+            def maybe_to_jax(key, val):
+                # Skip text-based keys that can't be JAX arrays
+                if key == "subtask_1_text":
+                    return val
+                # Recursively handle nested dicts (e.g., "image", "image_mask")
+                if isinstance(val, dict):
+                    return {k: maybe_to_jax(k, v) for k, v in val.items()}
+                return jax.numpy.asarray(val)
+            
+            return {k: maybe_to_jax(k, v) for k, v in item.items()}
         
         # Apply JAX sharding for distributed training
         sharding = self._get_sharding()
@@ -762,6 +788,7 @@ def create_robocoin_data_loader(
         use_quantile_norm=config.use_quantile_norm,
         td_n=config.td_n,
         single_host_batch=config.single_host_batch,
+        split=config.split,
     )
     prefetcher.start()
 
