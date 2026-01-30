@@ -1923,69 +1923,69 @@ def main(config: _config.TrainConfig):
         val_dataloader = None
     elif data_config.robocoin_data_config is not None:
         # RoboCOIN: get num_episodes from TFDS builder metadata
-        import tensorflow_datasets as tfds
+        # import tensorflow_datasets as tfds
         
-        robocoin_config = data_config.robocoin_data_config
-        builder = tfds.builder(robocoin_config.dataset_name, data_dir=robocoin_config.data_dir)
-        num_episodes = builder.info.splits["val"].num_examples
-        logging.info(f"RoboCOIN: {num_episodes} episodes in validation set")
+        # robocoin_config = data_config.robocoin_data_config
+        # builder = tfds.builder(robocoin_config.dataset_name, data_dir=robocoin_config.data_dir)
+        # num_episodes = builder.info.splits["val"].num_examples
+        # logging.info(f"RoboCOIN: {num_episodes} episodes in validation set")
         
-        # Select validation episode indices for RoboCOIN
-        val_rng = np.random.default_rng(config.seed)
-        val_episode_indices = val_rng.choice(
-            num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
-        ).tolist()
-        logging.info(f"Selected validation episodes: {val_episode_indices}")
-        
-        # Cache validation episodes to disk - only worker 0 collects and caches
-        val_episodes_cache_dir = config.validation_cache_dir if config.validation_cache_dir is not None else str(config.checkpoint_dir / "val_episodes")
-        
-        if jax.process_index() == 0:
-            logging.info("Worker 0: Collecting validation episodes for caching")
-            
-            val_loader_config = RoboCOINDataLoaderConfig(
-                data_dir=robocoin_config.data_dir,
-                dataset_name=robocoin_config.dataset_name,
-                split="val",
-                batch_size=256,  # Full batch size for single host
-                shuffle=False,
-                repeat=False,
-                seed=config.seed,
-                max_cameras=robocoin_config.max_cameras,
-                max_state_dim=robocoin_config.max_state_dim,
-                max_action_dim=robocoin_config.max_action_dim,
-                image_size=robocoin_config.image_size,
-                discount=robocoin_config.discount,
-                td_n=robocoin_config.td_n,
-                state_norm_stats=data_config.norm_stats,
-                use_quantile_norm=data_config.use_quantile_norm,
-                single_host_batch=True,  # Don't split batch across hosts
-                use_eef=robocoin_config.use_eef,
-            )
-            val_dataloader = create_robocoin_data_loader(val_loader_config)
-            
-            generate_validation_plots_dlimp(
-                model=None,  # Not needed for save_only
-                val_dataloader=val_dataloader,
-                val_episode_indices=val_episode_indices,
-                step=0,
-                action_conditioned=False,  # Not used for save_only
-                data_config=data_config,
-                cache_dir=val_episodes_cache_dir,
-                save_only=True,
-            )
-            val_dataloader.stop()
-            del val_dataloader
-            logging.info("Validation episodes cached successfully")
-        else:
-            logging.info(f"Worker {jax.process_index()}: Skipping validation cache collection (worker 0 handles this)")
-        
-        # val_dataloader = None
-        # num_episodes = 100
+        # # Select validation episode indices for RoboCOIN
         # val_rng = np.random.default_rng(config.seed)
         # val_episode_indices = val_rng.choice(
         #     num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
         # ).tolist()
+        # logging.info(f"Selected validation episodes: {val_episode_indices}")
+        
+        # # Cache validation episodes to disk - only worker 0 collects and caches
+        # val_episodes_cache_dir = config.validation_cache_dir if config.validation_cache_dir is not None else str(config.checkpoint_dir / "val_episodes")
+        
+        # if jax.process_index() == 0:
+        #     logging.info("Worker 0: Collecting validation episodes for caching")
+            
+        #     val_loader_config = RoboCOINDataLoaderConfig(
+        #         data_dir=robocoin_config.data_dir,
+        #         dataset_name=robocoin_config.dataset_name,
+        #         split="val",
+        #         batch_size=256,  # Full batch size for single host
+        #         shuffle=False,
+        #         repeat=False,
+        #         seed=config.seed,
+        #         max_cameras=robocoin_config.max_cameras,
+        #         max_state_dim=robocoin_config.max_state_dim,
+        #         max_action_dim=robocoin_config.max_action_dim,
+        #         image_size=robocoin_config.image_size,
+        #         discount=robocoin_config.discount,
+        #         td_n=robocoin_config.td_n,
+        #         state_norm_stats=data_config.norm_stats,
+        #         use_quantile_norm=data_config.use_quantile_norm,
+        #         single_host_batch=True,  # Don't split batch across hosts
+        #         use_eef=robocoin_config.use_eef,
+        #     )
+        #     val_dataloader = create_robocoin_data_loader(val_loader_config)
+            
+        #     generate_validation_plots_dlimp(
+        #         model=None,  # Not needed for save_only
+        #         val_dataloader=val_dataloader,
+        #         val_episode_indices=val_episode_indices,
+        #         step=0,
+        #         action_conditioned=False,  # Not used for save_only
+        #         data_config=data_config,
+        #         cache_dir=val_episodes_cache_dir,
+        #         save_only=True,
+        #     )
+        #     val_dataloader.stop()
+        #     del val_dataloader
+        #     logging.info("Validation episodes cached successfully")
+        # else:
+        #     logging.info(f"Worker {jax.process_index()}: Skipping validation cache collection (worker 0 handles this)")
+        
+        val_dataloader = None
+        num_episodes = 100
+        val_rng = np.random.default_rng(config.seed)
+        val_episode_indices = val_rng.choice(
+            num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
+        ).tolist()
 
         val_dataset = None
     else:
@@ -2045,33 +2045,34 @@ def main(config: _config.TrainConfig):
             f"({num_eval_envs} parallel envs)"
         )
 
-    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+    # train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
 
     if resuming:
         logging.info("Resuming training from checkpoint")
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        # train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
     # Unpack state and sharding
-    if not isinstance(train_state, training_utils.ActorCriticTrainState):
-        raise TypeError(f"Expected ActorCriticTrainState, got {type(train_state)}")
+    # if not isinstance(train_state, training_utils.ActorCriticTrainState):
+    #     raise TypeError(f"Expected ActorCriticTrainState, got {type(train_state)}")
 
-    critic_state = train_state.critic
-    policy_state = train_state.policy
-    critic_sharding = train_state_sharding.critic
-    policy_sharding = train_state_sharding.policy
-    logging.info(f"Initialized combined state:\nCritic: {training_utils.array_tree_to_info(critic_state.params)}")
+    # critic_state = train_state.critic
+    # policy_state = train_state.policy
+    # critic_sharding = train_state_sharding.critic
+    # policy_sharding = train_state_sharding.policy
+    # logging.info(f"Initialized combined state:\nCritic: {training_utils.array_tree_to_info(critic_state.params)}")
+    policy_state = None
     if policy_state:
         logging.info(f"Policy: {training_utils.array_tree_to_info(policy_state.params)}")
 
-    jax.block_until_ready(critic_state)
+    # jax.block_until_ready(critic_state)
 
     lr_schedule = config.lr_schedule.create()
-    ptrain_step = jax.jit(
-        functools.partial(value_function_train_step, config, lr_schedule),
-        in_shardings=(critic_sharding, data_sharding, replicated_sharding),
-        out_shardings=(critic_sharding, replicated_sharding),
-        donate_argnums=(0,),
-    )
+    # ptrain_step = jax.jit(
+    #     functools.partial(value_function_train_step, config, lr_schedule),
+    #     in_shardings=(critic_sharding, data_sharding, replicated_sharding),
+    #     out_shardings=(critic_sharding, replicated_sharding),
+    #     donate_argnums=(0,),
+    # )
 
     ppolicy_step = None
     if policy_state is not None:
@@ -2086,7 +2087,8 @@ def main(config: _config.TrainConfig):
             out_shardings=(policy_sharding, replicated_sharding),
         )
 
-    start_step = int(critic_state.step)
+    # start_step = int(critic_state.step)
+    start_step = 0
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
@@ -2103,12 +2105,12 @@ def main(config: _config.TrainConfig):
         # Split rng for this step
         rng, step_rng = jax.random.split(rng)
 
-        with timer.context("train_step_compute"), sharding.set_mesh(mesh):
-            critic_state, info = ptrain_step(critic_state, batch, step_rng)
+        # with timer.context("train_step_compute"), sharding.set_mesh(mesh):
+        #     critic_state, info = ptrain_step(critic_state, batch, step_rng)
 
-        with timer.context("train_step_sync"):
-            jax.block_until_ready(critic_state)
-            jax.block_until_ready(info)
+        # with timer.context("train_step_sync"):
+        #     jax.block_until_ready(critic_state)
+        #     jax.block_until_ready(info)
 
         # Policy training step (if enabled)
         if policy_training_enabled:
@@ -2124,23 +2126,22 @@ def main(config: _config.TrainConfig):
                 info.update(policy_info)
 
         if step % config.log_interval == 0:
-            info = jax.device_get(info)
+            # info = jax.device_get(info)
             # Add timing info to logged metrics (average and total)
             total_times = timer.get_total_times(reset=False)
             avg_times = timer.get_average_times(reset=True)
             timing_info = {f"average_times/{k}": v for k, v in avg_times.items()}
             timing_info.update({f"total_times/{k}": v for k, v in total_times.items()})
-            info.update(timing_info)
+            # info.update(timing_info)
 
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(info, step=step)
+            # info_str = ", ".join(f"{k}={v:.4f}" for k, v in info.items())
+            # pbar.write(f"Step {step}: {info_str}")
+            # wandb.log(info, step=step)
             
             # Memory debugging: log every 100 steps, force GC every 500 steps
-            # force_gc = (step % 500 == 0)
-            force_gc = False
+            force_gc = (step % 500 == 0)
             log_memory_debug(step, data_loader=data_loader, force_gc=force_gc, log_to_wandb=jax.process_index() == 0)
-
+            
         # Break down data loading into components
         with timer.context("data_fetch"):
             raw_batch = next(data_iter)

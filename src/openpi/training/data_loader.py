@@ -765,11 +765,10 @@ def create_robocoin_data_loader(
     # Get the RoboCOIN loader config from data_config
     robocoin_config = data_config.robocoin_data_config
 
-    # For distributed training, divide batch_size and shuffle_buffer_size by the number of hosts.
-    # Each host loads its own local batch and maintains its own shuffle buffer.
+    # For distributed training, divide batch_size by the number of hosts.
+    # local_shuffle_buffer_size is already per-host (specified directly in config).
     process_count = jax.process_count()
     local_batch_size = batch_size // process_count
-    local_shuffle_buffer_size = robocoin_config.shuffle_buffer_size // process_count
     
     if process_count > 1:
         # Set TensorFlow random seed per host for data diversity (as in pali-parl)
@@ -777,7 +776,7 @@ def create_robocoin_data_loader(
         logging.info(
             f"Distributed training: {process_count} hosts, "
             f"local_batch_size={local_batch_size} (global={batch_size}), "
-            f"local_shuffle_buffer_size={local_shuffle_buffer_size} (global={robocoin_config.shuffle_buffer_size})"
+            f"local_shuffle_buffer_size={robocoin_config.local_shuffle_buffer_size}"
         )
 
     # Update config with batch_size, shuffle, sharding, and normalization settings
@@ -786,7 +785,6 @@ def create_robocoin_data_loader(
         robocoin_config,
         batch_size=local_batch_size,
         shuffle=shuffle,
-        shuffle_buffer_size=local_shuffle_buffer_size,
         seed=seed + jax.process_index(),  # Different seed per host for data diversity
         num_batches=num_batches,
         sharding=sharding,

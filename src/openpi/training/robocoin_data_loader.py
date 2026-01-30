@@ -24,13 +24,16 @@ Output format follows the standard convention from openpi/models/model.py:
 from __future__ import annotations
 
 import dataclasses
+import gc
 import logging
 import queue
 import threading
 from typing import Any, Iterator
 import jax
+import jax.numpy as jnp
 
 import numpy as np
+import augmax
 import tensorflow as tf
 
 from openpi.models.model import IMAGE_KEYS
@@ -75,7 +78,7 @@ class RoboCOINDataLoaderConfig:
         split: Dataset split ("train", "test", etc.).
         batch_size: Number of samples per batch.
         shuffle: Whether to shuffle the data.
-        shuffle_buffer_size: Size of shuffle buffer for shuffling.
+        local_shuffle_buffer_size: Size of per-host shuffle buffer for shuffling.
         seed: Random seed for shuffling.
         prefetch_buffer_size: Number of batches to prefetch asynchronously.
         max_cameras: Maximum number of camera views.
@@ -98,7 +101,7 @@ class RoboCOINDataLoaderConfig:
     split: str = "train"
     batch_size: int = 64
     shuffle: bool = True
-    shuffle_buffer_size: int = 250000
+    local_shuffle_buffer_size: int = 250000
     seed: int = 86
     prefetch_buffer_size: int = 4
     max_cameras: int = DEFAULT_MAX_CAMERAS
@@ -125,6 +128,10 @@ class RoboCOINDataLoaderConfig:
     # If True, this host uses the full batch_size without splitting across hosts.
     # Useful for validation cache collection where only worker 0 needs the data.
     single_host_batch: bool = False
+    # Whether to use end-effector position state instead of joint angles.
+    # If True, constructs 14-D state as: [eef_sim_pose_state[:6], state[6], eef_sim_pose_state[6:12], state[13]]
+    # where eef_sim_pose_state is 12-D (6 left EEF + 6 right EEF) and state[6], state[13] are grippers.
+    use_eef: bool = False
 
 
 class AddBatchKeys:
@@ -191,6 +198,9 @@ class AddBatchKeys:
         # Camera image keys (RLDS format)
         cam_keys = [f"observation/image/cam_{i}" for i in range(self.max_cameras)]
         
+        # Get EEF state if present (for use_eef mode)
+        eef_state = episode.get("eef_sim_pose_state", None)
+        
         if self.td_n is None:
             # MC learning: next_* keys set to immediate next timestep (t+1)
             # This provides actual next-state data while still using MC returns for loss
@@ -198,6 +208,8 @@ class AddBatchKeys:
             
             if state is not None:
                 episode["next_observation/state"] = tf.gather(state, t_plus_1)
+            if eef_state is not None:
+                episode["next_eef_sim_pose_state"] = tf.gather(eef_state, t_plus_1)
             if action is not None:
                 episode["next_action"] = tf.gather(action, t_plus_1)
             for cam_key in cam_keys:
@@ -220,6 +232,8 @@ class AddBatchKeys:
             # Gather next_* values at t + td_n
             if state is not None:
                 episode["next_observation/state"] = tf.gather(state, t_plus_n)
+            if eef_state is not None:
+                episode["next_eef_sim_pose_state"] = tf.gather(eef_state, t_plus_n)
             if action is not None:
                 episode["next_action"] = tf.gather(action, t_plus_n)
             for cam_key in cam_keys:
@@ -244,6 +258,8 @@ class ImageResizeTransform:
 
     Applied element-wise (per-frame) using TF functions.
     Does NOT normalize.
+    
+    Uses tf.function to prevent eager mode function graph accumulation.
     """
 
     def __init__(
@@ -253,8 +269,14 @@ class ImageResizeTransform:
     ):
         self.target_size = target_size
         self.max_cameras = max_cameras
+        # Create the tf.function wrapped decoder once to avoid retracing
+        self._decode_and_resize_fn = tf.function(
+            self._decode_and_resize_impl,
+            input_signature=[tf.TensorSpec(shape=(), dtype=tf.string)],
+            reduce_retracing=True,
+        )
 
-    def _decode_and_resize(self, jpeg_bytes: tf.Tensor) -> tf.Tensor:
+    def _decode_and_resize_impl(self, jpeg_bytes: tf.Tensor) -> tf.Tensor:
         """Decode a JPEG image and resize it."""
         is_empty = tf.equal(tf.strings.length(jpeg_bytes), 0)
 
@@ -280,9 +302,9 @@ class ImageResizeTransform:
             [example.get(k, tf.constant(b"", dtype=tf.string)) for k in all_keys]
         )
 
-        # Process all cameras using tf.map_fn
+        # Process all cameras using tf.map_fn with the pre-traced function
         resized = tf.map_fn(
-            self._decode_and_resize,
+            self._decode_and_resize_fn,
             images,
             parallel_iterations=len(all_keys),
             fn_output_signature=tf.TensorSpec(
@@ -326,6 +348,7 @@ class AsyncBatchPrefetcher:
         td_n: int | None = None,
         single_host_batch: bool = False,
         split: str = "train",
+        use_eef: bool = False,
     ):
         self.iterator = iterator
         self.buffer = queue.Queue(maxsize=buffer_size)
@@ -344,6 +367,7 @@ class AsyncBatchPrefetcher:
         self._batch_count = 0
         self._crossed = 0
         self.td_n = td_n
+        self.use_eef = use_eef
         
         # Lazy-initialized tokenizer (to avoid download during import)
         self._tokenizer: PaligemmaTokenizer | None = None
@@ -383,6 +407,40 @@ class AsyncBatchPrefetcher:
         if self._state_normalize_fn is None:
             return batch
         return self._state_normalize_fn(batch)
+    
+    def _generate_negative_subtask_text(self, subtask_text: str) -> str:
+        """Generate negative subtask text based on specific rules.
+        
+        Args:
+            subtask_text: The original subtask text.
+            
+        Returns:
+            Negative subtask text following the specified transformation rules.
+        """
+        if "Place the plate" in subtask_text:
+            return "Place the plate on the table"
+        elif "Grab the knife" in subtask_text:
+            return "Grab the banana with your right hand"
+        elif "Place the knife" in subtask_text:
+            return "Place the knife on the board"
+        elif "Pass the plate" in subtask_text:
+            return "Rotate the plate with the right gripper"
+        else:
+            # Swap left to right and right to left
+            # Use a temporary marker to avoid double replacement
+            negative_text = subtask_text
+            # Replace "left" with a temporary marker, then "right" with "left", then marker with "right"
+            negative_text = negative_text.replace("left", "TEMP_LEFT_MARKER")
+            negative_text = negative_text.replace("right", "left")
+            negative_text = negative_text.replace("TEMP_LEFT_MARKER", "right")
+            return negative_text
+
+    def _swap_left_right_text(self, text: str) -> str:
+        """Swap 'left' and 'right' in text (simple, case-sensitive)."""
+        swapped = text.replace("left", "TEMP_LEFT_MARKER")
+        swapped = swapped.replace("right", "left")
+        swapped = swapped.replace("TEMP_LEFT_MARKER", "right")
+        return swapped
 
     def _transform_batch(self, raw_batch: dict[str, Any]) -> dict[str, Any]:
         """Transform raw TFDS batch to standard training pipeline format.
@@ -415,14 +473,50 @@ class AsyncBatchPrefetcher:
         # State (normalization applied at end of method)
         state = raw_batch.pop("observation/state", None)
         if state is not None:
-            batch["state"] = state.astype(np.float32)
+            state = state.astype(np.float32)
+            
+            # If use_eef, construct state from eef_sim_pose_state + grippers
+            if self.use_eef:
+                eef_state = raw_batch.pop("eef_sim_pose_state", None)
+                if eef_state is not None:
+                    eef_state = eef_state.astype(np.float32)
+                    # Construct: [eef[:6], state[6], eef[6:12], state[13]]
+                    # eef_sim_pose_state is 12-D: [left_eef(6), right_eef(6)]
+                    # state[6] = left gripper, state[13] = right gripper
+                    batch["state"] = np.concatenate([
+                        eef_state[:, :6],          # Left arm EEF positions
+                        state[:, 6:7],             # Left gripper
+                        eef_state[:, 6:12],        # Right arm EEF positions
+                        state[:, 13:14],           # Right gripper
+                    ], axis=-1)
+                else:
+                    logger.warning("use_eef=True but 'observation/eef_sim_pose_state' not found, using joint state")
+                    batch["state"] = state
+            else:
+                batch["state"] = state
 
         self._crossed += 1
         
         # Next state (set by AddBatchKeys transform)
         next_state = raw_batch.pop("next_observation/state", None)
         if next_state is not None:
-            batch["next_state"] = next_state.astype(np.float32)
+            next_state = next_state.astype(np.float32)
+            
+            # If use_eef, construct next_state from eef_sim_pose_state + grippers
+            if self.use_eef:
+                next_eef_state = raw_batch.pop("next_eef_sim_pose_state", None)
+                if next_eef_state is not None:
+                    next_eef_state = next_eef_state.astype(np.float32)
+                    batch["next_state"] = np.concatenate([
+                        next_eef_state[:, :6],
+                        next_state[:, 6:7],
+                        next_eef_state[:, 6:12],
+                        next_state[:, 13:14],
+                    ], axis=-1)
+                else:
+                    batch["next_state"] = next_state
+            else:
+                batch["next_state"] = next_state
 
         self._crossed += 1
 
@@ -501,6 +595,41 @@ class AsyncBatchPrefetcher:
             batch["next_image"] = next_images
             batch["next_image_mask"] = next_image_masks
 
+        # Counterfactual image/state for validation only.
+        # - Flip images horizontally
+        # - Swap left/right wrist image keys
+        # - Swap left/right arm values in the state vector
+        if self.split == "val" and images:
+            mirror_images = {}
+            mirror_image_masks = {}
+            for key, img in images.items():
+                # Deterministic horizontal flip via augmax.
+                rng = jax.random.PRNGKey(0)
+                sub_rngs = jax.random.split(rng, img.shape[0])
+                flipped = jax.vmap(augmax.HorizontalFlip(p = 1.0))(sub_rngs, jnp.asarray(img))
+                flipped = np.asarray(flipped)
+                mirror_key = key
+                if key == "left_wrist_0_rgb":
+                    mirror_key = "right_wrist_0_rgb"
+                elif key == "right_wrist_0_rgb":
+                    mirror_key = "left_wrist_0_rgb"
+                mirror_images[mirror_key] = flipped
+                mirror_image_masks[mirror_key] = image_masks.get(key, np.ones(img.shape[0], dtype=np.bool_))
+            batch["mirror_image"] = mirror_images
+            batch["mirror_image_mask"] = mirror_image_masks
+
+            # Mirror state: use batch["state"] which may be joint angles or EEF state
+            batch_state = batch.get("state")
+            assert batch_state is not None and batch_state.shape[-1] == 14
+            mirror_state = batch_state.copy()
+            # Swap left and right arm values, flipping signs for joints/EEF but not grippers
+            # Indices: 0-5 = left arm (joints or EEF), 6 = left gripper, 7-12 = right arm, 13 = right gripper
+            mirror_state[:, : 6] = -batch_state[:, 7 : 13]  # Right arm (negated) -> Left arm positions
+            mirror_state[:, 6] = batch_state[:, 13]  # Right gripper (non-negated) -> Left gripper position
+            mirror_state[:, 7 : 13] = -batch_state[:, : 6]  # Left arm (negated) -> Right arm positions
+            mirror_state[:, 13] = batch_state[:, 6]  # Left gripper (non-negated) -> Right gripper position
+            batch["mirror_state"] = mirror_state
+
         # V(s, l) training: For each datapoint, randomly sample one valid subtask.
         # Use first_null_index to determine valid subtask range [0, first_null_index).
         # Use that subtask's text as tokenized_prompt and compute mc_return as
@@ -547,10 +676,40 @@ class AsyncBatchPrefetcher:
             mc_returns = np.power(self.discount, selected_steps.astype(np.float32))  # [B]
             self._crossed += 1
             mc_returns = np.where(loss_masks, mc_returns, 0.0)
+
+            # For validation, store subtask_1 text for plotting labels
+            negative_subtask_1_texts = None
+            mirror_subtask_1_texts = None
+            if self.split == "val":
+                subtask_1_texts = []
+                for i in range(batch_size):
+                    text = subtask_texts_all[0][i]  # subtask_1 is at index 0
+                    if isinstance(text, bytes):
+                        text = text.decode("utf-8")
+                    subtask_1_texts.append(text)
+                batch["subtask_1_text"] = subtask_1_texts
+                
+                # Generate negative subtask texts for validation
+                negative_subtask_1_texts = []
+                for text in subtask_1_texts:
+                    negative_text = self._generate_negative_subtask_text(text)
+                    negative_subtask_1_texts.append(negative_text)
+                batch["negative_subtask_1_text"] = negative_subtask_1_texts
+
+                # Mirror subtask texts (swap left/right) for counterfactual image plot
+                mirror_subtask_1_texts = []
+                for text in subtask_1_texts:
+                    mirror_text = self._swap_left_right_text(text)
+                    mirror_subtask_1_texts.append(mirror_text)
+                batch["mirror_subtask_1_text"] = mirror_subtask_1_texts
             
-            # Tokenize all selected texts
+            # Tokenize all selected texts (and negative texts for validation)
             tokenized_prompts = []
             tokenized_masks = []
+            tokenized_negative_prompts = []
+            tokenized_negative_masks = []
+            tokenized_mirror_prompts = []
+            tokenized_mirror_masks = []
             for i in range(batch_size):
                 text = selected_texts[i]
                 if isinstance(text, bytes):
@@ -558,9 +717,33 @@ class AsyncBatchPrefetcher:
                 tokens, mask = self.tokenizer.tokenize(text, state = None)
                 tokenized_prompts.append(tokens)
                 tokenized_masks.append(mask)
+                
+                # Also tokenize negative text if in validation mode
+                if self.split == "val" and negative_subtask_1_texts is not None:
+                    negative_text = negative_subtask_1_texts[i]
+                    negative_tokens, negative_mask = self.tokenizer.tokenize(negative_text, state = None)
+                    tokenized_negative_prompts.append(negative_tokens)
+                    tokenized_negative_masks.append(negative_mask)
+
+                # Tokenize mirror text for counterfactual image plot
+                if self.split == "val" and mirror_subtask_1_texts is not None:
+                    mirror_text = mirror_subtask_1_texts[i]
+                    mirror_tokens, mirror_mask = self.tokenizer.tokenize(mirror_text, state = None)
+                    tokenized_mirror_prompts.append(mirror_tokens)
+                    tokenized_mirror_masks.append(mirror_mask)
             
             batch["tokenized_prompt"] = np.stack(tokenized_prompts, axis = 0)
             batch["tokenized_prompt_mask"] = np.stack(tokenized_masks, axis = 0)
+            
+            # Add negative tokenized prompts for validation
+            if self.split == "val" and tokenized_negative_prompts:
+                batch["tokenized_negative_prompt"] = np.stack(tokenized_negative_prompts, axis = 0)
+                batch["tokenized_negative_prompt_mask"] = np.stack(tokenized_negative_masks, axis = 0)
+
+            # Add mirror tokenized prompts for validation
+            if self.split == "val" and tokenized_mirror_prompts:
+                batch["mirror_tokenized_prompt"] = np.stack(tokenized_mirror_prompts, axis = 0)
+                batch["mirror_tokenized_prompt_mask"] = np.stack(tokenized_mirror_masks, axis = 0)
             batch["mc_return"] = mc_returns.astype(np.float32)
             self._crossed += 1
             batch["loss_mask"] = loss_masks.astype(np.bool_)
@@ -583,16 +766,6 @@ class AsyncBatchPrefetcher:
                 batch["reward"] = batch["termination"].astype(np.float32)
 
             batch["sampled_indices"] = sampled_indices
-            
-            # For validation, store subtask_1 text for plotting labels
-            if self.split == "val":
-                subtask_1_texts = []
-                for i in range(batch_size):
-                    text = subtask_texts_all[0][i]  # subtask_1 is at index 0
-                    if isinstance(text, bytes):
-                        text = text.decode("utf-8")
-                    subtask_1_texts.append(text)
-                batch["subtask_1_text"] = subtask_1_texts
         
         # Store metadata for debugging/analysis
         if first_null_index is not None:
@@ -612,10 +785,15 @@ class AsyncBatchPrefetcher:
         # Apply state normalization using transforms.Normalize
         batch = self._normalize_state_batch(batch)
 
+        if "mirror_state" in batch and self._state_normalize_fn is not None:
+            mirror_norm = self._state_normalize_fn({"state": batch["mirror_state"]})
+            batch["mirror_state"] = mirror_norm["state"]
+
         return batch
 
     def _prefetch_worker(self):
         """Worker function that runs in a separate thread to prefetch batches."""
+        batch_count = 0
         try:
             for raw_batch in self.iterator:
                 if self.stop_event.is_set():
@@ -623,7 +801,19 @@ class AsyncBatchPrefetcher:
 
                 # Transform batch to training format
                 batch = self._transform_batch(raw_batch)
+                
+                # Explicitly clear the raw_batch to release TF tensor references
+                raw_batch.clear()
+                del raw_batch
+                
                 self.buffer.put(batch)
+                batch_count += 1
+                
+                # Periodically force garbage collection to prevent memory accumulation
+                # TensorFlow eager mode can accumulate function graph caches
+                if batch_count % 100 == 0:
+                    gc.collect()
+                    
         except Exception as e:
             logger.error(f"Error in prefetch worker: {e}, crossed: {self._crossed}")
             self.exception = e
@@ -658,7 +848,7 @@ class AsyncBatchPrefetcher:
             # Convert to JAX arrays, but skip text keys that can't be converted
             def maybe_to_jax(key, val):
                 # Skip text-based keys that can't be JAX arrays
-                if key == "subtask_1_text":
+                if key in {"subtask_1_text", "negative_subtask_1_text", "mirror_subtask_1_text"}:
                     return val
                 # Recursively handle nested dicts (e.g., "image", "image_mask")
                 if isinstance(val, dict):
@@ -762,13 +952,13 @@ def create_robocoin_data_loader(
 
     # Frame-level shuffle if requested (separate from episode-level shuffle above)
     if config.shuffle:
-        dataset = dataset.shuffle(config.shuffle_buffer_size, seed=config.seed)
+        dataset = dataset.shuffle(config.local_shuffle_buffer_size, seed=config.seed)
 
     # Batch the data
     dataset = dataset.batch(config.batch_size, drop_remainder=config.drop_remainder)
 
     # Set RAM budget
-    dataset.with_ram_budget(1)
+    dataset = dataset.with_ram_budget(1)
 
     # Create numpy iterator
     numpy_iterator = dataset.as_numpy_iterator()
@@ -787,6 +977,7 @@ def create_robocoin_data_loader(
         state_norm_stats=config.state_norm_stats,
         use_quantile_norm=config.use_quantile_norm,
         td_n=config.td_n,
+        use_eef=config.use_eef,
         single_host_batch=config.single_host_batch,
         split=config.split,
     )

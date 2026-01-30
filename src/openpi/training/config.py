@@ -812,15 +812,22 @@ class RoboCOINDataConfig(DataConfigFactory):
     # Reward transformation: r' = reward_scale * r + reward_bias
     reward_scale: float = 1.0
     reward_bias: float = 0.0
-    # Shuffle buffer size for frame-level shuffling
-    shuffle_buffer_size: int = 250000
+    # Local (per-host) shuffle buffer size for frame-level shuffling
+    local_shuffle_buffer_size: int = 50000
     # TD-n parameter for temporal difference learning
     # - None: MC (Monte Carlo) learning - uses full episode return
     # - int: TD-n learning - bootstraps with value at t + td_n
     td_n: int | None = None
+    
+    # Whether to use end-effector position state instead of joint angles.
+    # If True, constructs 14-D state as: [eef_sim_pose_state[:6], state[6], eef_sim_pose_state[6:12], state[13]]
+    # where eef_sim_pose_state is 12-D (6 left EEF + 6 right EEF) and state[6], state[13] are grippers.
+    # Requires "eef_sim_pose_state" key in norm_stats.json for normalization of EEF components.
+    use_eef: bool = False
 
     # Path to norm_stats.json file (RoboCOIN-specific format)
     # Expected format: {"observation.state": {"mean": [...], "std": [...], "min": [...], "max": [...]}}
+    # For use_eef=True, also requires: {"eef_sim_pose_state": {"mean": [...], "std": [...], ...}}
     # Supports both local paths and GCS paths (gs://...)
     norm_stats_path: str | None = "gs://saksham-euw4/robocoin/norm_stats/norm_stats.json"
     
@@ -882,10 +889,75 @@ class RoboCOINDataConfig(DataConfigFactory):
         
         norm_stats = {}
         
-        # Map "observation.state" -> "state" for the Normalize transform
-        if "observation.state" in data:
-            state_stats = data["observation.state"]
+        # Check required keys exist
+        if "observation.state" not in data:
+            raise ValueError(f"norm_stats.json requires 'observation.state' key, but found: {list(data.keys())}")
+        
+        state_stats = data["observation.state"]
+        
+        if self.use_eef:
+            # EEF mode: construct combined norm stats from eef_sim_pose_state + observation.state grippers
+            if "eef_sim_pose_state" not in data:
+                raise ValueError(
+                    f"use_eef=True requires 'eef_sim_pose_state' key in norm_stats.json, "
+                    f"but found: {list(data.keys())}"
+                )
+            eef_stats = data["eef_sim_pose_state"]
             
+            if self.use_quantile_norm:
+                # Min-max normalization
+                if "min" not in state_stats or "max" not in state_stats:
+                    raise ValueError(f"use_quantile_norm=True requires 'min' and 'max' keys in observation.state")
+                if "min" not in eef_stats or "max" not in eef_stats:
+                    raise ValueError(f"use_quantile_norm=True requires 'min' and 'max' keys in eef_sim_pose_state")
+                
+                # Construct combined: [eef[:6], state[6], eef[6:12], state[13]]
+                combined_min = np.concatenate([
+                    np.array(eef_stats["min"])[:6],
+                    np.array(state_stats["min"])[6:7],
+                    np.array(eef_stats["min"])[6:12],
+                    np.array(state_stats["min"])[13:14],
+                ])
+                combined_max = np.concatenate([
+                    np.array(eef_stats["max"])[:6],
+                    np.array(state_stats["max"])[6:7],
+                    np.array(eef_stats["max"])[6:12],
+                    np.array(state_stats["max"])[13:14],
+                ])
+                norm_stats["state"] = _transforms.NormStats(
+                    mean=None,
+                    std=None,
+                    q01=combined_min,
+                    q99=combined_max,
+                )
+            else:
+                # Z-score normalization
+                if "mean" not in state_stats or "std" not in state_stats:
+                    raise ValueError(f"use_quantile_norm=False requires 'mean' and 'std' keys in observation.state")
+                if "mean" not in eef_stats or "std" not in eef_stats:
+                    raise ValueError(f"use_quantile_norm=False requires 'mean' and 'std' keys in eef_sim_pose_state")
+                
+                # Construct combined: [eef[:6], state[6], eef[6:12], state[13]]
+                combined_mean = np.concatenate([
+                    np.array(eef_stats["mean"])[:6],
+                    np.array(state_stats["mean"])[6:7],
+                    np.array(eef_stats["mean"])[6:12],
+                    np.array(state_stats["mean"])[13:14],
+                ])
+                combined_std = np.concatenate([
+                    np.array(eef_stats["std"])[:6],
+                    np.array(state_stats["std"])[6:7],
+                    np.array(eef_stats["std"])[6:12],
+                    np.array(state_stats["std"])[13:14],
+                ])
+                norm_stats["state"] = _transforms.NormStats(
+                    mean=combined_mean,
+                    std=combined_std,
+                    q01=None,
+                    q99=None,
+                )
+        else:
+            # Joint angle mode: use observation.state directly
             if self.use_quantile_norm:
                 # Min-max normalization: use min/max mapped to q01/q99
                 if "min" not in state_stats or "max" not in state_stats:
@@ -912,8 +984,6 @@ class RoboCOINDataConfig(DataConfigFactory):
                     q01=None,
                     q99=None,
                 )
-        else:
-            raise ValueError(f"use_quantile_norm={self.use_quantile_norm} requires 'observation.state' key in norm_stats, but found: {list(data.keys())}")
         
         logging.info(f"Loaded RoboCOIN norm_stats from {path_str}, keys: {list(norm_stats.keys())}")
         return norm_stats if norm_stats else None
@@ -968,8 +1038,9 @@ class RoboCOINDataConfig(DataConfigFactory):
             discount=self.discount,
             reward_scale=self.reward_scale,
             reward_bias=self.reward_bias,
-            shuffle_buffer_size=self.shuffle_buffer_size,
+            local_shuffle_buffer_size=self.local_shuffle_buffer_size,
             td_n=self.td_n,
+            use_eef=self.use_eef,
         )
 
 
@@ -1063,7 +1134,9 @@ class TrainConfig:
     # How often (in steps) to generate validation plots.
     plot_interval: int = 50000
     # Number of validation trajectories to use for plotting.
-    num_val_trajectories: int = 3
+    num_val_trajectories: int = 5
+    # Optional directory to cache validation episodes. If not set, it defaults to {checkpoint_dir}/val_episodes.
+    validation_cache_dir: str | None = None
     # Checkpoints matching step % keep_period == 0 will be preserved.
     keep_period: int | None = 100000
 
@@ -2491,12 +2564,12 @@ _CONFIGS = [
             tfds_data_dir="/data/group_data/rl/saksham3/",
             dataset_name="robocoin:1.0.0",
             discount=0.99,
-            shuffle_buffer_size=10000,
+            local_shuffle_buffer_size=50000,
             norm_stats_path="/data/group_data/rl/saksham3/robocoin/norm_stats/norm_stats.json",
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=30_000,
-        batch_size=32,
+        num_train_steps=3_500,
+        batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
             peak_lr=1e-5,
@@ -2506,9 +2579,10 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,  # DLIMP handles its own parallelism
         log_interval=100,
-        plot_interval=1,
+        plot_interval=100_000,
         fsdp_devices=2,
         # wandb_enabled=False,
+        validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache/",
     ),
     TrainConfig(
         name="robocoin_paligemma_v_mc",
@@ -2542,7 +2616,44 @@ _CONFIGS = [
         plot_interval=5_000,
         save_interval=5_000,
         fsdp_devices=16,
-    ),
+        validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache_counterfactual/",
+    ),  
+    TrainConfig(
+        name="robocoin_paligemma_v_mc_use_eef",
+        model=_value_function.MCValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,  # Proprioceptive state dimension for RoboCOIN
+                num_cameras=3,  # cam_0, cam_1, cam_2
+                image_size=(224, 224),
+                freeze_backbone=False,
+                max_token_len=48,  # Max tokens for subtask text
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="/data/group_data/rl/saksham3/",
+            dataset_name="robocoin:1.0.0",
+            norm_stats_path="gs://saksham-euw4/robocoin/norm_stats/norm_stats_eef.json",
+            discount=0.99,
+            use_eef=True,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=30_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,  # DLIMP handles its own parallelism
+        log_interval=100,
+        plot_interval=5_000,
+        save_interval=5_000,
+        fsdp_devices=16,
+        validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache_counterfactual/",
+    ), 
     TrainConfig(
         name="robocoin_paligemma_v_mc_ce",
         model=_value_function.MCValueFunctionConfig(
@@ -2576,6 +2687,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,
         log_interval=100,
+        validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache/",
     ),
     # RoboCOIN MC value function with HL-Gauss (soft categorical) loss.
     TrainConfig(
@@ -2591,8 +2703,8 @@ _CONFIGS = [
             head_config=_heads.CategoricalHeadConfig(
                 v_min=0.0,   # MC return = gamma^steps is in [0, 1]
                 v_max=1.0,
-                num_bins=128,  # Consistent with other HL-Gauss configs
-                sigma=0.75,    # Gaussian smoothing standard deviation
+                num_bins=51,  # Bin size is 0.02
+                sigma=0.015,    # ratio of sigma to bin size is 0.75
             ),
         ),
         data=RoboCOINDataConfig(
@@ -2612,6 +2724,10 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,
         log_interval=100,
+        plot_interval=5_000,
+        save_interval=5_000,
+        fsdp_devices=16,
+        validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache_counterfactual/",
     ),
     # RoboCOIN TD-30 value function config (regression loss).
     TrainConfig(
@@ -2645,6 +2761,9 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,  # DLIMP handles its own parallelism
         log_interval=100,
+        plot_interval=5_000,
+        fsdp_devices=16,
+        validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache/",
     ),
 ]
 
