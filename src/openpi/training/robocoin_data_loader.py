@@ -1,100 +1,72 @@
 """DLIMP-based data loader for the RoboCOIN TFDS dataset.
 
-This module provides a data loader for training V(s) value functions on the RoboCOIN
-dataset, which contains robot manipulation trajectories with images and proprioceptive
-state observations.
-
-The loader is adapted from survey_scripts/test_dlimp_dataloader.py and yields batches
-compatible with the batch_value_learning training pipeline.
+This module provides a data loader for training value functions and policies on the
+RoboCOIN dataset, which contains robot manipulation trajectories with images and
+proprioceptive state observations.
 
 Output format follows the standard convention from openpi/models/model.py:
     {
-        "image": {"base_0_rgb": ..., "left_wrist_0_rgb": ..., ...},  # Nested dict
+        "image": {"base_0_rgb": ..., "left_wrist_0_rgb": ..., ...},
         "image_mask": {"base_0_rgb": ..., ...},
-        "state": ...,
-        "next_state": ...,
-        "actions": ...,
-        "next_actions": ...,
-        "tokenized_prompt": [B, max_token_len],  # From subtask_1 text
-        "tokenized_prompt_mask": [B, max_token_len],
+        "state": [state_dim],
+        "next_state": [state_dim],
+        "actions": [action_horizon, action_dim],
+        "next_actions": [action_horizon, action_dim],
+        "action_mask": [action_horizon],
+        "next_action_mask": [action_horizon],
+        "tokenized_prompt": [max_token_len],
+        "tokenized_prompt_mask": [max_token_len],
         ...
     }
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 import dataclasses
-import gc
 import logging
-import queue
-import threading
-from typing import Any, Iterator
+from typing import Any
+
+import augmax
 import jax
 import jax.numpy as jnp
-
 import numpy as np
-import augmax
 import tensorflow as tf
 
+from openpi import transforms as _transforms
 from openpi.models.model import IMAGE_KEYS
 from openpi.models.tokenizer import PaligemmaTokenizer
-from openpi.training import sharding as _sharding
-from openpi import transforms as _transforms
 
 logger = logging.getLogger(__name__)
-
 # Disable GPU for TensorFlow (we only use it for data loading)
 tf.config.experimental.set_visible_devices([], "GPU")
 
+# =============================================================================
+# Constants
+# =============================================================================
 
-# Default configuration constants
 DEFAULT_DATA_DIR = "/data/group_data/rl/saksham3/"
 DEFAULT_DATASET_NAME = "robocoin:1.0.0"
 DEFAULT_MAX_CAMERAS = 3
 DEFAULT_MAX_STATE_DIM = 14
-DEFAULT_MAX_ACTION_DIM = 54
+DEFAULT_MAX_ACTION_DIM = 14
 DEFAULT_IMAGE_SIZE = (224, 224)
-DEFAULT_MAX_TOKEN_LEN = 48  # Max token length for subtask text tokenization
+DEFAULT_MAX_TOKEN_LEN = 48
+DEFAULT_ACTION_HORIZON = 30
 
-# Mapping from RLDS cam_X keys to standard IMAGE_KEYS
-# RLDS: observation/image/cam_0, cam_1, cam_2
-# Standard: base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb
 RLDS_TO_STANDARD_CAMERA_MAP = {
     f"cam_{i}": IMAGE_KEYS[i] for i in range(min(DEFAULT_MAX_CAMERAS, len(IMAGE_KEYS)))
 }
 
-# ImageNet normalization constants
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+# =============================================================================
+# Configuration
+# =============================================================================
 
 
 @dataclasses.dataclass(frozen=True)
 class RoboCOINDataLoaderConfig:
-    """Configuration for the RoboCOIN data loader.
-
-    Attributes:
-        data_dir: Directory containing the TFDS dataset.
-        dataset_name: Name of the dataset (e.g., "robocoin:1.0.0").
-        split: Dataset split ("train", "test", etc.).
-        batch_size: Number of samples per batch.
-        shuffle: Whether to shuffle the data.
-        local_shuffle_buffer_size: Size of per-host shuffle buffer for shuffling.
-        seed: Random seed for shuffling.
-        prefetch_buffer_size: Number of batches to prefetch asynchronously.
-        max_cameras: Maximum number of camera views.
-        max_state_dim: Maximum state dimension (for padding).
-        max_action_dim: Maximum action dimension (for padding).
-        image_size: Target image size (height, width).
-        drop_remainder: Whether to drop the last incomplete batch.
-        discount: Discount factor for MC return computation.
-        reward_scale: Reward scaling factor.
-        reward_bias: Reward bias.
-        max_token_len: Maximum token length for subtask text tokenization.
-        num_batches: Number of batches to yield (None for infinite).
-        sharding: JAX sharding for distributed training (None for default).
-        state_norm_stats: Normalization stats for state (NormStats or None).
-        use_quantile_norm: Whether to use quantile normalization for state.
-    """
+    """Configuration for the RoboCOIN data loader."""
 
     data_dir: str = DEFAULT_DATA_DIR
     dataset_name: str = DEFAULT_DATASET_NAME
@@ -105,162 +77,114 @@ class RoboCOINDataLoaderConfig:
     seed: int = 86
     prefetch_buffer_size: int = 4
     max_cameras: int = DEFAULT_MAX_CAMERAS
-    max_state_dim: int = DEFAULT_MAX_STATE_DIM          # Currently unused
-    max_action_dim: int = DEFAULT_MAX_ACTION_DIM        # Currently unused
+    max_state_dim: int = DEFAULT_MAX_STATE_DIM
+    max_action_dim: int = DEFAULT_MAX_ACTION_DIM
     image_size: tuple[int, int] = DEFAULT_IMAGE_SIZE
     drop_remainder: bool = False
     discount: float = 0.99
     reward_scale: float = 1.0
     reward_bias: float = 0.0
     max_token_len: int = DEFAULT_MAX_TOKEN_LEN
-    # Number of batches to yield (None for infinite)
     num_batches: int | None = None
-    # JAX sharding for distributed training (None for default batch sharding)
-    sharding: Any = None
-    # Normalization stats for state (dict with 'state' key -> NormStats)
     state_norm_stats: dict[str, Any] | None = None
-    # Whether to use quantile (min-max) normalization for state
     use_quantile_norm: bool = False
-    # TD-n parameter: None for MC learning, int for TD-n learning
     td_n: int | None = None
-    # Whether to repeat the dataset infinitely (True for training, False for validation)
     repeat: bool = True
-    # If True, this host uses the full batch_size without splitting across hosts.
-    # Useful for validation cache collection where only worker 0 needs the data.
-    single_host_batch: bool = False
-    # Whether to use end-effector position state instead of joint angles.
-    # If True, constructs 14-D state as: [eef_sim_pose_state[:6], state[6], eef_sim_pose_state[6:12], state[13]]
-    # where eef_sim_pose_state is 12-D (6 left EEF + 6 right EEF) and state[6], state[13] are grippers.
     use_eef: bool = False
+    action_horizon: int = DEFAULT_ACTION_HORIZON
 
 
-class AddBatchKeys:
-    """Trajectory-level transform to add next_* keys and episode boundary info.
+# =============================================================================
+# TF Transforms (used with tf.data.Dataset.map)
+# =============================================================================
+
+
+class AddTrajectoryKeys:
+    """Trajectory-level transform to add next_* keys and action chunks.
+
+    Must run as traj_map (before flatten) to access sequential timesteps.
     
-    This transform must run as a traj_map (before flatten) to have access to
-    sequential timesteps within an episode.
-    
-    For MC learning (td_n=None):
-    - next_* keys are set to current values (not used in loss)
-    - termination = is_terminal, truncation = False
-    
-    For TD-n learning (td_n=int):
-    - next_* keys are set to values at timestep t + td_n (clamped to ep_len - 1)
-    - termination = True for t >= ep_len - td_n (i.e., last td_n steps)
-    - truncation = False always
-    - td_reward = gamma ** (ep_len - 1 - t) for terminated steps
-    
-    Output keys follow RLDS flattened format (will be transformed to standard format by prefetcher):
-    - next_observation/state
-    - next_observation/image/cam_X
-    - next_action
-    - termination
-    - truncation
-    - td_reward (TD mode only)
+    Creates:
+    - next_observation/state, next_observation/image/cam_X: at t+1 (MC) or t+td_n (TD)
+    - action_chunk: [ep_len, action_horizon, action_dim] starting at current frame
+    - next_action_chunk: [ep_len, action_horizon, action_dim] starting at next frame
+    - action_mask: [ep_len, action_horizon] valid actions in chunk
+    - next_action_mask: [ep_len, action_horizon] valid actions in next chunk
     """
-    
+
     def __init__(
         self,
         td_n: int | None = None,
-        gamma: float = 0.99,
         max_cameras: int = DEFAULT_MAX_CAMERAS,
+        action_horizon: int = DEFAULT_ACTION_HORIZON,
+        use_eef: bool = False,
     ):
-        """Initialize the transform.
-        
-        Args:
-            td_n: Number of steps for TD learning. None for MC learning.
-            gamma: Discount factor for reward computation.
-            max_cameras: Number of camera views.
-            reward and termination overwritten in AsyncBatchPrefetcher
-        """
         self.td_n = td_n
-        self.gamma = gamma
         self.max_cameras = max_cameras
-    
+        self.action_horizon = action_horizon
+        self.use_eef = use_eef
+
     def map(self, episode: dict[str, Any]) -> dict[str, Any]:
-        """Add next_* keys and termination/reward fields to the episode.
+        ep_len = episode["_len"][0]
+        frame_indices = episode["_frame_index"]
+
+        # Validate required keys
+        if "observation/state" not in episode:
+            raise ValueError("Missing required key 'observation/state' in episode")
+        if "action" not in episode:
+            raise ValueError("Missing required key 'action' in episode")
         
-        Args:
-            episode: Episode dict with keys like observation/state, observation/image/cam_X, etc.
-                     Must have _len key indicating episode length.
+        state = episode["observation/state"]
+        action = episode["action"]
         
-        Returns:
-            Episode dict with added next_* and termination fields.
-        """
-        # Get episode length
-        ep_len = episode["_len"][0]  # Scalar tensor
-        frame_indices = episode["_frame_index"]  # (ep_len,)
+        # Validate EEF keys if use_eef is enabled
+        if self.use_eef:
+            if "eef_sim_pose_state" not in episode:
+                raise ValueError("use_eef=True but 'eef_sim_pose_state' not found in episode")
+            if "eef_sim_pose_action" not in episode:
+                raise ValueError("use_eef=True but 'eef_sim_pose_action' not found in episode")
+            eef_state = episode["eef_sim_pose_state"]
+            eef_action = episode["eef_sim_pose_action"]
         
-        # Get current observation keys
-        state = episode.get("observation/state", None)
-        action = episode.get("action", None)
-        
-        # Camera image keys (RLDS format)
         cam_keys = [f"observation/image/cam_{i}" for i in range(self.max_cameras)]
+
+        next_offset = 1 if self.td_n is None else self.td_n
+        next_indices = tf.minimum(frame_indices + next_offset, ep_len - 1)
+
+        episode["next_observation/state"] = tf.gather(state, next_indices)
         
-        # Get EEF state if present (for use_eef mode)
-        eef_state = episode.get("eef_sim_pose_state", None)
+        if self.use_eef:
+            episode["next_eef_sim_pose_state"] = tf.gather(eef_state, next_indices)
+            
+        for cam_key in cam_keys:
+            if cam_key in episode:
+                episode[f"next_{cam_key}"] = tf.gather(episode[cam_key], next_indices)
+
+        offsets = tf.range(self.action_horizon)
         
-        if self.td_n is None:
-            # MC learning: next_* keys set to immediate next timestep (t+1)
-            # This provides actual next-state data while still using MC returns for loss
-            t_plus_1 = tf.minimum(frame_indices + 1, ep_len - 1)
-            
-            if state is not None:
-                episode["next_observation/state"] = tf.gather(state, t_plus_1)
-            if eef_state is not None:
-                episode["next_eef_sim_pose_state"] = tf.gather(eef_state, t_plus_1)
-            if action is not None:
-                episode["next_action"] = tf.gather(action, t_plus_1)
-            for cam_key in cam_keys:
-                if cam_key in episode:
-                    episode[f"next_{cam_key}"] = tf.gather(episode[cam_key], t_plus_1)
-            
-            # Termination: True only at last step, truncation: False always
-            is_terminal = episode.get("is_terminal", tf.zeros_like(frame_indices, dtype=tf.bool))
-            episode["reward"] = tf.where(is_terminal, 1.0, 0.0)
-            episode["termination"] = tf.cast(is_terminal, tf.bool)
-            episode["truncation"] = tf.zeros_like(frame_indices, dtype=tf.bool)
-            
-        else:
-            # TD-n learning: next_* keys at t + td_n
-            td_n = self.td_n
-            
-            # Compute t + td_n indices, clamped to ep_len - 1
-            t_plus_n = tf.minimum(frame_indices + td_n, ep_len - 1)
-            
-            # Gather next_* values at t + td_n
-            if state is not None:
-                episode["next_observation/state"] = tf.gather(state, t_plus_n)
-            if eef_state is not None:
-                episode["next_eef_sim_pose_state"] = tf.gather(eef_state, t_plus_n)
-            if action is not None:
-                episode["next_action"] = tf.gather(action, t_plus_n)
-            for cam_key in cam_keys:
-                if cam_key in episode:
-                    episode[f"next_{cam_key}"] = tf.gather(episode[cam_key], t_plus_n)
-            
-            # Termination: True for t >= ep_len - td_n (last td_n steps)
-            termination = frame_indices >= ep_len - td_n
-            episode["termination"] = termination
-            episode["truncation"] = tf.zeros_like(frame_indices, dtype=tf.bool)
-            
-            # TD reward: gamma^(ep_len - 1 - t) for terminated steps, 0 otherwise
-            steps_to_end = tf.cast(ep_len - 1 - frame_indices, tf.float32)
-            td_reward = tf.pow(self.gamma, steps_to_end)
-            episode["reward"] = tf.where(termination, td_reward, 0.0)
+        chunk_indices = frame_indices[:, None] + offsets[None, :]
+        chunk_indices = tf.minimum(chunk_indices, ep_len - 1)
+        episode["action_chunk"] = tf.gather(action, chunk_indices)
         
+        next_chunk_indices = next_indices[:, None] + offsets[None, :]
+        next_chunk_indices = tf.minimum(next_chunk_indices, ep_len - 1)
+        episode["next_action_chunk"] = tf.gather(action, next_chunk_indices)
+
+        actual_indices = frame_indices[:, None] + offsets[None, :]
+        episode["action_mask"] = actual_indices < ep_len
+        
+        next_actual_indices = next_indices[:, None] + offsets[None, :]
+        episode["next_action_mask"] = next_actual_indices < ep_len
+
+        if self.use_eef:
+            episode["eef_action_chunk"] = tf.gather(eef_action, chunk_indices)
+            episode["next_eef_action_chunk"] = tf.gather(eef_action, next_chunk_indices)
+
         return episode
 
 
 class ImageResizeTransform:
-    """Decode JPEG images and resize to target size.
-
-    Applied element-wise (per-frame) using TF functions.
-    Does NOT normalize.
-    
-    Uses tf.function to prevent eager mode function graph accumulation.
-    """
+    """Decode JPEG images and resize to target size."""
 
     def __init__(
         self,
@@ -269,7 +193,6 @@ class ImageResizeTransform:
     ):
         self.target_size = target_size
         self.max_cameras = max_cameras
-        # Create the tf.function wrapped decoder once to avoid retracing
         self._decode_and_resize_fn = tf.function(
             self._decode_and_resize_impl,
             input_signature=[tf.TensorSpec(shape=(), dtype=tf.string)],
@@ -277,14 +200,12 @@ class ImageResizeTransform:
         )
 
     def _decode_and_resize_impl(self, jpeg_bytes: tf.Tensor) -> tf.Tensor:
-        """Decode a JPEG image and resize it."""
         is_empty = tf.equal(tf.strings.length(jpeg_bytes), 0)
 
         def decode_resize():
             image = tf.io.decode_jpeg(jpeg_bytes, channels=3, ratio=2)
             image = tf.image.resize(image, self.target_size, method="bilinear")
-            image = tf.cast(image, tf.uint8)
-            return image
+            return tf.cast(image, tf.uint8)
 
         def return_zeros():
             return tf.zeros((*self.target_size, 3), dtype=tf.uint8)
@@ -292,657 +213,432 @@ class ImageResizeTransform:
         return tf.cond(is_empty, return_zeros, decode_resize)
 
     def map(self, example: dict[str, Any]) -> dict[str, Any]:
-        """Decode and resize all camera images in the example."""
         cam_keys = [f"observation/image/cam_{i}" for i in range(self.max_cameras)]
         next_cam_keys = [f"next_observation/image/cam_{i}" for i in range(self.max_cameras)]
         all_keys = cam_keys + next_cam_keys
 
-        # Stack all camera images into a single tensor
-        images = tf.stack(
-            [example.get(k, tf.constant(b"", dtype=tf.string)) for k in all_keys]
-        )
-
-        # Process all cameras using tf.map_fn with the pre-traced function
+        images = tf.stack([example.get(k, tf.constant(b"", dtype=tf.string)) for k in all_keys])
         resized = tf.map_fn(
             self._decode_and_resize_fn,
             images,
             parallel_iterations=len(all_keys),
-            fn_output_signature=tf.TensorSpec(
-                shape=(*self.target_size, 3), dtype=tf.uint8
-            ),
+            fn_output_signature=tf.TensorSpec(shape=(*self.target_size, 3), dtype=tf.uint8),
         )
 
-        # Unstack back to dict
         for i, cam_key in enumerate(all_keys):
             if cam_key in example:
                 example[cam_key] = resized[i]
-
         return example
 
 
-class AsyncBatchPrefetcher:
-    """Asynchronously prefetch batches in a background thread.
+# =============================================================================
+# Main Transform (applied per-frame via frame_map)
+# =============================================================================
 
-    Performs state normalization and JAX sharding for distributed training.
-    Images are kept as uint8 for memory efficiency - PaliGemma normalizes internally.
+
+class MainTransform:
+    """TensorFlow transform for state/action/image restructuring.
     
-    Handles:
-    - State normalization (zscore or minmax)
-    - JAX sharding for distributed training
-    - Tokenization of subtask text using PaligemmaTokenizer
+    Applied per-frame. Handles state/action processing, image
+    restructuring, subtask sampling, tokenization, and normalization.
     """
 
     def __init__(
         self,
-        iterator: Iterator,
-        buffer_size: int = 2,
         max_cameras: int = DEFAULT_MAX_CAMERAS,
+        use_eef: bool = False,
+    ):
+        self.max_cameras = max_cameras
+        self.use_eef = use_eef
+
+    @staticmethod
+    def _construct_eef_repr(data: tf.Tensor, eef_data: tf.Tensor) -> tf.Tensor:
+        """Construct 14-D representation from EEF pose and gripper values."""
+        return tf.concat(
+            [
+                eef_data[..., :6],
+                data[..., 6:7],
+                eef_data[..., 6:12],
+                data[..., 13:14],
+            ],
+            axis=-1,
+        )
+
+    def _process_state(self, raw_frame: dict) -> dict:
+        """Process state and next_state with optional EEF representation."""
+        if "observation/state" not in raw_frame:
+            raise ValueError("Missing required key 'observation/state' in frame")
+        
+        state = tf.cast(raw_frame.pop("observation/state"), tf.float32)
+
+        if self.use_eef:
+            if "eef_sim_pose_state" not in raw_frame:
+                raise ValueError("use_eef=True but 'eef_sim_pose_state' not found in frame")
+            eef_state = tf.cast(raw_frame.pop("eef_sim_pose_state"), tf.float32)
+            processed_state = self._construct_eef_repr(state, eef_state)
+        else:
+            processed_state = state
+
+        if "next_observation/state" not in raw_frame:
+            raise ValueError("Missing required key 'next_observation/state' in frame")
+        
+        next_state = tf.cast(raw_frame.pop("next_observation/state"), tf.float32)
+        
+        if self.use_eef:
+            if "next_eef_sim_pose_state" not in raw_frame:
+                raise ValueError("use_eef=True but 'next_eef_sim_pose_state' not found in frame")
+            next_eef = tf.cast(raw_frame.pop("next_eef_sim_pose_state"), tf.float32)
+            processed_next_state = self._construct_eef_repr(next_state, next_eef)
+        else:
+            processed_next_state = next_state
+
+        return {"state": processed_state, "next_state": processed_next_state}
+
+    def _process_actions(self, raw_frame: dict) -> dict:
+        """Process action chunks and masks."""
+        if "action_chunk" not in raw_frame:
+            raise ValueError("Missing required key 'action_chunk' in frame")
+        
+        action_chunk = tf.cast(raw_frame.pop("action_chunk"), tf.float32)
+
+        if self.use_eef:
+            if "eef_action_chunk" not in raw_frame:
+                raise ValueError("use_eef=True but 'eef_action_chunk' not found in frame")
+            eef_chunk = tf.cast(raw_frame.pop("eef_action_chunk"), tf.float32)
+            actions = self._construct_eef_repr(action_chunk, eef_chunk)
+        else:
+            actions = action_chunk
+
+        if "action_mask" not in raw_frame:
+            raise ValueError("Missing required key 'action_mask' in frame")
+        action_mask = raw_frame.pop("action_mask")
+
+        if "next_action_chunk" not in raw_frame:
+            raise ValueError("Missing required key 'next_action_chunk' in frame")
+        
+        next_chunk = tf.cast(raw_frame.pop("next_action_chunk"), tf.float32)
+        
+        if self.use_eef:
+            if "next_eef_action_chunk" not in raw_frame:
+                raise ValueError("use_eef=True but 'next_eef_action_chunk' not found in frame")
+            next_eef_chunk = tf.cast(raw_frame.pop("next_eef_action_chunk"), tf.float32)
+            next_actions = self._construct_eef_repr(next_chunk, next_eef_chunk)
+        else:
+            next_actions = next_chunk
+
+        if "next_action_mask" not in raw_frame:
+            raise ValueError("Missing required key 'next_action_mask' in frame")
+        next_action_mask = raw_frame.pop("next_action_mask")
+
+        return {
+            "actions": actions,
+            "action_mask": action_mask,
+            "next_actions": next_actions,
+            "next_action_mask": next_action_mask,
+        }
+
+    def _restructure_images(self, raw_frame: dict, prefix: str = "") -> dict:
+        """Extract camera images from flat RLDS keys to nested dict format."""
+        images = {}
+        masks = {}
+        for cam_idx in range(self.max_cameras):
+            rlds_key = f"{prefix}observation/image/cam_{cam_idx}"
+            rlds_cam_name = f"cam_{cam_idx}"
+            standard_key = RLDS_TO_STANDARD_CAMERA_MAP.get(rlds_cam_name, rlds_cam_name)
+
+            if rlds_key in raw_frame:
+                img_data = raw_frame.pop(rlds_key)
+                images[standard_key] = img_data
+                masks[standard_key] = True
+        return {"images": images, "masks": masks}
+
+    def map(self, raw_frame: dict[str, Any]) -> dict[str, Any]:
+        """Transform a raw frame to intermediate format (TF tensors only)."""
+        frame = {}
+
+        # Process state/actions
+        frame.update(self._process_state(raw_frame))
+        frame.update(self._process_actions(raw_frame))
+
+        # Process images
+        current_imgs = self._restructure_images(raw_frame, prefix="")
+        next_imgs = self._restructure_images(raw_frame, prefix="next_")
+        
+        if current_imgs["images"]:
+            frame["image"] = current_imgs["images"]
+            frame["image_mask"] = current_imgs["masks"]
+        if next_imgs["images"]:
+            frame["next_image"] = next_imgs["images"]
+            frame["next_image_mask"] = next_imgs["masks"]
+
+        # Pass through metadata and subtask info (will be processed post-batch in NumPy)
+        for key in ["first_null_index", "steps_to_subtask_end", "episode_index", "_frame_index",
+                    "subtask_1", "subtask_2", "subtask_3", "subtask_4", "subtask_5"]:
+            if key in raw_frame:
+                frame[key] = raw_frame[key]
+
+        return frame
+
+
+# =============================================================================
+# Post-Batch NumPy Transform
+# =============================================================================
+
+
+class PostBatchTransform:
+    """NumPy transform applied after batching for tokenization and normalization."""
+
+    def __init__(
+        self,
         discount: float = 0.99,
         reward_scale: float = 1.0,
         reward_bias: float = 0.0,
         max_token_len: int = DEFAULT_MAX_TOKEN_LEN,
-        num_batches: int | None = None,
-        sharding: Any = None,
         state_norm_stats: dict[str, Any] | None = None,
         use_quantile_norm: bool = False,
         td_n: int | None = None,
-        single_host_batch: bool = False,
-        split: str = "train",
         use_eef: bool = False,
+        split: str = "train",
     ):
-        self.iterator = iterator
-        self.buffer = queue.Queue(maxsize=buffer_size)
-        self.max_cameras = max_cameras
         self.discount = discount
         self.reward_scale = reward_scale
         self.reward_bias = reward_bias
-        self.max_token_len = max_token_len
-        self.num_batches = num_batches
-        self.sharding = sharding
-        self.single_host_batch = single_host_batch
-        self.split = split
-        self.thread = None
-        self.stop_event = threading.Event()
-        self.exception = None
-        self._batch_count = 0
-        self._crossed = 0
         self.td_n = td_n
         self.use_eef = use_eef
-        
-        # Lazy-initialized tokenizer (to avoid download during import)
+        self.split = split
+
         self._tokenizer: PaligemmaTokenizer | None = None
-        
-        # Lazy-initialized default sharding
-        self._default_sharding = None
-        
-        # State normalization transform (reuses existing transforms.Normalize)
-        self._state_normalize_fn: _transforms.Normalize | None = None
+        self._max_token_len = max_token_len
+
+        self._normalize_fn: _transforms.Normalize | None = None
         if state_norm_stats is not None:
-            self._state_normalize_fn = _transforms.Normalize(
-                state_norm_stats, 
-                use_quantiles=use_quantile_norm
-            )
-    
+            self._normalize_fn = _transforms.Normalize(state_norm_stats, use_quantiles=use_quantile_norm)
+
     @property
     def tokenizer(self) -> PaligemmaTokenizer:
-        """Lazily initialize the PaliGemma tokenizer."""
         if self._tokenizer is None:
-            self._tokenizer = PaligemmaTokenizer(max_len=self.max_token_len)
+            self._tokenizer = PaligemmaTokenizer(max_len=self._max_token_len)
         return self._tokenizer
-    
-    def _get_sharding(self):
-        """Get the sharding to use for JAX arrays."""
-        if self.sharding is not None:
-            return self.sharding
-        if self._default_sharding is None:
-            # Use make_mesh from sharding module with single device for default batch sharding
-            mesh = _sharding.make_mesh(num_fsdp_devices = 1)
-            self._default_sharding = jax.sharding.NamedSharding(
-                mesh, jax.sharding.PartitionSpec(_sharding.DATA_AXIS)
-            )
-        return self._default_sharding
-    
-    def _normalize_state_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
-        """Apply state normalization using the configured Normalize transform."""
-        if self._state_normalize_fn is None:
-            return batch
-        return self._state_normalize_fn(batch)
-    
-    def _generate_negative_subtask_text(self, subtask_text: str) -> str:
-        """Generate negative subtask text based on specific rules.
-        
-        Args:
-            subtask_text: The original subtask text.
-            
-        Returns:
-            Negative subtask text following the specified transformation rules.
-        """
+
+    @staticmethod
+    def _generate_negative_subtask_text(subtask_text: str) -> str:
         if "Place the plate" in subtask_text:
             return "Place the plate on the table"
-        elif "Grab the knife" in subtask_text:
+        if "Grab the knife" in subtask_text:
             return "Grab the banana with your right hand"
-        elif "Place the knife" in subtask_text:
+        if "Place the knife" in subtask_text:
             return "Place the knife on the board"
-        elif "Pass the plate" in subtask_text:
+        if "Pass the plate" in subtask_text:
             return "Rotate the plate with the right gripper"
-        else:
-            # Swap left to right and right to left
-            # Use a temporary marker to avoid double replacement
-            negative_text = subtask_text
-            # Replace "left" with a temporary marker, then "right" with "left", then marker with "right"
-            negative_text = negative_text.replace("left", "TEMP_LEFT_MARKER")
-            negative_text = negative_text.replace("right", "left")
-            negative_text = negative_text.replace("TEMP_LEFT_MARKER", "right")
-            return negative_text
+        return PostBatchTransform._swap_left_right_text(subtask_text)
 
-    def _swap_left_right_text(self, text: str) -> str:
-        """Swap 'left' and 'right' in text (simple, case-sensitive)."""
+    @staticmethod
+    def _swap_left_right_text(text: str) -> str:
         swapped = text.replace("left", "TEMP_LEFT_MARKER")
         swapped = swapped.replace("right", "left")
         swapped = swapped.replace("TEMP_LEFT_MARKER", "right")
         return swapped
 
-    def _transform_batch(self, raw_batch: dict[str, Any]) -> dict[str, Any]:
-        """Transform raw TFDS batch to standard training pipeline format.
+    @staticmethod
+    def _decode_text(text: Any) -> str:
+        if isinstance(text, bytes):
+            return text.decode("utf-8")
+        return str(text)
 
-        Input format (from TFDS/DLIMP - flat RLDS keys):
-            - observation/state: [B, state_dim]
-            - observation/image/cam_X: [B, H, W, C] for each camera
-            - action: [B, action_dim]
-            - reward: [B]
-            - is_terminal: [B]
-            - is_first: [B]
+    @staticmethod
+    def _create_mirror_images(images: dict, image_masks: dict) -> tuple[dict, dict]:
+        """Create horizontally flipped images with swapped left/right wrist keys."""
+        mirror_images = {}
+        mirror_masks = {}
+        rng = jax.random.PRNGKey(0)
 
-        Output format (standard nested dict from model.py):
-            - image: {"base_0_rgb": [B, H, W, C], ...}  # Nested dict
-            - image_mask: {"base_0_rgb": [B], ...}
-            - state: [B, state_dim]
-            - next_image: {"base_0_rgb": [B, H, W, C], ...}
-            - next_image_mask: {"base_0_rgb": [B], ...}
-            - next_state: [B, state_dim]
-            - actions: [B, action_dim]
-            - next_actions: [B, action_dim]
-            - reward: [B]
-            - mc_return: [B]
-            - termination: [B]
-            - truncation: [B]
-        """
-        batch = {}
-        self._crossed = 0
+        for key, img in images.items():
+            sub_rngs = jax.random.split(rng, img.shape[0])
+            flipped = jax.vmap(augmax.HorizontalFlip(p=1.0))(sub_rngs, jnp.asarray(img))
+            flipped = np.asarray(flipped)
 
-        # State (normalization applied at end of method)
-        state = raw_batch.pop("observation/state", None)
-        if state is not None:
-            state = state.astype(np.float32)
-            
-            # If use_eef, construct state from eef_sim_pose_state + grippers
-            if self.use_eef:
-                eef_state = raw_batch.pop("eef_sim_pose_state", None)
-                if eef_state is not None:
-                    eef_state = eef_state.astype(np.float32)
-                    # Construct: [eef[:6], state[6], eef[6:12], state[13]]
-                    # eef_sim_pose_state is 12-D: [left_eef(6), right_eef(6)]
-                    # state[6] = left gripper, state[13] = right gripper
-                    batch["state"] = np.concatenate([
-                        eef_state[:, :6],          # Left arm EEF positions
-                        state[:, 6:7],             # Left gripper
-                        eef_state[:, 6:12],        # Right arm EEF positions
-                        state[:, 13:14],           # Right gripper
-                    ], axis=-1)
-                else:
-                    logger.warning("use_eef=True but 'observation/eef_sim_pose_state' not found, using joint state")
-                    batch["state"] = state
-            else:
-                batch["state"] = state
+            mirror_key = key
+            if key == "left_wrist_0_rgb":
+                mirror_key = "right_wrist_0_rgb"
+            elif key == "right_wrist_0_rgb":
+                mirror_key = "left_wrist_0_rgb"
 
-        self._crossed += 1
-        
-        # Next state (set by AddBatchKeys transform)
-        next_state = raw_batch.pop("next_observation/state", None)
-        if next_state is not None:
-            next_state = next_state.astype(np.float32)
-            
-            # If use_eef, construct next_state from eef_sim_pose_state + grippers
-            if self.use_eef:
-                next_eef_state = raw_batch.pop("next_eef_sim_pose_state", None)
-                if next_eef_state is not None:
-                    next_eef_state = next_eef_state.astype(np.float32)
-                    batch["next_state"] = np.concatenate([
-                        next_eef_state[:, :6],
-                        next_state[:, 6:7],
-                        next_eef_state[:, 6:12],
-                        next_state[:, 13:14],
-                    ], axis=-1)
-                else:
-                    batch["next_state"] = next_state
-            else:
-                batch["next_state"] = next_state
+            mirror_images[mirror_key] = flipped
+            mirror_masks[mirror_key] = image_masks.get(key, np.ones(img.shape[0], dtype=np.bool_))
+        return mirror_images, mirror_masks
 
-        self._crossed += 1
+    @staticmethod
+    def _create_mirror_state(state: np.ndarray) -> np.ndarray:
+        """Create mirrored state by swapping left/right arms."""
+        mirror_state = np.empty_like(state)
+        mirror_state[:, 0:7] = state[:, 7:14]
+        mirror_state[:, 7:14] = state[:, 0:7]
+        for idx in [1, 3, 5, 8, 10, 12]:
+            mirror_state[:, idx] = -mirror_state[:, idx]
+        return mirror_state
 
-        # Actions
-        action = raw_batch.pop("action", None)
-        if action is not None:
-            batch["actions"] = action
+    def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Apply post-batch processing: subtask sampling, tokenization, normalization."""
+        first_null_index = batch.get("first_null_index")
+        steps_to_subtask_end = batch.get("steps_to_subtask_end")
 
-        self._crossed += 1
-        
-        # Next actions (set by AddBatchKeys transform)
-        next_action = raw_batch.pop("next_action", None)
-        if next_action is not None:
-            batch["next_actions"] = next_action
+        if first_null_index is None or steps_to_subtask_end is None:
+            return batch
 
-        self._crossed += 1
+        first_null_index = first_null_index.astype(np.int32)
+        steps_to_subtask_end = steps_to_subtask_end.astype(np.int32)
+        batch_size = first_null_index.shape[0]
 
-        # Reward with scaling/bias
-        reward = raw_batch.pop("reward", None)
-        if reward is not None:
-            reward = reward.astype(np.float32) * self.reward_scale + self.reward_bias
-            batch["reward"] = reward
+        subtask_texts_all = [batch[f"subtask_{i}"] for i in range(1, 6)]
+        texts_stacked = np.stack(subtask_texts_all, axis=0)
 
-        self._crossed += 1
+        loss_masks = first_null_index > 0
 
-        # Episode boundaries (set by AddBatchKeys transform)
-        termination = raw_batch.pop("termination", None)
-        truncation = raw_batch.pop("truncation", None)
-        
-        if termination is not None:
-            batch["termination"] = termination.astype(np.bool_)
+        if self.split == "val":
+            sampled_indices = np.zeros(batch_size, dtype=np.int32)
         else:
-            batch["termination"] = np.zeros(state.shape[0], dtype=np.bool_)
-        
-        if truncation is not None:
-            batch["truncation"] = truncation.astype(np.bool_)
+            safe_upper_bound = np.maximum(first_null_index, 1)
+            sampled_indices = (np.random.rand(batch_size) * safe_upper_bound).astype(np.int32)
+
+        selected_texts = texts_stacked[sampled_indices, np.arange(batch_size)]
+        selected_steps = steps_to_subtask_end[np.arange(batch_size), sampled_indices]
+
+        mc_returns = np.power(self.discount, selected_steps.astype(np.float32))
+        mc_returns = np.where(loss_masks, mc_returns, 0.0)
+
+        batch["mc_return"] = mc_returns.astype(np.float32)
+        batch["loss_mask"] = loss_masks.astype(np.bool_)
+        batch["sampled_indices"] = sampled_indices
+
+        if self.td_n is not None:
+            within_horizon = selected_steps <= self.td_n
+            batch["termination"] = within_horizon
+            td_reward = np.power(self.discount, selected_steps.astype(np.float32))
+            batch["reward"] = np.where(within_horizon, td_reward, 0.0).astype(np.float32)
         else:
-            batch["truncation"] = np.zeros(state.shape[0], dtype=np.bool_)
+            batch["termination"] = (selected_steps == 0)
+            batch["reward"] = batch["termination"].astype(np.float32)
 
-        # Camera images - output as nested dict with standard keys
-        # Maps RLDS cam_X -> standard IMAGE_KEYS (base_0_rgb, etc.)
-        images = {}
-        image_masks = {}
-        next_images = {}
-        next_image_masks = {}
+        batch["truncation"] = np.zeros(batch_size, dtype=np.bool_)
 
-        for cam_idx in range(self.max_cameras):
-            rlds_key = f"observation/image/cam_{cam_idx}"
-            next_rlds_key = f"next_observation/image/cam_{cam_idx}"
-            rlds_cam_name = f"cam_{cam_idx}"
-            
-            # Map to standard key if available, otherwise keep original
-            standard_key = RLDS_TO_STANDARD_CAMERA_MAP.get(rlds_cam_name, rlds_cam_name)
-            
-            # Pop to prevent duplicate storage
-            img_data = raw_batch.pop(rlds_key, None)
-            if img_data is not None and img_data.size > 0:
-                # Keep images as uint8 - PaliGemma normalizes internally
-                images[standard_key] = img_data
-                image_masks[standard_key] = np.ones(img_data.shape[0], dtype=np.bool_)
-                self._crossed += 1
-            
-            # Next images (set by AddBatchKeys transform)
-            next_img_data = raw_batch.pop(next_rlds_key, None)
-            if next_img_data is not None and next_img_data.size > 0:
-                # Keep images as uint8 - PaliGemma normalizes internally
-                next_images[standard_key] = next_img_data
-                next_image_masks[standard_key] = np.ones(next_img_data.shape[0], dtype=np.bool_)
-                self._crossed += 1
+        # Tokenize prompts
+        tokenized_prompts = []
+        tokenized_masks = []
+        for i in range(batch_size):
+            text = self._decode_text(selected_texts[i])
+            tokens, mask = self.tokenizer.tokenize(text, state=None)
+            tokenized_prompts.append(tokens)
+            tokenized_masks.append(mask)
 
-        # Store as nested dicts (standard format from model.py)
-        if images:
-            batch["image"] = images
-            batch["image_mask"] = image_masks
-        if next_images:
-            batch["next_image"] = next_images
-            batch["next_image_mask"] = next_image_masks
+        batch["tokenized_prompt"] = np.stack(tokenized_prompts, axis=0)
+        batch["tokenized_prompt_mask"] = np.stack(tokenized_masks, axis=0)
 
-        # Counterfactual image/state for validation only.
-        # - Flip images horizontally
-        # - Swap left/right wrist image keys
-        # - Swap left/right arm values in the state vector
-        if self.split == "val" and images:
-            mirror_images = {}
-            mirror_image_masks = {}
-            for key, img in images.items():
-                # Deterministic horizontal flip via augmax.
-                rng = jax.random.PRNGKey(0)
-                sub_rngs = jax.random.split(rng, img.shape[0])
-                flipped = jax.vmap(augmax.HorizontalFlip(p = 1.0))(sub_rngs, jnp.asarray(img))
-                flipped = np.asarray(flipped)
-                mirror_key = key
-                if key == "left_wrist_0_rgb":
-                    mirror_key = "right_wrist_0_rgb"
-                elif key == "right_wrist_0_rgb":
-                    mirror_key = "left_wrist_0_rgb"
-                mirror_images[mirror_key] = flipped
-                mirror_image_masks[mirror_key] = image_masks.get(key, np.ones(img.shape[0], dtype=np.bool_))
-            batch["mirror_image"] = mirror_images
-            batch["mirror_image_mask"] = mirror_image_masks
+        if self.split == "val":
+            self._process_validation_extras(batch, subtask_texts_all, batch_size)
 
-            # Mirror state: use batch["state"] which may be joint angles or EEF state
+        # Clean up subtask keys
+        for i in range(1, 6):
+            batch.pop(f"subtask_{i}", None)
+
+        # Apply normalization
+        if self._normalize_fn is not None:
+            batch = self._normalize_fn(batch)
+
+        # Create mirror state after normalization
+        if "mirror_image" in batch and self._normalize_fn is not None:
             batch_state = batch.get("state")
-            assert batch_state is not None and batch_state.shape[-1] == 14
-            mirror_state = batch_state.copy()
-            # Swap left and right arm values, flipping signs for joints/EEF but not grippers
-            # Indices: 0-5 = left arm (joints or EEF), 6 = left gripper, 7-12 = right arm, 13 = right gripper
-            mirror_state[:, : 6] = -batch_state[:, 7 : 13]  # Right arm (negated) -> Left arm positions
-            mirror_state[:, 6] = batch_state[:, 13]  # Right gripper (non-negated) -> Left gripper position
-            mirror_state[:, 7 : 13] = -batch_state[:, : 6]  # Left arm (negated) -> Right arm positions
-            mirror_state[:, 13] = batch_state[:, 6]  # Left gripper (non-negated) -> Right gripper position
-            batch["mirror_state"] = mirror_state
-
-        # V(s, l) training: For each datapoint, randomly sample one valid subtask.
-        # Use first_null_index to determine valid subtask range [0, first_null_index).
-        # Use that subtask's text as tokenized_prompt and compute mc_return as
-        # gamma ** steps_to_subtask_end[sampled_idx].
-        first_null_index = raw_batch.get("first_null_index", None)
-        steps_to_subtask_end = raw_batch.get("steps_to_subtask_end", None)
-        subtask_is_last = raw_batch.get("subtask_is_last", None)
-        
-        if first_null_index is not None and steps_to_subtask_end is not None:
-            first_null_index = first_null_index.astype(np.int32)
-            steps_to_subtask_end = steps_to_subtask_end.astype(np.int32)
-            batch_size = first_null_index.shape[0]
-            
-            # Collect all subtask texts into a list of arrays
-            # subtask_texts_all[subtask_idx][batch_idx] -> text
-            subtask_texts_all = []
-            for subtask_idx in range(1, 6):  # subtask_1 through subtask_5
-                subtask_key = f"subtask_{subtask_idx}"
-                subtask_texts = raw_batch[subtask_key]
-                subtask_texts_all.append(subtask_texts)
-            
-            # Vectorized sampling: sample random index in [0, first_null_index) for each batch element
-            # If first_null_index is 0, there are no valid subtasks
-            loss_masks = first_null_index > 0  # [B] - True if there's at least one valid subtask
-            
-            # For validation, always use subtask_1 (index 0); for training, sample randomly
-            if self.split == "val":
-                sampled_indices = np.zeros(batch_size, dtype=np.int32)  # Always subtask_1
-            else:
-                safe_upper_bound = np.maximum(first_null_index, 1)
-                sampled_indices = (np.random.rand(batch_size) * safe_upper_bound).astype(np.int32)  # [B]
-            
-            # Gather the selected subtask text for each batch element
-            # Stack texts into shape [num_subtasks, B]
-            texts_stacked = np.stack(subtask_texts_all, axis = 0)  # [5, B]
-            
-            # Use advanced indexing: texts_stacked[sampled_indices[i], i] for each i
-            selected_texts = texts_stacked[sampled_indices, np.arange(batch_size)]  # [B]
-            
-            # Gather steps_to_subtask_end for the sampled indices
-            # steps_to_subtask_end is [B, 5], we want steps_to_subtask_end[i, sampled_indices[i]]
-            selected_steps = steps_to_subtask_end[np.arange(batch_size), sampled_indices]  # [B]
-            
-            mc_returns = np.power(self.discount, selected_steps.astype(np.float32))  # [B]
-            self._crossed += 1
-            mc_returns = np.where(loss_masks, mc_returns, 0.0)
-
-            # For validation, store subtask_1 text for plotting labels
-            negative_subtask_1_texts = None
-            mirror_subtask_1_texts = None
-            if self.split == "val":
-                subtask_1_texts = []
-                for i in range(batch_size):
-                    text = subtask_texts_all[0][i]  # subtask_1 is at index 0
-                    if isinstance(text, bytes):
-                        text = text.decode("utf-8")
-                    subtask_1_texts.append(text)
-                batch["subtask_1_text"] = subtask_1_texts
-                
-                # Generate negative subtask texts for validation
-                negative_subtask_1_texts = []
-                for text in subtask_1_texts:
-                    negative_text = self._generate_negative_subtask_text(text)
-                    negative_subtask_1_texts.append(negative_text)
-                batch["negative_subtask_1_text"] = negative_subtask_1_texts
-
-                # Mirror subtask texts (swap left/right) for counterfactual image plot
-                mirror_subtask_1_texts = []
-                for text in subtask_1_texts:
-                    mirror_text = self._swap_left_right_text(text)
-                    mirror_subtask_1_texts.append(mirror_text)
-                batch["mirror_subtask_1_text"] = mirror_subtask_1_texts
-            
-            # Tokenize all selected texts (and negative texts for validation)
-            tokenized_prompts = []
-            tokenized_masks = []
-            tokenized_negative_prompts = []
-            tokenized_negative_masks = []
-            tokenized_mirror_prompts = []
-            tokenized_mirror_masks = []
-            for i in range(batch_size):
-                text = selected_texts[i]
-                if isinstance(text, bytes):
-                    text = text.decode("utf-8")
-                tokens, mask = self.tokenizer.tokenize(text, state = None)
-                tokenized_prompts.append(tokens)
-                tokenized_masks.append(mask)
-                
-                # Also tokenize negative text if in validation mode
-                if self.split == "val" and negative_subtask_1_texts is not None:
-                    negative_text = negative_subtask_1_texts[i]
-                    negative_tokens, negative_mask = self.tokenizer.tokenize(negative_text, state = None)
-                    tokenized_negative_prompts.append(negative_tokens)
-                    tokenized_negative_masks.append(negative_mask)
-
-                # Tokenize mirror text for counterfactual image plot
-                if self.split == "val" and mirror_subtask_1_texts is not None:
-                    mirror_text = mirror_subtask_1_texts[i]
-                    mirror_tokens, mirror_mask = self.tokenizer.tokenize(mirror_text, state = None)
-                    tokenized_mirror_prompts.append(mirror_tokens)
-                    tokenized_mirror_masks.append(mirror_mask)
-            
-            batch["tokenized_prompt"] = np.stack(tokenized_prompts, axis = 0)
-            batch["tokenized_prompt_mask"] = np.stack(tokenized_masks, axis = 0)
-            
-            # Add negative tokenized prompts for validation
-            if self.split == "val" and tokenized_negative_prompts:
-                batch["tokenized_negative_prompt"] = np.stack(tokenized_negative_prompts, axis = 0)
-                batch["tokenized_negative_prompt_mask"] = np.stack(tokenized_negative_masks, axis = 0)
-
-            # Add mirror tokenized prompts for validation
-            if self.split == "val" and tokenized_mirror_prompts:
-                batch["mirror_tokenized_prompt"] = np.stack(tokenized_mirror_prompts, axis = 0)
-                batch["mirror_tokenized_prompt_mask"] = np.stack(tokenized_mirror_masks, axis = 0)
-            batch["mc_return"] = mc_returns.astype(np.float32)
-            self._crossed += 1
-            batch["loss_mask"] = loss_masks.astype(np.bool_)
-            
-            # Compute termination and reward based on td_n mode
-            # TD-n: termination = True if within TD horizon (use MC reward, no bootstrap)
-            #       reward = gamma ** selected_steps if within horizon, else 0
-            # MC (td_n=None): termination = True only at subtask completion (selected_steps == 0)
-            #                 reward = 1 if terminal, else 0
-            if self.td_n is not None:
-                # Within TD horizon: use MC reward (gamma^steps), mark as terminal (no bootstrap)
-                # Beyond TD horizon: no reward, bootstrap with V(next)
-                within_horizon = selected_steps <= self.td_n
-                batch["termination"] = within_horizon
-                td_reward = np.power(self.discount, selected_steps.astype(np.float32))
-                batch["reward"] = np.where(within_horizon, td_reward, 0.0).astype(np.float32)
-            else:
-                # MC mode: terminal only at subtask completion
-                batch["termination"] = (selected_steps == 0)
-                batch["reward"] = batch["termination"].astype(np.float32)
-
-            batch["sampled_indices"] = sampled_indices
-        
-        # Store metadata for debugging/analysis
-        if first_null_index is not None:
-            batch["first_null_index"] = first_null_index.astype(np.int32)
-        if steps_to_subtask_end is not None:
-            batch["steps_to_subtask_end"] = steps_to_subtask_end.astype(np.int32)
-
-        # Preserve episode_index and frame indices for validation episode identification
-        episode_index = raw_batch.get("episode_index", None)
-        if episode_index is not None:
-            batch["episode_index"] = episode_index.astype(np.int32)
-        
-        frame_index = raw_batch.get("_frame_index", None)
-        if frame_index is not None:
-            batch["_frame_index"] = frame_index.astype(np.int32)
-
-        # Apply state normalization using transforms.Normalize
-        batch = self._normalize_state_batch(batch)
-
-        if "mirror_state" in batch and self._state_normalize_fn is not None:
-            mirror_norm = self._state_normalize_fn({"state": batch["mirror_state"]})
-            batch["mirror_state"] = mirror_norm["state"]
+            if batch_state is not None and batch_state.shape[-1] == 14:
+                batch["mirror_state"] = self._create_mirror_state(batch_state)
 
         return batch
 
-    def _prefetch_worker(self):
-        """Worker function that runs in a separate thread to prefetch batches."""
-        batch_count = 0
-        try:
-            for raw_batch in self.iterator:
-                if self.stop_event.is_set():
-                    break
+    def _process_validation_extras(self, batch: dict, subtask_texts_all: list, batch_size: int) -> None:
+        """Process validation-specific extras."""
+        subtask_1_texts = [self._decode_text(subtask_texts_all[0][i]) for i in range(batch_size)]
+        batch["subtask_1_text"] = subtask_1_texts
 
-                # Transform batch to training format
-                batch = self._transform_batch(raw_batch)
-                
-                # Explicitly clear the raw_batch to release TF tensor references
-                raw_batch.clear()
-                del raw_batch
-                
-                self.buffer.put(batch)
-                batch_count += 1
-                
-                # Periodically force garbage collection to prevent memory accumulation
-                # TensorFlow eager mode can accumulate function graph caches
-                if batch_count % 100 == 0:
-                    gc.collect()
-                    
-        except Exception as e:
-            logger.error(f"Error in prefetch worker: {e}, crossed: {self._crossed}")
-            self.exception = e
-            self.buffer.put(None)
+        negative_texts = [self._generate_negative_subtask_text(t) for t in subtask_1_texts]
+        batch["negative_subtask_1_text"] = negative_texts
 
-    def start(self):
-        """Start the prefetching thread."""
-        self.thread = threading.Thread(target=self._prefetch_worker, daemon=True)
-        self.thread.start()
+        mirror_texts = [self._swap_left_right_text(t) for t in subtask_1_texts]
+        batch["mirror_subtask_1_text"] = mirror_texts
 
-    def __iter__(self):
-        """Make this object iterable."""
-        return self
+        neg_tokens, neg_masks, mirror_tokens, mirror_masks = [], [], [], []
+        for i in range(batch_size):
+            nt, nm = self.tokenizer.tokenize(negative_texts[i], state=None)
+            neg_tokens.append(nt)
+            neg_masks.append(nm)
 
-    def __next__(self) -> dict[str, Any]:
-        """Get the next prefetched batch with JAX sharding applied."""
-        # Check num_batches limit
-        if self.num_batches is not None and self._batch_count >= self.num_batches:
-            raise StopIteration
-        
-        if self.exception:
-            raise self.exception
+            mt, mm = self.tokenizer.tokenize(mirror_texts[i], state=None)
+            mirror_tokens.append(mt)
+            mirror_masks.append(mm)
 
-        item = self.buffer.get()
-        if item is None:
-            raise StopIteration
-        
-        self._batch_count += 1
-        
-        # Skip JAX sharding if single_host_batch is True (for validation cache collection)
-        if self.single_host_batch:
-            # Convert to JAX arrays, but skip text keys that can't be converted
-            def maybe_to_jax(key, val):
-                # Skip text-based keys that can't be JAX arrays
-                if key in {"subtask_1_text", "negative_subtask_1_text", "mirror_subtask_1_text"}:
-                    return val
-                # Recursively handle nested dicts (e.g., "image", "image_mask")
-                if isinstance(val, dict):
-                    return {k: maybe_to_jax(k, v) for k, v in val.items()}
-                return jax.numpy.asarray(val)
-            
-            return {k: maybe_to_jax(k, v) for k, v in item.items()}
-        
-        # Apply JAX sharding for distributed training
-        sharding = self._get_sharding()
-        return jax.tree.map(
-            lambda x: jax.make_array_from_process_local_data(sharding, x),
-            item
-        )
+        batch["tokenized_negative_prompt"] = np.stack(neg_tokens, axis=0)
+        batch["tokenized_negative_prompt_mask"] = np.stack(neg_masks, axis=0)
+        batch["mirror_tokenized_prompt"] = np.stack(mirror_tokens, axis=0)
+        batch["mirror_tokenized_prompt_mask"] = np.stack(mirror_masks, axis=0)
 
-    def stop(self):
-        """Stop the prefetching thread."""
-        self.stop_event.set()
-        if self.thread:
-            self.thread.join(timeout=5.0)
+        images = batch.get("image")
+        image_masks = batch.get("image_mask")
+        if images and self.use_eef:
+            mirror_images, mirror_masks_dict = self._create_mirror_images(images, image_masks)
+            batch["mirror_image"] = mirror_images
+            batch["mirror_image_mask"] = mirror_masks_dict
 
 
-def create_robocoin_data_loader(
-    config: RoboCOINDataLoaderConfig,
-) -> AsyncBatchPrefetcher:
+# =============================================================================
+# Main Factory Function
+# =============================================================================
+
+
+def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[dict[str, Any]]:
     """Create a DLIMP-based data loader for the RoboCOIN dataset.
 
     Args:
         config: Data loader configuration.
 
     Returns:
-        AsyncBatchPrefetcher iterator yielding batches compatible with
-        the batch_value_learning training pipeline.
+        NumPy iterator yielding batches compatible with the training pipeline.
     """
     import tensorflow_datasets as tfds
 
     try:
         import dlimp as dl
     except ImportError:
-        raise ImportError(
-            "dlimp is required for RoboCOIN data loading. "
-            "Install with: pip install dlimp"
-        )
+        raise ImportError("dlimp is required for RoboCOIN data loading. Install with: pip install dlimp")
 
-    print(f"Building DLIMP dataset: {config.dataset_name}")
-    print(f"Data directory: {config.data_dir}")
-    print(f"Batch size: {config.batch_size}")
-    print(f"Final RoboCOINDataLoaderConfig: {config}")
+    logger.info(f"Building DLIMP dataset: {config.dataset_name}")
+    logger.info(f"Data directory: {config.data_dir}")
+    logger.info(f"Batch size: {config.batch_size}")
+    logger.info(f"TD-n mode: {'MC (td_n=None)' if config.td_n is None else f'TD-{config.td_n}'}")
+    logger.info(f"Action horizon: {config.action_horizon}")
 
-    # Build TFDS dataset
     builder = tfds.builder(config.dataset_name, data_dir=config.data_dir)
+    dataset = dl.DLataset.from_rlds(builder, split=config.split, shuffle=True, num_parallel_reads=-1)
 
-    # Create DLIMP dataset from RLDS format
-    # Always shuffle episodes for randomization (episode-level shuffle)
-    # The config.shuffle controls frame-level shuffling after flatten
-    dataset = dl.DLataset.from_rlds(
-        builder, split=config.split, shuffle=True, num_parallel_reads=-1
-    )
-
-    # Drop episode-level metadata that does not align with per-step length
     def _drop_episode_metadata(episode: Any) -> Any:
         if isinstance(episode, dict):
             if "steps" in episode:
                 return {"steps": episode["steps"]}
-            filtered = {
-                key: value
-                for key, value in episode.items()
-                if key not in ("traj_metadata", "episode_metadata")
-            }
-            if filtered:
-                return filtered
+            return {k: v for k, v in episode.items() if k not in ("traj_metadata", "episode_metadata")}
         return episode
 
     dataset = dataset.map(_drop_episode_metadata)
 
-    # Repeat for continuous iteration (only for training, not validation)
     if config.repeat:
         dataset = dataset.repeat()
 
-    # Apply trajectory-level transform to add next_* keys for TD/MC learning
-    # This must run before flatten() to have access to sequential timesteps
-    logger.info(f"TD-n mode: {'MC (td_n=None)' if config.td_n is None else f'TD-{config.td_n}'}")
     dataset = dataset.traj_map(
-        AddBatchKeys(
+        AddTrajectoryKeys(
             td_n=config.td_n,
-            gamma=config.discount,
             max_cameras=config.max_cameras,
+            action_horizon=config.action_horizon,
+            use_eef=config.use_eef,
         ).map
     )
-    
-    # Flatten episodes to individual frames
+
     dataset = dataset.flatten()
 
-    # Apply per-frame transforms: decode and resize images
     dataset = dataset.frame_map(
         ImageResizeTransform(
             target_size=config.image_size,
@@ -950,60 +646,62 @@ def create_robocoin_data_loader(
         ).map
     )
 
-    # Frame-level shuffle if requested (separate from episode-level shuffle above)
+    dataset = dataset.frame_map(
+        MainTransform(
+            max_cameras=config.max_cameras,
+            use_eef=config.use_eef,
+        ).map
+    )
+
     if config.shuffle:
         dataset = dataset.shuffle(config.local_shuffle_buffer_size, seed=config.seed)
 
-    # Batch the data
     dataset = dataset.batch(config.batch_size, drop_remainder=config.drop_remainder)
-
-    # Set RAM budget
     dataset = dataset.with_ram_budget(1)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
-    # Create numpy iterator
-    numpy_iterator = dataset.as_numpy_iterator()
-
-    # Wrap with async prefetcher (handles transform, state normalization, and JAX sharding)
-    prefetcher = AsyncBatchPrefetcher(
-        numpy_iterator,
-        buffer_size=config.prefetch_buffer_size,
-        max_cameras=config.max_cameras,
+    # Create post-batch transform
+    post_batch_transform = PostBatchTransform(
         discount=config.discount,
         reward_scale=config.reward_scale,
         reward_bias=config.reward_bias,
         max_token_len=config.max_token_len,
-        num_batches=config.num_batches,
-        sharding=config.sharding,
         state_norm_stats=config.state_norm_stats,
         use_quantile_norm=config.use_quantile_norm,
         td_n=config.td_n,
         use_eef=config.use_eef,
-        single_host_batch=config.single_host_batch,
         split=config.split,
     )
-    prefetcher.start()
 
-    return prefetcher
+    # Wrap iterator to apply post-batch transform
+    class TransformedIterator:
+        def __init__(self, dataset, transform):
+            self._dataset = dataset
+            self._transform = transform
+            self._iterator = self._dataset.as_numpy_iterator()
+
+        def __iter__(self):
+            return self._iterator
+
+        def __next__(self):
+            batch = next(self._iterator)
+            return self._transform(batch)
+
+    return TransformedIterator(dataset, post_batch_transform)
+
+
+# =============================================================================
+# Wrapper Class for Compatibility
+# =============================================================================
 
 
 class RoboCOINDataLoader:
-    """Data loader wrapper compatible with the batch_value_learning interface.
-
-    Provides an iterator interface that yields batches for value function training.
-    """
+    """Data loader wrapper compatible with the batch_value_learning interface."""
 
     def __init__(self, config: RoboCOINDataLoaderConfig):
         self.config = config
-        self._iterator: AsyncBatchPrefetcher | None = None
+        self._iterator = None
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
-        """Create and return the data iterator."""
-        if self._iterator is not None:
-            self._iterator.stop()
         self._iterator = create_robocoin_data_loader(self.config)
         return self._iterator
-
-    def __del__(self):
-        """Cleanup the iterator when the loader is destroyed."""
-        if self._iterator is not None:
-            self._iterator.stop()

@@ -787,7 +787,7 @@ def create_robocoin_data_loader(
         shuffle=shuffle,
         seed=seed + jax.process_index(),  # Different seed per host for data diversity
         num_batches=num_batches,
-        sharding=sharding,
+        # sharding=sharding,
         state_norm_stats=data_config.norm_stats,
         use_quantile_norm=data_config.use_quantile_norm,
     )
