@@ -58,7 +58,6 @@ RLDS_TO_STANDARD_CAMERA_MAP = {
     f"cam_{i}": IMAGE_KEYS[i] for i in range(min(DEFAULT_MAX_CAMERAS, len(IMAGE_KEYS)))
 }
 
-
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -170,11 +169,14 @@ class AddTrajectoryKeys:
         next_chunk_indices = tf.minimum(next_chunk_indices, ep_len - 1)
         episode["next_action_chunk"] = tf.gather(action, next_chunk_indices)
 
-        actual_indices = frame_indices[:, None] + offsets[None, :]
-        episode["action_mask"] = actual_indices < ep_len
+        # Create per-subtask action masks: [ep_len, 5, action_horizon]
+        steps_to_subtask_end = episode.get("steps_to_subtask_end")  # [ep_len, 5]
+        subtask_mask = offsets[None, None, :] <= steps_to_subtask_end[:, :, None]  # [ep_len, 5, action_horizon]
+        episode["action_mask"] = subtask_mask  # [ep_len, 5, action_horizon]
         
-        next_actual_indices = next_indices[:, None] + offsets[None, :]
-        episode["next_action_mask"] = next_actual_indices < ep_len
+        next_steps = tf.gather(steps_to_subtask_end, next_indices)  # [ep_len, 5]
+        next_subtask_mask = offsets[None, None, :] <= next_steps[:, :, None]
+        episode["next_action_mask"] = next_subtask_mask
 
         if self.use_eef:
             episode["eef_action_chunk"] = tf.gather(eef_action, chunk_indices)
@@ -411,8 +413,7 @@ class PostBatchTransform:
         self._max_token_len = max_token_len
 
         self._normalize_fn: _transforms.Normalize | None = None
-        if state_norm_stats is not None:
-            self._normalize_fn = _transforms.Normalize(state_norm_stats, use_quantiles=use_quantile_norm)
+        self._normalize_fn = _transforms.Normalize(state_norm_stats, use_quantiles=use_quantile_norm)
 
     @property
     def tokenizer(self) -> PaligemmaTokenizer:
@@ -468,22 +469,29 @@ class PostBatchTransform:
         return mirror_images, mirror_masks
 
     @staticmethod
-    def _create_mirror_state(state: np.ndarray) -> np.ndarray:
-        """Create mirrored state by swapping left/right arms."""
-        mirror_state = np.empty_like(state)
-        mirror_state[:, 0:7] = state[:, 7:14]
-        mirror_state[:, 7:14] = state[:, 0:7]
+    def _mirror_14d_array(arr: np.ndarray) -> np.ndarray:
+        """Mirror a 14D array by swapping left/right arms and flipping appropriate signs.    
+        """
+        if arr.shape[-1] != 14:
+            raise ValueError(f"Expected last dimension to be 14, got {arr.shape[-1]}")
+        
+        mirror = np.empty_like(arr)
+        # Swap left (0:7) and right (7:14) arms
+        mirror[..., 0:7] = arr[..., 7:14]
+        mirror[..., 7:14] = arr[..., 0:7]
+        # Negate y-axis components (indices 1, 3, 5 for left arm, 8, 10, 12 for right arm)
         for idx in [1, 3, 5, 8, 10, 12]:
-            mirror_state[:, idx] = -mirror_state[:, idx]
-        return mirror_state
+            mirror[..., idx] = -mirror[..., idx]
+        return mirror
+
 
     def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Apply post-batch processing: subtask sampling, tokenization, normalization."""
         first_null_index = batch.get("first_null_index")
         steps_to_subtask_end = batch.get("steps_to_subtask_end")
 
-        if first_null_index is None or steps_to_subtask_end is None:
-            return batch
+        # if first_null_index is None or steps_to_subtask_end is None:
+        #     return batch
 
         first_null_index = first_null_index.astype(np.int32)
         steps_to_subtask_end = steps_to_subtask_end.astype(np.int32)
@@ -521,6 +529,13 @@ class PostBatchTransform:
 
         batch["truncation"] = np.zeros(batch_size, dtype=np.bool_)
 
+        # Select action_mask for the sampled subtask from per-subtask masks [B, 5, action_horizon]
+        if "action_mask" in batch:
+            batch["action_mask"] = batch["action_mask"][np.arange(batch_size), sampled_indices]
+        
+        if "next_action_mask" in batch:
+            batch["next_action_mask"] = batch["next_action_mask"][np.arange(batch_size), sampled_indices]
+
         # Tokenize prompts
         tokenized_prompts = []
         tokenized_masks = []
@@ -541,14 +556,18 @@ class PostBatchTransform:
             batch.pop(f"subtask_{i}", None)
 
         # Apply normalization
-        if self._normalize_fn is not None:
-            batch = self._normalize_fn(batch)
+        batch = self._normalize_fn(batch)
 
-        # Create mirror state after normalization
-        if "mirror_image" in batch and self._normalize_fn is not None:
+        # Create mirror state and action after normalization (for counterfactual validation)
+        if "mirror_image" in batch:
             batch_state = batch.get("state")
             if batch_state is not None and batch_state.shape[-1] == 14:
-                batch["mirror_state"] = self._create_mirror_state(batch_state)
+                batch["mirror_state"] = self._mirror_14d_array(batch_state)
+            
+            # Mirror actions for Q(s,a) models: actions have shape [B, action_horizon, 14]
+            batch_actions = batch.get("actions")
+            if batch_actions is not None and batch_actions.shape[-1] == 14:
+                batch["mirror_actions"] = self._mirror_14d_array(batch_actions)
 
         return batch
 
@@ -607,11 +626,11 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
     except ImportError:
         raise ImportError("dlimp is required for RoboCOIN data loading. Install with: pip install dlimp")
 
+    logger.info(f"Config: {config}")
     logger.info(f"Building DLIMP dataset: {config.dataset_name}")
     logger.info(f"Data directory: {config.data_dir}")
     logger.info(f"Batch size: {config.batch_size}")
-    logger.info(f"TD-n mode: {'MC (td_n=None)' if config.td_n is None else f'TD-{config.td_n}'}")
-    logger.info(f"Action horizon: {config.action_horizon}")
+    # logger.info(f"Returning just the numpy iterator")
 
     builder = tfds.builder(config.dataset_name, data_dir=config.data_dir)
     dataset = dl.DLataset.from_rlds(builder, split=config.split, shuffle=True, num_parallel_reads=-1)
@@ -660,6 +679,8 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
     dataset = dataset.with_ram_budget(1)
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
+    # return dataset.as_numpy_iterator()
+
     # Create post-batch transform
     post_batch_transform = PostBatchTransform(
         discount=config.discount,
@@ -681,7 +702,7 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
             self._iterator = self._dataset.as_numpy_iterator()
 
         def __iter__(self):
-            return self._iterator
+            return self
 
         def __next__(self):
             batch = next(self._iterator)
@@ -696,12 +717,42 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
 
 
 class RoboCOINDataLoader:
-    """Data loader wrapper compatible with the batch_value_learning interface."""
+    """Data loader wrapper compatible with the openpi data loader interface.
+    
+    Handles sharding similarly to RLDSDataLoader for multi-device training.
+    """
 
-    def __init__(self, config: RoboCOINDataLoaderConfig):
+    def __init__(
+        self,
+        config: RoboCOINDataLoaderConfig,
+        *,
+        sharding: jax.sharding.Sharding | None = None,
+        num_batches: int | None = None,
+    ):
         self.config = config
-        self._iterator = None
+        self._num_batches = num_batches if num_batches is not None else config.num_batches
+
+        if sharding is None:
+            # Use data parallel sharding by default (same as RLDSDataLoader)
+            sharding = jax.sharding.NamedSharding(
+                jax.sharding.Mesh(jax.devices(), ("B",)),
+                jax.sharding.PartitionSpec("B"),
+            )
+
+        self._sharding = sharding
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
-        self._iterator = create_robocoin_data_loader(self.config)
-        return self._iterator
+        num_items = 0
+        while True:
+            data_iter = create_robocoin_data_loader(self.config)
+            while True:
+                if self._num_batches is not None and num_items >= self._num_batches:
+                    return
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    break  # Exhausted the dataset, create new iterator
+                num_items += 1
+                yield jax.tree.map(
+                    lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch
+                )

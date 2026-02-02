@@ -779,21 +779,23 @@ def create_robocoin_data_loader(
             f"local_shuffle_buffer_size={robocoin_config.local_shuffle_buffer_size}"
         )
 
-    # Update config with batch_size, shuffle, sharding, and normalization settings
+    # Update config with batch_size, shuffle, and normalization settings
     import dataclasses as dc
     robocoin_config = dc.replace(
         robocoin_config,
         batch_size=local_batch_size,
         shuffle=shuffle,
         seed=seed + jax.process_index(),  # Different seed per host for data diversity
-        num_batches=num_batches,
-        # sharding=sharding,
         state_norm_stats=data_config.norm_stats,
         use_quantile_norm=data_config.use_quantile_norm,
     )
 
-    # Create the RoboCOIN data loader (handles sharding and normalization internally)
-    robocoin_loader = RoboCOINDataLoader(robocoin_config)
+    # Create the RoboCOIN data loader with sharding
+    robocoin_loader = RoboCOINDataLoader(
+        robocoin_config,
+        sharding=sharding,
+        num_batches=num_batches,
+    )
 
     return DataLoaderImpl(data_config, robocoin_loader)
 

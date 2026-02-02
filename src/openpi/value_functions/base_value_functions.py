@@ -65,6 +65,9 @@ class Transition:
             next_batch["tokenized_prompt"] = batch.get("next_tokenized_prompt", batch["tokenized_prompt"])
         if "tokenized_prompt_mask" in batch:
             next_batch["tokenized_prompt_mask"] = batch.get("next_tokenized_prompt_mask", batch["tokenized_prompt_mask"])
+        # Copy next_action_mask for Q(s,a) models
+        if "next_action_mask" in batch:
+            next_batch["action_mask"] = batch["next_action_mask"]
 
         next_observation = _model.Observation.from_dict(next_batch)
 
@@ -122,6 +125,9 @@ class MultiTransition:
             next_batch["tokenized_prompt"] = batch.get("next_tokenized_prompt", batch["tokenized_prompt"])
         if "tokenized_prompt_mask" in batch:
             next_batch["tokenized_prompt_mask"] = batch.get("next_tokenized_prompt_mask", batch["tokenized_prompt_mask"])
+        # Copy next_action_mask for Q(s,a) models
+        if "next_action_mask" in batch:
+            next_batch["action_mask"] = batch["next_action_mask"]
 
         next_observation = _model.Observation.from_dict(next_batch)
 

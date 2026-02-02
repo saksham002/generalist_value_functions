@@ -837,11 +837,7 @@ class RoboCOINDataConfig(DataConfigFactory):
     # - True: min-max normalization using min/max keys (mapped to q01/q99 for quantile transform)
     use_quantile_norm: bool = False
 
-    # Whether to condition on actions (Q(s,a) vs V(s))
-    # If True, action chunks are created and passed to the model
-    action_conditioned: bool = False
-
-    # Number of actions in the action chunk for Q(s,a) training
+    # Number of actions in the action chunk
     action_horizon: int = 30
 
     # Override repo_id from parent - not used for RoboCOIN
@@ -1032,7 +1028,7 @@ class RoboCOINDataConfig(DataConfigFactory):
                                 np.array(action_stats["max"])[13:14],
                             ]
                         )
-                        norm_stats["action_chunk"] = _transforms.NormStats(
+                        norm_stats["actions"] = _transforms.NormStats(
                             mean=None,
                             std=None,
                             q01=combined_action_min,
@@ -1056,7 +1052,7 @@ class RoboCOINDataConfig(DataConfigFactory):
                                 np.array(action_stats["std"])[13:14],
                             ]
                         )
-                        norm_stats["action_chunk"] = _transforms.NormStats(
+                        norm_stats["actions"] = _transforms.NormStats(
                             mean=combined_action_mean,
                             std=combined_action_std,
                             q01=None,
@@ -1064,14 +1060,14 @@ class RoboCOINDataConfig(DataConfigFactory):
                         )
             # Joint angle mode: use action stats directly
             elif self.use_quantile_norm:
-                norm_stats["action_chunk"] = _transforms.NormStats(
+                norm_stats["actions"] = _transforms.NormStats(
                     mean=None,
                     std=None,
                     q01=np.array(action_stats["min"]),
                     q99=np.array(action_stats["max"]),
                 )
             else:
-                norm_stats["action_chunk"] = _transforms.NormStats(
+                norm_stats["actions"] = _transforms.NormStats(
                     mean=np.array(action_stats["mean"]),
                     std=np.array(action_stats["std"]),
                     q01=None,
@@ -2727,7 +2723,7 @@ _CONFIGS = [
         data=RoboCOINDataConfig(
             tfds_data_dir="/data/group_data/rl/saksham3/",
             dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin/norm_stats/norm_stats_eef.json",
+            norm_stats_path="gs://saksham-euw4/robocoin/norm_stats/norm_stats.json",
             discount=0.99,
             use_eef=True,
         ),
@@ -2748,9 +2744,9 @@ _CONFIGS = [
         fsdp_devices=16,
         validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache_counterfactual/",
     ),
-    # RoboCOIN Q(s,a) with MC regression - action-conditioned value function
+    # RoboCOIN V(s) with mask_state=True (regression) - ablation: state masked out
     TrainConfig(
-        name="robocoin_paligemma_q_mc",
+        name="robocoin_paligemma_v_mc_use_eef_no_state",
         model=_value_function.MCValueFunctionConfig(
             network_config=_paligemma_network.PaliGemmaNetworkConfig(
                 state_dim=14,
@@ -2758,19 +2754,16 @@ _CONFIGS = [
                 image_size=(224, 224),
                 freeze_backbone=False,
                 max_token_len=48,
-                action_conditioned=True,
-                action_dim=14,
-                action_horizon=30,
+                mask_state=True,  # Ablation: mask out state token
             ),
             head_config=_heads.RegressionHeadConfig(),
         ),
         data=RoboCOINDataConfig(
             tfds_data_dir="/data/group_data/rl/saksham3/",
             dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin/norm_stats/norm_stats_eef.json",
+            norm_stats_path="gs://saksham-euw4/robocoin/norm_stats/norm_stats.json",
             discount=0.99,
             use_eef=True,
-            action_horizon=30,
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
         num_train_steps=30_000,
@@ -2782,6 +2775,92 @@ _CONFIGS = [
             decay_lr=1e-6,
         ),
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=5_000,
+        save_interval=5_000,
+        fsdp_devices=16,
+        validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache_counterfactual/",
+    ),
+    # RoboCOIN V(s) with mask_state=True (HL-Gauss) - ablation: state masked out
+    TrainConfig(
+        name="robocoin_paligemma_v_mc_use_eef_no_state_hl_gauss",
+        model=_value_function.MCValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(224, 224),
+                freeze_backbone=False,
+                max_token_len=48,
+                mask_state=True,  # Ablation: mask out state token
+            ),
+            head_config=_heads.CategoricalHeadConfig(
+                v_min=0.0,
+                v_max=1.0,
+                num_bins=51,
+                sigma=0.015,
+            ),
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="/data/group_data/rl/saksham3/",
+            dataset_name="robocoin:1.0.0",
+            norm_stats_path="gs://saksham-euw4/robocoin/norm_stats/norm_stats.json",
+            discount=0.99,
+            use_eef=True,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=30_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=5_000,
+        save_interval=5_000,
+        fsdp_devices=16,
+        validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache_counterfactual/",
+    ),
+    # RoboCOIN Q(s,a) with MC regression - action-conditioned value function
+    TrainConfig(
+        name="robocoin_paligemma_q_mc", # use_eef is True 
+        model=_value_function.MCValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(224, 224),
+                freeze_backbone=False,
+                max_token_len=48,
+                action_conditioned=True,
+                action_dim=14,
+                action_horizon=15,
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="/data/group_data/rl/saksham3/",
+            dataset_name="robocoin:1.0.0",
+            norm_stats_path="gs://saksham-euw4/robocoin/norm_stats/norm_stats.json",
+            # norm_stats_path="/data/group_data/rl/saksham3/robocoin/norm_stats/norm_stats.json",
+            discount=0.99,
+            use_eef=True,
+            action_horizon=15,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=30_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,  # DLIMP handles its own parallelism
         log_interval=100,
         plot_interval=5_000,
         save_interval=5_000,
