@@ -2914,49 +2914,6 @@ _CONFIGS = [
         fsdp_devices=16,
         validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache_counterfactual/",
     ),
-    # RoboCOIN MC value function with HL-Gauss head frozen to grouped-sum logits.
-    TrainConfig(
-        name="robocoin_paligemma_v_mc_hl_gauss_freeze_head",
-        model=_value_function.MCValueFunctionConfig(
-            network_config=_paligemma_network.PaliGemmaNetworkConfig(
-                state_dim=14,  # Proprioceptive state dimension for RoboCOIN
-                num_cameras=3,
-                image_size=(224, 224),
-                freeze_backbone=False,
-                max_token_len=48,
-                mask_state=True,
-            ),
-            head_config=_heads.CategoricalHeadConfig(
-                v_min=0.0,  # MC return = gamma^steps is in [0, 1]
-                v_max=1.0,
-                num_bins=64,
-                sigma=0.75 * (1.0 / (64 - 1)),
-                freeze_head=True,
-            ),
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="/data/group_data/rl/saksham3/",
-            dataset_name="robocoin:1.0.0",
-            discount=0.99,
-            use_eef=True,
-        ),
-        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=30_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=30_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        plot_interval=5_000,
-        save_interval=5_000,
-        fsdp_devices=16,
-        validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache_counterfactual/",
-    ),
     # RoboCOIN TD-30 value function config (regression loss).
     TrainConfig(
         name="robocoin_paligemma_v_td30",
@@ -2975,7 +2932,7 @@ _CONFIGS = [
             tfds_data_dir="/data/group_data/rl/saksham3/",
             dataset_name="robocoin:1.0.0",
             discount=0.99,
-            td_n=15,  # TD-30: bootstrap with value at t + 30
+            td_n=30,  # TD-30: bootstrap with value at t + 30
             use_eef=True,
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
