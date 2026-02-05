@@ -150,7 +150,7 @@ class PaliGemmaNetworkConfig:
     mask_state: bool = False
 
     # Fix order in which to iterate through keys
-    image_keys: list[str] = ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]
+    image_keys: tuple[str, str, str] = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
     def create(self, rng: at.KeyArrayLike) -> PaliGemmaValueNetwork:
         """Create a new PaliGemma value network with initialized parameters."""

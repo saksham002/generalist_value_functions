@@ -39,7 +39,7 @@ from openpi.models.tokenizer import PaligemmaTokenizer
 
 logger = logging.getLogger(__name__)
 # Disable GPU for TensorFlow (we only use it for data loading)
-tf.config.experimental.set_visible_devices([], "GPU")
+# tf.config.experimental.set_visible_devices([], "GPU")
 
 # =============================================================================
 # Constants
@@ -675,6 +675,8 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
     if config.shuffle:
         dataset = dataset.shuffle(config.local_shuffle_buffer_size, seed=config.seed)
 
+    logger.info(f"Removed all transforms and returning the numpy iterator.")
+
     dataset = dataset.batch(config.batch_size, drop_remainder=config.drop_remainder)
     dataset = dataset.with_ram_budget(1)
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
@@ -741,6 +743,13 @@ class RoboCOINDataLoader:
 
         self._sharding = sharding
 
+    def _to_sharded_array_or_passthrough(self, x: Any) -> Any:
+        """Convert numeric arrays to sharded JAX arrays; keep unsupported dtypes as-is."""
+        arr = np.asarray(x)
+        if arr.dtype.kind in {"O", "U", "S", "V", "M", "m"}:
+            return x
+        return jax.make_array_from_process_local_data(self._sharding, arr)
+
     def __iter__(self) -> Iterator[dict[str, Any]]:
         num_items = 0
         while True:
@@ -754,5 +763,5 @@ class RoboCOINDataLoader:
                     break  # Exhausted the dataset, create new iterator
                 num_items += 1
                 yield jax.tree.map(
-                    lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch
+                    self._to_sharded_array_or_passthrough, batch
                 )
