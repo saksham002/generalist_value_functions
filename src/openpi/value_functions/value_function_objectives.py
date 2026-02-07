@@ -141,6 +141,10 @@ def sarsa_objective(
     pred = head(features)
     td_error = pred - target
 
+    # MC loss for comparison: how well does V(s) match the true MC return?
+    mc_error = pred - transition.mc_return
+    mc_loss = jnp.mean(jnp.square(mc_error))
+
     info = {
         "predicted_value_mean": jnp.mean(pred),
         "predicted_value_std": jnp.std(pred),
@@ -149,6 +153,7 @@ def sarsa_objective(
         "td_error_mean": jnp.mean(td_error),
         "td_error_std": jnp.std(td_error),
         "next_value_mean": jnp.mean(target_value),
+        "mc_loss": mc_loss,
     }
     return loss, info
 

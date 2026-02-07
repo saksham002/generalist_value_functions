@@ -375,7 +375,7 @@ class MainTransform:
 
         # Pass through metadata and subtask info (will be processed post-batch in NumPy)
         for key in ["first_null_index", "steps_to_subtask_end", "episode_index", "_frame_index",
-                    "subtask_1", "subtask_2", "subtask_3", "subtask_4", "subtask_5"]:
+                    "subtask_1", "subtask_2", "subtask_3", "subtask_4", "subtask_5", "_traj_index"]:
             if key in raw_frame:
                 frame[key] = raw_frame[key]
 
@@ -519,7 +519,7 @@ class PostBatchTransform:
         batch["sampled_indices"] = sampled_indices
 
         if self.td_n is not None:
-            within_horizon = selected_steps <= self.td_n
+            within_horizon = selected_steps < self.td_n
             batch["termination"] = within_horizon
             td_reward = np.power(self.discount, selected_steps.astype(np.float32))
             batch["reward"] = np.where(within_horizon, td_reward, 0.0).astype(np.float32)
@@ -605,6 +605,7 @@ class PostBatchTransform:
             batch["mirror_image_mask"] = mirror_masks_dict
 
 
+
 # =============================================================================
 # Main Factory Function
 # =============================================================================
@@ -630,7 +631,6 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
     logger.info(f"Building DLIMP dataset: {config.dataset_name}")
     logger.info(f"Data directory: {config.data_dir}")
     logger.info(f"Batch size: {config.batch_size}")
-    # logger.info(f"Returning just the numpy iterator")
 
     builder = tfds.builder(config.dataset_name, data_dir=config.data_dir)
     dataset = dl.DLataset.from_rlds(builder, split=config.split, shuffle=True, num_parallel_reads=-1)
@@ -674,8 +674,6 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
 
     if config.shuffle:
         dataset = dataset.shuffle(config.local_shuffle_buffer_size, seed=config.seed)
-
-    logger.info(f"Removed all transforms and returning the numpy iterator.")
 
     dataset = dataset.batch(config.batch_size, drop_remainder=config.drop_remainder)
     dataset = dataset.with_ram_budget(1)
