@@ -99,8 +99,8 @@ if "checkpoint-base-dir" in train_args:
     train_args["checkpoint-base-dir"] = f"{train_args['checkpoint-base-dir']}/{suffix}"
 
 train_args_str = " \\\n\t".join([f"--{k}={v}" for k, v in train_args.items()])
-# train_script = os.environ.get("TRAIN_SCRIPT", "scripts/train_value_function.py")
-train_script = "scripts/train_value_function_debug.py"
+train_script = os.environ.get("TRAIN_SCRIPT", "scripts/train_value_function.py")
+# train_script = "scripts/train_value_function_debug.py"
 NFS_USER = os.environ.get("NFS_USER", "saksham")
 CHOWN_USER = os.environ.get("CHOWN_USER", NFS_USER)
 
@@ -157,7 +157,7 @@ echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 export LD_LIBRARY_PATH="/nfs/aidm_nfs/{NFS_USER}/ffmpeg-7/lib:"
 
 echo "WANDB_API_KEY: $WANDB_API_KEY"
-export WANDB_API_KEY="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"
+export WANDB_API_KEY="<wandb_api_key>"
 
 echo "Running sudo chown -R {CHOWN_USER}:{CHOWN_USER} /tmp/tpu_logs"
 sudo chown -R {CHOWN_USER}:{CHOWN_USER} /tmp/tpu_logs

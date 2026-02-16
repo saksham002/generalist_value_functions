@@ -2992,7 +2992,7 @@ _CONFIGS = [
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
             peak_lr=1e-5,
-            decay_steps=30_000,
+            decay_steps=100_000,
             decay_lr=1e-6,
         ),
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
@@ -3001,6 +3001,7 @@ _CONFIGS = [
         plot_interval=5_000,
         save_interval=5_000,
         fsdp_devices=16,
+        num_val_trajectories=24,
         validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache/",
     ),
     # RoboCOIN TD-15 value function config (regression loss).
