@@ -1512,7 +1512,9 @@ def generate_validation_plots_dlimp(
         # Track episodes currently being collected (in-memory) and those already saved to disk
         active_episodes: set[int] = set()  # Episodes currently in episode_frames dict
         saved_episode_count = 0  # Number of episodes saved to disk
-        logging.info(f"Collecting validation frames for first {num_val_trajectories} episodes encountered")
+        seen_repo_indices: set[int] = set[int]()  # repo_index values already collected
+        ep_to_repo: dict[int, int] = {}  # episode_index -> repo_index mapping
+        logging.info(f"Collecting validation frames for first {num_val_trajectories} unique repo_index episodes")
         
         # Create cache directory early if needed
         if cache_dir:
@@ -1531,6 +1533,10 @@ def generate_validation_plots_dlimp(
             if hasattr(episode_indices, "device"):
                 episode_indices = np.asarray(episode_indices)
             
+            repo_indices = batch.get("repo_index", None)
+            if repo_indices is not None and hasattr(repo_indices, "device"):
+                repo_indices = np.asarray(repo_indices)
+            
             # Get the set of episode indices present in this batch
             unique_batch_episodes = set(int(e) for e in episode_indices)
             
@@ -1548,7 +1554,7 @@ def generate_validation_plots_dlimp(
                         ep_cache_file = os.path.join(cache_dir, f"episode_{ep_idx}.pkl")
                         with open(ep_cache_file, "wb") as f:
                             pickle.dump(frames, f)
-                        logging.info(f"Saved episode {ep_idx} ({len(frames)} frames) to {ep_cache_file}")
+                        logging.info(f"Saved episode {ep_idx} ({len(frames)} frames, repo_index={ep_to_repo.get(ep_idx, '?')}) to {ep_cache_file}")
                     
                     # Remove from memory to save space
                     del episode_frames[ep_idx]
@@ -1569,14 +1575,24 @@ def generate_validation_plots_dlimp(
                 
                 # If we haven't seen this episode yet, start collecting if we have room
                 if ep_idx not in episode_frames and ep_idx not in active_episodes:
+                    # Check repo_index to avoid collecting duplicate episodes
+                    if repo_indices is not None:
+                        ri = int(repo_indices[i])
+                        if ri in seen_repo_indices:
+                            continue
+                    
                     # Check if we've already started collecting enough episodes
                     total_episodes_seen = len(active_episodes) + saved_episode_count
                     if total_episodes_seen >= num_val_trajectories:
-                        # Already have enough episodes, skip new ones
                         continue
+                    
                     # Start collecting this new episode
                     episode_frames[ep_idx] = []
                     active_episodes.add(ep_idx)
+                    if repo_indices is not None:
+                        ri = int(repo_indices[i])
+                        seen_repo_indices.add(ri)
+                        ep_to_repo[ep_idx] = ri
                 
                 # Skip if this episode is not being actively collected
                 if ep_idx not in active_episodes:
@@ -1598,7 +1614,7 @@ def generate_validation_plots_dlimp(
 
                 episode_frames[ep_idx].append(frame)
         
-        logging.info(f"Total episodes saved: {saved_episode_count}")
+        logging.info(f"Total episodes saved: {saved_episode_count}, unique repo_indices: {len(seen_repo_indices)}")
     
     # If save_only mode, return early without generating plots
     if save_only:

@@ -91,6 +91,7 @@ class RoboCOINDataLoaderConfig:
     repeat: bool = True
     use_eef: bool = False
     action_horizon: int = DEFAULT_ACTION_HORIZON
+    filter_n: int | None = None
 
 
 # =============================================================================
@@ -239,19 +240,21 @@ class ImageResizeTransform:
 
 
 class MainTransform:
-    """TensorFlow transform for state/action/image restructuring.
-    
-    Applied per-frame. Handles state/action processing, image
-    restructuring, subtask sampling, tokenization, and normalization.
-    """
+    """Per-frame TF transform: state/action/image restructuring, subtask sampling, reward keys."""
 
     def __init__(
         self,
         max_cameras: int = DEFAULT_MAX_CAMERAS,
         use_eef: bool = False,
+        discount: float = 0.99,
+        td_n: int | None = None,
+        split: str = "train",
     ):
         self.max_cameras = max_cameras
         self.use_eef = use_eef
+        self.discount = discount
+        self.td_n = td_n
+        self.split = split
 
     @staticmethod
     def _construct_eef_repr(data: tf.Tensor, eef_data: tf.Tensor) -> tf.Tensor:
@@ -354,8 +357,51 @@ class MainTransform:
                 masks[standard_key] = True
         return {"images": images, "masks": masks}
 
+    def _sample_subtask_and_compute_rewards(self, frame: dict, raw_frame: dict) -> None:
+        """Sample one subtask per frame; set scalar steps_to_subtask_end and reward keys."""
+        first_null = tf.cast(raw_frame["first_null_index"], tf.int32)
+        steps_all = tf.cast(raw_frame["steps_to_subtask_end"], tf.int32)  # [5]
+
+        if self.split == "val":
+            sampled_idx = tf.constant(0, dtype=tf.int32)
+        else:
+            safe_upper = tf.maximum(first_null, 1)
+            sampled_idx = tf.random.uniform([], minval=0, maxval=safe_upper, dtype=tf.int32)
+
+        selected_steps = steps_all[sampled_idx]
+        selected_steps_f = tf.cast(selected_steps, tf.float32)
+        loss_mask = first_null > 0
+
+        frame["steps_to_subtask_end"] = selected_steps
+        frame["sampled_index"] = sampled_idx
+        frame["loss_mask"] = loss_mask
+        frame["first_null_index"] = first_null
+
+        # Select action masks for sampled subtask: [5, H] -> [H]
+        frame["action_mask"] = frame["action_mask"][sampled_idx]
+        frame["next_action_mask"] = frame["next_action_mask"][sampled_idx]
+
+        # Select subtask text
+        texts = tf.stack([raw_frame[f"subtask_{i}"] for i in range(1, 6)])
+        frame["subtask_text"] = texts[sampled_idx]
+
+        # mc_return
+        mc_return = tf.pow(self.discount, selected_steps_f)
+        frame["mc_return"] = tf.where(loss_mask, mc_return, 0.0)
+
+        # termination / reward
+        if self.td_n is not None:
+            termination = selected_steps < self.td_n
+            td_reward = tf.pow(self.discount, selected_steps_f)
+            frame["termination"] = termination
+            frame["reward"] = tf.where(termination, td_reward, 0.0)
+        else:
+            frame["termination"] = tf.equal(selected_steps, 0)
+            frame["reward"] = tf.cast(frame["termination"], tf.float32)
+
+        frame["truncation"] = tf.constant(False)
+
     def map(self, raw_frame: dict[str, Any]) -> dict[str, Any]:
-        """Transform a raw frame to intermediate format (TF tensors only)."""
         frame = {}
 
         # Process state/actions
@@ -373,13 +419,31 @@ class MainTransform:
             frame["next_image"] = next_imgs["images"]
             frame["next_image_mask"] = next_imgs["masks"]
 
-        # Pass through metadata and subtask info (will be processed post-batch in NumPy)
-        for key in ["first_null_index", "steps_to_subtask_end", "episode_index", "_frame_index",
-                    "subtask_1", "subtask_2", "subtask_3", "subtask_4", "subtask_5", "_traj_index"]:
+        # Pass through metadata (subtask_1..5 needed for validation extras in PostBatchTransform)
+        for key in ["episode_index", "_frame_index", "_traj_index", "repo_index",
+                    "subtask_1", "subtask_2", "subtask_3", "subtask_4", "subtask_5"]:
             if key in raw_frame:
                 frame[key] = raw_frame[key]
 
+        # Sample subtask, select scalar steps_to_subtask_end, compute reward keys
+        self._sample_subtask_and_compute_rewards(frame, raw_frame)
+
         return frame
+
+
+# =============================================================================
+# Filter Transform (applied after MainTransform frame_map)
+# =============================================================================
+
+
+class FilterLastN:
+    """Filter out frames where steps_to_subtask_end < filter_n."""
+
+    def __init__(self, filter_n: int):
+        self.filter_n = filter_n
+
+    def filter(self, frame: dict[str, Any]) -> tf.Tensor:
+        return frame["steps_to_subtask_end"] >= self.filter_n
 
 
 # =============================================================================
@@ -392,27 +456,18 @@ class PostBatchTransform:
 
     def __init__(
         self,
-        discount: float = 0.99,
-        reward_scale: float = 1.0,
-        reward_bias: float = 0.0,
         max_token_len: int = DEFAULT_MAX_TOKEN_LEN,
         state_norm_stats: dict[str, Any] | None = None,
         use_quantile_norm: bool = False,
-        td_n: int | None = None,
         use_eef: bool = False,
         split: str = "train",
     ):
-        self.discount = discount
-        self.reward_scale = reward_scale
-        self.reward_bias = reward_bias
-        self.td_n = td_n
         self.use_eef = use_eef
         self.split = split
 
         self._tokenizer: PaligemmaTokenizer | None = None
         self._max_token_len = max_token_len
 
-        self._normalize_fn: _transforms.Normalize | None = None
         self._normalize_fn = _transforms.Normalize(state_norm_stats, use_quantiles=use_quantile_norm)
 
     @property
@@ -486,61 +541,14 @@ class PostBatchTransform:
 
 
     def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
-        """Apply post-batch processing: subtask sampling, tokenization, normalization."""
-        first_null_index = batch.get("first_null_index")
-        steps_to_subtask_end = batch.get("steps_to_subtask_end")
+        """Tokenize prompts, apply validation extras, normalize."""
+        batch_size = batch["subtask_text"].shape[0]
 
-        # if first_null_index is None or steps_to_subtask_end is None:
-        #     return batch
-
-        first_null_index = first_null_index.astype(np.int32)
-        steps_to_subtask_end = steps_to_subtask_end.astype(np.int32)
-        batch_size = first_null_index.shape[0]
-
-        subtask_texts_all = [batch[f"subtask_{i}"] for i in range(1, 6)]
-        texts_stacked = np.stack(subtask_texts_all, axis=0)
-
-        loss_masks = first_null_index > 0
-
-        if self.split == "val":
-            sampled_indices = np.zeros(batch_size, dtype=np.int32)
-        else:
-            safe_upper_bound = np.maximum(first_null_index, 1)
-            sampled_indices = (np.random.rand(batch_size) * safe_upper_bound).astype(np.int32)
-
-        selected_texts = texts_stacked[sampled_indices, np.arange(batch_size)]
-        selected_steps = steps_to_subtask_end[np.arange(batch_size), sampled_indices]
-
-        mc_returns = np.power(self.discount, selected_steps.astype(np.float32))
-        mc_returns = np.where(loss_masks, mc_returns, 0.0)
-
-        batch["mc_return"] = mc_returns.astype(np.float32)
-        batch["loss_mask"] = loss_masks.astype(np.bool_)
-        batch["sampled_indices"] = sampled_indices
-
-        if self.td_n is not None:
-            within_horizon = selected_steps < self.td_n
-            batch["termination"] = within_horizon
-            td_reward = np.power(self.discount, selected_steps.astype(np.float32))
-            batch["reward"] = np.where(within_horizon, td_reward, 0.0).astype(np.float32)
-        else:
-            batch["termination"] = (selected_steps == 0)
-            batch["reward"] = batch["termination"].astype(np.float32)
-
-        batch["truncation"] = np.zeros(batch_size, dtype=np.bool_)
-
-        # Select action_mask for the sampled subtask from per-subtask masks [B, 5, action_horizon]
-        if "action_mask" in batch:
-            batch["action_mask"] = batch["action_mask"][np.arange(batch_size), sampled_indices]
-        
-        if "next_action_mask" in batch:
-            batch["next_action_mask"] = batch["next_action_mask"][np.arange(batch_size), sampled_indices]
-
-        # Tokenize prompts
+        # Tokenize the already-selected subtask text
         tokenized_prompts = []
         tokenized_masks = []
         for i in range(batch_size):
-            text = self._decode_text(selected_texts[i])
+            text = self._decode_text(batch["subtask_text"][i])
             tokens, mask = self.tokenizer.tokenize(text, state=None)
             tokenized_prompts.append(tokens)
             tokenized_masks.append(mask)
@@ -549,31 +557,29 @@ class PostBatchTransform:
         batch["tokenized_prompt_mask"] = np.stack(tokenized_masks, axis=0)
 
         if self.split == "val":
-            self._process_validation_extras(batch, subtask_texts_all, batch_size)
+            self._process_validation_extras(batch, batch_size)
 
         # Clean up subtask keys
+        batch.pop("subtask_text", None)
         for i in range(1, 6):
             batch.pop(f"subtask_{i}", None)
 
         # Apply normalization
         batch = self._normalize_fn(batch)
 
-        # Create mirror state and action after normalization (for counterfactual validation)
+        # Mirror state/actions after normalization (for counterfactual validation)
         if "mirror_image" in batch:
             batch_state = batch.get("state")
             if batch_state is not None and batch_state.shape[-1] == 14:
                 batch["mirror_state"] = self._mirror_14d_array(batch_state)
-            
-            # Mirror actions for Q(s,a) models: actions have shape [B, action_horizon, 14]
             batch_actions = batch.get("actions")
             if batch_actions is not None and batch_actions.shape[-1] == 14:
                 batch["mirror_actions"] = self._mirror_14d_array(batch_actions)
 
         return batch
 
-    def _process_validation_extras(self, batch: dict, subtask_texts_all: list, batch_size: int) -> None:
-        """Process validation-specific extras."""
-        subtask_1_texts = [self._decode_text(subtask_texts_all[0][i]) for i in range(batch_size)]
+    def _process_validation_extras(self, batch: dict, batch_size: int) -> None:
+        subtask_1_texts = [self._decode_text(batch["subtask_1"][i]) for i in range(batch_size)]
         batch["subtask_1_text"] = subtask_1_texts
 
         negative_texts = [self._generate_negative_subtask_text(t) for t in subtask_1_texts]
@@ -633,7 +639,7 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
     logger.info(f"Batch size: {config.batch_size}")
 
     builder = tfds.builder(config.dataset_name, data_dir=config.data_dir)
-    dataset = dl.DLataset.from_rlds(builder, split=config.split, shuffle=True, num_parallel_reads=-1)
+    dataset = dl.DLataset.from_rlds(builder, split=config.split, shuffle=True, num_parallel_reads=8)
 
     def _drop_episode_metadata(episode: Any) -> Any:
         if isinstance(episode, dict):
@@ -656,7 +662,7 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
         ).map
     )
 
-    dataset = dataset.flatten()
+    dataset = dataset.flatten(num_parallel_calls=8)
 
     dataset = dataset.frame_map(
         ImageResizeTransform(
@@ -669,27 +675,26 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
         MainTransform(
             max_cameras=config.max_cameras,
             use_eef=config.use_eef,
+            discount=config.discount,
+            td_n=config.td_n,
+            split=config.split,
         ).map
     )
+
+    if config.filter_n is not None:
+        dataset = dataset.filter(FilterLastN(config.filter_n).filter)
 
     if config.shuffle:
         dataset = dataset.shuffle(config.local_shuffle_buffer_size, seed=config.seed)
 
     dataset = dataset.batch(config.batch_size, drop_remainder=config.drop_remainder)
     dataset = dataset.with_ram_budget(1)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    dataset = dataset.prefetch(4)
 
-    # return dataset.as_numpy_iterator()
-
-    # Create post-batch transform
     post_batch_transform = PostBatchTransform(
-        discount=config.discount,
-        reward_scale=config.reward_scale,
-        reward_bias=config.reward_bias,
         max_token_len=config.max_token_len,
         state_norm_stats=config.state_norm_stats,
         use_quantile_norm=config.use_quantile_norm,
-        td_n=config.td_n,
         use_eef=config.use_eef,
         split=config.split,
     )
