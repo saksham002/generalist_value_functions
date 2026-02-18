@@ -8,10 +8,10 @@ import os
 import re
 
 
-def get_tpu_config(zone, tpu_type, num_tpus, pod_name = None):
+def get_tpu_config(zone, tpu_type, num_tpus):
     """Generate TPU configuration for a given zone and TPU type."""
     NFS_DIRS = {
-        "europe-west4-b": "/nfs/aidm_nfs/saksham",
+        "europe-west4-b": "/nfs/aidm_nfs/saksham3",
     }
     CHECKPOINT_DIRS = {
         "europe-west4-b": "gs://saksham-euw4/checkpoints/robocoin/value_functions",
@@ -23,11 +23,7 @@ def get_tpu_config(zone, tpu_type, num_tpus, pod_name = None):
     SOURCE_DIR_NAME = "batch_value_learning"
 
     nfs = NFS_DIRS[zone]
-    if pod_name is not None and pod_name.endswith("-1"):
-        nfs = nfs + "3"
-
     checkpoints_dir = CHECKPOINT_DIRS[zone]
-    dataset_dir = DATASET_DIRS[zone]
 
     runtime_versions = {"v4": "tpu-ubuntu2204-base", "v5": "v2-alpha-tpuv5-lite"}
     accelerator_types = {"v4": f"v4-{num_tpus}", "v5": f"v5litepod-{num_tpus}"}
@@ -46,7 +42,6 @@ def get_tpu_config(zone, tpu_type, num_tpus, pod_name = None):
         "train_args": {
             "batch-size": 256,
             "checkpoint-base-dir": checkpoints_dir,
-            "data.tfds-data-dir": dataset_dir,
             "project-name": "robocoin_value_learning",
         },
     }
@@ -57,8 +52,9 @@ DEFAULT_TRAIN_ARGS = {
 }
 
 TPU_POD_CONFIGS = {
+    "eu-v5e-0": get_tpu_config("europe-west4-b", "v5", 64),
     "eu-v5-64-0": get_tpu_config("europe-west4-b", "v5", 64),
-    "eu-v5-64-1": get_tpu_config("europe-west4-b", "v5", 64, "v5e-tpu-64-1"),
+    "eu-v5-64-1": get_tpu_config("europe-west4-b", "v5", 64),
     "eu-v5-128": get_tpu_config("europe-west4-b", "v5", 128),
     "eu-v5-256": get_tpu_config("europe-west4-b", "v5", 256),
 }
@@ -68,6 +64,7 @@ TPU_POD_TYPES = {
     "v5e-tpu-128*": "eu-v5-128",
     "v5e-tpu-64-0": "eu-v5-64-0",
     "v5e-tpu-64-1": "eu-v5-64-1",
+    "v5e-0": "eu-v5e-0",
 }
 
 
@@ -101,7 +98,7 @@ if "checkpoint-base-dir" in train_args:
 train_args_str = " \\\n\t".join([f"--{k}={v}" for k, v in train_args.items()])
 train_script = os.environ.get("TRAIN_SCRIPT", "scripts/train_value_function.py")
 # train_script = "scripts/train_value_function_debug.py"
-NFS_USER = os.environ.get("NFS_USER", "saksham")
+NFS_USER = os.environ.get("NFS_USER", "saksham3")
 CHOWN_USER = os.environ.get("CHOWN_USER", NFS_USER)
 
 launch_script = f"""
@@ -154,10 +151,7 @@ echo "Running {config["setup_script"]}"
 {config["setup_script"]}
 
 echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
-export LD_LIBRARY_PATH="/nfs/aidm_nfs/{NFS_USER}/ffmpeg-7/lib:"
-
 echo "WANDB_API_KEY: $WANDB_API_KEY"
-export WANDB_API_KEY="<wandb_api_key>"
 
 echo "Running sudo chown -R {CHOWN_USER}:{CHOWN_USER} /tmp/tpu_logs"
 sudo chown -R {CHOWN_USER}:{CHOWN_USER} /tmp/tpu_logs

@@ -1000,67 +1000,61 @@ class RoboCOINDataConfig(DataConfigFactory):
             )
 
         # Add action_chunk normalization stats (for Q(s,a) training)
-        if "action" in data:
-            action_stats = data["action"]
+        if "action_diff" in data:
+            action_stats = data["action_diff"]
 
             if self.use_eef:
-                # EEF mode: construct combined action stats from eef_sim_pose_action + action grippers
-                if "eef_sim_pose_action" not in data:
-                    logging.warning(
-                        "use_eef=True but 'eef_sim_pose_action' not in norm_stats.json, "
-                        "skipping action_chunk normalization"
+                # EEF mode: construct combined action stats from eef_sim_pose_action_diff + action_diff grippers
+                eef_action_stats = data["eef_sim_pose_action_diff"]
+
+                if self.use_quantile_norm:
+                    # Min-max normalization
+                    combined_action_min = np.concatenate(
+                        [
+                            np.array(eef_action_stats["min"])[:6],
+                            np.array(action_stats["min"])[6:7],
+                            np.array(eef_action_stats["min"])[6:12],
+                            np.array(action_stats["min"])[13:14],
+                        ]
+                    )
+                    combined_action_max = np.concatenate(
+                        [
+                            np.array(eef_action_stats["max"])[:6],
+                            np.array(action_stats["max"])[6:7],
+                            np.array(eef_action_stats["max"])[6:12],
+                            np.array(action_stats["max"])[13:14],
+                        ]
+                    )
+                    norm_stats["actions"] = _transforms.NormStats(
+                        mean=None,
+                        std=None,
+                        q01=combined_action_min,
+                        q99=combined_action_max,
                     )
                 else:
-                    eef_action_stats = data["eef_sim_pose_action"]
-
-                    if self.use_quantile_norm:
-                        # Min-max normalization
-                        combined_action_min = np.concatenate(
-                            [
-                                np.array(eef_action_stats["min"])[:6],
-                                np.array(action_stats["min"])[6:7],
-                                np.array(eef_action_stats["min"])[6:12],
-                                np.array(action_stats["min"])[13:14],
-                            ]
-                        )
-                        combined_action_max = np.concatenate(
-                            [
-                                np.array(eef_action_stats["max"])[:6],
-                                np.array(action_stats["max"])[6:7],
-                                np.array(eef_action_stats["max"])[6:12],
-                                np.array(action_stats["max"])[13:14],
-                            ]
-                        )
-                        norm_stats["actions"] = _transforms.NormStats(
-                            mean=None,
-                            std=None,
-                            q01=combined_action_min,
-                            q99=combined_action_max,
-                        )
-                    else:
-                        # Z-score normalization
-                        combined_action_mean = np.concatenate(
-                            [
-                                np.array(eef_action_stats["mean"])[:6],
-                                np.array(action_stats["mean"])[6:7],
-                                np.array(eef_action_stats["mean"])[6:12],
-                                np.array(action_stats["mean"])[13:14],
-                            ]
-                        )
-                        combined_action_std = np.concatenate(
-                            [
-                                np.array(eef_action_stats["std"])[:6],
-                                np.array(action_stats["std"])[6:7],
-                                np.array(eef_action_stats["std"])[6:12],
-                                np.array(action_stats["std"])[13:14],
-                            ]
-                        )
-                        norm_stats["actions"] = _transforms.NormStats(
-                            mean=combined_action_mean,
-                            std=combined_action_std,
-                            q01=None,
-                            q99=None,
-                        )
+                    # Z-score normalization
+                    combined_action_mean = np.concatenate(
+                        [
+                            np.array(eef_action_stats["mean"])[:6],
+                            np.array(action_stats["mean"])[6:7],
+                            np.array(eef_action_stats["mean"])[6:12],
+                            np.array(action_stats["mean"])[13:14],
+                        ]
+                    )
+                    combined_action_std = np.concatenate(
+                        [
+                            np.array(eef_action_stats["std"])[:6],
+                            np.array(action_stats["std"])[6:7],
+                            np.array(eef_action_stats["std"])[6:12],
+                            np.array(action_stats["std"])[13:14],
+                        ]
+                    )
+                    norm_stats["actions"] = _transforms.NormStats(
+                        mean=combined_action_mean,
+                        std=combined_action_std,
+                        q01=None,
+                        q99=None,
+                    )
             # Joint angle mode: use action stats directly
             elif self.use_quantile_norm:
                 norm_stats["actions"] = _transforms.NormStats(
@@ -2987,12 +2981,12 @@ _CONFIGS = [
             use_eef=True,
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=100_000,
+        num_train_steps=86_000,
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
             peak_lr=1e-5,
-            decay_steps=100_000,
+            decay_steps=86_000,
             decay_lr=1e-6,
         ),
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
@@ -3040,6 +3034,55 @@ _CONFIGS = [
         plot_interval=5_000,
         fsdp_devices=16,
         validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache/",
+    ),
+    # RoboCOIN Q(s,a) SARSA with bimanual dataset. filter_n = td_n + 1 so that
+    # terminal action_diff (a[t+1] - a[t] where t+1 is beyond subtask end) is not used.
+    TrainConfig(
+        name="robocoin_bimanual_paligemma_q_sarsa",
+        model=_value_function.SARSAValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(224, 224),
+                freeze_backbone=False,
+                max_token_len=48,
+                action_conditioned=True,
+                action_dim=14,
+                action_horizon=15,
+            ),
+            head_config=_heads.CategoricalHeadConfig(
+                v_min=0.0,
+                v_max=1.0,
+                num_bins=51,
+                sigma=0.015,
+            ),
+            discount=0.99**15,
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            dataset_name="robocoin_bimanual:1.0.0",
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
+            discount=0.99,
+            td_n=15,
+            use_eef=True,
+            action_horizon=15,
+            filter_n=16,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=86_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=86_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=5_000,
+        fsdp_devices=16,
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache/",
     ),
     # RoboCOIN QC value function config (regression loss).
     TrainConfig(

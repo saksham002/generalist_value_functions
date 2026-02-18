@@ -42,6 +42,7 @@ import openpi.training.weight_loaders as _weight_loaders
 import openpi.transforms as _transforms
 import openpi.value_functions.base_value_functions as _value_fn
 from openpi.training.robocoin_data_loader import RoboCOINDataLoaderConfig, create_robocoin_data_loader
+from openpi.robocoin_utils.utils import count_subtask_segments, get_obs_and_action, stack_frames, stack_images
 
 
 def init_logging():
@@ -1046,7 +1047,7 @@ def _create_value_plot(
     step, 
     suffix, 
     oracle_values=None,
-    subtask_texts: set[str] | None = None,
+    subtask_texts: list[str] | None = None,
 ) -> "wandb.Image":
     """Create a matplotlib plot comparing MC returns vs predicted values.
     
@@ -1057,7 +1058,7 @@ def _create_value_plot(
         step: Training step.
         suffix: Suffix for the title.
         oracle_values: Optional list of oracle Q-values.
-        subtask_texts: Optional set of unique subtask texts for caption.
+        subtask_texts: Optional ordered list of subtask segment texts for caption.
     """
     fig, ax = plt.subplots(figsize=(10, 6))
     timesteps = np.arange(len(mc_returns))
@@ -1091,9 +1092,8 @@ def _create_value_plot(
     
     # Add numbered subtask list below x-axis label if provided
     if subtask_texts:
-        subtask_list = sorted(subtask_texts)
-        # Number the subtasks and group 3 per line
-        numbered_subtasks = [f"{i+1}. {text}" for i, text in enumerate(subtask_list)]
+        # Number the subtask segments and group 3 per line
+        numbered_subtasks = [f"{i+1}. {text}" for i, text in enumerate(subtask_texts)]
         lines = []
         for i in range(0, len(numbered_subtasks), 3):
             line = "  ".join(numbered_subtasks[i:i+3])
@@ -1325,135 +1325,6 @@ def _compute_oracle_ranking_metrics(
     return metrics
 
 
-def stack_frames(frame_dicts: list[dict], key: str) -> jax.Array | None:
-    """Stack a single key across all frame dicts into a JAX array.
-    
-    Args:
-        frame_dicts: List of frame dictionaries.
-        key: Key to stack from each frame dict.
-        
-    Returns:
-        JAX array of stacked values, or None if key not present.
-    """
-    if key not in frame_dicts[0]:
-        return None
-    
-    values = []
-    for f in frame_dicts:
-        val = f[key]
-        if hasattr(val, "device"):
-            val = np.asarray(val)
-        values.append(val)
-    return jnp.asarray(np.stack(values, axis=0))
-
-
-def stack_images(frame_dicts: list[dict], image_key: str) -> tuple[dict, dict]:
-    """Stack images from frame dicts with proper preprocessing.
-    
-    Args:
-        frame_dicts: List of frame dictionaries.
-        image_key: Key for the image dict (e.g., "image", "mirror_image").
-        
-    Returns:
-        Tuple of (images_dict, image_masks_dict) as JAX arrays.
-    """
-    if image_key not in frame_dicts[0]:
-        return {}, {}
-    
-    batch_size = len(frame_dicts)
-    images_dict = {}
-    image_masks_dict = {}
-    
-    for cam_key in frame_dicts[0][image_key].keys():
-        cam_images = []
-        for f in frame_dicts:
-            img = f[image_key][cam_key]
-            if hasattr(img, "device"):
-                img = np.asarray(img)
-            # Convert uint8 [0, 255] to float32 [-1, 1]
-            if img.dtype == np.uint8:
-                img = img.astype(np.float32) / 127.5 - 1.0
-            cam_images.append(img)
-        images_dict[cam_key] = jnp.asarray(np.stack(cam_images, axis=0))
-        image_masks_dict[cam_key] = jnp.ones((batch_size,), dtype=jnp.bool_)
-    
-    return images_dict, image_masks_dict
-
-
-def get_obs_and_action(
-    frame_dicts: list[dict],
-    prefix: str,
-    action_conditioned: bool,
-) -> tuple[_model.Observation, jax.Array | None]:
-    """Build an Observation and action from frame dicts with a given prefix.
-    
-    Args:
-        frame_dicts: List of frame dictionaries.
-        prefix: Key prefix (e.g., "", "mirror_", "negative_").
-                For prefix="", uses keys like "state", "image", "actions".
-                For prefix="mirror_", uses keys like "mirror_state", "mirror_image", "mirror_actions".
-                For prefix="negative_", only changes tokenized_prompt keys.
-        action_conditioned: Whether to include actions and action_mask.
-        
-    Returns:
-        Tuple of (Observation, action) where action is None if not action_conditioned.
-    """
-    # Handle key naming conventions
-    if prefix == "negative_":
-        # Negative only changes the prompt, uses same state/image/action as default
-        state_key = "state"
-        image_key = "image"
-        actions_key = "actions"
-        action_mask_key = "action_mask"
-        prompt_key = "tokenized_negative_prompt"
-        prompt_mask_key = "tokenized_negative_prompt_mask"
-    elif prefix == "mirror_":
-        state_key = "mirror_state"
-        image_key = "mirror_image"
-        actions_key = "mirror_actions"
-        action_mask_key = "action_mask"  # Same mask applies to mirrored actions
-        prompt_key = "mirror_tokenized_prompt"
-        prompt_mask_key = "mirror_tokenized_prompt_mask"
-    else:
-        # Default (empty prefix)
-        state_key = "state"
-        image_key = "image"
-        actions_key = "actions"
-        action_mask_key = "action_mask"
-        prompt_key = "tokenized_prompt"
-        prompt_mask_key = "tokenized_prompt_mask"
-    
-    # Stack state
-    state = stack_frames(frame_dicts, state_key)
-    if state is None:
-        raise ValueError(f"Missing required key '{state_key}' in frame dicts")
-    
-    # Stack images
-    images_dict, image_masks_dict = stack_images(frame_dicts, image_key)
-    
-    # Stack tokenized prompts
-    tokenized_prompt = stack_frames(frame_dicts, prompt_key)
-    tokenized_prompt_mask = stack_frames(frame_dicts, prompt_mask_key)
-    
-    # Stack action and action_mask if action_conditioned
-    action = None
-    action_mask = None
-    if action_conditioned:
-        action = stack_frames(frame_dicts, actions_key)
-        action_mask = stack_frames(frame_dicts, action_mask_key)
-    
-    # Build observation
-    obs = _model.Observation(
-        images=images_dict,
-        image_masks=image_masks_dict,
-        state=state,
-        tokenized_prompt=tokenized_prompt,
-        tokenized_prompt_mask=tokenized_prompt_mask,
-        action_mask=action_mask,
-    )
-    
-    return obs, action
-
 
 def generate_validation_plots_dlimp(
     model: _value_fn.BaseValueFunction,
@@ -1490,31 +1361,30 @@ def generate_validation_plots_dlimp(
     import pickle
     
     num_val_trajectories = len(val_episode_indices)
-    episode_frames: dict[int, list[dict]] = {}
+    traj_frames: dict[int, list[dict]] = {}  # keyed by _traj_index (unique)
     
-    # Check if cache directory exists with individual episode files
+    # Check if cache directory exists with individual traj files
     cache_exists = cache_dir and os.path.exists(cache_dir) and any(
-        f.startswith("episode_") and f.endswith(".pkl") for f in os.listdir(cache_dir)
+        f.startswith("traj_") and f.endswith(".pkl") for f in os.listdir(cache_dir)
     ) if cache_dir else False
         
     if cache_exists and not save_only:
-        # Load from cache - each episode is saved as a separate file
+        # Load from cache - each trajectory is saved as a separate file
         logging.info(f"Loading cached validation episodes from {cache_dir}")
         for filename in os.listdir(cache_dir):
-            if filename.startswith("episode_") and filename.endswith(".pkl"):
-                ep_idx = int(filename.replace("episode_", "").replace(".pkl", ""))
-                ep_cache_file = os.path.join(cache_dir, filename)
-                with open(ep_cache_file, "rb") as f:
-                    episode_frames[ep_idx] = pickle.load(f)
-        logging.info(f"Loaded {len(episode_frames)} episodes from cache")
+            if filename.startswith("traj_") and filename.endswith(".pkl"):
+                traj_idx = int(filename.replace("traj_", "").replace(".pkl", ""))
+                cache_file = os.path.join(cache_dir, filename)
+                with open(cache_file, "rb") as f:
+                    traj_frames[traj_idx] = pickle.load(f)
+        logging.info(f"Loaded {len(traj_frames)} trajectories from cache")
     elif not cache_exists:
-        # Collect from dataloader
-        # Track episodes currently being collected (in-memory) and those already saved to disk
-        active_episodes: set[int] = set()  # Episodes currently in episode_frames dict
-        saved_episode_count = 0  # Number of episodes saved to disk
-        seen_repo_indices: set[int] = set[int]()  # repo_index values already collected
-        ep_to_repo: dict[int, int] = {}  # episode_index -> repo_index mapping
-        logging.info(f"Collecting validation frames for first {num_val_trajectories} unique repo_index episodes")
+        # Collect from dataloader using _traj_index (unique) for tracking
+        active_trajs: set[int] = set()  # _traj_index values currently being collected
+        saved_traj_count = 0
+        seen_repo_indices: set[int] = set()
+        traj_to_repo: dict[int, int] = {}
+        logging.info(f"Collecting validation frames for first {num_val_trajectories} unique repo_index trajectories")
         
         # Create cache directory early if needed
         if cache_dir:
@@ -1523,88 +1393,73 @@ def generate_validation_plots_dlimp(
         # Iterate through the dataloader
         for batch in val_dataloader:
             
-            # Get episode indices for this batch
-            episode_indices = batch.get("episode_index", None)
-            if episode_indices is None:
-                logging.warning("Batch missing episode_index, cannot identify episodes")
+            traj_indices = batch.get("_traj_index", None)
+            if traj_indices is None:
+                logging.warning("Batch missing _traj_index, cannot identify trajectories")
                 continue
             
-            # Convert JAX arrays to numpy if needed
-            if hasattr(episode_indices, "device"):
-                episode_indices = np.asarray(episode_indices)
+            if hasattr(traj_indices, "device"):
+                traj_indices = np.asarray(traj_indices)
             
             repo_indices = batch.get("repo_index", None)
             if repo_indices is not None and hasattr(repo_indices, "device"):
                 repo_indices = np.asarray(repo_indices)
             
-            # Get the set of episode indices present in this batch
-            unique_batch_episodes = set(int(e) for e in episode_indices)
+            # Get the set of _traj_index values present in this batch
+            unique_batch_trajs = set(int(t) for t in traj_indices)
             
-            # Check which active episodes are NO LONGER in this batch (i.e., they are complete)
-            completed_episodes = active_episodes - unique_batch_episodes
-            for ep_idx in completed_episodes:
-                if ep_idx in episode_frames:
-                    # Sort frames by frame index before saving
-                    frames = episode_frames[ep_idx]
+            # Check which active trajs are NO LONGER in this batch (i.e., they are complete)
+            completed_trajs = active_trajs - unique_batch_trajs
+            for traj_idx in completed_trajs:
+                if traj_idx in traj_frames:
+                    frames = traj_frames[traj_idx]
                     if frames:
                         frames.sort(key=lambda f: f["_frame_index"])
                     
-                    # Save this episode to disk individually
                     if cache_dir:
-                        ep_cache_file = os.path.join(cache_dir, f"episode_{ep_idx}.pkl")
-                        with open(ep_cache_file, "wb") as f:
+                        cache_file = os.path.join(cache_dir, f"traj_{traj_idx}.pkl")
+                        with open(cache_file, "wb") as f:
                             pickle.dump(frames, f)
-                        logging.info(f"Saved episode {ep_idx} ({len(frames)} frames, repo_index={ep_to_repo.get(ep_idx, '?')}) to {ep_cache_file}")
+                        logging.info(f"Saved traj {traj_idx} ({len(frames)} frames, repo_index={traj_to_repo.get(traj_idx, '?')}) to {cache_file}")
                     
-                    # Remove from memory to save space
-                    del episode_frames[ep_idx]
-                    saved_episode_count += 1
+                    del traj_frames[traj_idx]
+                    saved_traj_count += 1
                     
-                # Remove from active set
-                active_episodes.discard(ep_idx)
+                active_trajs.discard(traj_idx)
             
-            # Check if we've saved enough episodes
-            if saved_episode_count >= num_val_trajectories:
-                logging.info(f"Saved {saved_episode_count} episodes, breaking early")
+            if saved_traj_count >= num_val_trajectories:
+                logging.info(f"Saved {saved_traj_count} trajectories, breaking early")
                 break
             
             # Process each sample in the batch
-            batch_size = episode_indices.shape[0]
+            batch_size = traj_indices.shape[0]
             for i in range(batch_size):
-                ep_idx = int(episode_indices[i])
+                traj_idx = int(traj_indices[i])
                 
-                # If we haven't seen this episode yet, start collecting if we have room
-                if ep_idx not in episode_frames and ep_idx not in active_episodes:
+                if traj_idx not in traj_frames and traj_idx not in active_trajs:
                     # Check repo_index to avoid collecting duplicate episodes
                     if repo_indices is not None:
                         ri = int(repo_indices[i])
                         if ri in seen_repo_indices:
                             continue
                     
-                    # Check if we've already started collecting enough episodes
-                    total_episodes_seen = len(active_episodes) + saved_episode_count
-                    if total_episodes_seen >= num_val_trajectories:
+                    total_seen = len(active_trajs) + saved_traj_count
+                    if total_seen >= num_val_trajectories:
                         continue
                     
-                    # Start collecting this new episode
-                    episode_frames[ep_idx] = []
-                    active_episodes.add(ep_idx)
+                    traj_frames[traj_idx] = []
+                    active_trajs.add(traj_idx)
                     if repo_indices is not None:
                         ri = int(repo_indices[i])
                         seen_repo_indices.add(ri)
-                        ep_to_repo[ep_idx] = ri
+                        traj_to_repo[traj_idx] = ri
                 
-                # Skip if this episode is not being actively collected
-                if ep_idx not in active_episodes:
+                if traj_idx not in active_trajs:
                     continue
                 
                 # Extract all frame data for this sample
                 frame = {}
                 for key, value in batch.items():
-                    if key == "_traj_index":
-                        continue  # Already processed
-                    
-                    # Handle nested dicts (e.g., "image", "image_mask")
                     if isinstance(value, dict):
                         frame[key] = {}
                         for sub_key, sub_value in value.items():
@@ -1612,34 +1467,67 @@ def generate_validation_plots_dlimp(
                     else:
                         frame[key] = np.asarray(value[i])
 
-                episode_frames[ep_idx].append(frame)
+                traj_frames[traj_idx].append(frame)
         
-        logging.info(f"Total episodes saved: {saved_episode_count}, unique repo_indices: {len(seen_repo_indices)}")
+        logging.info(f"Total trajectories saved: {saved_traj_count}, unique repo_indices: {len(seen_repo_indices)}")
     
     # If save_only mode, return early without generating plots
     if save_only:
         return {}
     
+    # Build traj_idx -> (repo_index, episode_index) mapping for plot names
+    traj_to_repo_ep: dict[int, tuple[int, int]] = {}
+    for traj_idx, frames in traj_frames.items():
+        ep_idx = int(frames[0]["episode_index"]) if frames and "episode_index" in frames[0] else traj_idx
+        repo_idx = int(frames[0]["repo_index"]) if frames and "repo_index" in frames[0] else 0
+        traj_to_repo_ep[traj_idx] = (repo_idx, ep_idx)
+
+    MAX_SUBTASK_SEGMENTS = 16
+    split_traj_frames = {}
+    split_traj_to_repo_ep: dict[str, tuple[int, int, str]] = {}
+    ep_subtasks: dict[str, list[str]] = {}
+    for traj_idx, frames in traj_frames.items():
+        repo_idx, ep_idx = traj_to_repo_ep[traj_idx]
+        n_segments, split_frame_idx, segments = count_subtask_segments(frames)
+        if n_segments > MAX_SUBTASK_SEGMENTS:
+            split_seg_idx = n_segments // 2
+            key_p0 = f"{traj_idx}_p0"
+            key_p1 = f"{traj_idx}_p1"
+            split_traj_frames[key_p0] = frames[:split_frame_idx]
+            split_traj_frames[key_p1] = frames[split_frame_idx:]
+            split_traj_to_repo_ep[key_p0] = (repo_idx, ep_idx, "_part0")
+            split_traj_to_repo_ep[key_p1] = (repo_idx, ep_idx, "_part1")
+            ep_subtasks[key_p0] = segments[:split_seg_idx]
+            ep_subtasks[key_p1] = segments[split_seg_idx:]
+            logging.info(f"Traj {traj_idx} (repo {repo_idx}, episode {ep_idx}): {n_segments} subtask segments > {MAX_SUBTASK_SEGMENTS}, splitting at segment {split_seg_idx}, frame {split_frame_idx} ({split_frame_idx} + {len(frames) - split_frame_idx} frames)")
+        else:
+            key = str(traj_idx)
+            split_traj_frames[key] = frames
+            split_traj_to_repo_ep[key] = (repo_idx, ep_idx, "")
+            ep_subtasks[key] = segments
+    traj_frames = split_traj_frames
+    traj_to_repo_ep = split_traj_to_repo_ep
+    del split_traj_frames, split_traj_to_repo_ep
+
     # Debug: log details about loaded episodes before generating plots
-    for ep_idx, frames in episode_frames.items():
+    for traj_key, frames in traj_frames.items():
         frame_keys = list(frames[0].keys()) if frames else []
-        logging.info(f"  Episode {ep_idx}: {len(frames)} frames, keys: {frame_keys}")
-    total_frames = sum(len(frames) for frames in episode_frames.values())
-    episode_indices = sorted(episode_frames.keys())
-    logging.info(f"Processing {len(episode_frames)} episodes: indices={episode_indices}, total_frames={total_frames}")
+        repo_idx, ep_idx, part = traj_to_repo_ep[traj_key]
+        logging.info(f"  Traj {traj_key} (repo {repo_idx}, episode {ep_idx}{part}): {len(frames)} frames, keys: {frame_keys}")
+    total_frames = sum(len(frames) for frames in traj_frames.values())
+    logging.info(f"Processing {len(traj_frames)} trajectory segments, total_frames={total_frames}")
     
     # Generate plots for each episode using batched inference
     images = {}
     
-    # Collect all valid frames from all episodes with their episode indices
-    all_frames = []  # List of (ep_idx, frame_idx_in_ep, frame_dict)
-    ep_mc_returns = {}  # ep_idx -> list of mc_returns
-    ep_loss_masks = {}  # ep_idx -> list of loss_mask values
-    ep_subtasks = {}  # ep_idx -> set of unique subtask_1 texts
-    ep_negative_subtasks = {}  # ep_idx -> set of unique negative subtask texts (if present)
-    ep_mirror_subtasks = {}  # ep_idx -> set of unique mirror subtask texts (if present)
+    # Collect all valid frames from all trajectories
+    all_frames = []  # List of (traj_idx, frame_idx_in_ep, frame_dict)
+    ep_mc_returns = {}  # traj_idx -> list of mc_returns
+    ep_loss_masks = {}  # traj_idx -> list of loss_mask values
+    ep_negative_subtasks = {}  # traj_idx -> ordered list of negative subtask segment texts
+    ep_mirror_subtasks = {}  # traj_idx -> ordered list of mirror subtask segment texts
     
-    for ep_idx, frames in episode_frames.items():
+    for ep_idx, frames in traj_frames.items():
         if len(frames) == 0:
             continue
         
@@ -1652,35 +1540,12 @@ def generate_validation_plots_dlimp(
         # Store MC returns and loss_masks for this episode
         ep_mc_returns[ep_idx] = [f["mc_return"] for _, f in valid_frames]
         ep_loss_masks[ep_idx] = [f.get("loss_mask", True) for _, f in valid_frames]
-        
-        # Collect unique subtask_1 texts from all frames in this episode
-        unique_subtasks = set()
-        for _, frame in valid_frames:
-            if "subtask_1_text" in frame:
-                text = frame["subtask_1_text"]
-                # pdb.set_trace()
-                text = text.item()
-                unique_subtasks.add(text)
-        ep_subtasks[ep_idx] = unique_subtasks
 
-        # Collect unique negative subtasks if provided by dataset.
-        unique_negative_subtasks = set()
-        for _, frame in valid_frames:
-            if "negative_subtask_1_text" in frame and frame["negative_subtask_1_text"] is not None:
-                neg = frame["negative_subtask_1_text"]
-                # Handle numpy scalar / bytes / python str
-                neg = neg.item()
-                unique_negative_subtasks.add(neg)
-        ep_negative_subtasks[ep_idx] = unique_negative_subtasks
+        _, _, negative_segments = count_subtask_segments(frames, prefix="negative_")
+        ep_negative_subtasks[ep_idx] = negative_segments
 
-        # Collect unique mirror subtasks if provided by dataset.
-        unique_mirror_subtasks = set()
-        for _, frame in valid_frames:
-            if "mirror_subtask_1_text" in frame and frame["mirror_subtask_1_text"] is not None:
-                mirror_text = frame["mirror_subtask_1_text"]
-                mirror_text = mirror_text.item()
-                unique_mirror_subtasks.add(mirror_text)
-        ep_mirror_subtasks[ep_idx] = unique_mirror_subtasks
+        _, _, mirror_segments = count_subtask_segments(frames, prefix="mirror_")
+        ep_mirror_subtasks[ep_idx] = mirror_segments
         
         # Add frames with their episode and frame indices
         for frame_idx, frame in valid_frames:
@@ -1754,47 +1619,49 @@ def generate_validation_plots_dlimp(
     
     total_predictions = sum(len(preds) for preds in all_predictions.values())
     logging.info(f"Computed {total_predictions} predictions")
-    # Create plots for each episode
-    for ep_idx in ep_mc_returns.keys():
-        mc_returns = ep_mc_returns[ep_idx]
-        loss_masks = ep_loss_masks[ep_idx]
-        predicted_values = all_predictions[ep_idx]
-        
+    # Create plots for each trajectory, using repo_index and episode_index in plot names
+    for traj_idx in ep_mc_returns.keys():
+        repo_idx, ep_idx, part_suffix = traj_to_repo_ep[traj_idx]
+        plot_key = f"val/repo_{repo_idx}_episode_{ep_idx}{part_suffix}"
+        mc_returns = ep_mc_returns[traj_idx]
+        loss_masks = ep_loss_masks[traj_idx]
+        predicted_values = all_predictions[traj_idx]
+
         if len(predicted_values) != len(mc_returns):
-            logging.warning(f"Episode {ep_idx}: mismatch between predictions ({len(predicted_values)}) and mc_returns ({len(mc_returns)})")
+            logging.warning(f"Traj {traj_idx} (repo {repo_idx}, episode {ep_idx}): mismatch between predictions ({len(predicted_values)}) and mc_returns ({len(mc_returns)})")
             continue
-        
+
         # Filter out frames where loss_mask is False
         filtered_mc_returns = []
         filtered_predictions = []
         for mc, pred, mask in zip(mc_returns, predicted_values, loss_masks):
-            if mask:  # Only include frames with valid loss_mask
+            if mask:
                 filtered_mc_returns.append(mc)
                 filtered_predictions.append(pred)
-        
+
         if len(filtered_mc_returns) == 0:
-            logging.warning(f"Episode {ep_idx}: no frames with loss_mask=True")
+            logging.warning(f"Traj {traj_idx} (repo {repo_idx}, episode {ep_idx}): no frames with loss_mask=True")
             continue
-        
-        subtasks = ep_subtasks.get(ep_idx, set())
-        
-        logging.info(f"Episode {ep_idx}: {len(filtered_predictions)}/{len(predicted_values)} frames after loss_mask filter, subtasks={subtasks}")
-        
-        # Create plots (only on worker 0)
+
+        subtasks = ep_subtasks.get(traj_idx, [])
+
+        logging.info(f"Traj {traj_idx} (repo {repo_idx}, episode {ep_idx}): {len(filtered_predictions)}/{len(predicted_values)} frames after loss_mask filter, subtasks={subtasks}")
+
+        # Create plots (only on worker 0), using repo_index and episode_index in wandb keys
         if jax.process_index() == 0:
-            images[f"val/episode_{ep_idx}"] = _create_value_plot(
-                filtered_mc_returns, filtered_predictions, ep_idx, step, " (RoboCOIN)", 
+            images[plot_key] = _create_value_plot(
+                filtered_mc_returns, filtered_predictions, ep_idx, step, " (RoboCOIN)",
                 oracle_values=None, subtask_texts=subtasks
             )
-            logging.info(f"Episode {ep_idx} plot created")
+            logging.info(f"Repo {repo_idx}, episode {ep_idx} plot created")
 
             # If negative subtasks/prompts are available, create a counterfactual text plot.
-            negative_subtasks = ep_negative_subtasks.get(ep_idx)
-            predicted_values_neg = all_predictions_neg.get(ep_idx, [])
+            negative_subtasks = ep_negative_subtasks.get(traj_idx)
+            predicted_values_neg = all_predictions_neg.get(traj_idx, [])
             if negative_subtasks and len(predicted_values_neg) == len(predicted_values):
                 filtered_predictions_neg = [pred for pred, mask in zip(predicted_values_neg, loss_masks) if mask]
                 if len(filtered_predictions_neg) == len(filtered_mc_returns) and len(filtered_predictions_neg) > 0:
-                    images[f"val/episode_{ep_idx}_counterfactual_text"] = _create_value_plot(
+                    images[f"{plot_key}_counterfactual_text"] = _create_value_plot(
                         filtered_mc_returns,
                         filtered_predictions_neg,
                         ep_idx,
@@ -1803,15 +1670,15 @@ def generate_validation_plots_dlimp(
                         oracle_values=None,
                         subtask_texts=negative_subtasks,
                     )
-                    logging.info(f"Episode {ep_idx} counterfactual text plot created")
+                    logging.info(f"Repo {repo_idx}, episode {ep_idx} counterfactual text plot created")
 
             # If mirror subtasks/prompts are available, create a counterfactual image plot.
-            mirror_subtasks = ep_mirror_subtasks.get(ep_idx)
-            predicted_values_mirror = all_predictions_mirror.get(ep_idx, [])
+            mirror_subtasks = ep_mirror_subtasks.get(traj_idx)
+            predicted_values_mirror = all_predictions_mirror.get(traj_idx, [])
             if mirror_subtasks and len(predicted_values_mirror) == len(predicted_values):
                 filtered_predictions_mirror = [pred for pred, mask in zip(predicted_values_mirror, loss_masks) if mask]
                 if len(filtered_predictions_mirror) == len(filtered_mc_returns) and len(filtered_predictions_mirror) > 0:
-                    images[f"val/episode_{ep_idx}_mirror_demo"] = _create_value_plot(
+                    images[f"{plot_key}_mirror_demo"] = _create_value_plot(
                         filtered_mc_returns,
                         filtered_predictions_mirror,
                         ep_idx,
@@ -1820,7 +1687,7 @@ def generate_validation_plots_dlimp(
                         oracle_values=None,
                         subtask_texts=mirror_subtasks,
                     )
-                    logging.info(f"Episode {ep_idx} mirrored demonstration plot created")
+                    logging.info(f"Repo {repo_idx}, episode {ep_idx} mirrored demonstration plot created")
     
     return images
 

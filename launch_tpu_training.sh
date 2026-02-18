@@ -55,12 +55,8 @@ CODE_DIR="batch_value_learning"
 # Resolve repo root (directory containing this script)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Determine NFS user directory based on pod name
-if [[ "$TPU_VM_NAME" =~ 64-1$ ]]; then
-    NFS_USER="saksham3"
-else
-    NFS_USER="saksham"
-fi
+# NFS user directory
+NFS_USER="saksham3"
 
 # HPC cluster source
 HPC_HOST="saksham3@login.babel.cs.cmu.edu"
@@ -138,7 +134,7 @@ tpc run --project=$PROJECT --zone=$ZONE --name=$TPU_VM_NAME --command="$MOUNT_CM
 # Step 2b: Sync from local to TPU pod NFS (now that NFS is mounted)
 echo "[Step 2b] Syncing to TPU NFS..."
 ssh ${TPU_IP} "mkdir -p ${NFS_DIR}"
-rsync -avz --exclude .git --exclude .venv --exclude __pycache__ --exclude '*.pyc' --exclude wandb --exclude .pytest_cache ${LOCAL_DIR} ${TPU_IP}:${NFS_DIR}/
+rsync -avz --no-perms --no-owner --no-group --no-times --exclude .git --exclude .venv --exclude __pycache__ --exclude '*.pyc' --exclude wandb --exclude .pytest_cache ${LOCAL_DIR} ${TPU_IP}:${NFS_DIR}/
 
 # Step 3a: Copy .bashrc from worker 0 to local, then upload to all workers
 echo "[Step 3a] Syncing .bashrc from worker 0 to all workers..."

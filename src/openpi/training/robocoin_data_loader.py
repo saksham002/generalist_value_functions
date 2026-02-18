@@ -131,20 +131,14 @@ class AddTrajectoryKeys:
         # Validate required keys
         if "observation/state" not in episode:
             raise ValueError("Missing required key 'observation/state' in episode")
-        if "action" not in episode:
-            raise ValueError("Missing required key 'action' in episode")
-        
         state = episode["observation/state"]
-        action = episode["action"]
-        
-        # Validate EEF keys if use_eef is enabled
+        action = episode["action_diff"]
+
         if self.use_eef:
             if "eef_sim_pose_state" not in episode:
                 raise ValueError("use_eef=True but 'eef_sim_pose_state' not found in episode")
-            if "eef_sim_pose_action" not in episode:
-                raise ValueError("use_eef=True but 'eef_sim_pose_action' not found in episode")
             eef_state = episode["eef_sim_pose_state"]
-            eef_action = episode["eef_sim_pose_action"]
+            eef_action = episode["eef_sim_pose_action_diff"]
         
         cam_keys = [f"observation/image/cam_{i}" for i in range(self.max_cameras)]
 

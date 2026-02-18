@@ -11,6 +11,8 @@ import functools
 import logging
 import platform as _platform
 import os
+import psutil
+import time
 from typing import Any
 import pdb
 
@@ -229,24 +231,96 @@ def get_memory_stats() -> dict[str, float]:
     except Exception:
         pass
     
-    # 9. Track glibc malloc stats (if available) - helps detect fragmentation
+    # 9. /proc/self/smaps_rollup — breakdown of RSS by category
+    try:
+        with open("/proc/self/smaps_rollup", "r") as f:
+            target_keys = {"Rss", "Pss", "Anonymous", "Swap", "Shared_Clean",
+                           "Shared_Dirty", "Private_Clean", "Private_Dirty"}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3 and parts[2] == "kB":
+                    key = parts[0].rstrip(":")
+                    if key in target_keys:
+                        stats[f"smaps_{key.lower()}_mb"] = int(parts[1]) / 1024
+    except FileNotFoundError:
+        logging.info("[MemoryDebug] /proc/self/smaps_rollup not available")
+    except Exception as e:
+        logging.info(f"[MemoryDebug] smaps_rollup failed: {type(e).__name__}: {e}")
+
+    # 10. /proc/self/status — VmRSS, VmHWM (peak RSS), VmData (heap+mmap), VmStk
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].rstrip(":") in ("VmRSS", "VmHWM", "VmData", "VmStk"):
+                    key = parts[0].rstrip(":")
+                    stats[f"proc_{key}_mb"] = int(parts[1]) / 1024
+    except Exception:
+        pass
+
+    # 11. tcmalloc stats (TPU VMs often use tcmalloc)
+    RTLD_NOLOAD = 4  # Value of RTLD_NOLOAD on Linux, not always in ctypes
+    try:
+        import ctypes
+        tcmalloc = None
+        tcmalloc_names = [
+            "libtcmalloc.so", "libtcmalloc_minimal.so",
+            "libtcmalloc.so.4", "libtcmalloc_minimal.so.4",
+        ]
+        for name in tcmalloc_names:
+            try:
+                tcmalloc = ctypes.CDLL(name, mode = RTLD_NOLOAD)
+                logging.info(f"[MemoryDebug] Found tcmalloc via RTLD_NOLOAD: {name}")
+                break
+            except OSError:
+                continue
+        if tcmalloc is None:
+            for name in tcmalloc_names:
+                try:
+                    tcmalloc = ctypes.CDLL(name)
+                    logging.info(f"[MemoryDebug] Loaded tcmalloc: {name}")
+                    break
+                except OSError:
+                    continue
+        if tcmalloc is None:
+            logging.info("[MemoryDebug] tcmalloc not found, trying generic mallinfo2 instead")
+        elif hasattr(tcmalloc, "MallocExtension_GetNumericProperty"):
+            get_prop = tcmalloc.MallocExtension_GetNumericProperty
+            get_prop.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t)]
+            get_prop.restype = ctypes.c_bool
+            for prop_name in [
+                b"generic.current_allocated_bytes",
+                b"generic.heap_size",
+                b"tcmalloc.pageheap_free_bytes",
+                b"tcmalloc.central_cache_free_bytes",
+                b"tcmalloc.transfer_cache_free_bytes",
+                b"tcmalloc.thread_cache_free_bytes",
+            ]:
+                val = ctypes.c_size_t(0)
+                if get_prop(prop_name, ctypes.byref(val)):
+                    stats[f"tc_{prop_name.decode().replace('.', '_')}_mb"] = val.value / 1024 / 1024
+        else:
+            logging.info("[MemoryDebug] tcmalloc loaded but missing MallocExtension_GetNumericProperty")
+    except Exception as e:
+        logging.info(f"[MemoryDebug] tcmalloc stats failed: {type(e).__name__}: {e}")
+
+    # 12. glibc malloc stats fallback (for GPU nodes)
     try:
         import ctypes
         libc = ctypes.CDLL("libc.so.6")
-        # Try mallinfo2 (glibc 2.33+) or mallinfo
         if hasattr(libc, 'mallinfo2'):
             class MallInfo2(ctypes.Structure):
                 _fields_ = [
-                    ("arena", ctypes.c_size_t),      # Non-mmapped space allocated
-                    ("ordblks", ctypes.c_size_t),   # Free chunks
-                    ("smblks", ctypes.c_size_t),    # Free fastbin blocks
-                    ("hblks", ctypes.c_size_t),     # Mmapped regions
-                    ("hblkhd", ctypes.c_size_t),    # Space in mmapped regions
-                    ("usmblks", ctypes.c_size_t),   # Always 0
-                    ("fsmblks", ctypes.c_size_t),   # Space in freed fastbin blocks
-                    ("uordblks", ctypes.c_size_t),  # Total allocated space
-                    ("fordblks", ctypes.c_size_t),  # Total free space
-                    ("keepcost", ctypes.c_size_t),  # Releasable space
+                    ("arena", ctypes.c_size_t),
+                    ("ordblks", ctypes.c_size_t),
+                    ("smblks", ctypes.c_size_t),
+                    ("hblks", ctypes.c_size_t),
+                    ("hblkhd", ctypes.c_size_t),
+                    ("usmblks", ctypes.c_size_t),
+                    ("fsmblks", ctypes.c_size_t),
+                    ("uordblks", ctypes.c_size_t),
+                    ("fordblks", ctypes.c_size_t),
+                    ("keepcost", ctypes.c_size_t),
                 ]
             libc.mallinfo2.restype = MallInfo2
             mi = libc.mallinfo2()
@@ -255,17 +329,27 @@ def get_memory_stats() -> dict[str, float]:
             stats["malloc_free_mb"] = mi.fordblks / 1024 / 1024
             stats["malloc_mmap_mb"] = mi.hblkhd / 1024 / 1024
             stats["malloc_releasable_mb"] = mi.keepcost / 1024 / 1024
-    except Exception as e:
-        pass  # malloc stats not available
-    
-    # 8. Approximate size of tracked objects (sample)
-    sample_size = 0
-    for obj in list(gc.get_objects())[:10000]:
+    except Exception:
+        pass
+
+    # 13. tf.data pipeline memory — count open iterators and Dataset objects by type
+    tf_interleave_count = 0
+    tf_prefetch_count = 0
+    tf_shuffle_count = 0
+    for obj in gc.get_objects():
         try:
-            sample_size += sys.getsizeof(obj)
+            obj_type = type(obj).__name__
+            if "Interleave" in obj_type:
+                tf_interleave_count += 1
+            elif "Prefetch" in obj_type:
+                tf_prefetch_count += 1
+            elif "Shuffle" in obj_type and "Dataset" in str(type(obj).__mro__):
+                tf_shuffle_count += 1
         except Exception:
             pass
-    stats["py_sample_objects_mb"] = sample_size / 1024 / 1024
+    stats["tf_interleave_objects"] = tf_interleave_count
+    stats["tf_prefetch_objects"] = tf_prefetch_count
+    stats["tf_shuffle_objects"] = tf_shuffle_count
     
     return stats
 
@@ -350,6 +434,14 @@ def log_memory_debug(step: int, data_loader=None, force_gc: bool = False, log_to
             pass
     
     return stats
+
+
+def force_tpu_sync_every_batch(value: Any, step: int) -> None:
+    """Force TPU execution and cross-host synchronization for debug runs."""
+    if jax.default_backend() != "tpu":
+        return
+    jax.block_until_ready(value)
+    multihost_utils.sync_global_devices(f"batch_sync_step_{step}")
 
 
 def init_wandb(
@@ -1325,6 +1417,136 @@ def _compute_oracle_ranking_metrics(
     return metrics
 
 
+def stack_frames(frame_dicts: list[dict], key: str) -> jax.Array | None:
+    """Stack a single key across all frame dicts into a JAX array.
+    
+    Args:
+        frame_dicts: List of frame dictionaries.
+        key: Key to stack from each frame dict.
+        
+    Returns:
+        JAX array of stacked values, or None if key not present.
+    """
+    if key not in frame_dicts[0]:
+        return None
+    
+    values = []
+    for f in frame_dicts:
+        val = f[key]
+        if hasattr(val, "device"):
+            val = np.asarray(val)
+        values.append(val)
+    return jnp.asarray(np.stack(values, axis=0))
+
+
+def stack_images(frame_dicts: list[dict], image_key: str) -> tuple[dict, dict]:
+    """Stack images from frame dicts with proper preprocessing.
+    
+    Args:
+        frame_dicts: List of frame dictionaries.
+        image_key: Key for the image dict (e.g., "image", "mirror_image").
+        
+    Returns:
+        Tuple of (images_dict, image_masks_dict) as JAX arrays.
+    """
+    if image_key not in frame_dicts[0]:
+        return {}, {}
+    
+    batch_size = len(frame_dicts)
+    images_dict = {}
+    image_masks_dict = {}
+    
+    for cam_key in frame_dicts[0][image_key].keys():
+        cam_images = []
+        for f in frame_dicts:
+            img = f[image_key][cam_key]
+            if hasattr(img, "device"):
+                img = np.asarray(img)
+            # Convert uint8 [0, 255] to float32 [-1, 1]
+            if img.dtype == np.uint8:
+                img = img.astype(np.float32) / 127.5 - 1.0
+            cam_images.append(img)
+        images_dict[cam_key] = jnp.asarray(np.stack(cam_images, axis=0))
+        image_masks_dict[cam_key] = jnp.ones((batch_size,), dtype=jnp.bool_)
+    
+    return images_dict, image_masks_dict
+
+
+def get_obs_and_action(
+    frame_dicts: list[dict],
+    prefix: str,
+    action_conditioned: bool,
+) -> tuple[_model.Observation, jax.Array | None]:
+    """Build an Observation and action from frame dicts with a given prefix.
+    
+    Args:
+        frame_dicts: List of frame dictionaries.
+        prefix: Key prefix (e.g., "", "mirror_", "negative_").
+                For prefix="", uses keys like "state", "image", "actions".
+                For prefix="mirror_", uses keys like "mirror_state", "mirror_image", "mirror_actions".
+                For prefix="negative_", only changes tokenized_prompt keys.
+        action_conditioned: Whether to include actions and action_mask.
+        
+    Returns:
+        Tuple of (Observation, action) where action is None if not action_conditioned.
+    """
+    # Handle key naming conventions
+    if prefix == "negative_":
+        # Negative only changes the prompt, uses same state/image/action as default
+        state_key = "state"
+        image_key = "image"
+        actions_key = "actions"
+        action_mask_key = "action_mask"
+        prompt_key = "tokenized_negative_prompt"
+        prompt_mask_key = "tokenized_negative_prompt_mask"
+    elif prefix == "mirror_":
+        state_key = "mirror_state"
+        image_key = "mirror_image"
+        actions_key = "mirror_actions"
+        action_mask_key = "action_mask"  # Same mask applies to mirrored actions
+        prompt_key = "mirror_tokenized_prompt"
+        prompt_mask_key = "mirror_tokenized_prompt_mask"
+    else:
+        # Default (empty prefix)
+        state_key = "state"
+        image_key = "image"
+        actions_key = "actions"
+        action_mask_key = "action_mask"
+        prompt_key = "tokenized_prompt"
+        prompt_mask_key = "tokenized_prompt_mask"
+    
+    # Stack state
+    state = stack_frames(frame_dicts, state_key)
+    if state is None:
+        raise ValueError(f"Missing required key '{state_key}' in frame dicts")
+    
+    # Stack images
+    images_dict, image_masks_dict = stack_images(frame_dicts, image_key)
+    
+    # Stack tokenized prompts
+    tokenized_prompt = stack_frames(frame_dicts, prompt_key)
+    tokenized_prompt_mask = stack_frames(frame_dicts, prompt_mask_key)
+    
+    # Stack action and action_mask if action_conditioned
+    action = None
+    action_mask = None
+    if action_conditioned:
+        action = stack_frames(frame_dicts, actions_key)
+        action_mask = stack_frames(frame_dicts, action_mask_key)
+    
+    # Build observation
+    obs = _model.Observation(
+        images=images_dict,
+        image_masks=image_masks_dict,
+        state=state,
+        tokenized_prompt=tokenized_prompt,
+        tokenized_prompt_mask=tokenized_prompt_mask,
+        action_mask=action_mask,
+    )
+    
+    return obs, action
+
+
 def generate_validation_plots_dlimp(
     model: _value_fn.BaseValueFunction,
     val_dataloader,
@@ -1366,15 +1588,7 @@ def generate_validation_plots_dlimp(
     cache_exists = cache_dir and os.path.exists(cache_dir) and any(
         f.startswith("episode_") and f.endswith(".pkl") for f in os.listdir(cache_dir)
     ) if cache_dir else False
-    
-    # If save_only mode and cache already exists, remove existing files and recollect
-    # if cache_exists and save_only:
-    #     logging.warning(f"Cache files already exist in {cache_dir} but save_only=True. Removing existing .pkl files.")
-    #     for filename in os.listdir(cache_dir):
-    #         if filename.startswith("episode_") and filename.endswith(".pkl"):
-    #             os.remove(os.path.join(cache_dir, filename))
-    #     cache_exists = False
-    
+        
     if cache_exists and not save_only:
         # Load from cache - each episode is saved as a separate file
         logging.info(f"Loading cached validation episodes from {cache_dir}")
@@ -1397,7 +1611,6 @@ def generate_validation_plots_dlimp(
             os.makedirs(cache_dir, exist_ok = True)
         
         # Iterate through the dataloader
-        # Note: Only worker 0 calls this function with single_host_batch=True
         for batch in val_dataloader:
             
             # Get episode indices for this batch
@@ -1419,7 +1632,7 @@ def generate_validation_plots_dlimp(
                 if ep_idx in episode_frames:
                     # Sort frames by frame index before saving
                     frames = episode_frames[ep_idx]
-                    if frames and "_frame_index" in frames[0]:
+                    if frames:
                         frames.sort(key=lambda f: f["_frame_index"])
                     
                     # Save this episode to disk individually
@@ -1501,7 +1714,6 @@ def generate_validation_plots_dlimp(
     ep_subtasks = {}  # ep_idx -> set of unique subtask_1 texts
     ep_negative_subtasks = {}  # ep_idx -> set of unique negative subtask texts (if present)
     ep_mirror_subtasks = {}  # ep_idx -> set of unique mirror subtask texts (if present)
-    # Note: ep_idx IS the episode_index (from the cached filename)
     
     for ep_idx, frames in episode_frames.items():
         if len(frames) == 0:
@@ -1556,11 +1768,20 @@ def generate_validation_plots_dlimp(
     
     logging.info(f"Processing {len(all_frames)} total frames across {len(ep_mc_returns)} episodes in batches of 64")
     
+    # Create JIT-compiled compute_value function for efficient batched inference
+    @nnx.jit
+    def jitted_compute_value(
+        model_to_use: _value_fn.BaseValueFunction,
+        obs: _model.Observation,
+        act: _model.Actions | None,
+    ) -> jnp.ndarray:
+        return model_to_use.compute_value(obs, act, take_min_over_ensemble=True)
+    
     # Process all frames in batches of 64
     BATCH_SIZE = 64
-    all_predictions = {}  # (ep_idx, frame_idx) -> predicted_value
-    all_predictions_neg = {}  # (ep_idx, frame_idx) -> predicted_value conditioned on negative prompt
-    all_predictions_mirror = {}  # (ep_idx, frame_idx) -> predicted_value conditioned on mirror image/prompt
+    all_predictions: dict[int, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
+    all_predictions_neg: dict[int, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
+    all_predictions_mirror: dict[int, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     
     for batch_start in range(0, len(all_frames), BATCH_SIZE):
         batch_end = min(batch_start + BATCH_SIZE, len(all_frames))
@@ -1570,105 +1791,8 @@ def generate_validation_plots_dlimp(
         # Extract frame dicts for this batch
         frame_dicts = [f[2] for f in batch_frames]
         
-        # Stack states: [batch_size, state_dim]
-        states = np.stack([f["state"] for f in frame_dicts], axis = 0)
-        obs_state = jnp.asarray(states)
-        
-        # Stack images if available
-        images_dict = {}
-        image_masks_dict = {}
-        if "image" in frame_dicts[0]:
-            for cam_key in frame_dicts[0]["image"].keys():
-                cam_images = []
-                for f in frame_dicts:
-                    img = f["image"][cam_key]
-                    if hasattr(img, "device"):
-                        img = np.asarray(img)
-                    # Convert uint8 [0, 255] to float32 [-1, 1]
-                    if img.dtype == np.uint8:
-                        img = img.astype(np.float32) / 127.5 - 1.0
-                    cam_images.append(img)
-                images_dict[cam_key] = jnp.asarray(np.stack(cam_images, axis = 0))
-                image_masks_dict[cam_key] = jnp.ones((batch_size,), dtype = jnp.bool_)
-
-        # Stack mirror images if available
-        mirror_images_dict = {}
-        mirror_image_masks_dict = {}
-        if "mirror_image" in frame_dicts[0]:
-            for cam_key in frame_dicts[0]["mirror_image"].keys():
-                cam_images = []
-                for f in frame_dicts:
-                    img = f["mirror_image"][cam_key]
-                    if hasattr(img, "device"):
-                        img = np.asarray(img)
-                    # Convert uint8 [0, 255] to float32 [-1, 1]
-                    if img.dtype == np.uint8:
-                        img = img.astype(np.float32) / 127.5 - 1.0
-                    cam_images.append(img)
-                mirror_images_dict[cam_key] = jnp.asarray(np.stack(cam_images, axis = 0))
-                mirror_image_masks_dict[cam_key] = jnp.ones((batch_size,), dtype = jnp.bool_)
-        
-        # Stack tokenized prompts if available
-        tokenized_prompt = None
-        tokenized_prompt_mask = None
-        if "tokenized_prompt" in frame_dicts[0]:
-            prompts = [np.asarray(f["tokenized_prompt"]) if hasattr(f["tokenized_prompt"], "device") 
-                      else f["tokenized_prompt"] for f in frame_dicts]
-            tokenized_prompt = jnp.asarray(np.stack(prompts, axis=0))
-        if "tokenized_prompt_mask" in frame_dicts[0]:
-            masks = [np.asarray(f["tokenized_prompt_mask"]) if hasattr(f["tokenized_prompt_mask"], "device")
-                    else f["tokenized_prompt_mask"] for f in frame_dicts]
-            tokenized_prompt_mask = jnp.asarray(np.stack(masks, axis=0))
-
-        # Stack mirror tokenized prompts if available
-        mirror_tokenized_prompt = None
-        mirror_tokenized_prompt_mask = None
-        if "mirror_tokenized_prompt" in frame_dicts[0]:
-            mirror_prompts = [
-                np.asarray(f["mirror_tokenized_prompt"]) if hasattr(f["mirror_tokenized_prompt"], "device")
-                else f["mirror_tokenized_prompt"] for f in frame_dicts
-            ]
-            mirror_tokenized_prompt = jnp.asarray(np.stack(mirror_prompts, axis = 0))
-        if "mirror_tokenized_prompt_mask" in frame_dicts[0]:
-            mirror_masks = [
-                np.asarray(f["mirror_tokenized_prompt_mask"]) if hasattr(f["mirror_tokenized_prompt_mask"], "device")
-                else f["mirror_tokenized_prompt_mask"] for f in frame_dicts
-            ]
-            mirror_tokenized_prompt_mask = jnp.asarray(np.stack(mirror_masks, axis = 0))
-
-        # Stack tokenized negative prompts if available (assumed to exist when enabled)
-        tokenized_negative_prompt = None
-        tokenized_negative_prompt_mask = None
-        if "tokenized_negative_prompt" in frame_dicts[0]:
-            neg_prompts = [
-                np.asarray(f["tokenized_negative_prompt"]) if hasattr(f["tokenized_negative_prompt"], "device")
-                else f["tokenized_negative_prompt"]
-                for f in frame_dicts
-            ]
-            tokenized_negative_prompt = jnp.asarray(np.stack(neg_prompts, axis=0))
-        if "tokenized_negative_prompt_mask" in frame_dicts[0]:
-            neg_masks = [
-                np.asarray(f["tokenized_negative_prompt_mask"]) if hasattr(f["tokenized_negative_prompt_mask"], "device")
-                else f["tokenized_negative_prompt_mask"]
-                for f in frame_dicts
-            ]
-            tokenized_negative_prompt_mask = jnp.asarray(np.stack(neg_masks, axis=0))
-        
-        # Build batched observation
-        obs = _model.Observation(
-            images=images_dict if images_dict else {},
-            image_masks=image_masks_dict if image_masks_dict else {},
-            state=obs_state,
-            tokenized_prompt=tokenized_prompt,
-            tokenized_prompt_mask=tokenized_prompt_mask,
-        )
-        
-        # Stack actions for Q(s, a) if action-conditioned
-        act = None
-        if action_conditioned and "actions" in frame_dicts[0]:
-            actions = [np.asarray(f["actions"]) if hasattr(f["actions"], "device")
-                      else f["actions"] for f in frame_dicts]
-            act = jnp.asarray(np.stack(actions, axis=0))
+        # Build default observation and action using helper function
+        obs, act = get_obs_and_action(frame_dicts, prefix="", action_conditioned=action_conditioned)
         
         # Log shapes for first batch only
         if batch_start == 0:
@@ -1679,55 +1803,38 @@ def generate_validation_plots_dlimp(
             if obs.tokenized_prompt is not None:
                 logging.info(f"  Batch obs.tokenized_prompt: shape={obs.tokenized_prompt.shape}")
         
-        # Batched forward pass
-        pred_values = model.compute_value(obs, act, take_min_over_ensemble=True)
+        # Batched forward pass (JIT-compiled)
+        pred_values = jitted_compute_value(model, obs, act)
         pred_values_np = jax.device_get(pred_values)
 
-        # Optional: second forward pass with negative prompt (same obs/images/state/actions)
+        # Optional: second forward pass with negative prompt (same images/state, different prompt)
         pred_values_neg_np = None
-        if tokenized_negative_prompt is not None and tokenized_negative_prompt_mask is not None:
-            obs_neg = _model.Observation(
-                images=images_dict if images_dict else {},
-                image_masks=image_masks_dict if image_masks_dict else {},
-                state=obs_state,
-                tokenized_prompt=tokenized_negative_prompt,
-                tokenized_prompt_mask=tokenized_negative_prompt_mask,
-            )
-            pred_values_neg = model.compute_value(obs_neg, act, take_min_over_ensemble=True)
+        if "tokenized_negative_prompt" in frame_dicts[0]:
+            obs_neg, act_neg = get_obs_and_action(frame_dicts, prefix="negative_", action_conditioned=action_conditioned)
+            pred_values_neg = jitted_compute_value(model, obs_neg, act_neg)
             pred_values_neg_np = jax.device_get(pred_values_neg)
 
-        # Optional: counterfactual image forward pass (mirror images + mirror state + mirror prompt)
         pred_values_mirror_np = None
-        if mirror_images_dict and "mirror_state" in frame_dicts[0]:
-            mirror_states = np.stack([f["mirror_state"] for f in frame_dicts], axis=0)
-            obs_mirror = _model.Observation(
-                images=mirror_images_dict,
-                image_masks=mirror_image_masks_dict,
-                state=jnp.asarray(mirror_states),
-                tokenized_prompt=mirror_tokenized_prompt,
-                tokenized_prompt_mask=mirror_tokenized_prompt_mask,
-            )
-            pred_values_mirror = model.compute_value(obs_mirror, act, take_min_over_ensemble=True)
+        if "mirror_state" in frame_dicts[0]:
+            obs_mirror, act_mirror = get_obs_and_action(frame_dicts, prefix="mirror_", action_conditioned=action_conditioned)
+            pred_values_mirror = jitted_compute_value(model, obs_mirror, act_mirror)
             pred_values_mirror_np = jax.device_get(pred_values_mirror)
         
-        # Store predictions with their episode/frame indices
-        for i, (ep_idx, frame_idx, _) in enumerate(batch_frames):
-            all_predictions[(ep_idx, frame_idx)] = float(pred_values_np[i])
+        # Store predictions by episode (frames are already in sorted order)
+        for i, (ep_idx, _, _) in enumerate(batch_frames):
+            all_predictions[ep_idx].append(float(pred_values_np[i]))
             if pred_values_neg_np is not None:
-                all_predictions_neg[(ep_idx, frame_idx)] = float(pred_values_neg_np[i])
+                all_predictions_neg[ep_idx].append(float(pred_values_neg_np[i]))
             if pred_values_mirror_np is not None:
-                all_predictions_mirror[(ep_idx, frame_idx)] = float(pred_values_mirror_np[i])
+                all_predictions_mirror[ep_idx].append(float(pred_values_mirror_np[i]))
     
-    logging.info(f"Computed {len(all_predictions)} predictions")
-    
-    # Reassemble predictions by episode and create plots
+    total_predictions = sum(len(preds) for preds in all_predictions.values())
+    logging.info(f"Computed {total_predictions} predictions")
+    # Create plots for each episode
     for ep_idx in ep_mc_returns.keys():
         mc_returns = ep_mc_returns[ep_idx]
         loss_masks = ep_loss_masks[ep_idx]
-        
-        # Get predictions for this episode in frame order
-        ep_frame_indices = sorted([frame_idx for (eidx, frame_idx) in all_predictions.keys() if eidx == ep_idx])
-        predicted_values = [all_predictions[(ep_idx, frame_idx)] for frame_idx in ep_frame_indices]
+        predicted_values = all_predictions[ep_idx]
         
         if len(predicted_values) != len(mc_returns):
             logging.warning(f"Episode {ep_idx}: mismatch between predictions ({len(predicted_values)}) and mc_returns ({len(mc_returns)})")
@@ -1759,65 +1866,37 @@ def generate_validation_plots_dlimp(
 
             # If negative subtasks/prompts are available, create a counterfactual text plot.
             negative_subtasks = ep_negative_subtasks.get(ep_idx)
-            if negative_subtasks:
-                ep_frame_indices_neg = sorted(
-                    [frame_idx for (eidx, frame_idx) in all_predictions_neg.keys() if eidx == ep_idx]
-                )
-                if len(ep_frame_indices_neg) == len(ep_frame_indices):
-                    predicted_values_neg = [all_predictions_neg[(ep_idx, frame_idx)] for frame_idx in ep_frame_indices_neg]
-
-                    filtered_predictions_neg = []
-                    for pred, mask in zip(predicted_values_neg, loss_masks):
-                        if mask:
-                            filtered_predictions_neg.append(pred)
-
-                    if len(filtered_predictions_neg) == len(filtered_mc_returns) and len(filtered_predictions_neg) > 0:
-                        images[f"val/episode_{ep_idx}_counterfactual_text"] = _create_value_plot(
-                            filtered_mc_returns,
-                            filtered_predictions_neg,
-                            ep_idx,
-                            step,
-                            " (Counterfactual Text)",
-                            oracle_values=None,
-                            subtask_texts=negative_subtasks,
-                        )
-                        logging.info(f"Episode {ep_idx} counterfactual text plot created")
-                else:
-                    logging.warning(
-                        f"Episode {ep_idx}: negative predictions length mismatch "
-                        f"(neg={len(ep_frame_indices_neg)} vs pos={len(ep_frame_indices)}); skipping negative plot."
+            predicted_values_neg = all_predictions_neg.get(ep_idx, [])
+            if negative_subtasks and len(predicted_values_neg) == len(predicted_values):
+                filtered_predictions_neg = [pred for pred, mask in zip(predicted_values_neg, loss_masks) if mask]
+                if len(filtered_predictions_neg) == len(filtered_mc_returns) and len(filtered_predictions_neg) > 0:
+                    images[f"val/episode_{ep_idx}_counterfactual_text"] = _create_value_plot(
+                        filtered_mc_returns,
+                        filtered_predictions_neg,
+                        ep_idx,
+                        step,
+                        " (Counterfactual Text)",
+                        oracle_values=None,
+                        subtask_texts=negative_subtasks,
                     )
+                    logging.info(f"Episode {ep_idx} counterfactual text plot created")
 
             # If mirror subtasks/prompts are available, create a counterfactual image plot.
             mirror_subtasks = ep_mirror_subtasks.get(ep_idx)
-            if mirror_subtasks:
-                ep_frame_indices_mirror = sorted(
-                    [frame_idx for (eidx, frame_idx) in all_predictions_mirror.keys() if eidx == ep_idx]
-                )
-                if len(ep_frame_indices_mirror) == len(ep_frame_indices):
-                    predicted_values_mirror = [all_predictions_mirror[(ep_idx, frame_idx)] for frame_idx in ep_frame_indices_mirror]
-
-                    filtered_predictions_mirror = []
-                    for pred, mask in zip(predicted_values_mirror, loss_masks):
-                        if mask:
-                            filtered_predictions_mirror.append(pred)
-
-                    if len(filtered_predictions_mirror) == len(filtered_mc_returns) and len(filtered_predictions_mirror) > 0:
-                        images[f"val/episode_{ep_idx}_counterfactual_image"] = _create_value_plot(
-                            filtered_mc_returns,
-                            filtered_predictions_mirror,
-                            ep_idx,
-                            step,
-                            " (Counterfactual Image)",
-                            oracle_values=None,
-                            subtask_texts=mirror_subtasks,
-                        )
-                        logging.info(f"Episode {ep_idx} counterfactual image plot created")
-                else:
-                    logging.warning(
-                        f"Episode {ep_idx}: mirror predictions length mismatch "
-                        f"(mirror={len(ep_frame_indices_mirror)} vs pos={len(ep_frame_indices)}); skipping mirror plot."
+            predicted_values_mirror = all_predictions_mirror.get(ep_idx, [])
+            if mirror_subtasks and len(predicted_values_mirror) == len(predicted_values):
+                filtered_predictions_mirror = [pred for pred, mask in zip(predicted_values_mirror, loss_masks) if mask]
+                if len(filtered_predictions_mirror) == len(filtered_mc_returns) and len(filtered_predictions_mirror) > 0:
+                    images[f"val/episode_{ep_idx}_mirror_demo"] = _create_value_plot(
+                        filtered_mc_returns,
+                        filtered_predictions_mirror,
+                        ep_idx,
+                        step,
+                        " (Mirror Demonstration)",
+                        oracle_values=None,
+                        subtask_texts=mirror_subtasks,
                     )
+                    logging.info(f"Episode {ep_idx} mirrored demonstration plot created")
     
     return images
 
@@ -1959,8 +2038,8 @@ def main(config: _config.TrainConfig):
         #         td_n=robocoin_config.td_n,
         #         state_norm_stats=data_config.norm_stats,
         #         use_quantile_norm=data_config.use_quantile_norm,
-        #         single_host_batch=True,  # Don't split batch across hosts
         #         use_eef=robocoin_config.use_eef,
+        #         action_horizon=robocoin_config.action_horizon,
         #     )
         #     val_dataloader = create_robocoin_data_loader(val_loader_config)
             
@@ -1974,7 +2053,6 @@ def main(config: _config.TrainConfig):
         #         cache_dir=val_episodes_cache_dir,
         #         save_only=True,
         #     )
-        #     val_dataloader.stop()
         #     del val_dataloader
         #     logging.info("Validation episodes cached successfully")
         # else:
@@ -2047,9 +2125,9 @@ def main(config: _config.TrainConfig):
 
     # train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
 
-    if resuming:
-        logging.info("Resuming training from checkpoint")
-        # train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+    # if resuming:
+    #     logging.info("Resuming training from checkpoint")
+    #     train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
     # Unpack state and sharding
     # if not isinstance(train_state, training_utils.ActorCriticTrainState):
@@ -2060,13 +2138,12 @@ def main(config: _config.TrainConfig):
     # critic_sharding = train_state_sharding.critic
     # policy_sharding = train_state_sharding.policy
     # logging.info(f"Initialized combined state:\nCritic: {training_utils.array_tree_to_info(critic_state.params)}")
-    policy_state = None
-    if policy_state:
-        logging.info(f"Policy: {training_utils.array_tree_to_info(policy_state.params)}")
+    # if policy_state:
+    #     logging.info(f"Policy: {training_utils.array_tree_to_info(policy_state.params)}")
 
     # jax.block_until_ready(critic_state)
 
-    lr_schedule = config.lr_schedule.create()
+    # lr_schedule = config.lr_schedule.create()
     # ptrain_step = jax.jit(
     #     functools.partial(value_function_train_step, config, lr_schedule),
     #     in_shardings=(critic_sharding, data_sharding, replicated_sharding),
@@ -2075,6 +2152,7 @@ def main(config: _config.TrainConfig):
     # )
 
     ppolicy_step = None
+    policy_state = None
     if policy_state is not None:
         ppolicy_step = jax.jit(
             functools.partial(policy_train_step, config, lr_schedule),
@@ -2101,10 +2179,49 @@ def main(config: _config.TrainConfig):
     # Log initial timing info
     logging.info(f"Starting training with batch_size={config.batch_size}, num_workers={config.num_workers}")
 
+    # On-demand tcmalloc heap profiling (avoids GCS timeout from continuous profiling)
+    _heap_profiler_started = False
+    _heap_profiler_lib = None
+    HEAP_PROFILE_START_STEP = 999_999_999
+    HEAP_PROFILE_DUMP_INTERVAL = 999_999_999
+    try:
+        import ctypes
+        _RTLD_NOLOAD = 4
+        for _tcname in ["libtcmalloc.so.4", "libtcmalloc.so", "libtcmalloc_minimal.so.4"]:
+            try:
+                _heap_profiler_lib = ctypes.CDLL(_tcname, mode = _RTLD_NOLOAD)
+                break
+            except OSError:
+                continue
+        if _heap_profiler_lib and hasattr(_heap_profiler_lib, "HeapProfilerStart"):
+            _heap_profiler_lib.HeapProfilerStart.argtypes = [ctypes.c_char_p]
+            _heap_profiler_lib.HeapProfilerStart.restype = None
+            _heap_profiler_lib.HeapProfilerDump.argtypes = [ctypes.c_char_p]
+            _heap_profiler_lib.HeapProfilerDump.restype = None
+            _heap_profiler_lib.HeapProfilerStop.restype = None
+            logging.info("[HeapProfiler] tcmalloc profiler API available, will start at step %d", HEAP_PROFILE_START_STEP)
+        else:
+            logging.info("[HeapProfiler] tcmalloc found but missing HeapProfiler API")
+            _heap_profiler_lib = None
+    except Exception as e:
+        logging.info(f"[HeapProfiler] init failed: {e}")
+
     for step in pbar:
         # Split rng for this step
         rng, step_rng = jax.random.split(rng)
 
+        # Start heap profiler after pipeline is warmed up, dump once, then stop
+        if not _heap_profiler_started and _heap_profiler_lib and step == HEAP_PROFILE_START_STEP:
+            _heap_profiler_lib.HeapProfilerStart(b"/tmp/heap_profile")
+            _heap_profiler_started = True
+            logging.info("[HeapProfiler] Started at step %d", step)
+
+        if _heap_profiler_started and step == HEAP_PROFILE_START_STEP + HEAP_PROFILE_DUMP_INTERVAL:
+            _heap_profiler_lib.HeapProfilerDump(b"final")
+            _heap_profiler_lib.HeapProfilerStop()
+            _heap_profiler_started = False
+            _heap_profiler_lib = None
+            logging.info("[HeapProfiler] Dumped and stopped at step %d", step)
         # with timer.context("train_step_compute"), sharding.set_mesh(mesh):
         #     critic_state, info = ptrain_step(critic_state, batch, step_rng)
 
@@ -2125,6 +2242,13 @@ def main(config: _config.TrainConfig):
                     jax.block_until_ready(policy_info)
                 info.update(policy_info)
 
+        time.sleep(0.8)
+
+        rss_gb = psutil.Process().memory_info().rss / 1024 / 1024 / 1024
+        if rss_gb > 180:
+            logging.warning(f"[OOM Guard] RSS = {rss_gb:.1f} GB exceeds 180 GB at step {step}, breaking.")
+            break
+
         if step % config.log_interval == 0:
             # info = jax.device_get(info)
             # Add timing info to logged metrics (average and total)
@@ -2140,8 +2264,9 @@ def main(config: _config.TrainConfig):
             
             # Memory debugging: log every 100 steps, force GC every 500 steps
             force_gc = (step % 500 == 0)
+            # force_gc = False
             log_memory_debug(step, data_loader=data_loader, force_gc=force_gc, log_to_wandb=jax.process_index() == 0)
-            
+
         # Break down data loading into components
         with timer.context("data_fetch"):
             raw_batch = next(data_iter)
@@ -2152,8 +2277,9 @@ def main(config: _config.TrainConfig):
                 batch = {"state": obs.state}
             else:
                 batch = raw_batch
+        force_tpu_sync_every_batch(batch, step)
 
-        if (step + 1) % config.save_interval == 0 or step + 1 == config.num_train_steps:
+        if (step + 1) % config.save_interval == 0:# or step + 1 == config.num_train_steps:
             with timer.context("checkpoint_save"):
                 state_to_save = training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
                 _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step)
