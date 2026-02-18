@@ -561,6 +561,11 @@ class PostBatchTransform:
         # Apply normalization
         batch = self._normalize_fn(batch)
 
+        # Clip normalized values to [-5, 5]
+        for key in ("state", "actions"):
+            if key in batch:
+                batch[key] = np.clip(batch[key], -5.0, 5.0)
+
         # Mirror state/actions after normalization (for counterfactual validation)
         if "mirror_image" in batch:
             batch_state = batch.get("state")
