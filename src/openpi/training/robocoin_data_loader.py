@@ -209,7 +209,7 @@ class ImageResizeTransform:
         is_empty = tf.equal(tf.strings.length(jpeg_bytes), 0)
 
         def decode_resize():
-            image = tf.io.decode_jpeg(jpeg_bytes, channels=3, ratio=2)
+            image = tf.io.decode_jpeg(jpeg_bytes, channels=3, ratio=1)
             image = tf.image.resize(image, self.target_size, method="bilinear")
             return tf.cast(image, tf.uint8)
 

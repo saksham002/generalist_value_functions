@@ -11,6 +11,7 @@ import functools
 import logging
 import platform as _platform
 import os
+import threading
 from typing import Any
 import pdb
 
@@ -42,7 +43,14 @@ import openpi.training.weight_loaders as _weight_loaders
 import openpi.transforms as _transforms
 import openpi.value_functions.base_value_functions as _value_fn
 from openpi.training.robocoin_data_loader import RoboCOINDataLoaderConfig, create_robocoin_data_loader
-from openpi.robocoin_utils.utils import count_subtask_segments, get_obs_and_action, stack_frames, stack_images
+from openpi.robocoin_utils.utils import (
+    cache_val_episodes,
+    count_subtask_segments,
+    get_obs_and_action,
+    predict_values,
+    stack_frames,
+    stack_images,
+)
 
 
 def init_logging():
@@ -1055,22 +1063,31 @@ def _create_value_video(
     frame_images: list[np.ndarray],
     fps: int,
 ) -> "wandb.Video":
-    """Create a wandb Video showing the base_0_rgb image alongside the value plot with a moving red line."""
-    import imageio
-    import tempfile
+    """Create a wandb GIF with a 2x2 layout: left wrist (top-left), right wrist (bottom-left),
+    value plot (top-right), base camera (bottom-right)."""
     T = len(mc_returns)
     timesteps = np.arange(T)
     video_frames = []
 
-    fig, (ax_img, ax_val) = plt.subplots(1, 2, figsize=(16, 6))
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    ax_left_wrist, ax_val = axes[0, 0], axes[0, 1]
+    ax_right_wrist, ax_base = axes[1, 0], axes[1, 1]
 
     for t in range(T):
-        ax_img.cla()
-        ax_val.cla()
+        for ax in axes.flat:
+            ax.cla()
 
-        ax_img.imshow(frame_images[t])
-        ax_img.axis("off")
-        ax_img.set_title(f"Timestep {t}", fontsize=12)
+        ax_left_wrist.imshow(frame_images[t][0])
+        ax_left_wrist.axis("off")
+        ax_left_wrist.set_title("Left Wrist", fontsize=12)
+
+        ax_right_wrist.imshow(frame_images[t][1])
+        ax_right_wrist.axis("off")
+        ax_right_wrist.set_title("Right Wrist", fontsize=12)
+
+        ax_base.imshow(frame_images[t][2])
+        ax_base.axis("off")
+        ax_base.set_title(f"Timestep {t}", fontsize=12)
 
         ax_val.plot(timesteps, mc_returns, label="MC Returns", color="blue", linewidth=2)
         ax_val.plot(timesteps, predicted_values, label="Predicted Value", color="orange", linewidth=2, linestyle="--")
@@ -1090,8 +1107,10 @@ def _create_value_video(
         video_frames.append(buf.copy())
 
     plt.close(fig)
-    # wandb.Video expects (T, C, H, W); moviepy (used internally) encodes as H.264/yuv420p by default.
     video_array = np.stack(video_frames).transpose(0, 3, 1, 2)
+    # GIF is used because wandb renders it inline. mp4 shows as "File type unknown" in the wandb UI.
+    # GIF's 256-color palette quantization causes a visible quality drop (color jitter appearance),
+    # but the video remains interpretable.
     return wandb.Video(video_array, fps = fps, format = "gif")
 
 
@@ -1118,7 +1137,7 @@ def _create_value_plot(
         oracle_values: Optional list of oracle Q-values.
         subtask_texts: Optional ordered list of subtask segment texts for caption.
         plot_video: If True and frame_images are provided, returns a wandb.Video instead of wandb.Image.
-        frame_images: Optional list of uint8 RGB images (one per timestep) for video mode.
+        frame_images: Optional list of (3, 224, 224, 3) uint8 arrays (left wrist, right wrist, base_0) per timestep.
         fps: Frame rate of the episode, used when encoding the output video.
     """
     if plot_video and frame_images is not None and len(frame_images) == len(mc_returns):
@@ -1389,6 +1408,89 @@ def _compute_oracle_ranking_metrics(
     return metrics
 
 
+_render_thread: threading.Thread | None = None
+
+
+def _render_and_log_plots(
+    all_predictions: dict,
+    all_predictions_neg: dict,
+    all_predictions_mirror: dict,
+    ep_mc_returns: dict,
+    ep_loss_masks: dict,
+    ep_frame_images: dict,
+    ep_fps: dict,
+    ep_subtasks: dict,
+    ep_negative_subtasks: dict,
+    ep_mirror_subtasks: dict,
+    traj_to_repo_ep: dict,
+    step: int,
+) -> None:
+    images = {}
+    for traj_idx in ep_mc_returns.keys():
+        repo_id, ep_idx, part_suffix = traj_to_repo_ep[traj_idx]
+        plot_key = f"val/{repo_id.removeprefix('RoboCOIN/')}_episode_{ep_idx}{part_suffix}"
+        mc_returns = ep_mc_returns[traj_idx]
+        loss_masks = ep_loss_masks[traj_idx]
+        predicted_values = all_predictions[traj_idx]
+
+        if len(predicted_values) != len(mc_returns):
+            logging.warning(f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}): mismatch between predictions ({len(predicted_values)}) and mc_returns ({len(mc_returns)})")
+            continue
+
+        filtered_mc_returns = []
+        filtered_predictions = []
+        for mc, pred, mask in zip(mc_returns, predicted_values, loss_masks):
+            if mask:
+                filtered_mc_returns.append(mc)
+                filtered_predictions.append(pred)
+
+        if len(filtered_mc_returns) == 0:
+            logging.warning(f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}): no frames with loss_mask=True")
+            continue
+
+        subtasks = ep_subtasks.get(traj_idx, [])
+        logging.info(f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}): {len(filtered_predictions)}/{len(predicted_values)} frames after loss_mask filter, subtasks={subtasks}")
+
+        ep_frame_images[traj_idx] = [img for img, mask in zip(ep_frame_images[traj_idx], loss_masks) if mask]
+
+        images[plot_key] = _create_value_plot(
+            filtered_mc_returns, filtered_predictions, ep_idx, step, " (RoboCOIN)",
+            oracle_values = None, subtask_texts = subtasks,
+            plot_video = True, frame_images = ep_frame_images[traj_idx],
+            fps = ep_fps[traj_idx],
+        )
+        logging.info(f"Repo {repo_id}, episode {ep_idx} plot created")
+
+        negative_subtasks = ep_negative_subtasks.get(traj_idx)
+        predicted_values_neg = all_predictions_neg.get(traj_idx, [])
+        if negative_subtasks and len(predicted_values_neg) == len(predicted_values):
+            filtered_predictions_neg = [pred for pred, mask in zip(predicted_values_neg, loss_masks) if mask]
+            if len(filtered_predictions_neg) == len(filtered_mc_returns) and len(filtered_predictions_neg) > 0:
+                images[f"{plot_key}_counterfactual_text"] = _create_value_plot(
+                    filtered_mc_returns, filtered_predictions_neg, ep_idx, step, " (Counterfactual Text)",
+                    oracle_values = None, subtask_texts = negative_subtasks,
+                )
+                logging.info(f"Repo {repo_id}, episode {ep_idx} counterfactual text plot created")
+
+        mirror_subtasks = ep_mirror_subtasks.get(traj_idx)
+        predicted_values_mirror = all_predictions_mirror.get(traj_idx, [])
+        if mirror_subtasks and len(predicted_values_mirror) == len(predicted_values):
+            filtered_predictions_mirror = [pred for pred, mask in zip(predicted_values_mirror, loss_masks) if mask]
+            if len(filtered_predictions_mirror) == len(filtered_mc_returns) and len(filtered_predictions_mirror) > 0:
+                images[f"{plot_key}_mirror_demo"] = _create_value_plot(
+                    filtered_mc_returns, filtered_predictions_mirror, ep_idx, step, " (Mirror Demonstration)",
+                    oracle_values = None, subtask_texts = mirror_subtasks,
+                )
+                logging.info(f"Repo {repo_id}, episode {ep_idx} mirrored demonstration plot created")
+
+    if images:
+        # Log without an explicit step so wandb uses the current step, avoiding the
+        # "step must be monotonically increasing" warning that occurs because this
+        # thread may run after further training steps have been logged. The actual
+        # validation step is visible in each plot title.
+        wandb.log(images)
+    logging.info(f"Render thread finished: logged {len(images)} plots for step {step}")
+
 
 def generate_validation_plots_dlimp(
     model: _value_fn.BaseValueFunction,
@@ -1403,144 +1505,33 @@ def generate_validation_plots_dlimp(
     include_repos: tuple[str, ...] = (),
 ) -> dict:
     """Generate validation plots for RoboCOIN using a dlimp dataloader.
-    
-    This function supports caching validation episodes to disk for faster
-    subsequent calls. On first call with save_only=True, it collects episodes
-    from the dataloader and saves them to .npy files. On subsequent calls,
-    it loads from cache instead of from the dataloader.
-    
+
+    Supports caching validation episodes to disk: on the first call with
+    save_only=True episodes are collected and saved; subsequent calls load
+    from cache instead of re-iterating the dataloader.
+
     Args:
-        model: The value function model
-        val_dataloader: RoboCOIN dataloader with repeat=False, shuffle=False
-        val_episode_indices: List of episode indices to plot (used for count only)
-        step: Current training step
-        action_conditioned: Whether the model is action-conditioned (Q vs V)
-        data_config: Data configuration
-        cache_dir: Directory to save/load cached validation episodes
-        save_only: If True, only save episodes to disk and return empty dict
-        
+        model: The value function model.
+        val_dataloader: RoboCOIN dataloader with repeat=False, shuffle=False.
+        val_episode_indices: List of episode indices to plot (used for count only).
+        step: Current training step.
+        action_conditioned: Whether the model is action-conditioned (Q vs V).
+        data_config: Data configuration.
+        cache_dir: Directory to save/load cached validation episodes.
+        save_only: If True, only save episodes to disk and return empty dict.
+
     Returns:
-        Dictionary of wandb images keyed by trajectory index (empty if save_only=True)
+        Empty dict (plots are logged asynchronously by a background thread).
     """
-    import os
-    import pickle
-    
     num_val_trajectories = len(val_episode_indices)
     assert len(include_repos) < num_val_trajectories, (
         f"include_repos ({len(include_repos)}) must be < num_val_trajectories ({num_val_trajectories})"
     )
-    traj_frames: dict[int, list[dict]] = {}  # keyed by _traj_index (unique)
-    
-    # Check if cache directory exists with individual traj files
-    cache_exists = cache_dir and os.path.exists(cache_dir) and any(
-        f.startswith("traj_") and f.endswith(".pkl") for f in os.listdir(cache_dir)
-    ) if cache_dir else False
-        
-    if cache_exists and not save_only:
-        # Load from cache - each trajectory is saved as a separate file
-        logging.info(f"Loading cached validation episodes from {cache_dir}")
-        for filename in os.listdir(cache_dir):
-            if filename.startswith("traj_") and filename.endswith(".pkl"):
-                traj_idx = int(filename.replace("traj_", "").replace(".pkl", ""))
-                cache_file = os.path.join(cache_dir, filename)
-                with open(cache_file, "rb") as f:
-                    traj_frames[traj_idx] = pickle.load(f)
-        logging.info(f"Loaded {len(traj_frames)} trajectories from cache")
-    elif not cache_exists:
-        # Collect from dataloader using _traj_index (unique) for tracking
-        active_trajs: set[int] = set()  # _traj_index values currently being collected
-        saved_traj_count = 0
-        seen_repo_ids: set[str] = set()
-        seen_required_repo_ids: set[str] = set()
-        num_non_required_slots = num_val_trajectories - len(include_repos)
-        logging.info(f"Collecting validation frames for first {num_val_trajectories} unique repo_id trajectories")
 
-        # Create cache directory early if needed
-        if cache_dir:
-            os.makedirs(cache_dir, exist_ok = True)
-
-        # Iterate through the dataloader
-        for batch in val_dataloader:
-
-            traj_indices = batch.get("_traj_index", None)
-            if traj_indices is None:
-                logging.warning("Batch missing _traj_index, cannot identify trajectories")
-                continue
-
-            if hasattr(traj_indices, "device"):
-                traj_indices = np.asarray(traj_indices)
-
-            # Get the set of _traj_index values present in this batch
-            unique_batch_trajs = set(int(t) for t in traj_indices)
-
-            # Check which active trajs are NO LONGER in this batch (i.e., they are complete)
-            completed_trajs = active_trajs - unique_batch_trajs
-            for traj_idx in completed_trajs:
-                if traj_idx in traj_frames:
-                    frames = traj_frames[traj_idx]
-                    if frames:
-                        frames.sort(key=lambda f: f["_frame_index"])
-
-                    if cache_dir:
-                        cache_file = os.path.join(cache_dir, f"traj_{traj_idx}.pkl")
-                        with open(cache_file, "wb") as f:
-                            pickle.dump(frames, f)
-                        logging.info(f"Saved traj {traj_idx} ({len(frames)} frames) to {cache_file}")
-
-                    del traj_frames[traj_idx]
-                    saved_traj_count += 1
-
-                active_trajs.discard(traj_idx)
-
-            if saved_traj_count >= num_val_trajectories:
-                logging.info(f"Saved {saved_traj_count} trajectories, breaking early")
-                break
-
-            # Process each sample in the batch
-            batch_size = traj_indices.shape[0]
-            for i in range(batch_size):
-                traj_idx = int(traj_indices[i])
-
-                if traj_idx not in traj_frames and traj_idx not in active_trajs:
-                    sample_repo_id = batch["repo_id"][i]
-                    if isinstance(sample_repo_id, bytes):
-                        sample_repo_id = sample_repo_id.decode("utf-8")
-                    if sample_repo_id in seen_repo_ids:
-                        continue
-
-                    is_required = sample_repo_id in include_repos and sample_repo_id not in seen_required_repo_ids
-                    if not is_required and num_non_required_slots == 0:
-                        continue
-
-                    traj_frames[traj_idx] = []
-                    active_trajs.add(traj_idx)
-                    seen_repo_ids.add(sample_repo_id)
-                    if is_required:
-                        seen_required_repo_ids.add(sample_repo_id)
-                    else:
-                        num_non_required_slots -= 1
-
-                if traj_idx not in active_trajs:
-                    continue
-                
-                # Extract all frame data for this sample
-                frame = {}
-                for key, value in batch.items():
-                    if isinstance(value, dict):
-                        frame[key] = {}
-                        for sub_key, sub_value in value.items():
-                            frame[key][sub_key] = np.asarray(sub_value[i])
-                    else:
-                        frame[key] = np.asarray(value[i])
-
-                traj_frames[traj_idx].append(frame)
-        
-        logging.info(f"Total trajectories saved: {saved_traj_count}, unique repo_ids: {len(seen_repo_ids)}")
-    
-    # If save_only mode, return early without generating plots
+    traj_frames = cache_val_episodes(val_dataloader, num_val_trajectories, cache_dir, include_repos, save_only)
     if save_only:
         return {}
-    
+
     # Build traj_idx -> (repo_id, episode_index) mapping for plot names
     traj_to_repo_ep: dict[int, tuple[str, int]] = {}
     for traj_idx, frames in traj_frames.items():
@@ -1579,36 +1570,36 @@ def generate_validation_plots_dlimp(
     traj_to_repo_ep = split_traj_to_repo_ep
     del split_traj_frames, split_traj_to_repo_ep
 
-    # Debug: log details about loaded episodes before generating plots
     for traj_key, frames in traj_frames.items():
         frame_keys = list(frames[0].keys()) if frames else []
         repo_id, ep_idx, part = traj_to_repo_ep[traj_key]
         logging.info(f"  Traj {traj_key} (repo {repo_id}, episode {ep_idx}{part}): {len(frames)} frames, keys: {frame_keys}")
     total_frames = sum(len(frames) for frames in traj_frames.values())
     logging.info(f"Processing {len(traj_frames)} trajectory segments, total_frames={total_frames}")
-    
-    # Generate plots for each episode using batched inference
-    images = {}
-    
-    # Collect all valid frames from all trajectories
-    all_frames = []  # List of (traj_idx, frame_idx_in_ep, frame_dict)
-    ep_mc_returns = {}  # traj_idx -> list of mc_returns
-    ep_loss_masks = {}  # traj_idx -> list of loss_mask values
-    ep_frame_images = {}  # traj_idx -> list of uint8 RGB images (base camera, one per valid frame)
-    ep_fps = {}  # traj_idx -> fps (constant per episode)
-    ep_negative_subtasks = {}  # traj_idx -> ordered list of negative subtask segment texts
-    ep_mirror_subtasks = {}  # traj_idx -> ordered list of mirror subtask segment texts
-    
+
+    all_frames = []
+    ep_mc_returns = {}
+    ep_loss_masks = {}
+    ep_frame_images = {}
+    ep_fps = {}
+    ep_negative_subtasks = {}
+    ep_mirror_subtasks = {}
+
     for ep_idx, frames in traj_frames.items():
         if len(frames) == 0:
             continue
 
-        # Store MC returns and loss_masks for this episode
         ep_mc_returns[ep_idx] = [f["mc_return"] for f in frames]
         ep_loss_masks[ep_idx] = [f["loss_mask"] for f in frames]
 
-        # Collect base camera images for video plots (uint8 RGB from dataloader)
-        ep_frame_images[ep_idx] = [np.asarray(f["image"]["base_0_rgb"]) for f in frames]
+        ep_frame_images[ep_idx] = [
+            np.stack([
+                np.asarray(f["image"]["left_wrist_0_rgb"]),
+                np.asarray(f["image"]["right_wrist_0_rgb"]),
+                np.asarray(f["image"]["base_0_rgb"]),
+            ])
+            for f in frames
+        ]
         ep_fps[ep_idx] = int(frames[0]["fps"])
 
         _, _, negative_segments = count_subtask_segments(frames, prefix="negative_")
@@ -1619,150 +1610,35 @@ def generate_validation_plots_dlimp(
 
         for frame_idx, frame in enumerate(frames):
             all_frames.append((ep_idx, frame_idx, frame))
-    
+
     if len(all_frames) == 0:
         logging.warning("No valid frames found across all episodes")
-        return images
-    
+        return {}
+
     logging.info(f"Processing {len(all_frames)} total frames across {len(ep_mc_returns)} episodes in batches of 64")
-    
-    # Create JIT-compiled compute_value function for efficient batched inference
-    @nnx.jit
-    def jitted_compute_value(
-        model_to_use: _value_fn.BaseValueFunction,
-        obs: _model.Observation,
-        act: _model.Actions | None,
-    ) -> jnp.ndarray:
-        return model_to_use.compute_value(obs, act, take_min_over_ensemble=True)
-    
-    # Process all frames in batches of 64
-    BATCH_SIZE = 64
-    all_predictions: dict[int, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
-    all_predictions_neg: dict[int, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
-    all_predictions_mirror: dict[int, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
-    
-    for batch_start in range(0, len(all_frames), BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, len(all_frames))
-        batch_frames = all_frames[batch_start:batch_end]
-        batch_size = len(batch_frames)
-        
-        # Extract frame dicts for this batch
-        frame_dicts = [f[2] for f in batch_frames]
-        
-        # Build default observation and action using helper function
-        obs, act = get_obs_and_action(frame_dicts, prefix="", action_conditioned=action_conditioned)
-        
-        # Log shapes for first batch only
-        if batch_start == 0:
-            logging.info(f"  Batch obs.state: shape={obs.state.shape}, dtype={obs.state.dtype}")
-            if obs.images:
-                for k, v in obs.images.items():
-                    logging.info(f"  Batch obs.images[{k}]: shape={v.shape}, dtype={v.dtype}")
-            if obs.tokenized_prompt is not None:
-                logging.info(f"  Batch obs.tokenized_prompt: shape={obs.tokenized_prompt.shape}")
-        
-        # Batched forward pass (JIT-compiled)
-        pred_values = jitted_compute_value(model, obs, act)
-        pred_values_np = jax.device_get(pred_values)
 
-        # Optional: second forward pass with negative prompt (same images/state, different prompt)
-        pred_values_neg_np = None
-        if "tokenized_negative_prompt" in frame_dicts[0]:
-            obs_neg, act_neg = get_obs_and_action(frame_dicts, prefix="negative_", action_conditioned=action_conditioned)
-            pred_values_neg = jitted_compute_value(model, obs_neg, act_neg)
-            pred_values_neg_np = jax.device_get(pred_values_neg)
+    all_predictions, all_predictions_neg, all_predictions_mirror = predict_values(
+        model, all_frames, ep_mc_returns, action_conditioned
+    )
 
-        pred_values_mirror_np = None
-        if "mirror_state" in frame_dicts[0]:
-            obs_mirror, act_mirror = get_obs_and_action(frame_dicts, prefix="mirror_", action_conditioned=action_conditioned)
-            pred_values_mirror = jitted_compute_value(model, obs_mirror, act_mirror)
-            pred_values_mirror_np = jax.device_get(pred_values_mirror)
-        
-        # Store predictions by episode (frames are already in sorted order)
-        for i, (ep_idx, _, _) in enumerate(batch_frames):
-            all_predictions[ep_idx].append(float(pred_values_np[i]))
-            if pred_values_neg_np is not None:
-                all_predictions_neg[ep_idx].append(float(pred_values_neg_np[i]))
-            if pred_values_mirror_np is not None:
-                all_predictions_mirror[ep_idx].append(float(pred_values_mirror_np[i]))
-    
-    total_predictions = sum(len(preds) for preds in all_predictions.values())
-    logging.info(f"Computed {total_predictions} predictions")
-    # Create plots for each trajectory, using repo_id and episode_index in plot names
-    for traj_idx in ep_mc_returns.keys():
-        repo_id, ep_idx, part_suffix = traj_to_repo_ep[traj_idx]
-        plot_key = f"val/{repo_id.removeprefix('RoboCOIN/')}_episode_{ep_idx}{part_suffix}"
-        mc_returns = ep_mc_returns[traj_idx]
-        loss_masks = ep_loss_masks[traj_idx]
-        predicted_values = all_predictions[traj_idx]
+    if jax.process_index() == 0:
+        global _render_thread
+        if _render_thread is not None and _render_thread.is_alive():
+            logging.warning("Previous render thread still running, waiting for it to finish...")
+            _render_thread.join()
+        _render_thread = threading.Thread(
+            target = _render_and_log_plots,
+            args = (
+                all_predictions, all_predictions_neg, all_predictions_mirror,
+                ep_mc_returns, ep_loss_masks, ep_frame_images, ep_fps,
+                ep_subtasks, ep_negative_subtasks, ep_mirror_subtasks,
+                traj_to_repo_ep, step,
+            ),
+            daemon = True,
+        )
+        _render_thread.start()
 
-        if len(predicted_values) != len(mc_returns):
-            logging.warning(f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}): mismatch between predictions ({len(predicted_values)}) and mc_returns ({len(mc_returns)})")
-            continue
-
-        # Filter out frames where loss_mask is False
-        filtered_mc_returns = []
-        filtered_predictions = []
-        for mc, pred, mask in zip(mc_returns, predicted_values, loss_masks):
-            if mask:
-                filtered_mc_returns.append(mc)
-                filtered_predictions.append(pred)
-
-        if len(filtered_mc_returns) == 0:
-            logging.warning(f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}): no frames with loss_mask=True")
-            continue
-
-        subtasks = ep_subtasks.get(traj_idx, [])
-
-        logging.info(f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}): {len(filtered_predictions)}/{len(predicted_values)} frames after loss_mask filter, subtasks={subtasks}")
-
-        ep_frame_images[traj_idx] = [img for img, mask in zip(ep_frame_images[traj_idx], loss_masks) if mask]
-
-        # Create plots (only on worker 0), using repo_id and episode_index in wandb keys
-        if jax.process_index() == 0:
-            images[plot_key] = _create_value_plot(
-                filtered_mc_returns, filtered_predictions, ep_idx, step, " (RoboCOIN)",
-                oracle_values = None, subtask_texts = subtasks,
-                plot_video = True, frame_images = ep_frame_images[traj_idx],
-                fps = ep_fps[traj_idx],
-            )
-            logging.info(f"Repo {repo_id}, episode {ep_idx} plot created")
-
-            # If negative subtasks/prompts are available, create a counterfactual text plot.
-            negative_subtasks = ep_negative_subtasks.get(traj_idx)
-            predicted_values_neg = all_predictions_neg.get(traj_idx, [])
-            if negative_subtasks and len(predicted_values_neg) == len(predicted_values):
-                filtered_predictions_neg = [pred for pred, mask in zip(predicted_values_neg, loss_masks) if mask]
-                if len(filtered_predictions_neg) == len(filtered_mc_returns) and len(filtered_predictions_neg) > 0:
-                    images[f"{plot_key}_counterfactual_text"] = _create_value_plot(
-                        filtered_mc_returns,
-                        filtered_predictions_neg,
-                        ep_idx,
-                        step,
-                        " (Counterfactual Text)",
-                        oracle_values=None,
-                        subtask_texts=negative_subtasks,
-                    )
-                    logging.info(f"Repo {repo_id}, episode {ep_idx} counterfactual text plot created")
-
-            # If mirror subtasks/prompts are available, create a counterfactual image plot.
-            mirror_subtasks = ep_mirror_subtasks.get(traj_idx)
-            predicted_values_mirror = all_predictions_mirror.get(traj_idx, [])
-            if mirror_subtasks and len(predicted_values_mirror) == len(predicted_values):
-                filtered_predictions_mirror = [pred for pred, mask in zip(predicted_values_mirror, loss_masks) if mask]
-                if len(filtered_predictions_mirror) == len(filtered_mc_returns) and len(filtered_predictions_mirror) > 0:
-                    images[f"{plot_key}_mirror_demo"] = _create_value_plot(
-                        filtered_mc_returns,
-                        filtered_predictions_mirror,
-                        ep_idx,
-                        step,
-                        " (Mirror Demonstration)",
-                        oracle_values=None,
-                        subtask_texts=mirror_subtasks,
-                    )
-                    logging.info(f"Repo {repo_id}, episode {ep_idx} mirrored demonstration plot created")
-    
-    return images
+    return {}
 
 
 def main(config: _config.TrainConfig):
@@ -2100,16 +1976,16 @@ def main(config: _config.TrainConfig):
                 _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step)
             
         # Generate validation plots (all workers participate for FSDP, only worker 0 creates plots/logs)
-        if (step + 1) % config.plot_interval == 0:
+        if (step + 1) % config.plot_interval == 0 or step == 0:
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
                 # Use dlimp-based validation for RoboCOIN, standard for others
                 if data_config.robocoin_data_config is not None:
-                    # Load validation episodes from cache (created during initialization)
-                    plot_images = generate_validation_plots_dlimp(
+                    # Inference runs on all workers; rendering/logging dispatched to background thread on worker 0.
+                    generate_validation_plots_dlimp(
                         model=model,
-                        val_dataloader=None,  # Not needed - load from cache
+                        val_dataloader=None,
                         val_episode_indices=val_episode_indices,
                         step=step,
                         action_conditioned=action_conditioned,
@@ -2125,13 +2001,12 @@ def main(config: _config.TrainConfig):
                         action_conditioned=action_conditioned,
                         data_config=data_config,
                     )
-                # Only worker 0 logs to wandb
-                if jax.process_index() == 0:
-                    if plot_images:
-                        logging.info(f"Generated {len(plot_images)} validation plot items at step {step}")
-                        wandb.log(plot_images, step=step)
-                    else:
-                        logging.warning(f"No validation plots generated at step {step}")
+                    if jax.process_index() == 0:
+                        if plot_images:
+                            logging.info(f"Generated {len(plot_images)} validation plot items at step {step}")
+                            wandb.log(plot_images, step=step)
+                        else:
+                            logging.warning(f"No validation plots generated at step {step}")
             
         # Policy evaluation (only on worker 0)
         if eval_enabled and (step + 1) % config.eval_interval == 0:
