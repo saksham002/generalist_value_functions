@@ -37,6 +37,8 @@ from openpi import transforms as _transforms
 from openpi.models.model import IMAGE_KEYS
 from openpi.models.tokenizer import PaligemmaTokenizer
 
+import pdb
+
 logger = logging.getLogger(__name__)
 # Disable GPU for TensorFlow (we only use it for data loading)
 # tf.config.experimental.set_visible_devices([], "GPU")
@@ -52,7 +54,7 @@ DEFAULT_MAX_STATE_DIM = 14
 DEFAULT_MAX_ACTION_DIM = 14
 DEFAULT_IMAGE_SIZE = (224, 224)
 DEFAULT_MAX_TOKEN_LEN = 48
-DEFAULT_ACTION_HORIZON = 30
+DEFAULT_ACTION_HORIZON = 25
 
 RLDS_TO_STANDARD_CAMERA_MAP = {
     f"cam_{i}": IMAGE_KEYS[i] for i in range(min(DEFAULT_MAX_CAMERAS, len(IMAGE_KEYS)))
@@ -92,6 +94,7 @@ class RoboCOINDataLoaderConfig:
     use_eef: bool = False
     action_horizon: int = DEFAULT_ACTION_HORIZON
     filter_n: int | None = None
+    mask_50fps: bool = False
 
 
 # =============================================================================
@@ -119,6 +122,8 @@ class AddTrajectoryKeys:
         action_horizon: int = DEFAULT_ACTION_HORIZON,
         use_eef: bool = False,
     ):
+        assert td_n is None or td_n % 5 == 0, f"td_n must be a multiple of 5, got {td_n}"
+        assert action_horizon % 5 == 0, f"action_horizon must be a multiple of 5, got {action_horizon}"
         self.td_n = td_n
         self.max_cameras = max_cameras
         self.action_horizon = action_horizon
@@ -142,7 +147,11 @@ class AddTrajectoryKeys:
         
         cam_keys = [f"observation/image/cam_{i}" for i in range(self.max_cameras)]
 
-        next_offset = 1 if self.td_n is None else self.td_n
+        if self.td_n is None:
+            next_offset = 1
+        else:
+            fps = episode["fps"][0]
+            next_offset = 3 * self.td_n // 5 if fps == 30 else self.td_n
         next_indices = tf.minimum(frame_indices + next_offset, ep_len - 1)
 
         episode["next_observation/state"] = tf.gather(state, next_indices)
@@ -243,12 +252,14 @@ class MainTransform:
         discount: float = 0.99,
         td_n: int | None = None,
         split: str = "train",
+        mask_50fps: bool = False,
     ):
         self.max_cameras = max_cameras
         self.use_eef = use_eef
         self.discount = discount
         self.td_n = td_n
         self.split = split
+        self.mask_50fps = mask_50fps
 
     @staticmethod
     def _construct_eef_repr(data: tf.Tensor, eef_data: tf.Tensor) -> tf.Tensor:
@@ -365,6 +376,8 @@ class MainTransform:
         selected_steps = steps_all[sampled_idx]
         selected_steps_f = tf.cast(selected_steps, tf.float32)
         loss_mask = first_null > 0
+        if self.mask_50fps:
+            loss_mask = tf.logical_and(loss_mask, tf.equal(tf.cast(raw_frame["fps"], tf.int32), 30))
 
         frame["steps_to_subtask_end"] = selected_steps
         frame["sampled_index"] = sampled_idx
@@ -379,14 +392,22 @@ class MainTransform:
         texts = tf.stack([raw_frame[f"subtask_{i}"] for i in range(1, 6)])
         frame["subtask_text"] = texts[sampled_idx]
 
-        # mc_return
-        mc_return = tf.pow(self.discount, selected_steps_f)
-        frame["mc_return"] = tf.where(loss_mask, mc_return, 0.0)
+        # TODO: make fps->exponent_per_step and fps->valid_action_fraction mappings configurable
+        fps = tf.cast(raw_frame["fps"], tf.int32)
+        exponent_per_step = tf.cast(tf.where(tf.equal(fps, 30), 5, 3), tf.float32)
+
+        # mc_return: gamma^(exponent_per_step * steps) so that the exponent is proportional to real time
+        frame["mc_return"] = tf.pow(self.discount, exponent_per_step * selected_steps_f)
+
+        # td_discount: per-sample gamma^(exponent_per_step * td_n), varies by fps.
+        # When td_n is None (MC), this is a placeholder (gamma^0 = 1.0) and is never used.
+        td_n = self.td_n if self.td_n is not None else 0
+        frame["td_discount"] = tf.pow(self.discount, exponent_per_step * tf.cast(td_n, tf.float32))
 
         # termination / reward
         if self.td_n is not None:
             termination = selected_steps < self.td_n
-            td_reward = tf.pow(self.discount, selected_steps_f)
+            td_reward = tf.pow(self.discount, exponent_per_step * selected_steps_f)
             frame["termination"] = termination
             frame["reward"] = tf.where(termination, td_reward, 0.0)
         else:
@@ -414,13 +435,26 @@ class MainTransform:
             frame["next_image_mask"] = next_imgs["masks"]
 
         # Pass through metadata (subtask_1..5 needed for validation extras in PostBatchTransform)
-        for key in ["episode_index", "_frame_index", "_traj_index", "repo_index",
+        for key in ["episode_index", "_frame_index", "_traj_index",
+                    "repo_id", "fps",
                     "subtask_1", "subtask_2", "subtask_3", "subtask_4", "subtask_5"]:
             if key in raw_frame:
                 frame[key] = raw_frame[key]
 
         # Sample subtask, select scalar steps_to_subtask_end, compute reward keys
         self._sample_subtask_and_compute_rewards(frame, raw_frame)
+
+        # For fps=30: action_horizon is specified for 50fps, so last 2/5 of the chunk is always invalid.
+        # The remaining 3/5 receives the usual subtask-based masking.
+        is_30fps = tf.equal(tf.cast(raw_frame["fps"], tf.int32), 30)
+        action_horizon_len = tf.shape(frame["action_mask"])[0]
+        num_valid_30fps = 3 * action_horizon_len // 5
+        fps_mask_30 = tf.sequence_mask(num_valid_30fps, action_horizon_len)
+        frame["action_mask"] = tf.where(is_30fps, tf.logical_and(frame["action_mask"], fps_mask_30), frame["action_mask"])
+        frame["next_action_mask"] = tf.where(is_30fps, tf.logical_and(frame["next_action_mask"], fps_mask_30), frame["next_action_mask"])
+
+        if self.split != "val":
+            frame.pop("repo_id", None)
 
         return frame
 
@@ -640,14 +674,14 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
     builder = tfds.builder(config.dataset_name, data_dir=config.data_dir)
     dataset = dl.DLataset.from_rlds(builder, split=config.split, shuffle=True, num_parallel_reads=8)
 
-    def _drop_episode_metadata(episode: Any) -> Any:
-        if isinstance(episode, dict):
-            if "steps" in episode:
-                return {"steps": episode["steps"]}
-            return {k: v for k, v in episode.items() if k not in ("traj_metadata", "episode_metadata")}
+    def _drop_traj_metadata(episode: Any) -> Any:
+        metadata = episode["traj_metadata"]["episode_metadata"]
+        episode["repo_id"] = metadata["repo_id"]
+        episode["fps"] = metadata["fps"]
+        del episode["traj_metadata"]
         return episode
 
-    dataset = dataset.map(_drop_episode_metadata)
+    dataset = dataset.map(_drop_traj_metadata)
 
     if config.repeat:
         dataset = dataset.repeat()
@@ -677,6 +711,7 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
             discount=config.discount,
             td_n=config.td_n,
             split=config.split,
+            mask_50fps=config.mask_50fps,
         ).map
     )
 

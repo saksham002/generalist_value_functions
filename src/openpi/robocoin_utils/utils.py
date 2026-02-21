@@ -150,10 +150,11 @@ def count_subtask_segments(frames: list[dict], prefix: str = "") -> tuple[int, i
         if hasattr(st, "item"):
             st = st.item()
         if st != prev:
-            count += 1
-            segments.append(st)
-            if prev is not None:
-                boundaries.append(i)
+            if st != "null":
+                count += 1
+                segments.append(st)
+                if prev is not None:
+                    boundaries.append(i)
             prev = st
     split_frame_idx = boundaries[count // 2 - 1] if boundaries else len(frames) // 2
     return count, split_frame_idx, segments

@@ -39,6 +39,7 @@ class Transition:
     mc_return: at.Float[at.Array, "*b"]
     termination: at.Bool[at.Array, "*b"]
     truncation: at.Bool[at.Array, "*b"]
+    td_discount: at.Float[at.Array, "*b"] | None
 
     @classmethod
     def from_batch(cls, batch: dict) -> "Transition":
@@ -80,6 +81,7 @@ class Transition:
             mc_return=jnp.asarray(batch["mc_return"]),
             termination=jnp.asarray(batch["termination"]),
             truncation=jnp.asarray(batch["truncation"]),
+            td_discount=jnp.asarray(batch["td_discount"]) if "td_discount" in batch else None,
         )
 
 
@@ -99,6 +101,7 @@ class MultiTransition:
     mc_return: at.Float[at.Array, "*b n"]
     termination: at.Bool[at.Array, "*b n"]
     truncation: at.Bool[at.Array, "*b n"]
+    td_discount: at.Float[at.Array, "*b n"] | None
 
     @classmethod
     def from_batch(cls, batch: dict) -> "MultiTransition":
@@ -140,6 +143,7 @@ class MultiTransition:
             mc_return=jnp.asarray(batch["mc_return"]),
             termination=jnp.asarray(batch["termination"]),
             truncation=jnp.asarray(batch["truncation"]),
+            td_discount=jnp.asarray(batch["td_discount"]) if "td_discount" in batch else None,
         )
 
 

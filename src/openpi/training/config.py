@@ -843,6 +843,9 @@ class RoboCOINDataConfig(DataConfigFactory):
     # If set, filter out frames where the sampled subtask's steps_to_subtask_end < filter_n
     filter_n: int | None = None
 
+    # If True, mask out 50fps samples (loss_mask = False for fps != 30)
+    mask_50fps: bool = False
+
     # Override repo_id from parent - not used for RoboCOIN
     repo_id: str = "robocoin"
 
@@ -1135,6 +1138,7 @@ class RoboCOINDataConfig(DataConfigFactory):
             use_eef=self.use_eef,
             action_horizon=self.action_horizon,
             filter_n=self.filter_n,
+            mask_50fps=self.mask_50fps,
         )
 
 
@@ -1229,6 +1233,8 @@ class TrainConfig:
     plot_interval: int = 50000
     # Number of validation trajectories to use for plotting.
     num_val_trajectories: int = 5
+    # Repo IDs guaranteed to appear in validation plots. Must have length < num_val_trajectories.
+    include_repos: tuple[str, ...] = ()
     # Optional directory to cache validation episodes. If not set, it defaults to {checkpoint_dir}/val_episodes.
     validation_cache_dir: str | None = None
     # Checkpoints matching step % keep_period == 0 will be preserved.
@@ -2655,26 +2661,26 @@ _CONFIGS = [
             head_config=_heads.RegressionHeadConfig(),
         ),
         data=RoboCOINDataConfig(
-            tfds_data_dir="/data/group_data/rl/saksham3/",
+            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
             dataset_name="robocoin:1.0.0",
-            discount=0.99,
+            discount=0.999,
             local_shuffle_buffer_size=50000,
-            # norm_stats_path="/data/group_data/rl/saksham3/robocoin/norm_stats/norm_stats.json",
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json"
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=5_000,
-        batch_size=16,
+        num_train_steps=120_000,
+        batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
             peak_lr=1e-5,
-            decay_steps=30_000,
+            decay_steps=120_000,
             decay_lr=1e-6,
         ),
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,  # DLIMP handles its own parallelism
         log_interval=100,
-        plot_interval=100_000,
-        save_interval=100_000,
+        plot_interval=200_000,
+        save_interval=200_000,
         fsdp_devices=16,
         # wandb_enabled=False,
         validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache/",
@@ -2955,7 +2961,7 @@ _CONFIGS = [
         fsdp_devices=16,
         validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache_counterfactual/",
     ),
-    # RoboCOIN V(s) with MC HL-Gauss, EEF state, bimanual dataset.
+    # RoboCOIN V(s) with MC regression, EEF state, bimanual dataset.
     TrainConfig(
         name="robocoin_bimanual_paligemma_v_mc",
         model=_value_function.MCValueFunctionConfig(
@@ -2966,36 +2972,115 @@ _CONFIGS = [
                 freeze_backbone=False,
                 max_token_len=48,
             ),
-            head_config=_heads.CategoricalHeadConfig(
-                v_min=0.0,
-                v_max=1.0,
-                num_bins=51,
-                sigma=0.015,
-            ),
+            head_config=_heads.RegressionHeadConfig(),
         ),
         data=RoboCOINDataConfig(
             tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin_bimanual:1.0.0",
+            dataset_name="robocoin:1.0.0",
             norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
-            discount=0.99,
+            discount=0.999,
             use_eef=True,
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=86_000,
+        num_train_steps=120_000,
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
             peak_lr=1e-5,
-            decay_steps=86_000,
+            decay_steps=120_000,
             decay_lr=1e-6,
         ),
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,
         log_interval=100,
-        plot_interval=5_000,
-        save_interval=5_000,
+        plot_interval=10_000,
+        save_interval=10_000,
         fsdp_devices=16,
-        num_val_trajectories=24,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache/",
+    ),
+    # RoboCOIN V(s) with MC regression, EEF state, bimanual dataset, 50fps masked out.
+    TrainConfig(
+        name="robocoin_bimanual_paligemma_v_mc_mask50fps",
+        model=_value_function.MCValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(224, 224),
+                freeze_backbone=False,
+                max_token_len=48,
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            dataset_name="robocoin:1.0.0",
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
+            discount=0.999,
+            use_eef=True,
+            mask_50fps=True,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=120_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=120_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=10_000,
+        save_interval=10_000,
+        fsdp_devices=16,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache/",
+    ),
+    # RoboCOIN V(s) with MC one-hot cross-entropy loss, EEF state, bimanual dataset.
+    TrainConfig(
+        name="robocoin_bimanual_paligemma_v_mc_one_hot",
+        model=_value_function.MCValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(224, 224),
+                freeze_backbone=False,
+                max_token_len=48,
+            ),
+            head_config=_heads.CrossEntropyHeadConfig(
+                v_min=0.0,
+                v_max=1.0,
+                num_bins=101,
+            ),
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            dataset_name="robocoin:1.0.0",
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
+            discount=0.999,
+            use_eef=True,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=230_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=10_000,
+        save_interval=10_000,
+        fsdp_devices=16,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning"),
         validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache/",
     ),
     # RoboCOIN TD-15 value function config (regression loss).
@@ -3038,8 +3123,8 @@ _CONFIGS = [
     # RoboCOIN Q(s,a) SARSA with bimanual dataset. filter_n = td_n + 1 so that
     # terminal action_diff (a[t+1] - a[t] where t+1 is beyond subtask end) is not used.
     TrainConfig(
-        name="robocoin_bimanual_paligemma_q_sarsa",
-        model=_value_function.SARSAValueFunctionConfig(
+        name="robocoin_bimanual_paligemma_q_mc",
+        model=_value_function.MCValueFunctionConfig(
             network_config=_paligemma_network.PaliGemmaNetworkConfig(
                 state_dim=14,
                 num_cameras=3,
@@ -3053,35 +3138,36 @@ _CONFIGS = [
             head_config=_heads.CategoricalHeadConfig(
                 v_min=0.0,
                 v_max=1.0,
-                num_bins=51,
-                sigma=0.015,
+                num_bins=101,
+                sigma=0.0075,  # 0.75 * bin_width (bin_width = 1/100 = 0.01)
             ),
-            discount=0.99**15,
         ),
         data=RoboCOINDataConfig(
             tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin_bimanual:1.0.0",
+            dataset_name="robocoin:1.0.0",
             norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
-            discount=0.99,
+            discount=0.999,
             td_n=15,
             use_eef=True,
             action_horizon=15,
             filter_n=16,
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=86_000,
+        num_train_steps=230_000,
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
             peak_lr=1e-5,
-            decay_steps=86_000,
+            decay_steps=230_000,
             decay_lr=1e-6,
         ),
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,
         log_interval=100,
-        plot_interval=5_000,
+        plot_interval=10_000,
         fsdp_devices=16,
+        num_val_trajectories=24,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning"),
         validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache/",
     ),
     # RoboCOIN QC value function config (regression loss).

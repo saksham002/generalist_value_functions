@@ -117,10 +117,11 @@ def sarsa_objective(
     Args:
         network: Online value network.
         head: Online value head.
-        transition: Transition or MultiTransition.
+        transition: Transition or MultiTransition. If transition.td_discount is set
+            (per-sample discount from the dataloader), it takes precedence over discount.
         target_network: Target network for stable target computation.
         target_head: Target head.
-        discount: Discount factor gamma.
+        discount: Fallback discount factor used when transition.td_discount is None.
         rng: Optional random key for stochastic operations (e.g., image augmentation).
 
     Returns:
@@ -130,8 +131,9 @@ def sarsa_objective(
     target_features = target_network.compute_features(transition.next_observation, transition.next_action)
     target_value = target_head(target_features)
 
+    effective_discount = transition.td_discount if transition.td_discount is not None else discount
     not_done = 1.0 - transition.termination.astype(jnp.float32)
-    target = transition.reward + discount * not_done * target_value
+    target = transition.reward + effective_discount * not_done * target_value
     target = jax.lax.stop_gradient(target)
 
     action = transition.action if network.action_conditioned else None
