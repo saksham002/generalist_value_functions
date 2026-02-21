@@ -1976,7 +1976,7 @@ def main(config: _config.TrainConfig):
                 _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step)
             
         # Generate validation plots (all workers participate for FSDP, only worker 0 creates plots/logs)
-        if (step + 1) % config.plot_interval == 0 or step == 0:
+        if (step + 1) % config.plot_interval == 0:
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
