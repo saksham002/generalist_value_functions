@@ -156,7 +156,7 @@ def count_subtask_segments(frames: list[dict], prefix: str = "") -> tuple[int, i
         if hasattr(st, "item"):
             st = st.item()
         if st != prev:
-            if st != "null":
+            if st.lower() not in ("null", "static", "abnormal"):
                 count += 1
                 segments.append(st)
                 if prev is not None:
@@ -301,11 +301,15 @@ def predict_values(
     all_frames: list[tuple],
     ep_mc_returns: dict,
     action_conditioned: bool,
-) -> tuple[dict[str, list[float]], dict[str, list[float]], dict[str, list[float]]]:
+) -> tuple[dict[str, list[float]], dict[str, list[float]], dict[str, list[float]], dict[str, list[np.ndarray]]]:
     """Run batched value function inference on collected validation frames.
 
     Performs three forward passes per batch where applicable: default prompt,
     negative (counterfactual) prompt, and mirrored demonstration.
+
+    When the network's compute_value returns (val, attn_scores) (e.g. PaliGemma at
+    inference), attention scores are collected alongside predictions and returned as
+    the fourth element. Otherwise the fourth element is an empty dict.
 
     Args:
         model: The value function model.
@@ -314,8 +318,7 @@ def predict_values(
         action_conditioned: Whether the model expects actions as input.
 
     Returns:
-        Tuple of (all_predictions, all_predictions_neg, all_predictions_mirror), each a dict
-        mapping traj_idx -> list of predicted float values in frame order.
+        Tuple of (all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores).
     """
     @nnx.jit
     def jitted_compute_value(
@@ -329,6 +332,7 @@ def predict_values(
     all_predictions: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_predictions_neg: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_predictions_mirror: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
+    all_attn_scores: dict[str, list[np.ndarray]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
 
     for batch_start in range(0, len(all_frames), BATCH_SIZE):
         batch_end = min(batch_start + BATCH_SIZE, len(all_frames))
@@ -346,20 +350,21 @@ def predict_values(
             if obs.tokenized_prompt is not None:
                 logging.info(f"  Batch obs.tokenized_prompt: shape={obs.tokenized_prompt.shape}")
 
-        pred_values_np = jax.device_get(jitted_compute_value(model, obs, act))
+        pred_values_np, attn_np = jax.device_get(jitted_compute_value(model, obs, act))
 
         pred_values_neg_np = None
         if "tokenized_negative_prompt" in frame_dicts[0]:
             obs_neg, act_neg = get_obs_and_action(frame_dicts, prefix="negative_", action_conditioned=action_conditioned)
-            pred_values_neg_np = jax.device_get(jitted_compute_value(model, obs_neg, act_neg))
+            pred_values_neg_np, _ = jax.device_get(jitted_compute_value(model, obs_neg, act_neg))
 
         pred_values_mirror_np = None
         if "mirror_state" in frame_dicts[0]:
             obs_mirror, act_mirror = get_obs_and_action(frame_dicts, prefix="mirror_", action_conditioned=action_conditioned)
-            pred_values_mirror_np = jax.device_get(jitted_compute_value(model, obs_mirror, act_mirror))
+            pred_values_mirror_np, _ = jax.device_get(jitted_compute_value(model, obs_mirror, act_mirror))
 
         for i, (ep_idx, _, _) in enumerate(batch_frames):
             all_predictions[ep_idx].append(float(pred_values_np[i]))
+            all_attn_scores[ep_idx].append(attn_np[i])
             if pred_values_neg_np is not None:
                 all_predictions_neg[ep_idx].append(float(pred_values_neg_np[i]))
             if pred_values_mirror_np is not None:
@@ -368,4 +373,4 @@ def predict_values(
     total_predictions = sum(len(preds) for preds in all_predictions.values())
     logging.info(f"Computed {total_predictions} predictions")
 
-    return all_predictions, all_predictions_neg, all_predictions_mirror
+    return all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores

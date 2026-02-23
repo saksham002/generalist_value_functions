@@ -771,8 +771,8 @@ def create_robocoin_data_loader(
     local_batch_size = batch_size // process_count
     
     if process_count > 1:
-        # Set TensorFlow random seed per host for data diversity (as in pali-parl)
-        tf.random.set_seed(jax.process_index())
+        # Set TensorFlow random seed per host
+        tf.random.set_seed(seed + jax.process_index())
         logging.info(
             f"Distributed training: {process_count} hosts, "
             f"local_batch_size={local_batch_size} (global={batch_size}), "
@@ -785,7 +785,7 @@ def create_robocoin_data_loader(
         robocoin_config,
         batch_size=local_batch_size,
         shuffle=shuffle,
-        seed=seed + jax.process_index(),  # Different seed per host for data diversity
+        seed=seed + jax.process_index(),  # Different seed per host
         state_norm_stats=data_config.norm_stats,
         use_quantile_norm=data_config.use_quantile_norm,
     )

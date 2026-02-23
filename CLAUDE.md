@@ -16,6 +16,9 @@ The repository supports both JAX and PyTorch implementations, with JAX being the
 
 ### Environment Setup
 ```bash
+# Activate the project virtualenv (required before running Python directly)
+source /data/user_data/saksham3/vla/bin/activate
+
 # Install dependencies (uses uv package manager)
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
@@ -246,6 +249,12 @@ Standardized data format using typed dataclasses:
 - Two variants: regression (MSE) and categorical (HL-Gauss)
 - Used for offline RL experiments on D4RL/Minari datasets
 
+## Backward Compatibility
+
+This repository is used by multiple people and supports non-RoboCOIN configs (e.g., D4RL, LIBERO, ALOHA). All changes must remain backward compatible:
+- New batch keys introduced by RoboCOIN-specific data pipelines must be optional (e.g., use `.get()` or check for key presence) in shared training/model code so that other configs continue to work without modification.
+- Do not require new fields in shared dataclasses (e.g., `Transition`, `MultiTransition`) to be non-None for non-RoboCOIN pipelines.
+
 ## Code Style and Quality Conventions
 
 ### General Code Style
@@ -403,3 +412,23 @@ If the user asks to run on the cluster (e.g., for GPU access, legacy D4RL with m
    - Need to install `cython<3` for mujoco-py compatibility: `uv pip install "cython<3"`
    - Install d4rl dependencies: `uv pip install gym==0.23.1 && uv pip install "d4rl @ git+https://github.com/Farama-Foundation/D4RL.git" --no-deps && uv pip install "mujoco-py<2.2,>=2.1"`
    - A pre-compiled mujoco_py .so file exists in the `parl` conda env and can be copied if build fails
+
+### Running on TPU Pods
+When setting up a new TPU pod, refer to `TPU_GUIDE.md` for important setup steps (GCS authentication, NFS permissions).
+
+**CRITICAL**: Never modify or delete files on a TPU pod. If a user request seems to involve modifying or deleting files on a TPU pod, ask for explicit confirmation before even requesting permission to run the involved commands.
+
+#### Checking if a TPU pod is free
+To check whether any worker is actively using the TPU accelerator:
+```bash
+gcloud compute tpus tpu-vm ssh <pod-name> --zone=europe-west4-b --worker=all --command="sudo lsof -w /dev/accel0 2>/dev/null; echo exit_\$?"
+```
+If all workers print only `exit_0` with no other output, the pod is free.
+
+#### Stale TPU lockfile
+JAX acquires `/tmp/libtpu_lockfile` on TPU init. If a job crashes without cleanup, the lockfile remains and blocks subsequent runs. To fix:
+1. Confirm the pod is truly free using the `lsof` command above.
+2. Delete the lockfile on all workers:
+```bash
+gcloud compute tpus tpu-vm ssh <pod-name> --zone=europe-west4-b --worker=all --command="sudo rm -f /tmp/libtpu_lockfile"
+```

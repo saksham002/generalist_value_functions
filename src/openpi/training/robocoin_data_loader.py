@@ -95,6 +95,7 @@ class RoboCOINDataLoaderConfig:
     action_horizon: int = DEFAULT_ACTION_HORIZON
     filter_n: int | None = None
     mask_50fps: bool = False
+    dont_mask_actions: bool = False
 
 
 # =============================================================================
@@ -133,17 +134,12 @@ class AddTrajectoryKeys:
         ep_len = episode["_len"][0]
         frame_indices = episode["_frame_index"]
 
-        # Validate required keys
-        if "observation/state" not in episode:
-            raise ValueError("Missing required key 'observation/state' in episode")
         state = episode["observation/state"]
-        action = episode["action_diff"]
+        action = episode["action"]
 
         if self.use_eef:
-            if "eef_sim_pose_state" not in episode:
-                raise ValueError("use_eef=True but 'eef_sim_pose_state' not found in episode")
             eef_state = episode["eef_sim_pose_state"]
-            eef_action = episode["eef_sim_pose_action_diff"]
+            eef_action = episode["eef_sim_pose_action"]
         
         cam_keys = [f"observation/image/cam_{i}" for i in range(self.max_cameras)]
 
@@ -379,6 +375,15 @@ class MainTransform:
         if self.mask_50fps:
             loss_mask = tf.logical_and(loss_mask, tf.equal(tf.cast(raw_frame["fps"], tf.int32), 30))
 
+        texts = tf.stack([raw_frame[f"subtask_{i}"] for i in range(1, 6)])
+        sampled_text = texts[sampled_idx]
+        sampled_text_lower = tf.strings.lower(sampled_text)
+        is_static_or_abnormal = tf.logical_or(
+            tf.equal(sampled_text_lower, b"static"),
+            tf.equal(sampled_text_lower, b"abnormal"),
+        )
+        loss_mask = tf.logical_and(loss_mask, tf.logical_not(is_static_or_abnormal))
+
         frame["steps_to_subtask_end"] = selected_steps
         frame["sampled_index"] = sampled_idx
         frame["loss_mask"] = loss_mask
@@ -388,9 +393,7 @@ class MainTransform:
         frame["action_mask"] = frame["action_mask"][sampled_idx]
         frame["next_action_mask"] = frame["next_action_mask"][sampled_idx]
 
-        # Select subtask text
-        texts = tf.stack([raw_frame[f"subtask_{i}"] for i in range(1, 6)])
-        frame["subtask_text"] = texts[sampled_idx]
+        frame["subtask_text"] = sampled_text
 
         # TODO: make fps->exponent_per_step and fps->valid_action_fraction mappings configurable
         fps = tf.cast(raw_frame["fps"], tf.int32)
@@ -399,14 +402,15 @@ class MainTransform:
         # mc_return: gamma^(exponent_per_step * steps) so that the exponent is proportional to real time
         frame["mc_return"] = tf.pow(self.discount, exponent_per_step * selected_steps_f)
 
-        # td_discount: per-sample gamma^(exponent_per_step * td_n), varies by fps.
+        # td_discount: gamma^(3 * td_n) — td_n is in 50fps steps.
         # When td_n is None (MC), this is a placeholder (gamma^0 = 1.0) and is never used.
         td_n = self.td_n if self.td_n is not None else 0
-        frame["td_discount"] = tf.pow(self.discount, exponent_per_step * tf.cast(td_n, tf.float32))
+        frame["td_discount"] = tf.pow(self.discount, 3.0 * tf.cast(td_n, tf.float32))
 
         # termination / reward
         if self.td_n is not None:
-            termination = selected_steps < self.td_n
+            td_n_native = tf.where(tf.equal(fps, 30), 3 * td_n // 5, td_n)
+            termination = selected_steps < td_n_native
             td_reward = tf.pow(self.discount, exponent_per_step * selected_steps_f)
             frame["termination"] = termination
             frame["reward"] = tf.where(termination, td_reward, 0.0)
@@ -465,13 +469,16 @@ class MainTransform:
 
 
 class FilterLastN:
-    """Filter out frames where steps_to_subtask_end < filter_n."""
+    """Filter out frames where steps_to_subtask_end < filter_n (specified in 50fps steps)."""
 
     def __init__(self, filter_n: int):
+        assert filter_n % 5 == 0, f"filter_n must be a multiple of 5, got {filter_n}"
         self.filter_n = filter_n
 
     def filter(self, frame: dict[str, Any]) -> tf.Tensor:
-        return frame["steps_to_subtask_end"] >= self.filter_n
+        fps = tf.cast(frame["fps"], tf.int32)
+        filter_n_native = tf.where(tf.equal(fps, 30), 3 * self.filter_n // 5, self.filter_n)
+        return frame["steps_to_subtask_end"] >= filter_n_native
 
 
 # =============================================================================
@@ -489,14 +496,19 @@ class PostBatchTransform:
         use_quantile_norm: bool = False,
         use_eef: bool = False,
         split: str = "train",
+        dont_mask_actions: bool = False,
     ):
         self.use_eef = use_eef
         self.split = split
+        self.dont_mask_actions = dont_mask_actions
 
         self._tokenizer: PaligemmaTokenizer | None = None
         self._max_token_len = max_token_len
 
         self._normalize_fn = _transforms.Normalize(state_norm_stats, use_quantiles=use_quantile_norm)
+
+        if dont_mask_actions:
+            self._rng = np.random.default_rng(seed=86)
 
     @property
     def tokenizer(self) -> PaligemmaTokenizer:
@@ -507,7 +519,7 @@ class PostBatchTransform:
     @staticmethod
     def _generate_negative_subtask_text(subtask_text: str) -> str:
         if "Place the plate" in subtask_text:
-            return "Place the plate on the table"
+            return "Place the plate on the dish rack"
         if "Grab the knife" in subtask_text:
             return "Grab the banana with your right hand"
         if "Place the knife" in subtask_text:
@@ -600,6 +612,9 @@ class PostBatchTransform:
             if key in batch:
                 batch[key] = np.clip(batch[key], -5.0, 5.0)
 
+        if self.dont_mask_actions:
+            self._replace_masked_actions(batch)
+
         # Mirror state/actions after normalization (for counterfactual validation)
         if "mirror_image" in batch:
             batch_state = batch.get("state")
@@ -610,6 +625,31 @@ class PostBatchTransform:
                 batch["mirror_actions"] = self._mirror_14d_array(batch_actions)
 
         return batch
+
+    def _replace_masked_actions(self, batch: dict) -> None:
+        """Replace subtask-masked action positions with last valid action plus standard normal noise.
+
+        Sets action_mask to all True after replacement.
+        """
+        actions = batch["actions"].copy()  # [B, H, D]
+        action_mask = batch["action_mask"].copy()  # [B, H]
+        batch_size, action_horizon, _ = actions.shape
+
+        # Index of last True per row: [B]
+        last_valid_idx = action_mask.sum(axis=-1) - 1
+        # Last valid action per sample: [B, D]
+        last_valid_actions = actions[np.arange(batch_size), last_valid_idx]
+
+        noise = (0.005 * self._rng.standard_normal(actions.shape)).astype(actions.dtype)
+        replacement = last_valid_actions[:, None, :] + noise  # [B, H, D]
+
+        mask_to_replace = ~action_mask  # [B, H]
+        actions[mask_to_replace] = replacement[mask_to_replace]
+        batch["actions"] = actions
+
+        action_mask[:] = True
+        action_mask[batch["fps"] == 30, 3 * action_horizon // 5 :] = False
+        batch["action_mask"] = action_mask
 
     def _process_validation_extras(self, batch: dict, batch_size: int) -> None:
         subtask_1_texts = [self._decode_text(batch["subtask_1"][i]) for i in range(batch_size)]
@@ -731,6 +771,7 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
         use_quantile_norm=config.use_quantile_norm,
         use_eef=config.use_eef,
         split=config.split,
+        dont_mask_actions=config.dont_mask_actions and config.split != "val",
     )
 
     # Wrap iterator to apply post-batch transform
@@ -802,3 +843,4 @@ class RoboCOINDataLoader:
                 yield jax.tree.map(
                     self._to_sharded_array_or_passthrough, batch
                 )
+

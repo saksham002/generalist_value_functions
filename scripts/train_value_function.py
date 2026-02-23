@@ -1411,10 +1411,39 @@ def _compute_oracle_ranking_metrics(
 _render_thread: threading.Thread | None = None
 
 
+def _create_attn_plot(
+    attn_scores: list[np.ndarray],
+    ep_idx: int,
+    step: int,
+    repo_id: str,
+    action_conditioned: bool,
+) -> "wandb.Image":
+    """Create a line plot of per-modality CLS attention scores over time."""
+    scores = np.stack(attn_scores, axis=0)  # [T, n_modalities]
+    timesteps = np.arange(len(scores))
+    labels = [f"img{i+1}" for i in range(3)] + ["text", "state"]
+    if action_conditioned:
+        labels.append("action")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for i, label in enumerate(labels):
+        ax.plot(timesteps, scores[:, i], label=label)
+    ax.set_xlabel("Timestep", fontsize=12)
+    ax.set_ylabel("Mean Attention Scores", fontsize=12)
+    ax.set_title(f"Episode {ep_idx} - Step {step} - CLS Attention ({repo_id})", fontsize=12)
+    ax.legend(loc="upper right", fontsize=10)
+    ax.grid(visible=True, alpha=0.3)
+    plt.tight_layout()
+    img = wandb.Image(fig)
+    plt.close(fig)
+    return img
+
+
 def _render_and_log_plots(
     all_predictions: dict,
     all_predictions_neg: dict,
     all_predictions_mirror: dict,
+    all_attn_scores: dict,
     ep_mc_returns: dict,
     ep_loss_masks: dict,
     ep_frame_images: dict,
@@ -1423,6 +1452,7 @@ def _render_and_log_plots(
     ep_negative_subtasks: dict,
     ep_mirror_subtasks: dict,
     traj_to_repo_ep: dict,
+    action_conditioned: bool,
     step: int,
 ) -> None:
     images = {}
@@ -1460,6 +1490,13 @@ def _render_and_log_plots(
             fps = ep_fps[traj_idx],
         )
         logging.info(f"Repo {repo_id}, episode {ep_idx} plot created")
+
+        attn_scores = all_attn_scores.get(traj_idx, [])
+        filtered_attn = [s for s, mask in zip(attn_scores, loss_masks) if mask]
+        if len(filtered_attn) == len(filtered_mc_returns) and len(filtered_attn) > 0:
+            images[f"{plot_key}_attn"] = _create_attn_plot(
+                filtered_attn, ep_idx, step, repo_id.removeprefix("RoboCOIN/"), action_conditioned
+            )
 
         negative_subtasks = ep_negative_subtasks.get(traj_idx)
         predicted_values_neg = all_predictions_neg.get(traj_idx, [])
@@ -1617,7 +1654,7 @@ def generate_validation_plots_dlimp(
 
     logging.info(f"Processing {len(all_frames)} total frames across {len(ep_mc_returns)} episodes in batches of 64")
 
-    all_predictions, all_predictions_neg, all_predictions_mirror = predict_values(
+    all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores = predict_values(
         model, all_frames, ep_mc_returns, action_conditioned
     )
 
@@ -1629,10 +1666,10 @@ def generate_validation_plots_dlimp(
         _render_thread = threading.Thread(
             target = _render_and_log_plots,
             args = (
-                all_predictions, all_predictions_neg, all_predictions_mirror,
+                all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores,
                 ep_mc_returns, ep_loss_masks, ep_frame_images, ep_fps,
                 ep_subtasks, ep_negative_subtasks, ep_mirror_subtasks,
-                traj_to_repo_ep, step,
+                traj_to_repo_ep, action_conditioned, step,
             ),
             daemon = True,
         )
@@ -1762,24 +1799,13 @@ def main(config: _config.TrainConfig):
         if jax.process_index() == 0:
             logging.info("Worker 0: Collecting validation episodes for caching")
             
-            val_loader_config = RoboCOINDataLoaderConfig(
-                data_dir=robocoin_config.data_dir,
-                dataset_name=robocoin_config.dataset_name,
+            import dataclasses as dc
+            val_loader_config = dc.replace(
+                robocoin_config,
                 split="val",
-                batch_size=256,  # Full batch size for single host
+                batch_size=256,
                 shuffle=False,
                 repeat=False,
-                seed=config.seed,
-                max_cameras=robocoin_config.max_cameras,
-                max_state_dim=robocoin_config.max_state_dim,
-                max_action_dim=robocoin_config.max_action_dim,
-                image_size=robocoin_config.image_size,
-                discount=robocoin_config.discount,
-                td_n=robocoin_config.td_n,
-                state_norm_stats=data_config.norm_stats,
-                use_quantile_norm=data_config.use_quantile_norm,
-                use_eef=robocoin_config.use_eef,
-                action_horizon=robocoin_config.action_horizon,
             )
             val_dataloader = create_robocoin_data_loader(val_loader_config)
             
@@ -1976,7 +2002,7 @@ def main(config: _config.TrainConfig):
                 _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step)
             
         # Generate validation plots (all workers participate for FSDP, only worker 0 creates plots/logs)
-        if (step + 1) % config.plot_interval == 0:
+        if (step + 1) % config.plot_interval == 0 or step + 1 == config.num_train_steps:
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
@@ -2009,7 +2035,7 @@ def main(config: _config.TrainConfig):
                             logging.warning(f"No validation plots generated at step {step}")
             
         # Policy evaluation (only on worker 0)
-        if eval_enabled and (step + 1) % config.eval_interval == 0:
+        if eval_enabled and ((step + 1) % config.eval_interval == 0 or step + 1 == config.num_train_steps):
             with timer.context("policy_eval"):
                 policy_model = nnx.merge(policy_state.model_def, policy_state.params)
 
@@ -2100,6 +2126,10 @@ def main(config: _config.TrainConfig):
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+
+    if _render_thread is not None and _render_thread.is_alive():
+        logging.info("Waiting for render thread to finish")
+        _render_thread.join()
 
 
 if __name__ == "__main__":

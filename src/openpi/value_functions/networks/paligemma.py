@@ -343,7 +343,7 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         action: _model.Actions | None = None,
         *,
         rng: at.KeyArrayLike | None = None,
-    ) -> at.Float[at.Array, "*b feature_dim"]:
+    ) -> at.Float[at.Array, "*b feature_dim"] | tuple[at.Float[at.Array, "*b feature_dim"], at.Float[at.Array, "*b _n"]]:
         """Compute features from observation (and optionally action) for value prediction.
 
         Args:
@@ -357,7 +357,10 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
                  enables augmentation during training.
 
         Returns:
-            Features of shape [batch, embed_dim] (CLS token embedding after LLM).
+            When rng is not None (training): features of shape [batch, embed_dim].
+            When rng is None (inference): (features, attn_scores) where attn_scores is
+                [batch, n_modalities] = mean over Gemma layers of CLS attention, grouped
+                by modality (img1..imgN, text, state, [actions if Q]).
         """
         # Preprocess observation (handles resizing, default masks, augmentation)
         # train=True enables augmentation when rng is provided
@@ -384,15 +387,53 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         # ar_mask is [0...0, 1, 1, ...] where state, actions, and CLS are causal
         attn_mask = make_attn_mask(input_mask, ar_mask)
 
-        # Forward through LLM (single expert, no adarms)
-        (output,), _ = self.PaliGemma.llm(
+        if train:
+            # Forward through LLM (single expert, no adarms)
+            (output,), _ = self.PaliGemma.llm(
+                [tokens],
+                mask=attn_mask,
+                positions=positions,
+                adarms_cond=[None],
+            )
+            # Extract CLS token output (last position) for value prediction
+            cls_features = output[:, -1, :]  # [B, embed_dim]
+            return cls_features
+
+        # Inference: also return per-modality CLS attention scores
+        (output,), _, all_cls_attn = self.PaliGemma.llm(
             [tokens],
             mask=attn_mask,
             positions=positions,
             adarms_cond=[None],
+            return_cls_attention_score_distribution=True,
         )
-
-        # Extract CLS token output (last position) for value prediction
         cls_features = output[:, -1, :]  # [B, embed_dim]
 
-        return cls_features
+        # all_cls_attn: [B, L, S]; mean over L -> [B, S] -> group by modality -> [B, n_modalities]
+        cls_attn_mean = all_cls_attn.mean(axis=1)
+        attn_scores = self._group_attn_scores(cls_attn_mean)
+
+        return cls_features, attn_scores
+
+    def _group_attn_scores(self, cls_attn_mean: jax.Array) -> jax.Array:
+        """Group per-position CLS attention [B, S] into per-modality scores [B, n_modalities].
+
+        Modality order: [img1, img2, ..., imgN, text, state, (actions if Q)]
+        Each image group sums over 256 patch positions; text/action groups sum over their tokens.
+        The CLS self-attention at the last sequence position is excluded from all groups.
+        """
+        img_end = self._num_cameras * NUM_PATCHES_PER_IMAGE
+        text_end = img_end + self._max_token_len
+
+        attn_parts = []
+        for i in range(self._num_cameras):
+            start = i * NUM_PATCHES_PER_IMAGE
+            end = start + NUM_PATCHES_PER_IMAGE
+            attn_parts.append(cls_attn_mean[:, start:end].sum(axis=-1))
+        attn_parts.append(cls_attn_mean[:, img_end:text_end].sum(axis=-1))  # text
+        attn_parts.append(cls_attn_mean[:, text_end])  # state (single token)
+        if self._action_conditioned:
+            action_start = text_end + 1
+            attn_parts.append(cls_attn_mean[:, action_start:action_start + self._action_horizon].sum(axis=-1))
+
+        return jnp.stack(attn_parts, axis=-1)

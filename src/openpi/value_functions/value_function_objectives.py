@@ -127,8 +127,10 @@ def sarsa_objective(
     Returns:
         Tuple of (per_sample_loss, info_dict).
     """
-    # Target network doesn't need augmentation (no gradient flow)
-    target_features = target_network.compute_features(transition.next_observation, transition.next_action)
+    # Target network doesn't need augmentation (no gradient flow).
+    # PaliGemma returns (features, attn_scores) when rng=None; unwrap if so.
+    target_out = target_network.compute_features(transition.next_observation, transition.next_action)
+    target_features = target_out[0] if isinstance(target_out, tuple) else target_out
     target_value = target_head(target_features)
 
     effective_discount = transition.td_discount if transition.td_discount is not None else discount

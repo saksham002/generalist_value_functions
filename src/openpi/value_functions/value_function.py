@@ -234,9 +234,15 @@ class ValueFunction(BaseValueFunction):
         action: _model.Actions | None = None,
         *,
         take_min_over_ensemble: bool = False,
-    ) -> at.Float[at.Array, "*b"]:
-        features = self.network.compute_features(observation, action)
-        val = self.head(features)
+    ) -> at.Float[at.Array, "*b"] | tuple[at.Float[at.Array, "*b"], at.Float[at.Array, "*b _n"]]:
+        out = self.network.compute_features(observation, action)
+        if isinstance(out, tuple):
+            features, attn_scores = out[0], out[1]
+            val = self.head(features)
+            if take_min_over_ensemble and val.ndim > 1:
+                val = jnp.min(val, axis=0)
+            return val, attn_scores
+        val = self.head(out)
         if take_min_over_ensemble and val.ndim > 1:
             val = jnp.min(val, axis=0)
         return val

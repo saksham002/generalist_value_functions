@@ -226,6 +226,8 @@ class Attention(nn.Module):
         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
 
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+        # CLS is the last query position; average over K kv-heads and G query groups -> [B, S]
+        cls_attn_row = probs[:, :, :, -1, :].mean(axis=(1, 2)).astype(jnp.float32)
 
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
@@ -246,7 +248,7 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
-        return out, (k, v)
+        return (out, (k, v)), cls_attn_row
 
 
 @at.typecheck
@@ -305,7 +307,7 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        (post_attn, kv_cache), cls_attn_row = attn(pre_attn, positions, attn_mask, kv_cache)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -330,7 +332,7 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
-        return xs, kv_cache
+        return xs, (kv_cache, cls_attn_row)
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -396,19 +398,30 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        return_cls_attention_score_distribution: bool = False,
+    ) -> (
+        tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]
+        | tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache, at.Float[at.Array, "b _l _s"]]
+    ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        # Block now returns (xs, (kv_cache, cls_attn_row)); scan stacks outputs along axis 0
+        # giving all_cls_attn shape [depth, B, S].
+        embedded, (kv_cache, all_cls_attn) = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
-        return [
+        output = [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+
+        if return_cls_attention_score_distribution:
+            # Transpose [depth, B, S] -> [B, depth, S] = [B, L, S]
+            return output, kv_cache, jnp.transpose(all_cls_attn, (1, 0, 2))
+        return output, kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
