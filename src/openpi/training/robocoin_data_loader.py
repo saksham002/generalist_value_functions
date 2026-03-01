@@ -35,7 +35,7 @@ import tensorflow as tf
 
 from openpi import transforms as _transforms
 from openpi.models.model import IMAGE_KEYS
-from openpi.models.tokenizer import PaligemmaTokenizer
+from openpi.models.tokenizer import Gemma3Tokenizer, PaligemmaTokenizer
 
 import pdb
 
@@ -497,12 +497,13 @@ class PostBatchTransform:
         use_eef: bool = False,
         split: str = "train",
         dont_mask_actions: bool = False,
+        tokenizer: PaligemmaTokenizer | Gemma3Tokenizer | None = None,
     ):
         self.use_eef = use_eef
         self.split = split
         self.dont_mask_actions = dont_mask_actions
 
-        self._tokenizer: PaligemmaTokenizer | None = None
+        self._tokenizer = tokenizer
         self._max_token_len = max_token_len
 
         self._normalize_fn = _transforms.Normalize(state_norm_stats, use_quantiles=use_quantile_norm)
@@ -511,9 +512,9 @@ class PostBatchTransform:
             self._rng = np.random.default_rng(seed=86)
 
     @property
-    def tokenizer(self) -> PaligemmaTokenizer:
+    def tokenizer(self) -> PaligemmaTokenizer | Gemma3Tokenizer:
         if self._tokenizer is None:
-            self._tokenizer = PaligemmaTokenizer(max_len=self._max_token_len)
+            self._tokenizer = PaligemmaTokenizer(max_len = self._max_token_len)
         return self._tokenizer
 
     @staticmethod
@@ -690,7 +691,10 @@ class PostBatchTransform:
 # =============================================================================
 
 
-def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[dict[str, Any]]:
+def create_robocoin_data_loader(
+    config: RoboCOINDataLoaderConfig,
+    tokenizer: PaligemmaTokenizer | Gemma3Tokenizer | None = None,
+) -> Iterator[dict[str, Any]]:
     """Create a DLIMP-based data loader for the RoboCOIN dataset.
 
     Args:
@@ -772,6 +776,7 @@ def create_robocoin_data_loader(config: RoboCOINDataLoaderConfig) -> Iterator[di
         use_eef=config.use_eef,
         split=config.split,
         dont_mask_actions=config.dont_mask_actions and config.split != "val",
+        tokenizer=tokenizer,
     )
 
     # Wrap iterator to apply post-batch transform
@@ -808,8 +813,10 @@ class RoboCOINDataLoader:
         *,
         sharding: jax.sharding.Sharding | None = None,
         num_batches: int | None = None,
+        tokenizer: PaligemmaTokenizer | Gemma3Tokenizer | None = None,
     ):
         self.config = config
+        self._tokenizer = tokenizer
         self._num_batches = num_batches if num_batches is not None else config.num_batches
 
         if sharding is None:
@@ -831,7 +838,7 @@ class RoboCOINDataLoader:
     def __iter__(self) -> Iterator[dict[str, Any]]:
         num_items = 0
         while True:
-            data_iter = create_robocoin_data_loader(self.config)
+            data_iter = create_robocoin_data_loader(self.config, tokenizer = self._tokenizer)
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
                     return

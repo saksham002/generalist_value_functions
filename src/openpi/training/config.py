@@ -837,8 +837,8 @@ class RoboCOINDataConfig(DataConfigFactory):
     # - True: min-max normalization using min/max keys (mapped to q01/q99 for quantile transform)
     use_quantile_norm: bool = False
 
-    # Number of actions in the action chunk
-    action_horizon: int = 30
+    # Maximum token length for prompt tokenization.
+    max_token_len: int = 48
 
     # If set, filter out frames where the sampled subtask's steps_to_subtask_end < filter_n
     filter_n: int | None = None
@@ -1134,13 +1134,13 @@ class RoboCOINDataConfig(DataConfigFactory):
             max_state_dim=self.max_state_dim,
             max_action_dim=self.max_action_dim,
             image_size=self.image_size,
+            max_token_len=self.max_token_len,
             discount=self.discount,
             reward_scale=self.reward_scale,
             reward_bias=self.reward_bias,
             local_shuffle_buffer_size=self.local_shuffle_buffer_size,
             td_n=self.td_n,
             use_eef=self.use_eef,
-            action_horizon=self.action_horizon,
             filter_n=self.filter_n,
             mask_50fps=self.mask_50fps,
             dont_mask_actions=self.dont_mask_actions,
@@ -1207,7 +1207,7 @@ class TrainConfig:
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     policy_lr_schedule: _optimizer.LRScheduleConfig | None = None
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
-    ema_decay: float | None = 0.99
+    ema_decay: float | None = None
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
@@ -1261,6 +1261,14 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+
+    # Backbone variant for tokenizer selection: "gemma3" uses Gemma3Tokenizer, None uses PaligemmaTokenizer.
+    backbone_variant: str | None = None
+    # Number of actions in the action chunk (used by RoboCOIN data pipeline).
+    action_horizon: int = 1
+
+    # Maximum gradient norm for clipping. None = no clipping.
+    clip_grad_norm: float | None = None
 
     # === Policy Training (Actor-Critic) ===
     # Optional policy model for actor-critic training. When set, the training script
@@ -2660,7 +2668,6 @@ _CONFIGS = [
                 state_dim=14,  # Proprioceptive state dimension for RoboCOIN
                 num_cameras=3,  # cam_0, cam_1, cam_2
                 image_size=(224, 224),
-                freeze_backbone=False,
                 max_token_len=48,  # Max tokens for subtask text
             ),
             head_config=_heads.RegressionHeadConfig(),
@@ -2673,7 +2680,7 @@ _CONFIGS = [
             norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json"
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=120_000,
+        num_train_steps=5,
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
@@ -2698,7 +2705,6 @@ _CONFIGS = [
                 state_dim=14,
                 num_cameras=3,
                 image_size=(224, 224),
-                freeze_backbone=False,
                 max_token_len=48,
             ),
             head_config=_heads.RegressionHeadConfig(),
@@ -2726,21 +2732,25 @@ _CONFIGS = [
         save_interval=10_000,
         fsdp_devices=16,
         num_val_trajectories=10,
-        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache/",
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
     ),
-    # RoboCOIN V(s) with MC regression, EEF state, bimanual dataset, 50fps masked out.
+    # RoboCOIN V(s) with MC objective and HL-Gauss head (101 bins), EEF state, bimanual dataset.
     TrainConfig(
-        name="robocoin_bimanual_paligemma_v_mc_mask50fps",
+        name="robocoin_bimanual_paligemma_v_mc_hl_gauss",
         model=_value_function.MCValueFunctionConfig(
             network_config=_paligemma_network.PaliGemmaNetworkConfig(
                 state_dim=14,
                 num_cameras=3,
                 image_size=(224, 224),
-                freeze_backbone=False,
                 max_token_len=48,
             ),
-            head_config=_heads.RegressionHeadConfig(),
+            head_config=_heads.CategoricalHeadConfig(
+                v_min=0.0,
+                v_max=1.0,
+                num_bins=101,
+                sigma=0.0075,
+            ),
         ),
         data=RoboCOINDataConfig(
             tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
@@ -2748,26 +2758,25 @@ _CONFIGS = [
             norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
             discount=0.999,
             use_eef=True,
-            mask_50fps=True,
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=120_000,
+        num_train_steps=230_000,
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
             peak_lr=1e-5,
-            decay_steps=120_000,
-            decay_lr=1e-6,
+            decay_steps=230_000,
+            decay_lr=1e-5,
         ),
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,
         log_interval=100,
-        plot_interval=10_000,
-        save_interval=10_000,
+        plot_interval=30_000,
+        save_interval=30_000,
         fsdp_devices=16,
         num_val_trajectories=10,
-        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache/",
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
     ),
     # RoboCOIN TD-15 value function config (regression loss).
     TrainConfig(
@@ -2777,7 +2786,6 @@ _CONFIGS = [
                 state_dim=14,  # Proprioceptive state dimension for RoboCOIN
                 num_cameras=3,  # cam_0, cam_1, cam_2
                 image_size=(224, 224),
-                freeze_backbone=False,
                 max_token_len=48,  # Max tokens for subtask text
             ),
             head_config=_heads.RegressionHeadConfig(),
@@ -2814,11 +2822,11 @@ _CONFIGS = [
                 state_dim=14,
                 num_cameras=3,
                 image_size=(224, 224),
-                freeze_backbone=False,
                 max_token_len=48,
                 action_conditioned=True,
                 action_dim=14,
-                action_horizon=25,
+                action_horizon=50,
+                mask_state=True,
             ),
             head_config=_heads.RegressionHeadConfig(),
         ),
@@ -2827,9 +2835,8 @@ _CONFIGS = [
             dataset_name="robocoin:1.0.0",
             norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
             discount=0.999,
-            td_n=25,
+            td_n=50,
             use_eef=True,
-            action_horizon=25,
             dont_mask_actions=True,
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
@@ -2847,9 +2854,10 @@ _CONFIGS = [
         plot_interval=30_000,
         save_interval=30_000,
         fsdp_devices=16,
+        action_horizon=50,
         num_val_trajectories=10,
-        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache/",
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
     ),
     # RoboCOIN Q(s,a) SARSA with bimanual dataset, HL-Gauss head.
     TrainConfig(
@@ -2859,11 +2867,10 @@ _CONFIGS = [
                 state_dim=14,
                 num_cameras=3,
                 image_size=(224, 224),
-                freeze_backbone=False,
                 max_token_len=48,
                 action_conditioned=True,
                 action_dim=14,
-                action_horizon=25,
+                action_horizon=50,
             ),
             head_config=_heads.CategoricalHeadConfig(
                 v_min=0.0,
@@ -2877,12 +2884,99 @@ _CONFIGS = [
             dataset_name="robocoin:1.0.0",
             norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
             discount=0.999,
-            td_n=25,
+            td_n=50,
             use_eef=True,
-            action_horizon=25,
             dont_mask_actions=True,
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=230_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=30_000,
+        save_interval=30_000,
+        fsdp_devices=16,
+        action_horizon=50,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
+    ),
+    # =========================================================================
+    # RoboCOIN Gemma 3 value function configs
+    # =========================================================================
+    TrainConfig(
+        name="debug_robocoin_gemma3",
+        model=_value_function.MCValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(896, 896),
+                max_token_len=48,
+                paligemma_variant="gemma3_dummy",
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            dataset_name="robocoin:1.0.0",
+            image_size = (896, 896),
+            discount=0.999,
+            local_shuffle_buffer_size=50000,
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=120_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=120_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=200_000,
+        save_interval=200_000,
+        fsdp_devices=16,
+        backbone_variant="gemma3",
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache/",
+    ),
+    TrainConfig(
+        name="robocoin_bimanual_gemma3_q_sarsa",
+        model=_value_function.SARSAValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(896, 896),
+                max_token_len=48,
+                paligemma_variant="gemma3_4b",
+                dtype="bfloat16",
+                action_conditioned=True,
+                action_dim=14,
+                action_horizon=50,
+                mask_state=True,
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            dataset_name="robocoin:1.0.0",
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
+            image_size = (896, 896),
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            dont_mask_actions=True,
+        ),
+        weight_loader=weight_loaders.Gemma3WeightLoader(),
         num_train_steps=230_000,
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -2897,9 +2991,11 @@ _CONFIGS = [
         plot_interval=30_000,
         save_interval=30_000,
         fsdp_devices=16,
+        backbone_variant="gemma3",
+        action_horizon=50,
         num_val_trajectories=10,
-        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache/",
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
     ),
 ]
 

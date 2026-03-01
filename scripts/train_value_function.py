@@ -439,7 +439,7 @@ def init_train_state(
             tx=critic_tx,
             opt_state=critic_tx.init(params.filter(config.trainable_filter)),
             ema_decay=config.ema_decay,
-            ema_params=None if config.ema_decay is None else params,
+            ema_params=None if config.ema_decay is None else jax.tree.map(jnp.copy, params),
         )
 
     policy_tx = None
@@ -488,11 +488,17 @@ def init_train_state(
     partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.critic.params.to_pure_dict())
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    # Pre-shard partial_params to match the FSDP output sharding so each chip
+    # only receives its shard (~x/N GB) instead of the full replicated copy
+    # (~x GB). This avoids OOM during init on memory-constrained devices.
+    params_sharding = sharding.fsdp_sharding(partial_params, mesh)
+    partial_params = jax.device_put(partial_params, params_sharding)
+
     train_state = jax.jit(
         init_actor_critic,
-        donate_argnums=(1,),
-        in_shardings=replicated_sharding,
-        out_shardings=state_sharding,
+        donate_argnums = (1,),
+        in_shardings = (replicated_sharding, params_sharding),
+        out_shardings = state_sharding,
     )(init_rng, partial_params)
 
     return train_state, state_sharding
@@ -572,6 +578,7 @@ def value_function_train_step(
         nnx.All(
             nnx.Param,
             nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            nnx.Not(nnx_utils.PathRegex(".*/target_(network|head)/.*")),
             lambda _, x: x.value.ndim > 1,
         ),
     )
@@ -1062,9 +1069,10 @@ def _create_value_video(
     oracle_values: list | None,
     frame_images: list[np.ndarray],
     fps: int,
+    subtask_texts: list[str] | None = None,
 ) -> "wandb.Video":
     """Create a wandb GIF with a 2x2 layout: left wrist (top-left), right wrist (bottom-left),
-    value plot (top-right), base camera (bottom-right)."""
+    value plot (top-right), base camera (bottom-right). Subtask list shown below the plot."""
     T = len(mc_returns)
     timesteps = np.arange(T)
     video_frames = []
@@ -1072,6 +1080,18 @@ def _create_value_video(
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     ax_left_wrist, ax_val = axes[0, 0], axes[0, 1]
     ax_right_wrist, ax_base = axes[1, 0], axes[1, 1]
+
+    # Pre-compute subtask caption and adjust layout once
+    subtask_caption = None
+    if subtask_texts:
+        numbered_subtasks = [f"{i+1}. {text}" for i, text in enumerate(subtask_texts)]
+        lines = []
+        for i in range(0, len(numbered_subtasks), 3):
+            lines.append("  ".join(numbered_subtasks[i:i+3]))
+        subtask_caption = "Subtasks:\n" + "\n".join(lines)
+        num_lines = len(lines) + 1
+        bottom_margin = 0.10 + 0.03 * num_lines
+        fig.subplots_adjust(bottom = bottom_margin)
 
     for t in range(T):
         for ax in axes.flat:
@@ -1100,7 +1120,14 @@ def _create_value_video(
         ax_val.legend(fontsize=11)
         ax_val.grid(visible=True, alpha=0.3)
 
-        plt.tight_layout()
+        if subtask_caption is None:
+            plt.tight_layout()
+        else:
+            for txt in fig.texts:
+                txt.remove()
+            fig.text(0.5, 0.01, subtask_caption, ha='center', va='bottom', fontsize=9,
+                     family='monospace', linespacing=1.5)
+
         fig.canvas.draw()
         w, h = fig.canvas.get_width_height()
         buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
@@ -1141,7 +1168,7 @@ def _create_value_plot(
         fps: Frame rate of the episode, used when encoding the output video.
     """
     if plot_video and frame_images is not None and len(frame_images) == len(mc_returns):
-        return _create_value_video(mc_returns, predicted_values, ep_idx, step, suffix, oracle_values, frame_images, fps)
+        return _create_value_video(mc_returns, predicted_values, ep_idx, step, suffix, oracle_values, frame_images, fps, subtask_texts)
 
     fig, ax = plt.subplots(figsize=(10, 6))
     timesteps = np.arange(len(mc_returns))
@@ -1421,7 +1448,9 @@ def _create_attn_plot(
     """Create a line plot of per-modality CLS attention scores over time."""
     scores = np.stack(attn_scores, axis=0)  # [T, n_modalities]
     timesteps = np.arange(len(scores))
-    labels = [f"img{i+1}" for i in range(3)] + ["text", "state"]
+    labels = [f"img{i+1}" for i in range(3)] + ["text"]
+    if scores.shape[1] > 4 + int(action_conditioned):
+        labels.append("state")
     if action_conditioned:
         labels.append("action")
 
@@ -1527,6 +1556,7 @@ def _render_and_log_plots(
         # validation step is visible in each plot title.
         wandb.log(images)
     logging.info(f"Render thread finished: logged {len(images)} plots for step {step}")
+    del images, ep_frame_images, all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores
 
 
 def generate_validation_plots_dlimp(
@@ -1657,12 +1687,15 @@ def generate_validation_plots_dlimp(
     all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores = predict_values(
         model, all_frames, ep_mc_returns, action_conditioned
     )
+    del all_frames, traj_frames
 
     if jax.process_index() == 0:
         global _render_thread
-        if _render_thread is not None and _render_thread.is_alive():
-            logging.warning("Previous render thread still running, waiting for it to finish...")
+        if _render_thread is not None:
+            if _render_thread.is_alive():
+                logging.warning("Previous render thread still running, waiting for it to finish...")
             _render_thread.join()
+            _render_thread = None
         _render_thread = threading.Thread(
             target = _render_and_log_plots,
             args = (
@@ -1800,14 +1833,18 @@ def main(config: _config.TrainConfig):
             logging.info("Worker 0: Collecting validation episodes for caching")
             
             import dataclasses as dc
+            from openpi.models.tokenizer import create_tokenizer
+
             val_loader_config = dc.replace(
                 robocoin_config,
                 split="val",
                 batch_size=256,
                 shuffle=False,
                 repeat=False,
+                action_horizon = config.action_horizon,
             )
-            val_dataloader = create_robocoin_data_loader(val_loader_config)
+            val_tokenizer = create_tokenizer(config.backbone_variant, val_loader_config.max_token_len)
+            val_dataloader = create_robocoin_data_loader(val_loader_config, tokenizer = val_tokenizer)
             
             generate_validation_plots_dlimp(
                 model=None,  # Not needed for save_only
@@ -2127,9 +2164,15 @@ def main(config: _config.TrainConfig):
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
 
-    if _render_thread is not None and _render_thread.is_alive():
+    # Keep all hosts alive until rank 0 has fully completed async rendering/logging.
+
+    if jax.process_index() == 0 and _render_thread is not None and _render_thread.is_alive():
         logging.info("Waiting for render thread to finish")
         _render_thread.join()
+
+    if jax.process_count() > 1:
+        logging.info("Waiting at post-render multihost barrier")
+        multihost_utils.sync_global_devices("train_value_function_post_render_join")
 
 
 if __name__ == "__main__":

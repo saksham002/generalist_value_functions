@@ -2,6 +2,8 @@ import logging
 import os
 import pickle
 
+logger = logging.getLogger(__name__)
+
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
@@ -9,6 +11,15 @@ import numpy as np
 
 import openpi.value_functions.base_value_functions as _value_fn
 from openpi.models import model as _model
+
+
+@nnx.jit
+def _jitted_compute_value(
+    model_to_use: _value_fn.BaseValueFunction,
+    obs: _model.Observation,
+    act: _model.Actions | None,
+) -> jnp.ndarray:
+    return model_to_use.compute_value(obs, act, take_min_over_ensemble = True)
 
 
 def stack_frames(frame_dicts: list[dict], key: str) -> jax.Array | None:
@@ -199,21 +210,21 @@ def cache_val_episodes(
     )
 
     if cache_exists and not save_only:
-        logging.info(f"Loading cached validation episodes from {cache_dir}")
+        logger.info(f"Loading cached validation episodes from {cache_dir}")
         for filename in os.listdir(cache_dir):
             if filename.startswith("traj_") and filename.endswith(".pkl"):
                 traj_idx = int(filename.replace("traj_", "").replace(".pkl", ""))
                 cache_file = os.path.join(cache_dir, filename)
                 with open(cache_file, "rb") as f:
                     traj_frames[traj_idx] = pickle.load(f)
-        logging.info(f"Loaded {len(traj_frames)} trajectories from cache")
+        logger.info(f"Loaded {len(traj_frames)} trajectories from cache")
     elif not cache_exists:
         active_trajs: set[int] = set()
         saved_traj_count = 0
         seen_repo_ids: set[str] = set()
         seen_required_repo_ids: set[str] = set()
         num_non_required_slots = num_val_trajectories - len(include_repos)
-        logging.info(f"Collecting validation frames for first {num_val_trajectories} unique repo_id trajectories")
+        logger.info(f"Collecting validation frames for first {num_val_trajectories} unique repo_id trajectories")
 
         if cache_dir:
             os.makedirs(cache_dir, exist_ok = True)
@@ -221,7 +232,7 @@ def cache_val_episodes(
         for batch in val_dataloader:
             traj_indices = batch.get("_traj_index", None)
             if traj_indices is None:
-                logging.warning("Batch missing _traj_index, cannot identify trajectories")
+                logger.warning("Batch missing _traj_index, cannot identify trajectories")
                 continue
 
             if hasattr(traj_indices, "device"):
@@ -240,7 +251,7 @@ def cache_val_episodes(
                         cache_file = os.path.join(cache_dir, f"traj_{traj_idx}.pkl")
                         with open(cache_file, "wb") as f:
                             pickle.dump(frames, f)
-                        logging.info(f"Saved traj {traj_idx} ({len(frames)} frames) to {cache_file}")
+                        logger.info(f"Saved traj {traj_idx} ({len(frames)} frames) to {cache_file}")
 
                     del traj_frames[traj_idx]
                     saved_traj_count += 1
@@ -248,7 +259,7 @@ def cache_val_episodes(
                 active_trajs.discard(traj_idx)
 
             if saved_traj_count >= num_val_trajectories:
-                logging.info(f"Saved {saved_traj_count} trajectories, breaking early")
+                logger.info(f"Saved {saved_traj_count} trajectories, breaking early")
                 break
 
             batch_size = traj_indices.shape[0]
@@ -288,7 +299,7 @@ def cache_val_episodes(
 
                 traj_frames[traj_idx].append(frame)
 
-        logging.info(f"Total trajectories saved: {saved_traj_count}, unique repo_ids: {len(seen_repo_ids)}")
+        logger.info(f"Total trajectories saved: {saved_traj_count}, unique repo_ids: {len(seen_repo_ids)}")
 
     if save_only:
         return {}
@@ -320,14 +331,6 @@ def predict_values(
     Returns:
         Tuple of (all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores).
     """
-    @nnx.jit
-    def jitted_compute_value(
-        model_to_use: _value_fn.BaseValueFunction,
-        obs: _model.Observation,
-        act: _model.Actions | None,
-    ) -> jnp.ndarray:
-        return model_to_use.compute_value(obs, act, take_min_over_ensemble=True)
-
     BATCH_SIZE = 64
     all_predictions: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_predictions_neg: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
@@ -343,24 +346,24 @@ def predict_values(
         obs, act = get_obs_and_action(frame_dicts, prefix="", action_conditioned=action_conditioned)
 
         if batch_start == 0:
-            logging.info(f"  Batch obs.state: shape={obs.state.shape}, dtype={obs.state.dtype}")
+            logger.info(f"  Batch obs.state: shape={obs.state.shape}, dtype={obs.state.dtype}")
             if obs.images:
                 for k, v in obs.images.items():
-                    logging.info(f"  Batch obs.images[{k}]: shape={v.shape}, dtype={v.dtype}")
+                    logger.info(f"  Batch obs.images[{k}]: shape={v.shape}, dtype={v.dtype}")
             if obs.tokenized_prompt is not None:
-                logging.info(f"  Batch obs.tokenized_prompt: shape={obs.tokenized_prompt.shape}")
+                logger.info(f"  Batch obs.tokenized_prompt: shape={obs.tokenized_prompt.shape}")
 
-        pred_values_np, attn_np = jax.device_get(jitted_compute_value(model, obs, act))
+        pred_values_np, attn_np = jax.device_get(_jitted_compute_value(model, obs, act))
 
         pred_values_neg_np = None
         if "tokenized_negative_prompt" in frame_dicts[0]:
             obs_neg, act_neg = get_obs_and_action(frame_dicts, prefix="negative_", action_conditioned=action_conditioned)
-            pred_values_neg_np, _ = jax.device_get(jitted_compute_value(model, obs_neg, act_neg))
+            pred_values_neg_np, _ = jax.device_get(_jitted_compute_value(model, obs_neg, act_neg))
 
         pred_values_mirror_np = None
         if "mirror_state" in frame_dicts[0]:
             obs_mirror, act_mirror = get_obs_and_action(frame_dicts, prefix="mirror_", action_conditioned=action_conditioned)
-            pred_values_mirror_np, _ = jax.device_get(jitted_compute_value(model, obs_mirror, act_mirror))
+            pred_values_mirror_np, _ = jax.device_get(_jitted_compute_value(model, obs_mirror, act_mirror))
 
         for i, (ep_idx, _, _) in enumerate(batch_frames):
             all_predictions[ep_idx].append(float(pred_values_np[i]))
@@ -371,6 +374,6 @@ def predict_values(
                 all_predictions_mirror[ep_idx].append(float(pred_values_mirror_np[i]))
 
     total_predictions = sum(len(preds) for preds in all_predictions.values())
-    logging.info(f"Computed {total_predictions} predictions")
+    logger.info(f"Computed {total_predictions} predictions")
 
     return all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores

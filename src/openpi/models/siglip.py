@@ -16,6 +16,7 @@
 
 from collections.abc import Sequence
 
+import einops
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -203,6 +204,10 @@ class _Module(nn.Module):
     # or "dots_with_no_batch_dims_saveable" for more speed (memory costly)
     remat_policy: str = "nothing_saveable"
     dtype_mm: str = "float32"
+    output_tokens: int | None = None
+    # When set, applies the Gemma 3 multimodal projector after the encoder:
+    # RMSNorm -> Linear(siglip_width -> mm_proj_dim).
+    mm_proj_dim: int | None = None
 
     @nn.compact
     def __call__(self, image, *, train=False):
@@ -248,6 +253,22 @@ class _Module(nn.Module):
             dtype_mm=self.dtype_mm,
             name="Transformer",
         )(x, deterministic=not train)
+        # Spatial average pooling to reduce token count (e.g. 4096 -> 256 for 896x896)
+        if self.output_tokens is not None and x.shape[1] != self.output_tokens:
+            cur_length = x.shape[1]
+            cur_width = int(cur_length ** 0.5)
+            assert cur_width ** 2 == cur_length
+            output_width = int(self.output_tokens ** 0.5)
+            assert output_width ** 2 == self.output_tokens, (
+                f"Cannot pool {x.shape} to {self.output_tokens}"
+            )
+            assert cur_width % output_width == 0, f"{cur_width=} {output_width=}"
+            window = cur_width // output_width
+            x = einops.rearrange(x, "b (h w) d -> b h w d", h = cur_width, w = cur_width)
+            window_shape = (window, window)
+            x = nn.avg_pool(x, window_shape = window_shape, strides = window_shape)
+            x = einops.rearrange(x, "b h w d -> b (h w) d")
+
         encoded = out["encoded"] = x
 
         if self.pool_type == "map":
@@ -268,7 +289,9 @@ class _Module(nn.Module):
         else:
             raise ValueError(f"Unknown pool type: '{self.pool_type}'")
 
-        x_2d = jnp.reshape(encoded, [n, h, w, -1])
+        seq_len = encoded.shape[1]
+        h_out = int(seq_len ** 0.5)
+        x_2d = jnp.reshape(encoded, [n, h_out, seq_len // h_out, -1])
 
         if self.rep_size:
             rep_size = self.width if self.rep_size is True else self.rep_size
@@ -286,6 +309,14 @@ class _Module(nn.Module):
             head = nn.Dense(self.num_classes, dtype=self.dtype_mm, name="head", **kw)
             x_2d = out["logits_2d"] = head(x_2d)
             x = out["logits"] = head(x)
+
+        if self.mm_proj_dim is not None:
+            x_f32 = x.astype(jnp.float32)
+            var = jnp.mean(jnp.square(x_f32), axis = -1, keepdims = True)
+            scale = self.param("mm_soft_embedding_norm", nn.initializers.zeros, (x.shape[-1],))
+            normed = x_f32 * jnp.reciprocal(jnp.sqrt(var + 1e-6)) * (1.0 + scale)
+            x = nn.Dense(self.mm_proj_dim, use_bias = False, dtype = jnp.float32, name = "mm_input_projection")(normed).astype(self.dtype_mm)
+            out["projected"] = x
 
         return x, out
 

@@ -48,6 +48,47 @@ class PaligemmaTokenizer:
         return np.asarray(tokens), np.asarray(mask)
 
 
+class Gemma3Tokenizer:
+    def __init__(self, max_len: int = 48):
+        self._max_len = max_len
+
+        path = download.maybe_download("gs://gemma-data/tokenizers/tokenizer_gemma3.model")
+        with path.open("rb") as f:
+            self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto = f.read())
+
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+        if state is not None:
+            discretized_state = np.digitize(state, bins = np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            state_str = " ".join(map(str, discretized_state))
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            tokens = self._tokenizer.encode(full_prompt, add_bos = True)
+        else:
+            tokens = self._tokenizer.encode(cleaned_text, add_bos = True) + self._tokenizer.encode("\n")
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            padding = [False] * (self._max_len - tokens_len)
+            mask = [True] * tokens_len + padding
+            tokens = tokens + padding
+        else:
+            if len(tokens) > self._max_len:
+                logging.warning(
+                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            mask = [True] * self._max_len
+
+        return np.asarray(tokens), np.asarray(mask)
+
+
+def create_tokenizer(backbone_variant: str | None, max_len: int) -> PaligemmaTokenizer | Gemma3Tokenizer:
+    """Factory function that returns the appropriate tokenizer for the given backbone variant."""
+    if backbone_variant == "gemma3":
+        return Gemma3Tokenizer(max_len = max_len)
+    return PaligemmaTokenizer(max_len = max_len)
+
+
 class FASTTokenizer:
     def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
         self._max_len = max_len

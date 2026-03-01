@@ -46,6 +46,7 @@ from typing_extensions import override
 from openpi.models import model as _model
 from openpi.models.model import IMAGE_KEYS
 import openpi.models.gemma as _gemma
+import openpi.models.gemma3 as _gemma3
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 from openpi.value_functions.networks.base_networks import BaseValueNetwork
@@ -125,9 +126,6 @@ class PaliGemmaNetworkConfig:
     # Input image resolution (should match PaliGemma training: 224x224)
     image_size: tuple[int, int] = (224, 224)
 
-    # Whether to freeze the PaliGemma backbone during training
-    freeze_backbone: bool = True
-
     # Maximum token length for text prompts
     max_token_len: int = 48
 
@@ -135,7 +133,7 @@ class PaliGemmaNetworkConfig:
     paligemma_variant: str = "gemma_2b"
 
     # Dtype for computations
-    dtype: str = "bfloat16"
+    dtype: str = "float32"
 
     # Whether this network is action-conditioned (Q(s,a) vs V(s))
     action_conditioned: bool = False
@@ -151,6 +149,16 @@ class PaliGemmaNetworkConfig:
 
     # Fix order in which to iterate through keys
     image_keys: tuple[str, str, str] = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+
+    def get_tokenizer(self, max_len: int | None = None):
+        """Return the appropriate text tokenizer for this variant."""
+        from openpi.models.tokenizer import Gemma3Tokenizer, PaligemmaTokenizer
+
+        if max_len is None:
+            max_len = self.max_token_len
+        if self.paligemma_variant.startswith("gemma3_"):
+            return Gemma3Tokenizer(max_len = max_len)
+        return PaligemmaTokenizer(max_len = max_len)
 
     def create(self, rng: at.KeyArrayLike) -> PaliGemmaValueNetwork:
         """Create a new PaliGemma value network with initialized parameters."""
@@ -187,37 +195,58 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
 
         self.config = config
         self._action_conditioned = config.action_conditioned
-        self._freeze_backbone = config.freeze_backbone
         self._num_cameras = config.num_cameras
         self._max_token_len = config.max_token_len
         self._action_horizon = config.action_horizon
         self._action_dim = config.action_dim
         self._mask_state = config.mask_state
         self._image_keys = config.image_keys
+        self._image_size = config.image_size
 
-        # Get PaliGemma config (same as pi0.py)
-        paligemma_config = _gemma.get_config(config.paligemma_variant)
+        # Get config and module class based on variant
+        if config.paligemma_variant.startswith("gemma3_"):
+            paligemma_config = _gemma3.get_config(config.paligemma_variant)
+            gemma_module_cls = _gemma3.Module
+        else:
+            paligemma_config = _gemma.get_config(config.paligemma_variant)
+            gemma_module_cls = _gemma.Module
+
         embed_dim = paligemma_config.width
 
         # Initialize Gemma LLM (single config, no action expert)
         llm = nnx_bridge.ToNNX(
-            _gemma.Module(
-                configs=[paligemma_config],
-                embed_dtype=config.dtype,
-                adarms=False,
+            gemma_module_cls(
+                configs = [paligemma_config],
+                embed_dtype = config.dtype,
+                adarms = False,
             )
         )
-        llm.lazy_init(rngs=rngs, method="init", use_adarms=[False])
+        llm.lazy_init(rngs = rngs, method = "init", use_adarms = [False])
 
-        # Initialize SigLIP image encoder
+        # Initialize SigLIP image encoder.
+        # For Gemma 3 variants, mm_proj_dim passes the LLM width into SigLIP so it applies the
+        # full Gemma 3 multimodal projector internally (RMSNorm + Linear + sqrt(embed_dim) scale).
+        # For non-Gemma3 variants (original PaliGemma), num_classes=embed_dim applies the linear
+        # projection directly inside the SigLIP head Dense layer.
+        if config.paligemma_variant.startswith("gemma3_"):
+            siglip_kwargs = {
+                "variant": "So400m/14",
+                "pool_type": "none",
+                "scan": True,
+                "dtype_mm": config.dtype,
+                "output_tokens": NUM_PATCHES_PER_IMAGE,
+                "mm_proj_dim": embed_dim,
+            }
+        else:
+            siglip_kwargs = {
+                "num_classes": paligemma_config.width,
+                "variant": "So400m/14",
+                "pool_type": "none",
+                "scan": True,
+                "dtype_mm": config.dtype,
+            }
         img = nnx_bridge.ToNNX(
-            _siglip.Module(
-                num_classes=paligemma_config.width,
-                variant="So400m/14",
-                pool_type="none",
-                scan=True,
-                dtype_mm=config.dtype,
-            )
+            _siglip.Module(**siglip_kwargs)
         )
         # Initialize with a fake image
         fake_image = jnp.zeros((1, config.image_size[0], config.image_size[1], 3), dtype=jnp.float32)
@@ -303,15 +332,13 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             # Text tokens: bidirectional with images
             ar_mask += [False] * tokenized_inputs.shape[1]
 
-        # 3. Add state token
-        state_token = self.state_proj(observation.state)[:, None, :]  # [B, 1, embed_dim]
-        tokens.append(state_token)
-        if self._mask_state:
-            input_mask.append(jnp.zeros((batch_size, 1), dtype=jnp.bool_))
-        else:
+        # 3. Add state token (skip entirely when mask_state is True)
+        if not self._mask_state:
+            state_token = self.state_proj(observation.state)[:, None, :]  # [B, 1, embed_dim]
+            tokens.append(state_token)
             input_mask.append(jnp.ones((batch_size, 1), dtype=jnp.bool_))
-        # State uses ar_mask=True (causal - can attend to images/text but not be attended)
-        ar_mask.append(True)
+            # State uses ar_mask=True (causal - can attend to images/text but not be attended)
+            ar_mask.append(True)
 
         # 4. Add action tokens if action_conditioned
         if self._action_conditioned:
@@ -365,7 +392,7 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         # Preprocess observation (handles resizing, default masks, augmentation)
         # train=True enables augmentation when rng is provided
         train = rng is not None
-        observation = _model.preprocess_observation(rng, observation, train=train)
+        observation = _model.preprocess_observation(rng, observation, train=train, image_resolution=self._image_size)
 
         # Extract action array and mask if action_conditioned
         action_array = None
@@ -418,7 +445,7 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
     def _group_attn_scores(self, cls_attn_mean: jax.Array) -> jax.Array:
         """Group per-position CLS attention [B, S] into per-modality scores [B, n_modalities].
 
-        Modality order: [img1, img2, ..., imgN, text, state, (actions if Q)]
+        Modality order: [img1, img2, ..., imgN, text, (state if not mask_state), (actions if Q)]
         Each image group sums over 256 patch positions; text/action groups sum over their tokens.
         The CLS self-attention at the last sequence position is excluded from all groups.
         """
@@ -431,9 +458,12 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             end = start + NUM_PATCHES_PER_IMAGE
             attn_parts.append(cls_attn_mean[:, start:end].sum(axis=-1))
         attn_parts.append(cls_attn_mean[:, img_end:text_end].sum(axis=-1))  # text
-        attn_parts.append(cls_attn_mean[:, text_end])  # state (single token)
-        if self._action_conditioned:
+        if not self._mask_state:
+            attn_parts.append(cls_attn_mean[:, text_end])  # state (single token)
             action_start = text_end + 1
+        else:
+            action_start = text_end
+        if self._action_conditioned:
             attn_parts.append(cls_attn_mean[:, action_start:action_start + self._action_horizon].sum(axis=-1))
 
         return jnp.stack(attn_parts, axis=-1)

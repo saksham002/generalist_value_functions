@@ -581,6 +581,17 @@ def create_data_loader(
 
     # Check for RoboCOIN dataset (DLIMP-based image+text+state loader)
     if data_config.robocoin_data_config is not None:
+        import dataclasses as dc
+
+        from openpi.models.tokenizer import create_tokenizer
+
+        robocoin_config = dc.replace(
+            data_config.robocoin_data_config,
+            action_horizon = config.action_horizon,
+        )
+        data_config = dc.replace(data_config, robocoin_data_config = robocoin_config)
+
+        tokenizer = create_tokenizer(config.backbone_variant, robocoin_config.max_token_len)
         return create_robocoin_data_loader(
             data_config,
             batch_size=config.batch_size,
@@ -589,6 +600,7 @@ def create_data_loader(
             num_batches=num_batches,
             seed=config.seed,
             framework=framework,
+            tokenizer=tokenizer,
         )
 
     if data_config.rlds_data_dir is not None:
@@ -736,6 +748,7 @@ def create_robocoin_data_loader(
     num_batches: int | None = None,
     seed: int = 0,
     framework: str = "jax",
+    tokenizer = None,
 ) -> DataLoader:
     """Create a DLIMP-based data loader for RoboCOIN image+text+state data.
 
@@ -795,6 +808,7 @@ def create_robocoin_data_loader(
         robocoin_config,
         sharding=sharding,
         num_batches=num_batches,
+        tokenizer=tokenizer,
     )
 
     return DataLoaderImpl(data_config, robocoin_loader)

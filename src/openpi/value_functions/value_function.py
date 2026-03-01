@@ -103,12 +103,12 @@ class SARSAValueFunctionConfig(ValueFunctionConfig):
     @override
     def create(self, rng: at.KeyArrayLike) -> SARSAValueFunction:
         rng = jax.random.key(rng) if isinstance(rng, int) else rng
-        net_rng, head_rng, target_net_rng, target_head_rng = jax.random.split(rng, 4)
+        net_rng, head_rng = jax.random.split(rng, 2)
 
         network = self.network_config.create(net_rng)
         head = self.head_config.create(network.feature_dim, head_rng)
-        target_network = self.network_config.create(target_net_rng)
-        target_head = self.head_config.create(target_network.feature_dim, target_head_rng)
+        target_network = self.network_config.create(net_rng)
+        target_head = self.head_config.create(target_network.feature_dim, head_rng)
 
         return SARSAValueFunction(
             network=network,
@@ -199,12 +199,12 @@ class SACValueFunctionConfig(ValueFunctionConfig):
     @override
     def create(self, rng: at.KeyArrayLike) -> SACValueFunction:
         rng = jax.random.key(rng) if isinstance(rng, int) else rng
-        net_rng, head_rng, target_net_rng, target_head_rng = jax.random.split(rng, 4)
+        net_rng, head_rng = jax.random.split(rng, 2)
 
         network = self.network_config.create(net_rng)
         head = self.head_config.create(network.feature_dim, head_rng)
-        target_network = self.network_config.create(target_net_rng)
-        target_head = self.head_config.create(target_network.feature_dim, target_head_rng)
+        target_network = self.network_config.create(net_rng)
+        target_head = self.head_config.create(target_network.feature_dim, head_rng)
 
         return SACValueFunction(
             network=network,
@@ -539,12 +539,12 @@ class MultiSARSAValueFunctionConfig(BaseMultiValueFunctionConfig):
     @override
     def create(self, rng: at.KeyArrayLike) -> MultiSARSAValueFunction:
         rng = jax.random.key(rng) if isinstance(rng, int) else rng
-        net_rng, head_rng, target_net_rng, target_head_rng = jax.random.split(rng, 4)
+        net_rng, head_rng = jax.random.split(rng, 2)
 
         network = self.network_config.create(net_rng)
         head = self.head_config.create(network.feature_dim, head_rng)
-        target_network = self.network_config.create(target_net_rng)
-        target_head = self.head_config.create(target_network.feature_dim, target_head_rng)
+        target_network = self.network_config.create(net_rng)
+        target_head = self.head_config.create(target_network.feature_dim, head_rng)
 
         return MultiSARSAValueFunction(
             network=network,
