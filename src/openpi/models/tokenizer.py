@@ -49,8 +49,15 @@ class PaligemmaTokenizer:
 
 
 class Gemma3Tokenizer:
-    def __init__(self, max_len: int = 48):
+    # Gemma 3 special token IDs
+    BOS_ID = 2
+    START_OF_IMAGE_ID = 255999
+    END_OF_IMAGE_ID = 256000
+    NEWLINE_NEWLINE_ID = 108
+
+    def __init__(self, max_len: int = 48, num_images: int = 0):
         self._max_len = max_len
+        self._num_images = num_images
 
         path = download.maybe_download("gs://gemma-data/tokenizers/tokenizer_gemma3.model")
         with path.open("rb") as f:
@@ -65,27 +72,38 @@ class Gemma3Tokenizer:
             tokens = self._tokenizer.encode(full_prompt, add_bos = True)
         else:
             tokens = self._tokenizer.encode(cleaned_text, add_bos = True) + self._tokenizer.encode("\n")
+
+        # Insert <start_of_image> markers after BOS so the LLM knows where image blocks go.
+        # Format: [BOS, <SOI>, <SOI>, ..., text_1, text_2, ..., \n, pad...]
+        # The actual image patches are spliced in later by _embed_sequence_gemma3.
+        if self._num_images > 0:
+            soi_markers = [self.START_OF_IMAGE_ID] * self._num_images
+            tokens = [tokens[0]] + soi_markers + tokens[1:]
+
+        total_len = self._max_len + self._num_images
         tokens_len = len(tokens)
-        if tokens_len < self._max_len:
-            padding = [False] * (self._max_len - tokens_len)
+        if tokens_len < total_len:
+            padding = [False] * (total_len - tokens_len)
             mask = [True] * tokens_len + padding
             tokens = tokens + padding
         else:
-            if len(tokens) > self._max_len:
+            if tokens_len > total_len:
                 logging.warning(
-                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
+                    f"Token length ({tokens_len}) exceeds max length ({total_len}), truncating. "
                     "Consider increasing the `max_token_len` in your model config if this happens frequently."
                 )
-            tokens = tokens[: self._max_len]
-            mask = [True] * self._max_len
+            tokens = tokens[: total_len]
+            mask = [True] * total_len
 
         return np.asarray(tokens), np.asarray(mask)
 
 
-def create_tokenizer(backbone_variant: str | None, max_len: int) -> PaligemmaTokenizer | Gemma3Tokenizer:
+def create_tokenizer(
+    backbone_variant: str | None, max_len: int, num_images: int = 0
+) -> PaligemmaTokenizer | Gemma3Tokenizer:
     """Factory function that returns the appropriate tokenizer for the given backbone variant."""
     if backbone_variant == "gemma3":
-        return Gemma3Tokenizer(max_len = max_len)
+        return Gemma3Tokenizer(max_len = max_len, num_images = num_images)
     return PaligemmaTokenizer(max_len = max_len)
 
 

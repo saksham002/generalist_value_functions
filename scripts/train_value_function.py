@@ -1843,7 +1843,8 @@ def main(config: _config.TrainConfig):
                 repeat=False,
                 action_horizon = config.action_horizon,
             )
-            val_tokenizer = create_tokenizer(config.backbone_variant, val_loader_config.max_token_len)
+            num_images = val_loader_config.max_cameras if config.backbone_variant == "gemma3" else 0
+            val_tokenizer = create_tokenizer(config.backbone_variant, val_loader_config.max_token_len, num_images = num_images)
             val_dataloader = create_robocoin_data_loader(val_loader_config, tokenizer = val_tokenizer)
             
             generate_validation_plots_dlimp(

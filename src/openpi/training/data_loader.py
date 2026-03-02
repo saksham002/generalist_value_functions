@@ -591,7 +591,8 @@ def create_data_loader(
         )
         data_config = dc.replace(data_config, robocoin_data_config = robocoin_config)
 
-        tokenizer = create_tokenizer(config.backbone_variant, robocoin_config.max_token_len)
+        num_images = robocoin_config.max_cameras if config.backbone_variant == "gemma3" else 0
+        tokenizer = create_tokenizer(config.backbone_variant, robocoin_config.max_token_len, num_images = num_images)
         return create_robocoin_data_loader(
             data_config,
             batch_size=config.batch_size,

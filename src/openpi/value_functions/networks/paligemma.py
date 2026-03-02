@@ -3,8 +3,8 @@
 Uses a pre-trained PaliGemma backbone (ViT + Gemma LLM) as a feature encoder
 for training subtask-conditioned state value functions V(s, l) where l is a subtask.
 
-Sequence structure:
-    [img1_patches...] [img2_patches...] [img3_patches...] [text_tokens...] [state_embed] [CLS]
+Sequence structure (Gemma 3):
+    [BOS] [img1_block(260)] [img2_block(260)] [img3_block(260)] [text_tokens...] [state_embed] [CLS]
 
 Where:
 - img*_patches: 256 patches per image from ViT (14x14 patches from 224x224)
@@ -55,6 +55,9 @@ from openpi.value_functions.networks.base_networks import BaseValueNetwork
 # Number of patches per image (224/14 = 16, 16*16 = 256)
 NUM_PATCHES_PER_IMAGE = 256
 
+# Gemma 3 image block: [\n\n, <SOI>, 256 patches, <EOI>, \n\n]
+GEMMA3_TOKENS_PER_IMAGE_BLOCK = NUM_PATCHES_PER_IMAGE + 4
+
 
 def make_attn_mask(
     input_mask: jax.Array,
@@ -93,6 +96,55 @@ def make_attn_mask(
     # Apply valid positions mask (both positions must be valid)
     valid = input_mask[:, None, :] * input_mask[:, :, None]
     mask = jnp.logical_and(mask, valid)
+
+    return mask
+
+
+def make_gemma3_attn_mask(
+    input_mask: jax.Array,
+    num_cameras: int,
+) -> jax.Array:
+    """Create attention mask for Gemma 3 value network with bidirectional image-patch blocks.
+
+    Sequence layout:
+        [BOS] [img_block_1 (260)] [img_block_2 (260)] ... [text] [state] [(actions)] [CLS]
+
+    Each 260-token image block: [\\n\\n, <SOI>, 256 patches, <EOI>, \\n\\n]
+
+    Attention rules:
+    - Causal base: every token can attend to itself and all earlier tokens (if both valid).
+    - Bidirectional overlay: within each image block, patch positions (offsets 2..257) attend
+      to each other bidirectionally. Demarcation tokens (\\n\\n, <SOI>, <EOI>) stay causal.
+
+    Args:
+        input_mask: bool[B, S] — True for valid positions, False for padding.
+        num_cameras: number of image blocks in the sequence (after BOS).
+
+    Returns:
+        Attention mask [B, S, S] where True means "can attend".
+    """
+    batch_size, seq_len = input_mask.shape
+
+    # Causal base mask
+    causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))  # [S, S]
+    causal = jnp.broadcast_to(causal[None], (batch_size, seq_len, seq_len))
+
+    # Build bidirectional overlay for image patch positions (offset by 1 for BOS)
+    bidirectional = jnp.zeros((seq_len, seq_len), dtype=jnp.bool_)
+    for cam_idx in range(num_cameras):
+        block_start = 1 + cam_idx * GEMMA3_TOKENS_PER_IMAGE_BLOCK
+        patch_start = block_start + 2   # skip \n\n, <SOI>
+        patch_end = patch_start + NUM_PATCHES_PER_IMAGE  # 256 patches
+        # Patches within same block can attend bidirectionally
+        patch_range = jnp.arange(seq_len)
+        in_block = (patch_range >= patch_start) & (patch_range < patch_end)
+        bidirectional = bidirectional | (in_block[None, :] & in_block[:, None])
+
+    mask = causal | jnp.broadcast_to(bidirectional[None], (batch_size, seq_len, seq_len))
+
+    # Apply valid positions mask (both query and key must be valid)
+    valid = input_mask[:, None, :] & input_mask[:, :, None]
+    mask = mask & valid
 
     return mask
 
@@ -157,7 +209,7 @@ class PaliGemmaNetworkConfig:
         if max_len is None:
             max_len = self.max_token_len
         if self.paligemma_variant.startswith("gemma3_"):
-            return Gemma3Tokenizer(max_len = max_len)
+            return Gemma3Tokenizer(max_len = max_len, num_images = self.num_cameras)
         return PaligemmaTokenizer(max_len = max_len)
 
     def create(self, rng: at.KeyArrayLike) -> PaliGemmaValueNetwork:
@@ -195,6 +247,7 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
 
         self.config = config
         self._action_conditioned = config.action_conditioned
+        self._is_gemma3 = config.paligemma_variant.startswith("gemma3_")
         self._num_cameras = config.num_cameras
         self._max_token_len = config.max_token_len
         self._action_horizon = config.action_horizon
@@ -270,6 +323,20 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         # Feature dimension is the Gemma embedding dimension
         self._feature_dim = embed_dim
         self._embed_dim = embed_dim
+
+        # Cached demarcation embeddings (populated on first forward call, after weights are loaded)
+        self._cached_special_emb: jax.Array | None = None
+
+    def _get_special_embeddings(self) -> jax.Array:
+        """Return cached [BOS, \\n\\n, <SOI>, <EOI>] embeddings [1, 4, D], computing on first call."""
+        if self._cached_special_emb is None:
+            from openpi.models.tokenizer import Gemma3Tokenizer
+            special_ids = jnp.array([[Gemma3Tokenizer.BOS_ID,
+                                      Gemma3Tokenizer.NEWLINE_NEWLINE_ID,
+                                      Gemma3Tokenizer.START_OF_IMAGE_ID,
+                                      Gemma3Tokenizer.END_OF_IMAGE_ID]])
+            self._cached_special_emb = self.PaliGemma.llm(special_ids, method = "embed")
+        return self._cached_special_emb
 
     @property
     def action_conditioned(self) -> bool:
@@ -363,6 +430,93 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
 
         return tokens, input_mask, ar_mask
 
+    def _embed_sequence_gemma3(
+        self,
+        observation: _model.Observation,
+        action: jax.Array | None = None,
+        action_mask: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Embed full sequence for Gemma 3 with image demarcation tokens.
+
+        Sequence layout:
+            [BOS] [img_block_1 (260)] ... [img_block_N (260)] [text] [state] [(actions)] [CLS]
+
+        Gemma 3 wraps each image's patch tokens with demarcation tokens:
+            [\\n\\n, <SOI>, 256 patches, <EOI>, \\n\\n]  (260 tokens per image)
+
+        BOS is placed first (position 0) so that image blocks start at position 1,
+        matching the reference gemma library which requires BOS before <start_of_image>.
+
+        Returns:
+            Tuple of (tokens, input_mask, attn_mask)
+            - tokens: [B, seq_len, embed_dim]
+            - input_mask: [B, seq_len] bool
+            - attn_mask: [B, seq_len, seq_len] bool — causal + bidirectional-patch-block mask
+        """
+        batch_size = observation.state.shape[0]
+
+        special_emb = self._get_special_embeddings()  # [1, 4, D]
+        bos_emb = special_emb[:, 0 : 1, :]     # [1, 1, D]
+        newline_emb = special_emb[:, 1 : 2, :]  # [1, 1, D]
+        soi_emb = special_emb[:, 2 : 3, :]
+        eoi_emb = special_emb[:, 3 : 4, :]
+
+        tokens = []
+        input_mask = []
+
+        # BOS token at position 0
+        tokens.append(jnp.broadcast_to(bos_emb, (batch_size, 1, self._embed_dim)))
+        input_mask.append(jnp.ones((batch_size, 1), dtype = jnp.bool_))
+
+        # Build image blocks: [\n\n, <SOI>, patches(256), <EOI>, \n\n] per camera
+        for name in self._image_keys:
+            image_tokens, _ = self.PaliGemma.img(observation.images[name], train = False)
+            cam_mask = observation.image_masks[name]  # [B, 1] or [B]
+
+            nn_b = jnp.broadcast_to(newline_emb, (batch_size, 1, self._embed_dim))
+            soi_b = jnp.broadcast_to(soi_emb, (batch_size, 1, self._embed_dim))
+            eoi_b = jnp.broadcast_to(eoi_emb, (batch_size, 1, self._embed_dim))
+
+            block = jnp.concatenate([nn_b, soi_b, image_tokens, eoi_b, nn_b], axis = 1)  # [B, 260, D]
+            tokens.append(block)
+
+            block_mask = einops.repeat(cam_mask, "b -> b s", s = GEMMA3_TOKENS_PER_IMAGE_BLOCK)
+            input_mask.append(block_mask)
+
+        # Embed text tokens, stripping BOS and <SOI> markers inserted by the tokenizer.
+        # tokenized_prompt = [BOS, <SOI>_1, <SOI>_2, ..., <SOI>_N, text_1, ..., \n, pad...]
+        # Strip BOS (already placed above) and SOI markers (handled by image blocks).
+        num_cameras = self._num_cameras
+        text_only = observation.tokenized_prompt[:, 1 + num_cameras :]
+        text_mask = observation.tokenized_prompt_mask[:, 1 + num_cameras :]
+        text_emb = self.PaliGemma.llm(text_only, method = "embed")
+        tokens.append(text_emb)
+        input_mask.append(text_mask)
+
+        # State token
+        if not self._mask_state:
+            state_token = self.state_proj(observation.state)[:, None, :]
+            tokens.append(state_token)
+            input_mask.append(jnp.ones((batch_size, 1), dtype = jnp.bool_))
+
+        # Action tokens
+        if self._action_conditioned:
+            action_tokens = self.action_proj(action)
+            tokens.append(action_tokens)
+            input_mask.append(action_mask)
+
+        # CLS token
+        cls_tokens = jnp.broadcast_to(self.cls_token.value, (batch_size, 1, self._embed_dim))
+        tokens.append(cls_tokens)
+        input_mask.append(jnp.ones((batch_size, 1), dtype = jnp.bool_))
+
+        tokens = jnp.concatenate(tokens, axis = 1)
+        input_mask = jnp.concatenate(input_mask, axis = 1)
+
+        attn_mask = make_gemma3_attn_mask(input_mask, num_cameras)
+
+        return tokens, input_mask, attn_mask
+
     @override
     def compute_features(
         self,
@@ -402,17 +556,19 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             assert action_array.shape[1] == self._action_horizon
             action_mask_array = observation.action_mask  # [B, action_horizon] or None
 
-        # Build embeddings: [images] [text] [state] [actions (if Q(s,a))] [CLS]
-        tokens, input_mask, ar_mask = self._embed_sequence(
-            observation, action=action_array, action_mask=action_mask_array
-        )
+        # Build embeddings and attention mask
+        if self._is_gemma3:
+            tokens, input_mask, attn_mask = self._embed_sequence_gemma3(
+                observation, action = action_array, action_mask = action_mask_array
+            )
+        else:
+            tokens, input_mask, ar_mask = self._embed_sequence(
+                observation, action = action_array, action_mask = action_mask_array
+            )
+            attn_mask = make_attn_mask(input_mask, ar_mask)
 
         # Compute positions: cumsum of valid positions, starting from 0
-        positions = jnp.cumsum(input_mask.astype(jnp.int32), axis=1) - 1
-
-        # Create attention mask
-        # ar_mask is [0...0, 1, 1, ...] where state, actions, and CLS are causal
-        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask.astype(jnp.int32), axis = 1) - 1
 
         if train:
             # Forward through LLM (single expert, no adarms)
@@ -446,24 +602,42 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         """Group per-position CLS attention [B, S] into per-modality scores [B, n_modalities].
 
         Modality order: [img1, img2, ..., imgN, text, (state if not mask_state), (actions if Q)]
-        Each image group sums over 256 patch positions; text/action groups sum over their tokens.
+        Each image group sums over 256 patch positions (excluding demarcation tokens for Gemma 3).
         The CLS self-attention at the last sequence position is excluded from all groups.
         """
-        img_end = self._num_cameras * NUM_PATCHES_PER_IMAGE
-        text_end = img_end + self._max_token_len
-
         attn_parts = []
-        for i in range(self._num_cameras):
-            start = i * NUM_PATCHES_PER_IMAGE
-            end = start + NUM_PATCHES_PER_IMAGE
-            attn_parts.append(cls_attn_mean[:, start:end].sum(axis=-1))
-        attn_parts.append(cls_attn_mean[:, img_end:text_end].sum(axis=-1))  # text
+
+        if self._is_gemma3:
+            # Layout: [BOS] [img_block_1 (260)] ... [img_block_N (260)] [text] ...
+            # Each image block: [\n\n, <SOI>, 256 patches, <EOI>, \n\n]
+            # Only sum the 256 patch positions (offsets 2..257 within each block)
+            for i in range(self._num_cameras):
+                block_start = 1 + i * GEMMA3_TOKENS_PER_IMAGE_BLOCK
+                patch_start = block_start + 2
+                patch_end = patch_start + NUM_PATCHES_PER_IMAGE
+                attn_parts.append(cls_attn_mean[:, patch_start : patch_end].sum(axis = -1))
+
+            # Text starts after BOS + all image blocks.
+            # Text region has (max_token_len - 1 - num_cameras) positions (BOS and SOI
+            # markers stripped, placed explicitly earlier in the sequence).
+            text_start = 1 + self._num_cameras * GEMMA3_TOKENS_PER_IMAGE_BLOCK
+            text_end = text_start + self._max_token_len - 1 - self._num_cameras
+        else:
+            for i in range(self._num_cameras):
+                start = i * NUM_PATCHES_PER_IMAGE
+                end = start + NUM_PATCHES_PER_IMAGE
+                attn_parts.append(cls_attn_mean[:, start : end].sum(axis = -1))
+
+            text_start = self._num_cameras * NUM_PATCHES_PER_IMAGE
+            text_end = text_start + self._max_token_len
+
+        attn_parts.append(cls_attn_mean[:, text_start : text_end].sum(axis = -1))  # text
         if not self._mask_state:
             attn_parts.append(cls_attn_mean[:, text_end])  # state (single token)
             action_start = text_end + 1
         else:
             action_start = text_end
         if self._action_conditioned:
-            attn_parts.append(cls_attn_mean[:, action_start:action_start + self._action_horizon].sum(axis=-1))
+            attn_parts.append(cls_attn_mean[:, action_start : action_start + self._action_horizon].sum(axis = -1))
 
-        return jnp.stack(attn_parts, axis=-1)
+        return jnp.stack(attn_parts, axis = -1)
