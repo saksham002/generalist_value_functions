@@ -35,6 +35,7 @@ Position Embeddings:
 from __future__ import annotations
 
 import dataclasses
+import logging
 
 import einops
 import flax.nnx as nnx
@@ -50,6 +51,8 @@ import openpi.models.gemma3 as _gemma3
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 from openpi.value_functions.networks.base_networks import BaseValueNetwork
+
+logger = logging.getLogger(__name__)
 
 
 # Number of patches per image (224/14 = 16, 16*16 = 256)
@@ -185,19 +188,13 @@ class PaliGemmaNetworkConfig:
     paligemma_variant: str = "gemma_2b"
 
     # Dtype for computations
-    dtype: str = "float32"
+    dtype: str = "bfloat16"
 
-    # Whether this network is action-conditioned (Q(s,a) vs V(s))
-    action_conditioned: bool = False
-
-    # Action dimension (required when action_conditioned=True)
+    # Action dimension (required when action_horizon is provided)
     action_dim: int = 14
 
-    # Number of actions in chunk (required when action_conditioned=True)
-    action_horizon: int = 1
-
     # Whether to mask out the state token in the attention mask (for ablation studies)
-    mask_state: bool = False
+    no_state: bool = False
 
     # Fix order in which to iterate through keys
     image_keys: tuple[str, str, str] = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
@@ -212,9 +209,9 @@ class PaliGemmaNetworkConfig:
             return Gemma3Tokenizer(max_len = max_len, num_images = self.num_cameras)
         return PaligemmaTokenizer(max_len = max_len)
 
-    def create(self, rng: at.KeyArrayLike) -> PaliGemmaValueNetwork:
+    def create(self, rng: at.KeyArrayLike, action_horizon: int | None = None) -> PaliGemmaValueNetwork:
         """Create a new PaliGemma value network with initialized parameters."""
-        return PaliGemmaValueNetwork(self, rngs=nnx.Rngs(rng))
+        return PaliGemmaValueNetwork(self, rngs = nnx.Rngs(rng), action_horizon = action_horizon)
 
 
 class PaliGemmaValueNetwork(BaseValueNetwork):
@@ -242,19 +239,26 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
     - CLS token (last): can attend to all, but others cannot attend to it
     """
 
-    def __init__(self, config: PaliGemmaNetworkConfig, rngs: nnx.Rngs):
+    def __init__(self, config: PaliGemmaNetworkConfig, rngs: nnx.Rngs, action_horizon: int | None = None):
         super().__init__()
 
         self.config = config
-        self._action_conditioned = config.action_conditioned
+        self._action_conditioned = action_horizon is not None
         self._is_gemma3 = config.paligemma_variant.startswith("gemma3_")
         self._num_cameras = config.num_cameras
         self._max_token_len = config.max_token_len
-        self._action_horizon = config.action_horizon
+        self._action_horizon = action_horizon if action_horizon is not None else 0
         self._action_dim = config.action_dim
-        self._mask_state = config.mask_state
+        self._no_state = config.no_state
         self._image_keys = config.image_keys
         self._image_size = config.image_size
+
+        logger.info(
+            "PaliGemmaValueNetwork: variant=%s, is_gemma3=%s, action_conditioned=%s, "
+            "action_horizon=%s, no_state=%s",
+            config.paligemma_variant, self._is_gemma3, self._action_conditioned,
+            self._action_horizon, self._no_state,
+        )
 
         # Get config and module class based on variant
         if config.paligemma_variant.startswith("gemma3_"):
@@ -312,12 +316,13 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         self.cls_token = nnx.Param(jax.random.normal(rngs.params(), (1, 1, embed_dim)) * 0.02)
 
         # State projection: state_dim -> embed_dim (single token)
-        self.state_proj = nnx.Linear(config.state_dim, embed_dim, rngs=rngs)
+        self.state_proj: nnx.Linear | None = None
+        if not self._no_state:
+            self.state_proj = nnx.Linear(config.state_dim, embed_dim, rngs=rngs)
 
         # Action projection: action_dim -> embed_dim (one token per action in chunk)
-        # Only created if action_conditioned is True
         self.action_proj: nnx.Linear | None = None
-        if config.action_conditioned:
+        if self._action_conditioned:
             self.action_proj = nnx.Linear(config.action_dim, embed_dim, rngs=rngs)
 
         # Feature dimension is the Gemma embedding dimension
@@ -399,8 +404,8 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             # Text tokens: bidirectional with images
             ar_mask += [False] * tokenized_inputs.shape[1]
 
-        # 3. Add state token (skip entirely when mask_state is True)
-        if not self._mask_state:
+        # 3. Add state token (skip entirely when no_state is True)
+        if not self._no_state:
             state_token = self.state_proj(observation.state)[:, None, :]  # [B, 1, embed_dim]
             tokens.append(state_token)
             input_mask.append(jnp.ones((batch_size, 1), dtype=jnp.bool_))
@@ -494,7 +499,7 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         input_mask.append(text_mask)
 
         # State token
-        if not self._mask_state:
+        if not self._no_state:
             state_token = self.state_proj(observation.state)[:, None, :]
             tokens.append(state_token)
             input_mask.append(jnp.ones((batch_size, 1), dtype = jnp.bool_))
@@ -601,7 +606,7 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
     def _group_attn_scores(self, cls_attn_mean: jax.Array) -> jax.Array:
         """Group per-position CLS attention [B, S] into per-modality scores [B, n_modalities].
 
-        Modality order: [img1, img2, ..., imgN, text, (state if not mask_state), (actions if Q)]
+        Modality order: [img1, img2, ..., imgN, text, (state if not no_state), (actions if Q)]
         Each image group sums over 256 patch positions (excluding demarcation tokens for Gemma 3).
         The CLS self-attention at the last sequence position is excluded from all groups.
         """
@@ -632,7 +637,7 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             text_end = text_start + self._max_token_len
 
         attn_parts.append(cls_attn_mean[:, text_start : text_end].sum(axis = -1))  # text
-        if not self._mask_state:
+        if not self._no_state:
             attn_parts.append(cls_attn_mean[:, text_end])  # state (single token)
             action_start = text_end + 1
         else:

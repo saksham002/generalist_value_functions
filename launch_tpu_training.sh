@@ -40,12 +40,6 @@ if [[ "$SYNC_SOURCE" != "local" && "$SYNC_SOURCE" != "hpc" ]]; then
     exit 1
 fi
 
-if [[ "$SYNC_SOURCE" == "hpc" ]]; then
-    CHOWN_USER="saksham3"
-else
-    CHOWN_USER="saksham"
-fi
-
 PROJECT="cmu-aidm-v2"
 ZONE="europe-west4-b"
 
@@ -111,7 +105,6 @@ echo "ZONE: $ZONE"
 echo "CONFIG_NAME: $CONFIG_NAME"
 echo "TRAIN_ARGS: $TRAIN_ARGS"
 echo "SYNC_SOURCE: $SYNC_SOURCE"
-echo "CHOWN_USER: $CHOWN_USER"
 echo "Number of workers: ${NUM_WORKERS:-unknown}"
 echo "============================================"
 
@@ -148,7 +141,6 @@ export CONFIG_NAME
 export TRAIN_ARGS
 export TRAIN_SCRIPT
 export NFS_USER
-export CHOWN_USER
 POD_NAME=$TPU_VM_NAME tpc launch pod_config.py --project=$PROJECT
 
 # Connect to the pod

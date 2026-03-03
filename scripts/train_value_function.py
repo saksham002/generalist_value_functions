@@ -42,6 +42,7 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 import openpi.transforms as _transforms
 import openpi.value_functions.base_value_functions as _value_fn
+import openpi.value_functions.value_function as _value_fn_impl
 from openpi.training.robocoin_data_loader import RoboCOINDataLoaderConfig, create_robocoin_data_loader
 from openpi.robocoin_utils.utils import (
     cache_val_episodes,
@@ -414,7 +415,12 @@ def init_train_state(
 
     if not isinstance(config.model, _value_fn.BaseValueFunctionConfig):
         raise TypeError(f"Expected BaseValueFunctionConfig, got {type(config.model)}")
-    model_config: _value_fn.BaseValueFunctionConfig = config.model
+    if isinstance(config.model, _value_fn_impl.ValueFunctionConfig):
+        model_config: _value_fn.BaseValueFunctionConfig = dataclasses.replace(
+            config.model, action_horizon = config.action_horizon,
+        )
+    else:
+        model_config = config.model
 
     def init_critic(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)
@@ -578,7 +584,7 @@ def value_function_train_step(
         nnx.All(
             nnx.Param,
             nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
-            nnx.Not(nnx_utils.PathRegex(".*/target_(network|head)/.*")),
+            nnx.Not(nnx_utils.PathRegex(".*target_(network|head)/.*")),
             lambda _, x: x.value.ndim > 1,
         ),
     )
@@ -1841,7 +1847,9 @@ def main(config: _config.TrainConfig):
                 batch_size=256,
                 shuffle=False,
                 repeat=False,
-                action_horizon = config.action_horizon,
+                action_horizon = config.action_horizon or 5,
+                state_norm_stats = data_config.norm_stats,
+                use_quantile_norm = data_config.use_quantile_norm,
             )
             num_images = val_loader_config.max_cameras if config.backbone_variant == "gemma3" else 0
             val_tokenizer = create_tokenizer(config.backbone_variant, val_loader_config.max_token_len, num_images = num_images)
@@ -1904,12 +1912,7 @@ def main(config: _config.TrainConfig):
         
         val_episodes_cache_dir = None  # No caching for non-RoboCOIN datasets
     
-    # Detect action_conditioned: check network_config (for MC/SARSA) or q_network_config (for IQL)
-    # For ensemble configs, check base_config for the actual network settings
-    network_config = getattr(config.model, "network_config", None) or getattr(config.model, "q_network_config", None)
-    if hasattr(network_config, "base_config"):
-        network_config = network_config.base_config  # Unwrap EnsembleNetworkConfig
-    action_conditioned = getattr(network_config, "action_conditioned", False)
+    action_conditioned = config.action_horizon is not None
     logging.info(f"Validation plots: action_conditioned={action_conditioned}")
 
     # Set up evaluation environment if enabled

@@ -99,7 +99,6 @@ train_args_str = " \\\n\t".join([f"--{k}={v}" for k, v in train_args.items()])
 train_script = os.environ.get("TRAIN_SCRIPT", "scripts/train_value_function.py")
 # train_script = "scripts/train_value_function_debug.py"
 NFS_USER = os.environ.get("NFS_USER", "saksham3")
-CHOWN_USER = os.environ.get("CHOWN_USER", NFS_USER)
 
 launch_script = f"""
 #!/bin/bash
@@ -112,12 +111,13 @@ echo "CONFIG_NAME: {config_name}"
 echo "TRAIN_ARGS: {train_args_str}"
 echo "SRC_DIR: {config["src_dir"]}"
 echo "NFS_USER: {NFS_USER}"
-echo "CHOWN_USER: {CHOWN_USER}"
 
 echo "Running source {config["src_dir"]}/vla/bin/activate"
 source {config["src_dir"]}/vla/bin/activate
 
 # Set platform for TPU distributed training
+export HOME=/home/saksham3
+sudo chmod -R 777 $HOME
 export PLATFORM=tpu
 export GCS_READ_CACHE_BLOCK_SIZE_MB=0
 export GCS_READ_CACHE_MAX_STALENESS=0
@@ -153,12 +153,21 @@ echo "Running {config["setup_script"]}"
 echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 echo "WANDB_API_KEY: $WANDB_API_KEY"
 
-echo "Running sudo chown -R {CHOWN_USER}:{CHOWN_USER} /tmp/tpu_logs"
-sudo chown -R {CHOWN_USER}:{CHOWN_USER} /tmp/tpu_logs
+echo "Running sudo chmod -R 777 /tmp/tpu_logs"
+sudo chmod -R 777 /tmp/tpu_logs
+
+if [[ "$(hostname)" == *-w-0 ]]; then
+    echo "Worker 0: fixing NFS permissions..."
+    sudo chmod -R 777 /nfs/aidm_nfs/saksham3/batch_value_learning/
+    sudo chmod -R 777 /nfs/aidm_nfs/saksham3/robocoin
+fi
 
 echo "Running python {train_script} {config_name} {train_args_str} --resume"
 python {train_script} {config_name} \\
     {train_args_str} --resume
+EXIT_CODE=$?
+echo "Training exited with code $EXIT_CODE"
+exec bash
 """
 
 if os.environ.get("VERBOSE", "0") == "1":

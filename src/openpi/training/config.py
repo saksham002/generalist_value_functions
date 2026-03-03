@@ -1264,8 +1264,8 @@ class TrainConfig:
 
     # Backbone variant for tokenizer selection: "gemma3" uses Gemma3Tokenizer, None uses PaligemmaTokenizer.
     backbone_variant: str | None = None
-    # Number of actions in the action chunk (used by RoboCOIN data pipeline).
-    action_horizon: int = 1
+    # Number of actions in the action chunk. None means V(s), not Q(s,a).
+    action_horizon: int | None = None
 
     # Maximum gradient norm for clipping. None = no clipping.
     clip_grad_norm: float | None = None
@@ -2823,10 +2823,8 @@ _CONFIGS = [
                 num_cameras=3,
                 image_size=(224, 224),
                 max_token_len=48,
-                action_conditioned=True,
                 action_dim=14,
-                action_horizon=50,
-                mask_state=True,
+                no_state=True,
             ),
             head_config=_heads.RegressionHeadConfig(),
         ),
@@ -2868,9 +2866,7 @@ _CONFIGS = [
                 num_cameras=3,
                 image_size=(224, 224),
                 max_token_len=48,
-                action_conditioned=True,
                 action_dim=14,
-                action_horizon=50,
             ),
             head_config=_heads.CategoricalHeadConfig(
                 v_min=0.0,
@@ -2920,6 +2916,7 @@ _CONFIGS = [
                 image_size=(896, 896),
                 max_token_len=48,
                 paligemma_variant="gemma3_dummy",
+                dtype="float32",
             ),
             head_config=_heads.RegressionHeadConfig(),
         ),
@@ -2959,10 +2956,8 @@ _CONFIGS = [
                 max_token_len=48,
                 paligemma_variant="gemma3_4b",
                 dtype="bfloat16",
-                action_conditioned=True,
                 action_dim=14,
-                action_horizon=50,
-                mask_state=True,
+                no_state=True,
             ),
             head_config=_heads.RegressionHeadConfig(),
         ),

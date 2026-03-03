@@ -587,10 +587,11 @@ def create_data_loader(
 
         robocoin_config = dc.replace(
             data_config.robocoin_data_config,
-            action_horizon = config.action_horizon,
+            action_horizon = config.action_horizon or 5,
         )
         data_config = dc.replace(data_config, robocoin_data_config = robocoin_config)
 
+        # num_images unused for PaliGemma, used for Gemma3
         num_images = robocoin_config.max_cameras if config.backbone_variant == "gemma3" else 0
         tokenizer = create_tokenizer(config.backbone_variant, robocoin_config.max_token_len, num_images = num_images)
         return create_robocoin_data_loader(

@@ -50,6 +50,9 @@ class ValueFunctionConfig(BaseValueFunctionConfig):
     network_config: MLPNetworkConfig | PaliGemmaNetworkConfig
     head_config: HeadConfig
 
+    # Number of actions in the action chunk. None means V(s), not Q(s,a).
+    action_horizon: int | None = None
+
     @override
     def create(self, rng: at.KeyArrayLike) -> ValueFunction:
         raise NotImplementedError("Use a specific config subclass (MCValueFunctionConfig, etc.)")
@@ -69,8 +72,8 @@ class ValueFunctionConfig(BaseValueFunctionConfig):
                 state=jax.ShapeDtypeStruct([batch_size, nc.state_dim], jnp.float32),
             )
         target = jax.ShapeDtypeStruct([batch_size], jnp.float32)
-        if nc.action_conditioned:
-            actions = jax.ShapeDtypeStruct([batch_size, nc.action_horizon, nc.action_dim], jnp.float32)
+        if self.action_horizon is not None:
+            actions = jax.ShapeDtypeStruct([batch_size, self.action_horizon, nc.action_dim], jnp.float32)
             return obs, actions, target
         return obs, target
 
@@ -87,7 +90,12 @@ class MCValueFunctionConfig(ValueFunctionConfig):
         rng = jax.random.key(rng) if isinstance(rng, int) else rng
         net_rng, head_rng = jax.random.split(rng)
 
-        network = self.network_config.create(net_rng)
+        # PaliGemmaNetworkConfig receives action_horizon at creation time instead of
+        # storing it as a config field. MLPNetworkConfig keeps it in its own config.
+        if isinstance(self.network_config, PaliGemmaNetworkConfig):
+            network = self.network_config.create(net_rng, action_horizon = self.action_horizon)
+        else:
+            network = self.network_config.create(net_rng)
         head = self.head_config.create(network.feature_dim, head_rng)
 
         return MCValueFunction(network=network, head=head)
@@ -105,9 +113,13 @@ class SARSAValueFunctionConfig(ValueFunctionConfig):
         rng = jax.random.key(rng) if isinstance(rng, int) else rng
         net_rng, head_rng = jax.random.split(rng, 2)
 
-        network = self.network_config.create(net_rng)
+        if isinstance(self.network_config, PaliGemmaNetworkConfig):
+            network = self.network_config.create(net_rng, action_horizon = self.action_horizon)
+            target_network = self.network_config.create(net_rng, action_horizon = self.action_horizon)
+        else:
+            network = self.network_config.create(net_rng)
+            target_network = self.network_config.create(net_rng)
         head = self.head_config.create(network.feature_dim, head_rng)
-        target_network = self.network_config.create(net_rng)
         target_head = self.head_config.create(target_network.feature_dim, head_rng)
 
         return SARSAValueFunction(
@@ -201,9 +213,13 @@ class SACValueFunctionConfig(ValueFunctionConfig):
         rng = jax.random.key(rng) if isinstance(rng, int) else rng
         net_rng, head_rng = jax.random.split(rng, 2)
 
-        network = self.network_config.create(net_rng)
+        if isinstance(self.network_config, PaliGemmaNetworkConfig):
+            network = self.network_config.create(net_rng, action_horizon = self.action_horizon)
+            target_network = self.network_config.create(net_rng, action_horizon = self.action_horizon)
+        else:
+            network = self.network_config.create(net_rng)
+            target_network = self.network_config.create(net_rng)
         head = self.head_config.create(network.feature_dim, head_rng)
-        target_network = self.network_config.create(net_rng)
         target_head = self.head_config.create(target_network.feature_dim, head_rng)
 
         return SACValueFunction(

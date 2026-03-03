@@ -491,31 +491,23 @@ class PostBatchTransform:
 
     def __init__(
         self,
+        tokenizer: PaligemmaTokenizer | Gemma3Tokenizer,
         max_token_len: int = DEFAULT_MAX_TOKEN_LEN,
         state_norm_stats: dict[str, Any] | None = None,
         use_quantile_norm: bool = False,
         use_eef: bool = False,
         split: str = "train",
         dont_mask_actions: bool = False,
-        tokenizer: PaligemmaTokenizer | Gemma3Tokenizer | None = None,
     ):
         self.use_eef = use_eef
         self.split = split
         self.dont_mask_actions = dont_mask_actions
-
-        self._tokenizer = tokenizer
-        self._max_token_len = max_token_len
+        self.tokenizer = tokenizer
 
         self._normalize_fn = _transforms.Normalize(state_norm_stats, use_quantiles=use_quantile_norm)
 
         if dont_mask_actions:
             self._rng = np.random.default_rng(seed=86)
-
-    @property
-    def tokenizer(self) -> PaligemmaTokenizer | Gemma3Tokenizer:
-        if self._tokenizer is None:
-            self._tokenizer = PaligemmaTokenizer(max_len = self._max_token_len)
-        return self._tokenizer
 
     @staticmethod
     def _generate_negative_subtask_text(subtask_text: str) -> str:
@@ -693,7 +685,7 @@ class PostBatchTransform:
 
 def create_robocoin_data_loader(
     config: RoboCOINDataLoaderConfig,
-    tokenizer: PaligemmaTokenizer | Gemma3Tokenizer | None = None,
+    tokenizer: PaligemmaTokenizer | Gemma3Tokenizer,
 ) -> Iterator[dict[str, Any]]:
     """Create a DLIMP-based data loader for the RoboCOIN dataset.
 
@@ -811,9 +803,9 @@ class RoboCOINDataLoader:
         self,
         config: RoboCOINDataLoaderConfig,
         *,
+        tokenizer: PaligemmaTokenizer | Gemma3Tokenizer,
         sharding: jax.sharding.Sharding | None = None,
         num_batches: int | None = None,
-        tokenizer: PaligemmaTokenizer | Gemma3Tokenizer | None = None,
     ):
         self.config = config
         self._tokenizer = tokenizer
