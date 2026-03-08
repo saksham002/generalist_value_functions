@@ -311,11 +311,11 @@ class _Module(nn.Module):
             x = out["logits"] = head(x)
 
         if self.mm_proj_dim is not None:
-            x_f32 = x.astype(jnp.float32)
-            var = jnp.mean(jnp.square(x_f32), axis = -1, keepdims = True)
+            dtype = x.dtype
+            var = jnp.mean(jnp.square(x), axis = -1, keepdims = True)
             scale = self.param("mm_soft_embedding_norm", nn.initializers.zeros, (x.shape[-1],))
-            normed = x_f32 * jnp.reciprocal(jnp.sqrt(var + 1e-6)) * (1.0 + scale)
-            x = nn.Dense(self.mm_proj_dim, use_bias = False, dtype = jnp.float32, name = "mm_input_projection")(normed).astype(self.dtype_mm)
+            normed = x * jnp.reciprocal(jnp.sqrt(var + 1e-6)) * (1.0 + scale.astype(dtype))
+            x = nn.Dense(self.mm_proj_dim, use_bias = False, dtype = dtype, name = "mm_input_projection")(normed)
             out["projected"] = x
 
         return x, out

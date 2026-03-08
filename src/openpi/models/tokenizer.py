@@ -103,7 +103,9 @@ def create_tokenizer(
 ) -> PaligemmaTokenizer | Gemma3Tokenizer:
     """Factory function that returns the appropriate tokenizer for the given backbone variant."""
     if backbone_variant == "gemma3":
+        logging.info(f"Creating Gemma3Tokenizer: max_len={max_len}, num_images={num_images}")
         return Gemma3Tokenizer(max_len = max_len, num_images = num_images)
+    logging.info(f"Creating PaligemmaTokenizer: max_len={max_len}")
     return PaligemmaTokenizer(max_len = max_len)
 
 

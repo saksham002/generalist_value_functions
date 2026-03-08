@@ -162,6 +162,7 @@ def count_subtask_segments(frames: list[dict], prefix: str = "") -> tuple[int, i
     prev = None
     boundaries = []
     segments = []
+    segment_starts = []
     for i, f in enumerate(frames):
         st = f[key]
         if hasattr(st, "item"):
@@ -170,11 +171,18 @@ def count_subtask_segments(frames: list[dict], prefix: str = "") -> tuple[int, i
             if st.lower() not in ("null", "static", "abnormal"):
                 count += 1
                 segments.append(st)
+                segment_starts.append(i)
                 if prev is not None:
                     boundaries.append(i)
             prev = st
+
+    labeled_segments = []
+    for idx, (text, start) in enumerate(zip(segments, segment_starts)):
+        end = segment_starts[idx + 1] if idx + 1 < len(segment_starts) else len(frames)
+        labeled_segments.append(f"{text} - [{start}, {end})")
+
     split_frame_idx = boundaries[count // 2 - 1] if boundaries else len(frames) // 2
-    return count, split_frame_idx, segments
+    return count, split_frame_idx, labeled_segments
 
 
 def cache_val_episodes(
@@ -298,6 +306,22 @@ def cache_val_episodes(
                         frame[key] = np.asarray(value[i])
 
                 traj_frames[traj_idx].append(frame)
+
+        # Save any remaining active trajectories that were still in-progress when the dataloader ended
+        for traj_idx in list(active_trajs):
+            if saved_traj_count >= num_val_trajectories:
+                break
+            if traj_idx in traj_frames:
+                frames = traj_frames[traj_idx]
+                if frames:
+                    frames.sort(key = lambda f: f["_frame_index"])
+                if cache_dir:
+                    cache_file = os.path.join(cache_dir, f"traj_{traj_idx}.pkl")
+                    with open(cache_file, "wb") as f:
+                        pickle.dump(frames, f)
+                    logger.info(f"Saved remaining traj {traj_idx} ({len(frames)} frames) to {cache_file}")
+                del traj_frames[traj_idx]
+                saved_traj_count += 1
 
         logger.info(f"Total trajectories saved: {saved_traj_count}, unique repo_ids: {len(seen_repo_ids)}")
 

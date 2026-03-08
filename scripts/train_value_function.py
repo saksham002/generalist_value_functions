@@ -437,6 +437,12 @@ def init_train_state(
             config.freeze_filter,
             lambda p: p.replace(p.value.astype(jnp.bfloat16)),
         )
+        weight_dtype = jnp.dtype(model_config.weight_dtype) if hasattr(model_config, "weight_dtype") else jnp.float32
+        params = nnx_utils.state_map(
+            params,
+            config.trainable_filter,
+            lambda p: p.replace(p.value.astype(weight_dtype)),
+        )
 
         return training_utils.TrainState(
             step=0,
@@ -588,6 +594,15 @@ def value_function_train_step(
             lambda _, x: x.value.ndim > 1,
         ),
     )
+    target_params = nnx.state(
+        model,
+        nnx.All(
+            nnx.Param,
+            nnx_utils.PathRegex(".*target_(network|head)/.*"),
+            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            lambda _, x: x.value.ndim > 1,
+        ),
+    )
 
     # Batch statistics
     obs_state = transition.observation.state
@@ -628,6 +643,7 @@ def value_function_train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        "target_param_norm": optax.global_norm(target_params),
         "learning_rate": lr_schedule(state.step),
         **value_info,
         **batch_stats,
@@ -1796,10 +1812,36 @@ def main(config: _config.TrainConfig):
     # Select fixed validation trajectories for plotting
     # Create validation dataset - use NumpyDataset for minari/legacy D4RL, LeRobotDataset otherwise
     data_config = config.data.create(config.assets_dirs, config.model)
+
+    # Apply val_only overrides to data_config and effective config values
+    if config.val_only:
+        logging.info("val_only mode: applying validation-specific overrides")
+        import dataclasses as dc
+
+        if data_config.robocoin_data_config is not None:
+            rc = data_config.robocoin_data_config
+            rc_overrides = {}
+            if config.val_only_data_dir is not None:
+                rc_overrides["data_dir"] = config.val_only_data_dir
+            if config.val_only_dataset_name is not None:
+                rc_overrides["dataset_name"] = config.val_only_dataset_name
+            if rc_overrides:
+                rc = dc.replace(rc, **rc_overrides)
+                data_config = dc.replace(data_config, robocoin_data_config = rc)
+
+        if config.val_only_norm_stats_path is not None and isinstance(config.data, _config.RoboCOINDataConfig):
+            overridden_data_factory = dc.replace(config.data, norm_stats_path = config.val_only_norm_stats_path)
+            norm_stats = overridden_data_factory._load_robocoin_norm_stats()
+            data_config = dc.replace(data_config, norm_stats = norm_stats)
+
+    effective_include_repos = config.val_only_include_repos if (config.val_only and config.val_only_include_repos is not None) else config.include_repos
+    effective_num_val_trajectories = config.val_only_num_val_trajectories if (config.val_only and config.val_only_num_val_trajectories is not None) else config.num_val_trajectories
+    effective_validation_cache_dir = config.val_only_validation_cache_dir if (config.val_only and config.val_only_validation_cache_dir is not None) else config.validation_cache_dir
+
     # Initialize variables for all branches
     num_episodes = None
     val_dataloader = None
-    
+
     if data_config.minari_dataset_id is not None:
         val_dataset = _data_loader.create_numpy_dataset_from_minari(
             data_config.minari_dataset_id,
@@ -1828,23 +1870,24 @@ def main(config: _config.TrainConfig):
         # Select validation episode indices for RoboCOIN
         val_rng = np.random.default_rng(config.seed)
         val_episode_indices = val_rng.choice(
-            num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
+            num_episodes, size=min(effective_num_val_trajectories, num_episodes), replace=False
         ).tolist()
         logging.info(f"Selected validation episodes: {val_episode_indices}")
-        
+
         # Cache validation episodes to disk - only worker 0 collects and caches
-        val_episodes_cache_dir = config.validation_cache_dir if config.validation_cache_dir is not None else str(config.checkpoint_dir / "val_episodes")
-        
+        val_episodes_cache_dir = effective_validation_cache_dir if effective_validation_cache_dir is not None else str(config.checkpoint_dir / "val_episodes")
+
         if jax.process_index() == 0:
             logging.info("Worker 0: Collecting validation episodes for caching")
-            
+
             import dataclasses as dc
             from openpi.models.tokenizer import create_tokenizer
 
             val_loader_config = dc.replace(
                 robocoin_config,
                 split="val",
-                batch_size=256,
+                batch_size=64,
+                prefetch_buffer_size=2,
                 shuffle=False,
                 repeat=False,
                 action_horizon = config.action_horizon or 5,
@@ -1854,7 +1897,7 @@ def main(config: _config.TrainConfig):
             num_images = val_loader_config.max_cameras if config.backbone_variant == "gemma3" else 0
             val_tokenizer = create_tokenizer(config.backbone_variant, val_loader_config.max_token_len, num_images = num_images)
             val_dataloader = create_robocoin_data_loader(val_loader_config, tokenizer = val_tokenizer)
-            
+
             generate_validation_plots_dlimp(
                 model=None,  # Not needed for save_only
                 val_dataloader=val_dataloader,
@@ -1864,7 +1907,7 @@ def main(config: _config.TrainConfig):
                 data_config=data_config,
                 cache_dir=val_episodes_cache_dir,
                 save_only=True,
-                include_repos=config.include_repos,
+                include_repos=effective_include_repos,
             )
             del val_dataloader
             logging.info("Validation episodes cached successfully")
@@ -1894,7 +1937,7 @@ def main(config: _config.TrainConfig):
         if hasattr(val_dataset, "episode_starts") and hasattr(val_dataset, "episode_ends"):
             episode_lengths = val_dataset.episode_ends - val_dataset.episode_starts
             valid_episode_indices = np.where(episode_lengths >= min_episode_length)[0]
-            if len(valid_episode_indices) < config.num_val_trajectories:
+            if len(valid_episode_indices) < effective_num_val_trajectories:
                 logging.warning(
                     f"Only {len(valid_episode_indices)} episodes with >= {min_episode_length} frames, "
                     f"using all of them for validation"
@@ -1902,11 +1945,11 @@ def main(config: _config.TrainConfig):
                 val_episode_indices = valid_episode_indices.tolist()
             else:
                 val_episode_indices = val_rng.choice(
-                    valid_episode_indices, size=config.num_val_trajectories, replace=False
+                    valid_episode_indices, size=effective_num_val_trajectories, replace=False
                 ).tolist()
         else:
             val_episode_indices = val_rng.choice(
-                num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
+                num_episodes, size=min(effective_num_val_trajectories, num_episodes), replace=False
             ).tolist()
         logging.info(f"Selected validation episodes: {val_episode_indices}")
         
@@ -1950,6 +1993,46 @@ def main(config: _config.TrainConfig):
         logging.info(f"Policy: {training_utils.array_tree_to_info(policy_state.params)}")
 
     jax.block_until_ready(critic_state)
+
+    # === val_only mode: run one validation pass and exit ===
+    if config.val_only:
+        logging.info("val_only mode: running validation plotting")
+        step = int(critic_state.step)
+        model = nnx.merge(critic_state.model_def, critic_state.params)
+
+        if data_config.robocoin_data_config is not None:
+            generate_validation_plots_dlimp(
+                model=model,
+                val_dataloader=None,
+                val_episode_indices=val_episode_indices,
+                step=step,
+                action_conditioned=action_conditioned,
+                data_config=data_config,
+                cache_dir=val_episodes_cache_dir,
+            )
+        else:
+            plot_images = generate_validation_plots(
+                model=model,
+                dataset=val_dataset,
+                val_episode_indices=val_episode_indices,
+                step=step,
+                action_conditioned=action_conditioned,
+                data_config=data_config,
+            )
+            if jax.process_index() == 0 and plot_images:
+                logging.info(f"Generated {len(plot_images)} validation plot items")
+                wandb.log(plot_images, step=step)
+
+        # Wait for background render thread if any
+        if jax.process_index() == 0 and _render_thread is not None and _render_thread.is_alive():
+            logging.info("Waiting for render thread to finish")
+            _render_thread.join()
+
+        if jax.process_count() > 1:
+            multihost_utils.sync_global_devices("val_only_done")
+
+        logging.info("val_only mode complete")
+        return
 
     lr_schedule = config.lr_schedule.create()
     ptrain_step = jax.jit(
@@ -2017,6 +2100,7 @@ def main(config: _config.TrainConfig):
             timing_info.update({f"total_times/{k}": v for k, v in total_times.items()})
             info.update(timing_info)
 
+            info = {k: float(v) for k, v in info.items()}
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(info, step=step)
@@ -2041,7 +2125,7 @@ def main(config: _config.TrainConfig):
             with timer.context("checkpoint_save"):
                 state_to_save = training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
                 _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step)
-            
+
         # Generate validation plots (all workers participate for FSDP, only worker 0 creates plots/logs)
         if (step + 1) % config.plot_interval == 0 or step + 1 == config.num_train_steps:
             with timer.context("validation_plot"):

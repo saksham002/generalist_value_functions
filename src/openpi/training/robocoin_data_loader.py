@@ -622,27 +622,27 @@ class PostBatchTransform:
     def _replace_masked_actions(self, batch: dict) -> None:
         """Replace subtask-masked action positions with last valid action plus standard normal noise.
 
-        Sets action_mask to all True after replacement.
+        Applied to both current and next action chunks so that Q(s,a) and Q(s',a')
+        see the same masking convention.
         """
-        actions = batch["actions"].copy()  # [B, H, D]
-        action_mask = batch["action_mask"].copy()  # [B, H]
-        batch_size, action_horizon, _ = actions.shape
+        fps = batch["fps"]
+        for actions_key, mask_key in [("actions", "action_mask"), ("next_actions", "next_action_mask")]:
+            actions = batch[actions_key].copy()
+            action_mask = batch[mask_key].copy()
+            batch_size, action_horizon, _ = actions.shape
 
-        # Index of last True per row: [B]
-        last_valid_idx = action_mask.sum(axis=-1) - 1
-        # Last valid action per sample: [B, D]
-        last_valid_actions = actions[np.arange(batch_size), last_valid_idx]
+            last_valid_idx = action_mask.sum(axis = -1) - 1
+            last_valid_actions = actions[np.arange(batch_size), last_valid_idx]
 
-        noise = (0.005 * self._rng.standard_normal(actions.shape)).astype(actions.dtype)
-        replacement = last_valid_actions[:, None, :] + noise  # [B, H, D]
+            noise = (0.005 * self._rng.standard_normal(actions.shape)).astype(actions.dtype)
+            replacement = last_valid_actions[:, None, :] + noise
 
-        mask_to_replace = ~action_mask  # [B, H]
-        actions[mask_to_replace] = replacement[mask_to_replace]
-        batch["actions"] = actions
+            actions[~action_mask] = replacement[~action_mask]
+            action_mask[:] = True
+            action_mask[fps == 30, 3 * action_horizon // 5 :] = False
 
-        action_mask[:] = True
-        action_mask[batch["fps"] == 30, 3 * action_horizon // 5 :] = False
-        batch["action_mask"] = action_mask
+            batch[actions_key] = actions
+            batch[mask_key] = action_mask
 
     def _process_validation_extras(self, batch: dict, batch_size: int) -> None:
         subtask_1_texts = [self._decode_text(batch["subtask_1"][i]) for i in range(batch_size)]
@@ -759,7 +759,7 @@ def create_robocoin_data_loader(
 
     dataset = dataset.batch(config.batch_size, drop_remainder=config.drop_remainder)
     dataset = dataset.with_ram_budget(1)
-    dataset = dataset.prefetch(4)
+    dataset = dataset.prefetch(config.prefetch_buffer_size)
 
     post_batch_transform = PostBatchTransform(
         max_token_len=config.max_token_len,
@@ -767,7 +767,7 @@ def create_robocoin_data_loader(
         use_quantile_norm=config.use_quantile_norm,
         use_eef=config.use_eef,
         split=config.split,
-        dont_mask_actions=config.dont_mask_actions and config.split != "val",
+        dont_mask_actions=config.dont_mask_actions,
         tokenizer=tokenizer,
     )
 

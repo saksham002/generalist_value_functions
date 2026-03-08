@@ -118,14 +118,20 @@ else
     echo "[Step 1/3] SYNC_SOURCE=hpc: skipping HPC->local sync (using ${LOCAL_DIR})"
 fi
 
-# Step 2a: Ensure NFS is mounted on all TPU workers (must happen before rsync to NFS)
-echo "[Step 2a] Checking/mounting NFS on all TPU workers..."
+# Step 2a: Add local SSH public key to authorized_keys on all workers
+echo "[Step 2a] Adding SSH public key to all workers..."
+LOCAL_PUBKEY=$(cat ~/.ssh/id_ed25519.pub)
+gcloud compute tpus tpu-vm ssh $TPU_VM_NAME --project=$PROJECT --zone=$ZONE --worker=all \
+    --command="grep -qF '${LOCAL_PUBKEY}' ~/.ssh/authorized_keys 2>/dev/null || echo '${LOCAL_PUBKEY}' >> ~/.ssh/authorized_keys"
+
+# Step 2b: Ensure NFS is mounted on all TPU workers (must happen before rsync to NFS)
+echo "[Step 2b] Checking/mounting NFS on all TPU workers..."
 export POD_NAME=$TPU_VM_NAME
 MOUNT_CMD="if ! mount | grep -q aidm_nfs; then echo 'NFS not mounted, mounting...'; sudo apt -y update && sudo apt -y install nfs-common && sudo mkdir -p -m 777 /nfs/aidm_nfs && sudo mount -o rw,intr 10.155.154.42:/europe /nfs/aidm_nfs && echo 'NFS mounted successfully'; else echo 'NFS already mounted'; fi"
 tpc run --project=$PROJECT --zone=$ZONE --name=$TPU_VM_NAME --command="$MOUNT_CMD"
 
-# Step 2b: Sync from local to TPU pod NFS (now that NFS is mounted)
-echo "[Step 2b] Syncing to TPU NFS..."
+# Step 2c: Sync from local to TPU pod NFS (now that NFS is mounted)
+echo "[Step 2c] Syncing to TPU NFS..."
 ssh ${TPU_IP} "mkdir -p ${NFS_DIR}"
 rsync -avz --no-perms --no-owner --no-group --no-times --exclude .git --exclude .venv --exclude __pycache__ --exclude '*.pyc' --exclude wandb --exclude .pytest_cache ${LOCAL_DIR} ${TPU_IP}:${NFS_DIR}/
 

@@ -95,11 +95,11 @@ class RMSNorm(nn.Module):
     @nn.compact
     def __call__(self, x, cond):
         dtype = x.dtype
-        var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis = -1, keepdims = True)
-        normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))
+        var = jnp.mean(jnp.square(x), axis = -1, keepdims = True)
+        normed_inputs = x * jnp.reciprocal(jnp.sqrt(var + 1e-06))
         scale = self.param("scale", nn.initializers.zeros_init(), (x.shape[-1]))
-        normed_inputs = normed_inputs * (1 + scale)
-        return normed_inputs.astype(dtype), None
+        normed_inputs = normed_inputs * (1 + scale.astype(dtype))
+        return normed_inputs, None
 
 
 @at.typecheck
@@ -127,12 +127,35 @@ class Embedder(nn.Module):
 
 def _apply_rope(x, *, positions, base_frequency, scale_factor):
     """Applies RoPE positions [B, L] to x [B, L, H, D] with dynamic base frequency and scale factor."""
-    freq_exponents = (2.0 / x.shape[-1]) * jnp.arange(x.shape[-1] // 2, dtype = jnp.float32)
+    dtype = x.dtype
+    freq_exponents = (2.0 / x.shape[-1]) * jnp.arange(x.shape[-1] // 2, dtype = dtype)
     timescale = base_frequency ** freq_exponents
     timescale = timescale * scale_factor
-    radians = positions[..., None] / timescale[None, None, :]
+    radians = positions[..., None].astype(dtype) / timescale[None, None, :]
     radians = radians[..., None, :]
     sin, cos = jnp.sin(radians), jnp.cos(radians)
+    x1, x2 = jnp.split(x, 2, axis = -1)
+    res = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis = -1)
+    return res
+
+
+def _precompute_rope_sincos(
+    positions: at.Int[at.Array, "b t"],
+    head_dim: int,
+    base_frequency: float,
+    scale_factor: float,
+    dtype: str,
+) -> tuple[at.Float[at.Array, "b t 1 half_d"], at.Float[at.Array, "b t 1 half_d"]]:
+    """Precompute sin/cos tables for RoPE for given frequency parameters."""
+    freq_exponents = (2.0 / head_dim) * jnp.arange(head_dim // 2, dtype = dtype)
+    timescale = base_frequency ** freq_exponents * scale_factor
+    radians = positions[..., None].astype(dtype) / timescale[None, None, :]
+    radians = radians[..., None, :]
+    return jnp.sin(radians), jnp.cos(radians)
+
+
+def _apply_rope_precomputed(x, sin, cos):
+    """Apply RoPE using precomputed sin/cos tables."""
     x1, x2 = jnp.split(x, 2, axis = -1)
     res = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis = -1)
     return res.astype(x.dtype)
@@ -162,7 +185,7 @@ class Attention(nn.Module):
     config: Config
 
     @nn.compact
-    def __call__(self, x, positions, attn_mask, kv_cache, attn_type_flag):
+    def __call__(self, x, positions, attn_mask, kv_cache, attn_type_flag, sliding_mask, rope_tables):
         config = self.config
         dtype = x.dtype
 
@@ -184,57 +207,34 @@ class Attention(nn.Module):
         q, _ = RMSNorm(name = "query_norm")(q, None)
         k, _ = RMSNorm(name = "key_norm")(k, None)
 
-        # Dynamic RoPE: select base_frequency and scale_factor based on attention type
-        base_freq = jnp.where(
-            attn_type_flag,
-            jnp.float32(config.global_rope_base_freq),
-            jnp.float32(config.local_rope_base_freq),
-        )
-        scale_factor = jnp.where(
-            attn_type_flag,
-            jnp.float32(config.global_rope_scale_factor),
-            jnp.float32(config.local_rope_scale_factor),
-        )
+        # Select precomputed RoPE sin/cos based on attention type (local vs global)
+        (sin_local, cos_local), (sin_global, cos_global) = rope_tables
+        sin = jnp.where(attn_type_flag, sin_global, sin_local)
+        cos = jnp.where(attn_type_flag, cos_global, cos_local)
 
-        q = _apply_rope(q, positions = positions, base_frequency = base_freq, scale_factor = scale_factor)
+        q = _apply_rope_precomputed(q, sin, cos)
         q *= config.head_dim ** -0.5
-        k = _apply_rope(k, positions = positions, base_frequency = base_freq, scale_factor = scale_factor)
+        k = _apply_rope_precomputed(k, sin, cos)
 
         assert q.dtype == k.dtype == v.dtype == dtype
 
         if kv_cache is not None:
             cache_k, cache_v, cache_positions = kv_cache
-            # cache_k, cache_v = kv_cache
             k = jnp.concatenate([cache_k, k], axis = 1)
             v = jnp.concatenate([cache_v, v], axis = 1)
             cache_positions = jnp.concatenate([cache_positions, positions], axis = 1)
-            # cache_positions = jnp.concatenate([cache_positions, positions], axis = 1)
         else:
             cache_positions = positions
-            # cache_positions = positions
 
         q = einops.rearrange(q, "B T (K G) H -> B T K G H", K = config.num_kv_heads)
-        logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type = jnp.float32)
+        logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type = dtype)
 
         if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
             raise ValueError(
                 f"Attention mask with shape {attn_mask.shape} but shapes for q and k are: {q.shape} and {k.shape}"
             )
 
-        # Sliding window mask: restrict local attention using absolute token positions.
-        sliding_mask = _create_sliding_mask(
-            positions,
-            cache_positions = cache_positions,
-            sliding_window_size = config.sliding_window_size,
-        )
-        # seq_len_q = q.shape[1]
-        # seq_len_k = k.shape[1]
-        # q_positions = jnp.arange(seq_len_q)[None, :, None]
-        # k_positions = jnp.arange(seq_len_k)[None, None, :]
-        # sliding_mask = jnp.abs(q_positions - k_positions) < config.sliding_window_size
-        sliding_mask = sliding_mask[:, None, :, :]  # [1, 1, T, S]
-
-        # Apply sliding mask only for local attention (attn_type_flag == 0)
+        # Apply precomputed sliding mask only for local attention (attn_type_flag == 0)
         effective_mask = jnp.where(attn_type_flag, attn_mask, attn_mask & sliding_mask)
 
         big_neg = -2.3819763e38
@@ -242,7 +242,7 @@ class Attention(nn.Module):
 
         probs = jax.nn.softmax(masked_logits, axis = -1).astype(dtype)
         # CLS is the last query position; average over K kv-heads and G query groups -> [B, S]
-        cls_attn_row = probs[:, :, :, -1, :].mean(axis = (1, 2)).astype(jnp.float32)
+        cls_attn_row = probs[:, :, :, -1, :].mean(axis = (1, 2))
 
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
@@ -255,7 +255,6 @@ class Attention(nn.Module):
         output = jnp.einsum("BTNH,NHD->BTD", encoded, attn_vec_einsum)
 
         return (output, (k, v, cache_positions)), cls_attn_row
-        # return (output, (k, v)), cls_attn_row
 
 
 @at.typecheck
@@ -297,7 +296,7 @@ class Block(nn.Module):
     config: Config
 
     @nn.compact
-    def __call__(self, x, kv_cache, positions, attn_mask, adarms_cond, attn_type_flag, deterministic = True):  # noqa: FBT002
+    def __call__(self, x, kv_cache, positions, attn_mask, adarms_cond, attn_type_flag, sliding_mask, rope_tables, deterministic = True):  # noqa: FBT002
         x = sharding.activation_sharding_constraint(x)
 
         # Pre-attention norm
@@ -307,7 +306,7 @@ class Block(nn.Module):
         # Attention
         (post_attn, kv_cache), cls_attn_row = Attention(
             config = self.config, name = "attn"
-        )(pre_attn, positions, attn_mask, kv_cache, attn_type_flag)
+        )(pre_attn, positions, attn_mask, kv_cache, attn_type_flag, sliding_mask, rope_tables)
         post_attn = sharding.activation_sharding_constraint(post_attn)
 
         # Post-attention norm (Gemma 3 addition)
@@ -372,7 +371,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse = False,
-            static_argnums = (6,),  # 0=self, 7=deterministic
+            static_argnums = (8,),  # deterministic (excluding self)
             policy = jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -380,11 +379,13 @@ class Module(nn.Module):
             variable_axes = {"params": 0},
             split_rngs = {"params": True, "dropout": True},
             in_axes = (
-                0,       # kv_cache
+                0,             # kv_cache
                 nn.broadcast,  # positions
                 nn.broadcast,  # attn_mask
                 nn.broadcast,  # adarms_cond
-                0,       # attn_type_flag (per-layer)
+                0,             # attn_type_flag (per-layer)
+                nn.broadcast,  # sliding_mask
+                nn.broadcast,  # rope_tables
                 nn.broadcast,  # deterministic
             ),
             length = config.depth,
@@ -421,8 +422,24 @@ class Module(nn.Module):
         x = x.astype(self.embed_dtype)
         mask = jnp.asarray(mask)[:, None, :, :]
 
+        config = self.configs[0]
+
+        # Precompute sliding window mask once for all layers
+        sliding_mask = _create_sliding_mask(
+            positions, sliding_window_size = config.sliding_window_size,
+        )[:, None, :, :]  # [B, 1, T, S]
+
+        # Precompute RoPE sin/cos tables for both local and global frequencies
+        local_sincos = _precompute_rope_sincos(
+            positions, config.head_dim, config.local_rope_base_freq, config.local_rope_scale_factor, self.embed_dtype,
+        )
+        global_sincos = _precompute_rope_sincos(
+            positions, config.head_dim, config.global_rope_base_freq, config.global_rope_scale_factor, self.embed_dtype,
+        )
+        rope_tables = (local_sincos, global_sincos)
+
         x, (kv_cache, all_cls_attn) = self.layers(
-            x, kv_cache, positions, mask, None, self._attn_type_flags, deterministic
+            x, kv_cache, positions, mask, None, self._attn_type_flags, sliding_mask, rope_tables, deterministic
         )
 
         assert x.dtype == jnp.dtype(self.embed_dtype)

@@ -329,19 +329,14 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         self._feature_dim = embed_dim
         self._embed_dim = embed_dim
 
-        # Cached demarcation embeddings (populated on first forward call, after weights are loaded)
-        self._cached_special_emb: jax.Array | None = None
-
     def _get_special_embeddings(self) -> jax.Array:
-        """Return cached [BOS, \\n\\n, <SOI>, <EOI>] embeddings [1, 4, D], computing on first call."""
-        if self._cached_special_emb is None:
-            from openpi.models.tokenizer import Gemma3Tokenizer
-            special_ids = jnp.array([[Gemma3Tokenizer.BOS_ID,
-                                      Gemma3Tokenizer.NEWLINE_NEWLINE_ID,
-                                      Gemma3Tokenizer.START_OF_IMAGE_ID,
-                                      Gemma3Tokenizer.END_OF_IMAGE_ID]])
-            self._cached_special_emb = self.PaliGemma.llm(special_ids, method = "embed")
-        return self._cached_special_emb
+        """Return [BOS, \\n\\n, <SOI>, <EOI>] embeddings [1, 4, D]."""
+        from openpi.models.tokenizer import Gemma3Tokenizer
+        special_ids = jnp.array([[Gemma3Tokenizer.BOS_ID,
+                                  Gemma3Tokenizer.NEWLINE_NEWLINE_ID,
+                                  Gemma3Tokenizer.START_OF_IMAGE_ID,
+                                  Gemma3Tokenizer.END_OF_IMAGE_ID]])
+        return self.PaliGemma.llm(special_ids, method = "embed")
 
     @property
     def action_conditioned(self) -> bool:

@@ -94,19 +94,20 @@ class Gemma3WeightLoader(WeightLoader):
     """
 
     checkpoint_path: str = "gs://gemma-data/checkpoints/gemma3-4b-pt"
-    local_dir: str = "/data/user_data/saksham3/gemma3_checkpoints"
+    local_dir: str = "~/.cache/openpi/gemma3_checkpoints"
 
     def load(self, params: at.Params) -> at.Params:
         import os
         import subprocess
 
-        local_checkpoint = os.path.join(self.local_dir, os.path.basename(self.checkpoint_path))
+        local_dir = os.path.expanduser(self.local_dir)
+        local_checkpoint = os.path.join(local_dir, os.path.basename(self.checkpoint_path))
 
         if not os.path.exists(local_checkpoint):
             logger.info(f"Downloading Gemma 3 checkpoint to {local_checkpoint}...")
-            os.makedirs(self.local_dir, exist_ok = True)
+            os.makedirs(local_dir, exist_ok = True)
             subprocess.run(
-                ["gsutil", "-m", "cp", "-r", self.checkpoint_path, self.local_dir],
+                ["gsutil", "-m", "cp", "-r", self.checkpoint_path, local_dir],
                 check = True,
             )
 

@@ -158,6 +158,7 @@ def sarsa_objective(
         "td_error_std": jnp.std(td_error),
         "next_value_mean": jnp.mean(target_value),
         "mc_loss": mc_loss,
+        "effective_discount": jnp.mean(effective_discount),
     }
     return loss, info
 

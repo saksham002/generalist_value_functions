@@ -1285,6 +1285,16 @@ class TrainConfig:
     # - 0: Frozen critic mode (requires weight_loader to load critic checkpoint)
     critic_steps_per_policy_step: int = 1
 
+    # === Validation-Only Mode ===
+    # If true, skip training: load checkpoint, run one validation pass, then exit.
+    val_only: bool = False
+    val_only_data_dir: str | None = None
+    val_only_dataset_name: str | None = None
+    val_only_norm_stats_path: str | None = None
+    val_only_include_repos: tuple[str, ...] | None = None
+    val_only_validation_cache_dir: str | None = None
+    val_only_num_val_trajectories: int | None = None
+
     # === Policy Evaluation ===
     # How often (in training steps) to run policy evaluation. 0 = disabled.
     eval_interval: int = 100000
@@ -2816,6 +2826,48 @@ _CONFIGS = [
     ),
     # RoboCOIN Q(s,a) SARSA with bimanual dataset, regression head.
     TrainConfig(
+        name="debug_robocoin_bimanual_paligemma_q_sarsa",
+        model=_value_function.SARSAValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(224, 224),
+                max_token_len=48,
+                action_dim=14,
+                no_state=True,
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="gs://saksham-euw4",
+            dataset_name="robocoin:1.0.0",
+            norm_stats_path="gs://saksham-euw4/robocoin/norm_stats/norm_stats.json",
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            dont_mask_actions=True,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=30_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=1,
+        plot_interval=200_000,
+        save_interval=200_000,
+        fsdp_devices=16,
+        action_horizon=50,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
+    ),
+    TrainConfig(
         name="robocoin_bimanual_paligemma_q_sarsa",
         model=_value_function.SARSAValueFunctionConfig(
             network_config=_paligemma_network.PaliGemmaNetworkConfig(
@@ -2849,13 +2901,20 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,
         log_interval=100,
-        plot_interval=30_000,
-        save_interval=30_000,
+        plot_interval=50_000,
+        save_interval=50_000,
         fsdp_devices=16,
         action_horizon=50,
         num_val_trajectories=10,
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
+        val_only=True,
+        val_only_data_dir="gs://saksham-euw4/hdf5/",
+        val_only_dataset_name="real_hang:1.0.0",
+        val_only_norm_stats_path="gs://saksham-euw4/hdf5/real_hang/norm_stats/norm_stats.json",
+        val_only_validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang/",
+        val_only_num_val_trajectories=1,
+        val_only_include_repos=(),
     ),
     # RoboCOIN Q(s,a) SARSA with bimanual dataset, HL-Gauss head.
     TrainConfig(
@@ -2947,7 +3006,7 @@ _CONFIGS = [
         validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache/",
     ),
     TrainConfig(
-        name="robocoin_bimanual_gemma3_q_sarsa",
+        name="robocoin_bimanual_gemma3_q_sarsa_gpu",
         model=_value_function.SARSAValueFunctionConfig(
             network_config=_paligemma_network.PaliGemmaNetworkConfig(
                 state_dim=14,
@@ -2955,7 +3014,6 @@ _CONFIGS = [
                 image_size=(896, 896),
                 max_token_len=48,
                 paligemma_variant="gemma3_4b",
-                dtype="bfloat16",
                 action_dim=14,
                 no_state=True,
             ),
@@ -2966,6 +3024,7 @@ _CONFIGS = [
             dataset_name="robocoin:1.0.0",
             norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
             image_size = (896, 896),
+            local_shuffle_buffer_size=50_000,
             discount=0.999,
             td_n=50,
             use_eef=True,
@@ -2983,14 +3042,60 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,
         log_interval=100,
-        plot_interval=30_000,
-        save_interval=30_000,
+        plot_interval=50_000,
+        save_interval=50_000,
+        fsdp_devices=8,
+        backbone_variant="gemma3",
+        action_horizon=50,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/data/user_data/saksham3/robocoin/val_episodes_cache_50_896/",
+    ),
+    TrainConfig(
+        name="robocoin_bimanual_gemma3_q_sarsa",
+        model=_value_function.SARSAValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(896, 896),
+                max_token_len=48,
+                paligemma_variant="gemma3_4b",
+                action_dim=14,
+                no_state=True,
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            dataset_name="robocoin:1.0.0",
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
+            image_size = (896, 896),
+            local_shuffle_buffer_size=5_000,
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            dont_mask_actions=True,
+        ),
+        weight_loader=weight_loaders.Gemma3WeightLoader(),
+        num_train_steps=230_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=50_000,
+        save_interval=50_000,
         fsdp_devices=16,
         backbone_variant="gemma3",
         action_horizon=50,
         num_val_trajectories=10,
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50_896/",
     ),
 ]
 

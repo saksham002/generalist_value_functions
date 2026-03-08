@@ -57,6 +57,13 @@ class ValueFunctionConfig(BaseValueFunctionConfig):
     def create(self, rng: at.KeyArrayLike) -> ValueFunction:
         raise NotImplementedError("Use a specific config subclass (MCValueFunctionConfig, etc.)")
 
+    @property
+    def weight_dtype(self) -> str:
+        """Dtype for model weights, derived from the network config."""
+        if isinstance(self.network_config, PaliGemmaNetworkConfig):
+            return self.network_config.dtype
+        return "float32"
+
     @override
     def inputs_spec(
         self, *, batch_size: int = 1
