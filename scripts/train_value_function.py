@@ -368,6 +368,7 @@ def init_wandb(
     resuming: bool,
     log_code: bool = False,
     enabled: bool = True,
+    ft_config: _config.FineTuneConfig | None = None,
 ):
     # Only worker 0 should initialize wandb to avoid file conflicts and duplicate runs
     if not enabled or jax.process_index() != 0:
@@ -381,7 +382,8 @@ def init_wandb(
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
         wandb.init(id=run_id, resume="must", project=config.project_name)
     else:
-        run_name = config.exp_name if config.exp_name else config.name
+        base_name = config.exp_name if config.exp_name else config.name
+        run_name = f"{base_name}/{ft_config.name}" if ft_config is not None else base_name
         wandb.init(
             name=run_name,
             config=dataclasses.asdict(config),
@@ -1572,10 +1574,9 @@ def _render_and_log_plots(
                 logging.info(f"Repo {repo_id}, episode {ep_idx} mirrored demonstration plot created")
 
     if images:
-        # Log without an explicit step so wandb uses the current step, avoiding the
-        # "step must be monotonically increasing" warning that occurs because this
-        # thread may run after further training steps have been logged. The actual
-        # validation step is visible in each plot title.
+        # Log without an explicit step, avoiding the "step must be monotonically
+        # increasing" warning that occurs because this thread may run after further
+        # training steps have been logged.
         wandb.log(images)
     logging.info(f"Render thread finished: logged {len(images)} plots for step {step}")
     del images, ep_frame_images, all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores
@@ -1784,14 +1785,36 @@ def main(config: _config.TrainConfig):
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    # Resolve FineTuneConfig and apply dataset overrides before creating the data loader
+    ft_config = _config.get_fine_tune_config(config.fine_tune) if config.fine_tune is not None else None
+
+    if ft_config is not None:
+        import dataclasses as dc
+        ft_config = dc.replace(ft_config, overwrite = config.overwrite, resume = config.resume)
+
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         config.checkpoint_dir,
         keep_period=config.keep_period,
         overwrite=config.overwrite,
         resume=config.resume,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    wandb_resuming = resuming and ft_config is None
+    init_wandb(config, resuming=wandb_resuming, enabled=config.wandb_enabled, ft_config=ft_config)
     logging.info(f"Initialized checkpoint manager with resuming={resuming}, config.resume={config.resume}")
+
+    if ft_config is not None and isinstance(config.data, _config.RoboCOINDataConfig):
+        logging.info(f"Fine-tune mode: applying overrides from '{ft_config.name}' (val_only={ft_config.val_only})")
+        import dataclasses as dc
+
+        data_overrides = {}
+        if ft_config.data_dir is not None:
+            data_overrides["tfds_data_dir"] = ft_config.data_dir
+        if ft_config.dataset_name is not None:
+            data_overrides["dataset_name"] = ft_config.dataset_name
+        if ft_config.norm_stats_path is not None:
+            data_overrides["norm_stats_path"] = ft_config.norm_stats_path
+        if data_overrides:
+            config = dc.replace(config, data = dc.replace(config.data, **data_overrides))
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -1809,34 +1832,12 @@ def main(config: _config.TrainConfig):
 
     logging.info(f"Initialized data loader. Batch keys: {list(batch.keys()) if isinstance(batch, dict) else 'tuple'}")
 
-    # Select fixed validation trajectories for plotting
-    # Create validation dataset - use NumpyDataset for minari/legacy D4RL, LeRobotDataset otherwise
+    # Create validation data_config (same overridden config.data)
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    # Apply val_only overrides to data_config and effective config values
-    if config.val_only:
-        logging.info("val_only mode: applying validation-specific overrides")
-        import dataclasses as dc
-
-        if data_config.robocoin_data_config is not None:
-            rc = data_config.robocoin_data_config
-            rc_overrides = {}
-            if config.val_only_data_dir is not None:
-                rc_overrides["data_dir"] = config.val_only_data_dir
-            if config.val_only_dataset_name is not None:
-                rc_overrides["dataset_name"] = config.val_only_dataset_name
-            if rc_overrides:
-                rc = dc.replace(rc, **rc_overrides)
-                data_config = dc.replace(data_config, robocoin_data_config = rc)
-
-        if config.val_only_norm_stats_path is not None and isinstance(config.data, _config.RoboCOINDataConfig):
-            overridden_data_factory = dc.replace(config.data, norm_stats_path = config.val_only_norm_stats_path)
-            norm_stats = overridden_data_factory._load_robocoin_norm_stats()
-            data_config = dc.replace(data_config, norm_stats = norm_stats)
-
-    effective_include_repos = config.val_only_include_repos if (config.val_only and config.val_only_include_repos is not None) else config.include_repos
-    effective_num_val_trajectories = config.val_only_num_val_trajectories if (config.val_only and config.val_only_num_val_trajectories is not None) else config.num_val_trajectories
-    effective_validation_cache_dir = config.val_only_validation_cache_dir if (config.val_only and config.val_only_validation_cache_dir is not None) else config.validation_cache_dir
+    effective_include_repos = ft_config.include_repos if (ft_config is not None and ft_config.include_repos is not None) else config.include_repos
+    effective_num_val_trajectories = ft_config.num_val_trajectories if (ft_config is not None and ft_config.num_val_trajectories is not None) else config.num_val_trajectories
+    effective_validation_cache_dir = ft_config.validation_cache_dir if (ft_config is not None and ft_config.validation_cache_dir is not None) else config.validation_cache_dir
 
     # Initialize variables for all branches
     num_episodes = None
@@ -1995,7 +1996,7 @@ def main(config: _config.TrainConfig):
     jax.block_until_ready(critic_state)
 
     # === val_only mode: run one validation pass and exit ===
-    if config.val_only:
+    if ft_config is not None and ft_config.val_only:
         logging.info("val_only mode: running validation plotting")
         step = int(critic_state.step)
         model = nnx.merge(critic_state.model_def, critic_state.params)
@@ -2021,7 +2022,7 @@ def main(config: _config.TrainConfig):
             )
             if jax.process_index() == 0 and plot_images:
                 logging.info(f"Generated {len(plot_images)} validation plot items")
-                wandb.log(plot_images, step=step)
+                wandb.log(plot_images)
 
         # Wait for background render thread if any
         if jax.process_index() == 0 and _render_thread is not None and _render_thread.is_alive():
@@ -2034,7 +2035,52 @@ def main(config: _config.TrainConfig):
         logging.info("val_only mode complete")
         return
 
-    lr_schedule = config.lr_schedule.create()
+    # Determine effective training parameters based on fine-tune config
+    pretrained_step = int(critic_state.step)
+    is_fine_tuning = ft_config is not None and not ft_config.val_only
+
+    if is_fine_tuning:
+        effective_num_train_steps = pretrained_step + ft_config.num_train_steps
+        effective_save_interval = ft_config.save_interval
+        effective_plot_interval = ft_config.plot_interval
+        effective_keep_period = ft_config.keep_period
+        effective_log_interval = ft_config.log_interval
+
+        # Create a fresh optimizer with the fine-tune LR schedule
+        ft_lr_schedule_config = ft_config.lr_schedule
+        ft_tx = _optimizer.create_optimizer(config.optimizer, ft_lr_schedule_config, weight_decay_mask = None)
+        ft_opt_state = ft_tx.init(critic_state.params.filter(config.trainable_filter))
+
+        critic_state = critic_state.replace(tx = ft_tx, opt_state = ft_opt_state)
+        critic_sharding = sharding.fsdp_sharding(critic_state, mesh)
+
+        # LR schedule for logging: 0-indexed relative to pretrained_step
+        ft_lr_schedule_fn = ft_lr_schedule_config.create()
+
+        def lr_schedule(step, _base = pretrained_step, _fn = ft_lr_schedule_fn):
+            return _fn(step - _base)
+
+        # Save fine-tune checkpoints under <pretrained_checkpoint_dir>/<ft_config_name>/
+        ft_checkpoint_dir = config.checkpoint_dir / ft_config.name
+        checkpoint_manager, _ = _checkpoints.initialize_checkpoint_dir(
+            ft_checkpoint_dir,
+            keep_period = effective_keep_period,
+            overwrite = ft_config.overwrite,
+            resume = ft_config.resume,
+        )
+
+        logging.info(
+            f"Fine-tuning: {ft_config.num_train_steps} steps from pretrained step {pretrained_step}, "
+            f"total steps = {effective_num_train_steps}, checkpoint_dir = {ft_checkpoint_dir}"
+        )
+    else:
+        effective_num_train_steps = config.num_train_steps
+        effective_save_interval = config.save_interval
+        effective_plot_interval = config.plot_interval
+        effective_keep_period = config.keep_period
+        effective_log_interval = config.log_interval
+        lr_schedule = config.lr_schedule.create()
+
     ptrain_step = jax.jit(
         functools.partial(value_function_train_step, config, lr_schedule),
         in_shardings=(critic_sharding, data_sharding, replicated_sharding),
@@ -2057,9 +2103,9 @@ def main(config: _config.TrainConfig):
 
     start_step = int(critic_state.step)
     pbar = tqdm.tqdm(
-        range(start_step, config.num_train_steps),
+        range(start_step, effective_num_train_steps),
         initial=start_step,
-        total=config.num_train_steps,
+        total=effective_num_train_steps,
         dynamic_ncols=True,
     )
 
@@ -2091,7 +2137,7 @@ def main(config: _config.TrainConfig):
                     jax.block_until_ready(policy_info)
                 info.update(policy_info)
 
-        if step % config.log_interval == 0:
+        if step % effective_log_interval == 0:
             info = jax.device_get(info)
             # Add timing info to logged metrics (average and total)
             total_times = timer.get_total_times(reset=False)
@@ -2121,13 +2167,13 @@ def main(config: _config.TrainConfig):
             else:
                 batch = raw_batch
 
-        if (step + 1) % config.save_interval == 0 or step + 1 == config.num_train_steps:
+        if (step + 1) % effective_save_interval == 0 or step + 1 == effective_num_train_steps:
             with timer.context("checkpoint_save"):
                 state_to_save = training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
                 _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step)
 
         # Generate validation plots (all workers participate for FSDP, only worker 0 creates plots/logs)
-        if (step + 1) % config.plot_interval == 0 or step + 1 == config.num_train_steps:
+        if (step + 1) % effective_plot_interval == 0 or step + 1 == effective_num_train_steps:
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
@@ -2160,7 +2206,7 @@ def main(config: _config.TrainConfig):
                             logging.warning(f"No validation plots generated at step {step}")
             
         # Policy evaluation (only on worker 0)
-        if eval_enabled and ((step + 1) % config.eval_interval == 0 or step + 1 == config.num_train_steps):
+        if eval_enabled and ((step + 1) % config.eval_interval == 0 or step + 1 == effective_num_train_steps):
             with timer.context("policy_eval"):
                 policy_model = nnx.merge(policy_state.model_def, policy_state.params)
 

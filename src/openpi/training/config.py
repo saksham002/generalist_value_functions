@@ -850,6 +850,10 @@ class RoboCOINDataConfig(DataConfigFactory):
     # masked are replaced with the last valid action plus Gaussian noise (std=0.005).
     dont_mask_actions: bool = False
 
+    # When False, DataLoaderImpl returns (Observation, Actions) tuples for policy training.
+    # When True, returns raw dicts for value function / RL training.
+    rl_mode: bool = True
+
     # Override repo_id from parent - not used for RoboCOIN
     repo_id: str = "robocoin"
 
@@ -1089,11 +1093,13 @@ class RoboCOINDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        # Value function transforms for RL training
-        data_transforms = _transforms.Group(
-            inputs=[_value_transforms.ValueFunctionInputs()],
-            outputs=[],
-        )
+        if self.rl_mode:
+            data_transforms = _transforms.Group(
+                inputs=[_value_transforms.ValueFunctionInputs()],
+                outputs=[],
+            )
+        else:
+            data_transforms = _transforms.Group(inputs=[], outputs=[])
         model_transforms = _transforms.Group(inputs=[], outputs=[])
 
         # Use dataset name as asset_id
@@ -1115,7 +1121,7 @@ class RoboCOINDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             use_quantile_norm=self.use_quantile_norm,
-            rl_mode=True,
+            rl_mode=self.rl_mode,
             discount=self.discount,
             reward_scale=self.reward_scale,
             reward_bias=self.reward_bias,
@@ -1143,7 +1149,7 @@ class RoboCOINDataConfig(DataConfigFactory):
             use_eef=self.use_eef,
             filter_n=self.filter_n,
             mask_50fps=self.mask_50fps,
-            dont_mask_actions=self.dont_mask_actions,
+            dont_mask_actions=self.dont_mask_actions if not self.rl_mode else False,
         )
 
 
@@ -1179,6 +1185,47 @@ class LegacyD4RLEvalEnvConfig(EvalEnvConfig):
     """
 
     legacy_d4rl_env_name: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class FineTuneConfig:
+    """Configuration for fine-tuning or validation-only evaluation on a different dataset.
+
+    Registered in _FINE_TUNE_CONFIGS and referenced by name from TrainConfig.fine_tune.
+    When applied, overrides the base config's dataset, schedule, and checkpoint intervals.
+    """
+
+    name: str = ""
+
+    # Dataset overrides
+    data_dir: str | None = None
+    dataset_name: str | None = None
+    norm_stats_path: str | None = None
+
+    # Validation overrides
+    include_repos: tuple[str, ...] | None = None
+    validation_cache_dir: str | None = None
+    num_val_trajectories: int | None = None
+
+    # Training schedule (0-indexed internally relative to pretrained step)
+    num_train_steps: int = 0
+    lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(
+        default_factory = _optimizer.CosineDecaySchedule
+    )
+
+    # If True, skip training: load checkpoint, run validation, exit.
+    val_only: bool = False
+
+    # Save/plot intervals for fine-tuning
+    save_interval: int = 50
+    plot_interval: int = 50
+    keep_period: int | None = 50
+    log_interval: int = 1
+
+    # If true, will overwrite the fine-tune checkpoint directory if it already exists.
+    overwrite: bool = False
+    # If true, will resume fine-tuning from the last fine-tune checkpoint.
+    resume: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1285,15 +1332,9 @@ class TrainConfig:
     # - 0: Frozen critic mode (requires weight_loader to load critic checkpoint)
     critic_steps_per_policy_step: int = 1
 
-    # === Validation-Only Mode ===
-    # If true, skip training: load checkpoint, run one validation pass, then exit.
-    val_only: bool = False
-    val_only_data_dir: str | None = None
-    val_only_dataset_name: str | None = None
-    val_only_norm_stats_path: str | None = None
-    val_only_include_repos: tuple[str, ...] | None = None
-    val_only_validation_cache_dir: str | None = None
-    val_only_num_val_trajectories: int | None = None
+    # === Fine-Tuning / Validation-Only Mode ===
+    # Name of a FineTuneConfig to apply. When set, overrides dataset, schedule, and intervals.
+    fine_tune: str | None = None
 
     # === Policy Evaluation ===
     # How often (in training steps) to run policy evaluation. 0 = disabled.
@@ -1325,6 +1366,10 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.fine_tune is not None and self.fine_tune not in _FINE_TUNE_CONFIGS_DICT:
+            closest = difflib.get_close_matches(self.fine_tune, _FINE_TUNE_CONFIGS_DICT.keys(), n = 1, cutoff = 0.0)
+            closest_str = f" Did you mean '{closest[0]}'? " if closest else ""
+            raise ValueError(f"FineTuneConfig '{self.fine_tune}' not found.{closest_str}")
 
 
 def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
@@ -2228,6 +2273,55 @@ def _make_antmaze_large_diverse_v2_legacy_configs_safe() -> list[TrainConfig]:
         return []
 
 
+# =============================================================================
+# Fine-tune configs
+# =============================================================================
+
+_FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
+    FineTuneConfig(
+        name = "real_hang_val_only",
+        data_dir = "gs://saksham-euw4/hdf5/",
+        dataset_name = "real_hang:1.0.0",
+        norm_stats_path = "gs://saksham-euw4/hdf5/real_hang/norm_stats/norm_stats.json",
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang/",
+        num_val_trajectories = 1,
+        include_repos = (),
+        val_only = True,
+    ),
+    FineTuneConfig(
+        name = "real_hang_finetune_300",
+        data_dir = "gs://saksham-euw4/hdf5/",
+        dataset_name = "real_hang:1.0.0",
+        norm_stats_path = "gs://saksham-euw4/hdf5/real_hang/norm_stats/norm_stats.json",
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang/",
+        num_val_trajectories = 3,
+        include_repos = (),
+        num_train_steps = 300,
+        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
+        save_interval = 50,
+        plot_interval = 50,
+        keep_period = 50,
+    ),
+]
+
+if len({c.name for c in _FINE_TUNE_CONFIGS}) != len(_FINE_TUNE_CONFIGS):
+    raise ValueError("FineTuneConfig names must be unique.")
+_FINE_TUNE_CONFIGS_DICT: dict[str, FineTuneConfig] = {c.name: c for c in _FINE_TUNE_CONFIGS}
+
+
+def get_fine_tune_config(name: str) -> FineTuneConfig:
+    """Get a FineTuneConfig by name."""
+    if name not in _FINE_TUNE_CONFIGS_DICT:
+        closest = difflib.get_close_matches(name, _FINE_TUNE_CONFIGS_DICT.keys(), n = 1, cutoff = 0.0)
+        closest_str = f" Did you mean '{closest[0]}'? " if closest else ""
+        raise ValueError(f"FineTuneConfig '{name}' not found.{closest_str}")
+    return _FINE_TUNE_CONFIGS_DICT[name]
+
+
+# =============================================================================
+# Train configs
+# =============================================================================
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -2908,13 +3002,6 @@ _CONFIGS = [
         num_val_trajectories=10,
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
-        val_only=True,
-        val_only_data_dir="gs://saksham-euw4/hdf5/",
-        val_only_dataset_name="real_hang:1.0.0",
-        val_only_norm_stats_path="gs://saksham-euw4/hdf5/real_hang/norm_stats/norm_stats.json",
-        val_only_validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang/",
-        val_only_num_val_trajectories=1,
-        val_only_include_repos=(),
     ),
     # RoboCOIN Q(s,a) SARSA with bimanual dataset, HL-Gauss head.
     TrainConfig(
@@ -3096,6 +3183,49 @@ _CONFIGS = [
         num_val_trajectories=10,
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50_896/",
+    ),
+    # =============================================================================
+    # RoboCOIN π₀.5 policy training
+    # =============================================================================
+    TrainConfig(
+        name="robocoin_bimanual_pi05",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            action_dim=14,
+            action_horizon=50,
+            max_token_len=48,
+            pi05=True,
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            dataset_name="robocoin:1.0.0",
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            dont_mask_actions=True,
+            rl_mode=False,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=230_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=50_000,
+        save_interval=50_000,
+        fsdp_devices=16,
+        action_horizon=50,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
     ),
 ]
 
