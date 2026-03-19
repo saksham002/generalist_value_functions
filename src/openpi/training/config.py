@@ -2996,7 +2996,7 @@ _CONFIGS = [
         data=RoboCOINDataConfig(
             tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
             dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/global_norm_stats.json",
             discount=0.999,
             td_n=50,
             use_eef=True,
@@ -3018,7 +3018,7 @@ _CONFIGS = [
         log_interval=100,
         plot_interval=50_000,
         save_interval=50_000,
-        fsdp_devices=1,
+        fsdp_devices=16,
         action_horizon=50,
         num_val_trajectories=10,
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
@@ -3231,7 +3231,7 @@ _CONFIGS = [
             use_chunk_wise_delta=True,
             use_quantile_norm=True,
         ),
-        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=230_000,
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -3248,10 +3248,10 @@ _CONFIGS = [
         action_horizon=50,
     ),
     # =============================================================================
-    # RoboCOIN π₀.5 policy training (GPU, no chunk-wise delta)
+    # RoboCOIN π₀.5 policy training (test, no chunk-wise delta)
     # =============================================================================
     TrainConfig(
-        name="robocoin_bimanual_pi05_gpu",
+        name="robocoin_bimanual_pi05_test",
         model=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b",
             action_expert_variant="gemma_300m",
@@ -3260,7 +3260,7 @@ _CONFIGS = [
             max_token_len=96,
             pi05=True,
             action_dim_offset=14,
-            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
+            action_dim_mask=(True,) * 32,
         ),
         data=RoboCOINDataConfig(
             tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
@@ -3270,10 +3270,9 @@ _CONFIGS = [
             td_n=50,
             use_eef=True,
             critic_mode=False,
-            use_chunk_wise_delta=False,
             use_quantile_norm=True,
         ),
-        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=230_000,
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -3286,7 +3285,7 @@ _CONFIGS = [
         num_workers=0,
         log_interval=100,
         save_interval=50_000,
-        fsdp_devices=4,
+        fsdp_devices=16,
         action_horizon=50,
     ),
     # =============================================================================
@@ -3316,7 +3315,7 @@ _CONFIGS = [
             use_chunk_wise_delta=True,
             use_quantile_norm=True,
         ),
-        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=230_000,
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(

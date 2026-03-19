@@ -217,9 +217,8 @@ if [[ "$(hostname)" == *-w-0 ]]; then
     sudo chmod -R 777 /nfs/aidm_nfs/saksham3/robocoin
 fi
 
-{"" if is_eval else f'echo "Running python {run_script} {config_name} --resume {run_args_str}"'}
-{"" if is_eval else f"python {run_script} {config_name} --resume"}{"" if not is_eval else f'echo "Running python {run_script} {run_args_str}"'}
-{"" if not is_eval else f"python {run_script}"} \
+echo "Running python {run_script} {config_name + ' --resume' if not is_eval else ''} {run_args_str}"
+python {run_script} {config_name + ' --resume' if not is_eval else ''} \\
 	{run_args_str}
 echo "Script exited with code $?"
 sleep 30

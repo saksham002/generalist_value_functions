@@ -90,15 +90,16 @@ class Pi0(_model.BaseModel):
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
-        self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+        param_dtype = jnp.dtype(config.dtype)
+        self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, param_dtype = param_dtype, rngs=rngs)
         if config.pi05:
-            self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-            self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, param_dtype = param_dtype, rngs=rngs)
+            self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, param_dtype = param_dtype, rngs=rngs)
         else:
-            self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
-            self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
-            self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-        self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+            self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, param_dtype = param_dtype, rngs=rngs)
+            self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, param_dtype = param_dtype, rngs=rngs)
+            self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, param_dtype = param_dtype, rngs=rngs)
+        self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, param_dtype = param_dtype, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -282,3 +283,53 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def compute_sampling_loss(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        gt_actions: _model.Actions,
+        *,
+        action_mean: at.Float[at.Array, "ad"],
+        action_std: at.Float[at.Array, "ad"],
+        use_quantile_unnorm: bool = False,
+        action_q01: at.Float[at.Array, "ad"] | None = None,
+        action_q99: at.Float[at.Array, "ad"] | None = None,
+    ) -> dict[str, at.Array]:
+        """Sample actions via ODE and compute L1/L2 in unnormalized action space."""
+        sampled = self.sample_actions(rng, observation)  # (b, ah, ad)
+
+        # Unnormalize
+        if use_quantile_unnorm:
+            sampled_unnorm = (sampled + 1.0) / 2.0 * (action_q99 - action_q01) + action_q01
+            gt_unnorm = (gt_actions + 1.0) / 2.0 * (action_q99 - action_q01) + action_q01
+        else:
+            sampled_unnorm = sampled * action_std + action_mean
+            gt_unnorm = gt_actions * action_std + action_mean
+
+        abs_diff = jnp.abs(sampled_unnorm - gt_unnorm)  # (b, ah, ad)
+        sq_diff = jnp.square(sampled_unnorm - gt_unnorm)  # (b, ah, ad)
+
+        # Mask over action dims and reduce to (b, ah)
+        if self.action_dim_mask is not None:
+            dim_mask = jnp.array(self.action_dim_mask, dtype = jnp.float32)[None, None, :]  # (1, 1, ad)
+            l1_per_step = jnp.sum(abs_diff * dim_mask, axis = -1) / jnp.sum(dim_mask)
+            sq_per_step = jnp.sum(sq_diff * dim_mask, axis = -1) / jnp.sum(dim_mask)
+        else:
+            l1_per_step = jnp.mean(abs_diff, axis = -1)
+            sq_per_step = jnp.mean(sq_diff, axis = -1)
+
+        # Mask over (batch, action_horizon)
+        batch_size = gt_actions.shape[0]
+        action_horizon = gt_actions.shape[1]
+        mask = jnp.ones((batch_size, action_horizon))
+        if observation.action_mask is not None:
+            mask = mask * observation.action_mask
+        if observation.loss_mask is not None:
+            mask = mask * observation.loss_mask[:, None]
+        num_valid = jnp.maximum(jnp.sum(mask), 1.0)
+
+        l1 = jnp.sum(l1_per_step * mask) / num_valid
+        mse = jnp.sum(sq_per_step * mask) / num_valid
+
+        return {"sampling/l1": l1, "sampling/mse": mse}

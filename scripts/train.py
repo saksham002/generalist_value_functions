@@ -104,6 +104,13 @@ def init_train_state(
         params = nnx.state(model)
         # Convert frozen params to bfloat16.
         params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
+        # Convert trainable params to model weight dtype.
+        weight_dtype = jnp.dtype(getattr(config.model, "dtype", "float32"))
+        params = nnx_utils.state_map(
+            params,
+            config.trainable_filter,
+            lambda p: p.replace(p.value.astype(weight_dtype)),
+        )
 
         return training_utils.TrainState(
             step=0,
@@ -205,10 +212,13 @@ def train_step(
         "batch/action_max": jnp.max(actions),
     }
 
+    grads_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), grads)
+    kernel_params_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), kernel_params)
+
     info = {
         "loss": loss,
-        "grad_norm": optax.global_norm(grads),
-        "param_norm": optax.global_norm(kernel_params),
+        "grad_norm": optax.global_norm(grads_f32),
+        "param_norm": optax.global_norm(kernel_params_f32),
         "learning_rate": lr_schedule(state.step),
         **batch_stats,
     }
@@ -217,6 +227,19 @@ def train_step(
         info["batch/loss_mask_valid_fraction"] = jnp.mean(observation.loss_mask)
 
     return new_state, info
+
+
+def compute_sampling_loss(
+    sampling_loss_kwargs: dict,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> dict[str, at.Array]:
+    """Thin wrapper: merges model from state and calls model.compute_sampling_loss."""
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+    observation, gt_actions = batch
+    return model.compute_sampling_loss(rng, observation, gt_actions, **sampling_loss_kwargs)
 
 
 def main(config: _config.TrainConfig):
@@ -234,7 +257,7 @@ def main(config: _config.TrainConfig):
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
     rng = jax.random.key(config.seed)
-    train_rng, init_rng = jax.random.split(rng)
+    train_rng, sampling_rng, init_rng = jax.random.split(rng, 3)
 
     mesh = sharding.make_mesh(config.fsdp_devices)
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
@@ -281,6 +304,28 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
+    # Sampling loss: unnormalize actions and compute L1/L2 every log_interval
+    data_config = data_loader.data_config()
+    action_norm_stats = data_config.norm_stats.get("actions") if data_config.norm_stats else None
+    use_quantile_unnorm = data_config.use_quantile_norm
+    sampling_loss_kwargs = {}
+    if action_norm_stats is not None:
+        sampling_loss_kwargs["action_mean"] = jnp.array(action_norm_stats.mean)
+        sampling_loss_kwargs["action_std"] = jnp.array(action_norm_stats.std)
+        sampling_loss_kwargs["use_quantile_unnorm"] = use_quantile_unnorm
+        if use_quantile_unnorm:
+            sampling_loss_kwargs["action_q01"] = jnp.array(action_norm_stats.q01)
+            sampling_loss_kwargs["action_q99"] = jnp.array(action_norm_stats.q99)
+    else:
+        sampling_loss_kwargs["action_mean"] = jnp.zeros(config.model.action_dim)
+        sampling_loss_kwargs["action_std"] = jnp.ones(config.model.action_dim)
+
+    pcompute_sampling_loss = jax.jit(
+        functools.partial(compute_sampling_loss, sampling_loss_kwargs),
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        out_shardings=replicated_sharding,
+    )
+
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
@@ -300,7 +345,13 @@ def main(config: _config.TrainConfig):
             jax.block_until_ready(info)
 
         if step % config.log_interval == 0:
+            with timer.context("sampling_loss"), sharding.set_mesh(mesh):
+                sampling_rng, sampling_step_rng = jax.random.split(sampling_rng)
+                sampling_info = pcompute_sampling_loss(sampling_step_rng, train_state, batch)
+            sampling_info = jax.device_get(sampling_info)
+
             info = jax.device_get(info)
+            info.update(sampling_info)
             total_times = timer.get_total_times(reset = False)
             avg_times = timer.get_average_times(reset = True)
             timing_info = {f"average_times/{k}": v for k, v in avg_times.items()}
