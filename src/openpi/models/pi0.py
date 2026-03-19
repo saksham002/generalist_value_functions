@@ -67,6 +67,7 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.action_dim_mask = config.action_dim_mask
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -211,7 +212,11 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        sq_err = jnp.square(v_t - u_t)
+        if self.action_dim_mask is not None:
+            dim_mask = jnp.array(self.action_dim_mask, dtype=jnp.float32)[None, None, :]  # (1, 1, ad)
+            return jnp.sum(sq_err * dim_mask, axis = -1) / jnp.sum(dim_mask)
+        return jnp.mean(sq_err, axis = -1)
 
     @override
     def sample_actions(

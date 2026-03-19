@@ -95,7 +95,7 @@ class TestMCValueFunction:
         transition = make_transition(4, 10)
         loss, info = model.compute_loss(transition)
         assert loss.shape == (4,)
-        assert "predicted_value_mean" in info
+        assert "predicted_value" in info
 
     def test_categorical_head(self):
         config = MCValueFunctionConfig(
@@ -127,7 +127,7 @@ class TestSARSAValueFunction:
         loss, info = model.compute_loss(transition)
 
         assert loss.shape == (4,)
-        assert "next_value_mean" in info
+        assert "next_value" in info
 
         # Test target network update
         model.post_step_update()
@@ -599,7 +599,7 @@ class TestMultiMCValueFunction:
         transition = make_multi_transition(2, 4, 10)
         loss, info = model.compute_loss(transition)
         assert loss.shape == (2, 4)
-        assert "predicted_value_mean" in info
+        assert "predicted_value" in info
 
 
 class TestMultiSARSAValueFunction:
@@ -625,7 +625,7 @@ class TestMultiSARSAValueFunction:
         loss, info = model.compute_loss(transition)
 
         assert loss.shape == (2, 4)
-        assert "next_value_mean" in info
+        assert "next_value" in info
 
         # Test target network update
         model.post_step_update()

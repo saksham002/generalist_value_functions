@@ -11,6 +11,24 @@ import numpy as np
 
 import openpi.value_functions.base_value_functions as _value_fn
 from openpi.models import model as _model
+from openpi.value_functions.networks.base_networks import BaseValueNetwork
+
+
+def detokenize_prompt(token_ids: np.ndarray, mask: np.ndarray) -> str:
+    """Decode a token ID vector back to text using the PaliGemma SentencePiece model.
+
+    Args:
+        token_ids: 1D array of token IDs.
+        mask: Boolean mask of valid (non-padding) positions.
+
+    Returns:
+        Decoded text string.
+    """
+    from openpi.models.tokenizer import PaligemmaTokenizer
+
+    tokenizer = PaligemmaTokenizer()
+    ids = np.asarray(token_ids)[np.asarray(mask, dtype = bool)]
+    return tokenizer._tokenizer.decode(ids.tolist())
 
 
 @nnx.jit
@@ -401,3 +419,61 @@ def predict_values(
     logger.info(f"Computed {total_predictions} predictions")
 
     return all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores
+
+
+@nnx.jit
+def _jitted_compute_features(
+    network: BaseValueNetwork,
+    obs: _model.Observation,
+    act: _model.Actions | None,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    return network.compute_features(obs, act)
+
+
+def extract_embeddings(
+    network: BaseValueNetwork,
+    all_frames: list[tuple],
+    ep_keys: set,
+    action_conditioned: bool,
+    batch_size: int = 64,
+) -> dict[str, list[np.ndarray]]:
+    """Batched feature extraction, returning per-episode lists of embedding vectors.
+
+    Args:
+        network: The value network (before the head).
+        all_frames: List of (ep_key, frame_idx_in_ep, frame_dict) tuples.
+        ep_keys: Set of episode keys to collect embeddings for.
+        action_conditioned: Whether the network expects actions as input.
+        batch_size: Number of frames per forward pass.
+
+    Returns:
+        Dict mapping ep_key -> list of embedding numpy arrays [embed_dim].
+    """
+    all_embeddings: dict[str, list[np.ndarray]] = {k: [] for k in ep_keys}
+
+    for batch_start in range(0, len(all_frames), batch_size):
+        batch_end = min(batch_start + batch_size, len(all_frames))
+        batch_frames = all_frames[batch_start:batch_end]
+
+        frame_dicts = [f[2] for f in batch_frames]
+        obs, act = get_obs_and_action(frame_dicts, prefix = "", action_conditioned = action_conditioned)
+
+        result = _jitted_compute_features(network, obs, act)
+        if isinstance(result, tuple):
+            features = result[0]
+        else:
+            features = result
+        current_batch_size = len(batch_frames)
+        features = jax.experimental.multihost_utils.process_allgather(features, tiled = True)
+        assert features.shape == (current_batch_size, network.feature_dim), (
+            f"Expected ({current_batch_size}, {network.feature_dim}), got {features.shape}"
+        )
+        features_np = jax.device_get(features)
+
+        for i, (ep_key, _, _) in enumerate(batch_frames):
+            all_embeddings[ep_key].append(features_np[i])
+
+    total = sum(len(v) for v in all_embeddings.values())
+    logger.info(f"Extracted {total} embeddings across {len(ep_keys)} episodes")
+
+    return all_embeddings

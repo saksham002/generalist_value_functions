@@ -121,14 +121,30 @@ class _NormStatsDict(pydantic.BaseModel):
     norm_stats: dict[str, NormStats]
 
 
-def serialize_json(norm_stats: dict[str, NormStats]) -> str:
+class _EmbodimentNormStatsDict(pydantic.BaseModel):
+    norm_stats: dict[str, dict[str, NormStats]]
+
+
+def _is_embodiment_keyed(norm_stats: dict) -> bool:
+    """Check if norm_stats is embodiment-keyed (nested dict of dicts of NormStats)."""
+    first_value = next(iter(norm_stats.values()))
+    return isinstance(first_value, dict) and not isinstance(first_value, NormStats)
+
+
+def serialize_json(norm_stats: dict[str, NormStats] | dict[str, dict[str, NormStats]]) -> str:
     """Serialize the running statistics to a JSON string."""
+    if _is_embodiment_keyed(norm_stats):
+        return _EmbodimentNormStatsDict(norm_stats=norm_stats).model_dump_json(indent=2)
     return _NormStatsDict(norm_stats=norm_stats).model_dump_json(indent=2)
 
 
-def deserialize_json(data: str) -> dict[str, NormStats]:
+def deserialize_json(data: str) -> dict[str, NormStats] | dict[str, dict[str, NormStats]]:
     """Deserialize the running statistics from a JSON string."""
-    return _NormStatsDict(**json.loads(data)).norm_stats
+    parsed = json.loads(data)
+    first_value = next(iter(parsed["norm_stats"].values()))
+    if isinstance(first_value, dict) and "mean" not in first_value:
+        return _EmbodimentNormStatsDict(**parsed).norm_stats
+    return _NormStatsDict(**parsed).norm_stats
 
 
 def save(directory: pathlib.Path | str, norm_stats: dict[str, NormStats]) -> None:

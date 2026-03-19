@@ -115,7 +115,7 @@ class DataConfig:
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
     # RL training mode options (for value function training)
-    rl_mode: bool = False  # If True, use value function training pipeline
+    critic_mode: bool = False  # If True, use value function training pipeline
     discount: float = 0.99  # Discount factor (used if MC returns not in dataset)
 
     # Reward transformation: r' = reward_scale * r + reward_bias (applied before MC return computation)
@@ -184,7 +184,7 @@ class ModelTransformFactory(GroupFactory):
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
+                        _transforms.PadStatesAndActions(model_config.action_dim, action_dim_offset = model_config.action_dim_offset),
                     ],
                 )
             case _model.ModelType.PI0_FAST:
@@ -525,7 +525,7 @@ class D4RLDataConfig(DataConfigFactory):
     D4RL datasets contain state observations and actions only.
     To convert D4RL data to LeRobot format, see examples/d4rl/convert_d4rl_to_lerobot.py
 
-    When rl_mode=True, the data loader will:
+    When critic_mode=True, the data loader will:
     1. Load transitions as SARSA tuples: (s, a, r, s', a')
     2. Compute discounted Monte-Carlo returns for each trajectory
     3. Include 'mc_return' in the data dict for value function training
@@ -537,7 +537,7 @@ class D4RLDataConfig(DataConfigFactory):
     default_task: str | None = None
 
     # RL training mode options
-    rl_mode: bool = False  # If True, load SARSA tuples + MC returns
+    critic_mode: bool = False  # If True, load SARSA tuples + MC returns
     discount: float = 0.99  # Discount factor for MC return computation
 
     @override
@@ -545,7 +545,7 @@ class D4RLDataConfig(DataConfigFactory):
         # No repack needed - D4RL LeRobot datasets already have 'state' and 'actions' keys
         repack_transform = _transforms.Group(inputs=[])
 
-        if self.rl_mode:
+        if self.critic_mode:
             # RL mode: use value function transforms
             # All RL fields are stored in the dataset (computed at conversion time)
             data_transforms = _transforms.Group(
@@ -568,7 +568,7 @@ class D4RLDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
-            rl_mode=self.rl_mode,
+            critic_mode=self.critic_mode,
             discount=self.discount,
         )
 
@@ -635,7 +635,7 @@ class MinariDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             use_quantile_norm=False,
-            rl_mode=True,
+            critic_mode=True,
             discount=self.discount,
             reward_scale=self.reward_scale,
             reward_bias=self.reward_bias,
@@ -739,7 +739,7 @@ class LegacyD4RLDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             use_quantile_norm=False,
-            rl_mode=True,
+            critic_mode=True,
             discount=self.discount,
             reward_scale=self.reward_scale,
             reward_bias=self.reward_bias,
@@ -850,40 +850,164 @@ class RoboCOINDataConfig(DataConfigFactory):
     # masked are replaced with the last valid action plus Gaussian noise (std=0.005).
     dont_mask_actions: bool = False
 
+    # If True, subtract the first action in the chunk from all actions (chunk-wise delta).
+    # Uses action_diff / eef_sim_pose_action_diff norm stats keys instead of action / eef_sim_pose_action.
+    use_chunk_wise_delta: bool = False
+
     # When False, DataLoaderImpl returns (Observation, Actions) tuples for policy training.
     # When True, returns raw dicts for value function / RL training.
-    rl_mode: bool = True
+    critic_mode: bool = True
 
     # Override repo_id from parent - not used for RoboCOIN
     repo_id: str = "robocoin"
 
-    def _load_robocoin_norm_stats(self) -> dict[str, _transforms.NormStats] | None:
+    def _build_norm_stats_from_raw(self, data: dict) -> dict[str, _transforms.NormStats]:
+        """Build a dict of NormStats from raw JSON data (flat format with keys like 'observation.state')."""
+        import numpy as np
+
+        norm_stats = {}
+
+        if "observation.state" not in data:
+            raise ValueError(f"norm_stats.json requires 'observation.state' key, but found: {list(data.keys())}")
+
+        state_stats = data["observation.state"]
+
+        if self.use_quantile_norm:
+            q_lo, q_hi = "q01", "q99"
+            if q_lo not in state_stats or q_hi not in state_stats:
+                raise ValueError(
+                    f"use_quantile_norm=True requires '{q_lo}' and '{q_hi}' keys in norm_stats, "
+                    f"but found: {list(state_stats.keys())}"
+                )
+            q01_arr = np.array(state_stats[q_lo])
+            q99_arr = np.array(state_stats[q_hi])
+            norm_stats["state"] = _transforms.NormStats(
+                mean=np.zeros_like(q01_arr),
+                std=np.ones_like(q01_arr),
+                q01=q01_arr,
+                q99=q99_arr,
+            )
+        else:
+            if "mean" not in state_stats or "std" not in state_stats:
+                raise ValueError(
+                    f"use_quantile_norm=False requires 'mean' and 'std' keys in norm_stats, "
+                    f"but found: {list(state_stats.keys())}"
+                )
+            mean_arr = np.array(state_stats["mean"])
+            norm_stats["state"] = _transforms.NormStats(
+                mean=mean_arr,
+                std=np.array(state_stats["std"]),
+                q01=np.zeros_like(mean_arr),
+                q99=np.ones_like(mean_arr),
+            )
+
+        action_key = "action_diff" if self.use_chunk_wise_delta else "action"
+        eef_action_key = "eef_sim_pose_action_diff" if self.use_chunk_wise_delta else "eef_sim_pose_action"
+        ax = -1 if self.use_chunk_wise_delta else 0
+
+        if action_key in data:
+            action_stats = data[action_key]
+
+            if self.use_eef:
+                if eef_action_key not in data:
+                    raise ValueError(f"use_eef=True requires '{eef_action_key}' key in norm_stats.json, but found: {list(data.keys())}")
+                eef_action_stats = data[eef_action_key]
+
+                if self.use_quantile_norm:
+                    q_lo, q_hi = "q01", "q99"
+                    combined_action_q01 = np.concatenate(
+                        [
+                            np.array(eef_action_stats[q_lo])[..., :6],
+                            np.array(action_stats[q_lo])[..., 6:7],
+                            np.array(eef_action_stats[q_lo])[..., 6:12],
+                            np.array(action_stats[q_lo])[..., 13:14],
+                        ],
+                        axis = ax,
+                    )
+                    combined_action_q99 = np.concatenate(
+                        [
+                            np.array(eef_action_stats[q_hi])[..., :6],
+                            np.array(action_stats[q_hi])[..., 6:7],
+                            np.array(eef_action_stats[q_hi])[..., 6:12],
+                            np.array(action_stats[q_hi])[..., 13:14],
+                        ],
+                        axis = ax,
+                    )
+                    norm_stats["actions"] = _transforms.NormStats(
+                        mean=np.zeros_like(combined_action_q01),
+                        std=np.ones_like(combined_action_q01),
+                        q01=combined_action_q01,
+                        q99=combined_action_q99,
+                    )
+                else:
+                    combined_action_mean = np.concatenate(
+                        [
+                            np.array(eef_action_stats["mean"])[..., :6],
+                            np.array(action_stats["mean"])[..., 6:7],
+                            np.array(eef_action_stats["mean"])[..., 6:12],
+                            np.array(action_stats["mean"])[..., 13:14],
+                        ],
+                        axis = ax,
+                    )
+                    combined_action_std = np.concatenate(
+                        [
+                            np.array(eef_action_stats["std"])[..., :6],
+                            np.array(action_stats["std"])[..., 6:7],
+                            np.array(eef_action_stats["std"])[..., 6:12],
+                            np.array(action_stats["std"])[..., 13:14],
+                        ],
+                        axis = ax,
+                    )
+                    norm_stats["actions"] = _transforms.NormStats(
+                        mean=combined_action_mean,
+                        std=combined_action_std,
+                        q01=np.zeros_like(combined_action_mean),
+                        q99=np.ones_like(combined_action_mean),
+                    )
+            elif self.use_quantile_norm:
+                q_lo, q_hi = "q01", "q99"
+                q01_arr = np.array(action_stats[q_lo])
+                q99_arr = np.array(action_stats[q_hi])
+                norm_stats["actions"] = _transforms.NormStats(
+                    mean=np.zeros_like(q01_arr),
+                    std=np.ones_like(q01_arr),
+                    q01=q01_arr,
+                    q99=q99_arr,
+                )
+            else:
+                mean_arr = np.array(action_stats["mean"])
+                norm_stats["actions"] = _transforms.NormStats(
+                    mean=mean_arr,
+                    std=np.array(action_stats["std"]),
+                    q01=np.zeros_like(mean_arr),
+                    q99=np.ones_like(mean_arr),
+                )
+
+        if "state" in norm_stats:
+            norm_stats["next_state"] = norm_stats["state"]
+        if "actions" in norm_stats:
+            norm_stats["next_actions"] = norm_stats["actions"]
+
+        return norm_stats
+
+    def _load_robocoin_norm_stats(self) -> dict[str, _transforms.NormStats] | dict[str, dict[str, _transforms.NormStats]] | None:
         """Load normalization stats from RoboCOIN-specific JSON format.
 
-        The JSON format uses nested keys like "observation.state" with:
-        - mean, std: for z-score normalization (use_quantile_norm=False)
-        - min, max: for min-max normalization (use_quantile_norm=True)
-
-        Maps to NormStats:
-        - mean/std -> mean/std (z-score)
-        - min/max -> q01/q99 (quantile transform does min-max)
+        Supports two formats:
+        - Flat: top-level keys are stat keys (e.g. 'observation.state', 'action').
+          Returns dict[str, NormStats].
+        - Embodiment-keyed: top-level keys are embodiment names, each mapping to a flat dict.
+          Returns dict[str, dict[str, NormStats]] (embodiment -> stat key -> NormStats).
 
         Supports both local paths and GCS paths (gs://...).
-
-        Raises:
-            FileNotFoundError: If norm_stats_path is set but file doesn't exist.
-            ValueError: If required keys are missing from the JSON.
         """
         if self.norm_stats_path is None:
             return None
 
         import json
 
-        import numpy as np
-
         path_str = self.norm_stats_path
 
-        # Use tf.io.gfile for GCS paths, standard file I/O otherwise
         if path_str.startswith("gs://"):
             import tensorflow as tf
 
@@ -906,201 +1030,35 @@ class RoboCOINDataConfig(DataConfigFactory):
             with open(path) as f:
                 data = json.load(f)
 
-        norm_stats = {}
+        # Detect embodiment-keyed format: first value is a dict containing 'observation.state'
+        first_value = next(iter(data.values()))
+        if isinstance(first_value, dict) and "observation.state" in first_value:
+            norm_stats = {emb: self._build_norm_stats_from_raw(emb_data) for emb, emb_data in data.items()}
+            logging.info(f"Loaded embodiment-keyed RoboCOIN norm_stats from {path_str}, embodiments: {list(norm_stats.keys())}")
+            return norm_stats
 
-        # Check required keys exist
-        if "observation.state" not in data:
-            raise ValueError(f"norm_stats.json requires 'observation.state' key, but found: {list(data.keys())}")
-
-        state_stats = data["observation.state"]
-
-        if self.use_eef:
-            # EEF mode: construct combined norm stats from eef_sim_pose_state + observation.state grippers
-            if "eef_sim_pose_state" not in data:
-                raise ValueError(
-                    f"use_eef=True requires 'eef_sim_pose_state' key in norm_stats.json, but found: {list(data.keys())}"
-                )
-            eef_stats = data["eef_sim_pose_state"]
-
-            if self.use_quantile_norm:
-                # Min-max normalization
-                if "min" not in state_stats or "max" not in state_stats:
-                    raise ValueError("use_quantile_norm=True requires 'min' and 'max' keys in observation.state")
-                if "min" not in eef_stats or "max" not in eef_stats:
-                    raise ValueError("use_quantile_norm=True requires 'min' and 'max' keys in eef_sim_pose_state")
-
-                # Construct combined: [eef[:6], state[6], eef[6:12], state[13]]
-                combined_min = np.concatenate(
-                    [
-                        np.array(eef_stats["min"])[:6],
-                        np.array(state_stats["min"])[6:7],
-                        np.array(eef_stats["min"])[6:12],
-                        np.array(state_stats["min"])[13:14],
-                    ]
-                )
-                combined_max = np.concatenate(
-                    [
-                        np.array(eef_stats["max"])[:6],
-                        np.array(state_stats["max"])[6:7],
-                        np.array(eef_stats["max"])[6:12],
-                        np.array(state_stats["max"])[13:14],
-                    ]
-                )
-                norm_stats["state"] = _transforms.NormStats(
-                    mean=None,
-                    std=None,
-                    q01=combined_min,
-                    q99=combined_max,
-                )
-            else:
-                # Z-score normalization
-                if "mean" not in state_stats or "std" not in state_stats:
-                    raise ValueError("use_quantile_norm=False requires 'mean' and 'std' keys in observation.state")
-                if "mean" not in eef_stats or "std" not in eef_stats:
-                    raise ValueError("use_quantile_norm=False requires 'mean' and 'std' keys in eef_sim_pose_state")
-
-                # Construct combined: [eef[:6], state[6], eef[6:12], state[13]]
-                combined_mean = np.concatenate(
-                    [
-                        np.array(eef_stats["mean"])[:6],
-                        np.array(state_stats["mean"])[6:7],
-                        np.array(eef_stats["mean"])[6:12],
-                        np.array(state_stats["mean"])[13:14],
-                    ]
-                )
-                combined_std = np.concatenate(
-                    [
-                        np.array(eef_stats["std"])[:6],
-                        np.array(state_stats["std"])[6:7],
-                        np.array(eef_stats["std"])[6:12],
-                        np.array(state_stats["std"])[13:14],
-                    ]
-                )
-                norm_stats["state"] = _transforms.NormStats(
-                    mean=combined_mean,
-                    std=combined_std,
-                    q01=None,
-                    q99=None,
-                )
-        # Joint angle mode: use observation.state directly
-        elif self.use_quantile_norm:
-            # Min-max normalization: use min/max mapped to q01/q99
-            if "min" not in state_stats or "max" not in state_stats:
-                raise ValueError(
-                    f"use_quantile_norm=True requires 'min' and 'max' keys in norm_stats, "
-                    f"but found: {list(state_stats.keys())}"
-                )
-            norm_stats["state"] = _transforms.NormStats(
-                mean=None,  # Not used for quantile
-                std=None,  # Not used for quantile
-                q01=np.array(state_stats["min"]),
-                q99=np.array(state_stats["max"]),
-            )
-        else:
-            # Z-score normalization: use mean/std
-            if "mean" not in state_stats or "std" not in state_stats:
-                raise ValueError(
-                    f"use_quantile_norm=False requires 'mean' and 'std' keys in norm_stats, "
-                    f"but found: {list(state_stats.keys())}"
-                )
-            norm_stats["state"] = _transforms.NormStats(
-                mean=np.array(state_stats["mean"]),
-                std=np.array(state_stats["std"]),
-                q01=None,
-                q99=None,
-            )
-
-        # Add action_chunk normalization stats (for Q(s,a) training)
-        if "action" in data:
-            action_stats = data["action"]
-
-            if self.use_eef:
-                # EEF mode: construct combined action stats from eef_sim_pose_action + action grippers
-                eef_action_stats = data["eef_sim_pose_action"]
-
-                if self.use_quantile_norm:
-                    # Min-max normalization
-                    combined_action_min = np.concatenate(
-                        [
-                            np.array(eef_action_stats["min"])[:6],
-                            np.array(action_stats["min"])[6:7],
-                            np.array(eef_action_stats["min"])[6:12],
-                            np.array(action_stats["min"])[13:14],
-                        ]
-                    )
-                    combined_action_max = np.concatenate(
-                        [
-                            np.array(eef_action_stats["max"])[:6],
-                            np.array(action_stats["max"])[6:7],
-                            np.array(eef_action_stats["max"])[6:12],
-                            np.array(action_stats["max"])[13:14],
-                        ]
-                    )
-                    norm_stats["actions"] = _transforms.NormStats(
-                        mean=None,
-                        std=None,
-                        q01=combined_action_min,
-                        q99=combined_action_max,
-                    )
-                else:
-                    # Z-score normalization
-                    combined_action_mean = np.concatenate(
-                        [
-                            np.array(eef_action_stats["mean"])[:6],
-                            np.array(action_stats["mean"])[6:7],
-                            np.array(eef_action_stats["mean"])[6:12],
-                            np.array(action_stats["mean"])[13:14],
-                        ]
-                    )
-                    combined_action_std = np.concatenate(
-                        [
-                            np.array(eef_action_stats["std"])[:6],
-                            np.array(action_stats["std"])[6:7],
-                            np.array(eef_action_stats["std"])[6:12],
-                            np.array(action_stats["std"])[13:14],
-                        ]
-                    )
-                    norm_stats["actions"] = _transforms.NormStats(
-                        mean=combined_action_mean,
-                        std=combined_action_std,
-                        q01=None,
-                        q99=None,
-                    )
-            # Joint angle mode: use action stats directly
-            elif self.use_quantile_norm:
-                norm_stats["actions"] = _transforms.NormStats(
-                    mean=None,
-                    std=None,
-                    q01=np.array(action_stats["min"]),
-                    q99=np.array(action_stats["max"]),
-                )
-            else:
-                norm_stats["actions"] = _transforms.NormStats(
-                    mean=np.array(action_stats["mean"]),
-                    std=np.array(action_stats["std"]),
-                    q01=None,
-                    q99=None,
-                )
-
-        # Add next_state and next_actions with same normalization as their current counterparts
-        if "state" in norm_stats:
-            norm_stats["next_state"] = norm_stats["state"]
-        if "actions" in norm_stats:
-            norm_stats["next_actions"] = norm_stats["actions"]
-
+        norm_stats = self._build_norm_stats_from_raw(data)
         logging.info(f"Loaded RoboCOIN norm_stats from {path_str}, keys: {list(norm_stats.keys())}")
         return norm_stats if norm_stats else None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        if self.rl_mode:
+        assert not (not self.critic_mode and self.dont_mask_actions), (
+            "dont_mask_actions=True is incompatible with critic_mode=False (policy training): "
+            "synthetic action padding would corrupt the flow matching loss."
+        )
+        if self.critic_mode:
             data_transforms = _transforms.Group(
                 inputs=[_value_transforms.ValueFunctionInputs()],
                 outputs=[],
             )
+            # Critics don't need discrete state tokenization or action padding.
+            # Tokenization (with state=None) is handled in RoboCOINPostTFTransform.
+            model_transforms = _transforms.Group(inputs=[], outputs=[])
         else:
             data_transforms = _transforms.Group(inputs=[], outputs=[])
-        model_transforms = _transforms.Group(inputs=[], outputs=[])
+            # Policy training: use standard model transforms (TokenizePrompt + PadStatesAndActions).
+            model_transforms = ModelTransformFactory(default_prompt = None)(model_config)
 
         # Use dataset name as asset_id
         asset_id = self.dataset_name.replace(":", "_").replace("/", "_")
@@ -1121,7 +1079,7 @@ class RoboCOINDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             use_quantile_norm=self.use_quantile_norm,
-            rl_mode=self.rl_mode,
+            critic_mode=self.critic_mode,
             discount=self.discount,
             reward_scale=self.reward_scale,
             reward_bias=self.reward_bias,
@@ -1149,7 +1107,10 @@ class RoboCOINDataConfig(DataConfigFactory):
             use_eef=self.use_eef,
             filter_n=self.filter_n,
             mask_50fps=self.mask_50fps,
-            dont_mask_actions=self.dont_mask_actions if not self.rl_mode else False,
+            dont_mask_actions=self.dont_mask_actions,
+            use_chunk_wise_delta=self.use_chunk_wise_delta,
+            critic_mode=self.critic_mode,
+            use_quantile_norm=self.use_quantile_norm,
         )
 
 
@@ -1299,6 +1260,8 @@ class TrainConfig:
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
+    # Optional wandb group name for organizing runs within a project.
+    wandb_group: str | None = None
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -2294,13 +2257,27 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         dataset_name = "real_hang:1.0.0",
         norm_stats_path = "gs://saksham-euw4/hdf5/real_hang/norm_stats/norm_stats.json",
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang/",
-        num_val_trajectories = 3,
+        num_val_trajectories = 1,
         include_repos = (),
         num_train_steps = 300,
         lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
         save_interval = 50,
         plot_interval = 50,
         keep_period = 50,
+    ),
+    FineTuneConfig(
+        name = "real_hang_finetune_75",
+        data_dir = "gs://saksham-euw4/hdf5/",
+        dataset_name = "real_hang:1.0.0",
+        norm_stats_path = "gs://saksham-euw4/hdf5/real_hang/norm_stats/norm_stats.json",
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang_75/",
+        num_val_trajectories = 2,
+        include_repos = (),
+        num_train_steps = 2000,
+        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
+        save_interval = 500,
+        plot_interval = 500,
+        keep_period = 500,
     ),
 ]
 
@@ -3003,6 +2980,50 @@ _CONFIGS = [
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
     ),
+    # RoboCOIN Q(s,a) SARSA with bimanual dataset, chunk-wise delta actions, quantile norm.
+    TrainConfig(
+        name="robocoin_bimanual_paligemma_q_sarsa_chunk_wise",
+        model=_value_function.SARSAValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(224, 224),
+                max_token_len=48,
+                action_dim=14,
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            dataset_name="robocoin:1.0.0",
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            dont_mask_actions=True,
+            use_chunk_wise_delta=True,
+            use_quantile_norm=True,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=230_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=50_000,
+        save_interval=50_000,
+        fsdp_devices=1,
+        action_horizon=50,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
+    ),
     # RoboCOIN Q(s,a) SARSA with bimanual dataset, HL-Gauss head.
     TrainConfig(
         name="robocoin_bimanual_paligemma_q_sarsa_hl_gauss",
@@ -3192,20 +3213,23 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b",
             action_expert_variant="gemma_300m",
-            action_dim=14,
+            action_dim=32,
             action_horizon=50,
-            max_token_len=48,
+            max_token_len=96,
             pi05=True,
+            action_dim_offset=14,
+            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
         ),
         data=RoboCOINDataConfig(
             tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
             dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
             discount=0.999,
             td_n=50,
             use_eef=True,
-            dont_mask_actions=True,
-            rl_mode=False,
+            critic_mode=False,
+            use_chunk_wise_delta=True,
+            use_quantile_norm=True,
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
         num_train_steps=230_000,
@@ -3219,13 +3243,94 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,
         log_interval=100,
-        plot_interval=50_000,
         save_interval=50_000,
         fsdp_devices=16,
         action_horizon=50,
-        num_val_trajectories=10,
-        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
+    ),
+    # =============================================================================
+    # RoboCOIN π₀.5 policy training (GPU, no chunk-wise delta)
+    # =============================================================================
+    TrainConfig(
+        name="robocoin_bimanual_pi05_gpu",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=96,
+            pi05=True,
+            action_dim_offset=14,
+            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            dataset_name="robocoin:1.0.0",
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            critic_mode=False,
+            use_chunk_wise_delta=False,
+            use_quantile_norm=True,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=230_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        save_interval=50_000,
+        fsdp_devices=4,
+        action_horizon=50,
+    ),
+    # =============================================================================
+    # RoboCOIN π₀.5 policy training (no state input ablation)
+    # =============================================================================
+    TrainConfig(
+        name="robocoin_bimanual_pi05_no_state",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=96,
+            pi05=True,
+            discrete_state_input=False,
+            action_dim_offset=14,
+            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
+        ),
+        data=RoboCOINDataConfig(
+            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            dataset_name="robocoin:1.0.0",
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            critic_mode=False,
+            use_chunk_wise_delta=True,
+            use_quantile_norm=True,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=230_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        save_interval=50_000,
+        fsdp_devices=16,
+        action_horizon=50,
     ),
 ]
 

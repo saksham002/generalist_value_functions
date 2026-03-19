@@ -326,14 +326,24 @@ class PromptFromLeRobotTask(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
-    """Zero-pads states and actions to the model action dimension."""
+    """Zero-pads states and actions to the model action dimension.
+
+    When action_dim_offset > 0, values are placed at [offset : offset + d]
+    and an action_dim_mask (bool[model_action_dim]) marks the real positions.
+    """
 
     model_action_dim: int
+    action_dim_offset: int = 0
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
-        if "actions" in data:
-            data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        if self.action_dim_offset > 0:
+            data["state"] = _insert_at_offset(data["state"], self.model_action_dim, self.action_dim_offset)
+            if "actions" in data:
+                data["actions"] = _insert_at_offset(data["actions"], self.model_action_dim, self.action_dim_offset)
+        else:
+            data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis = -1)
+            if "actions" in data:
+                data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis = -1)
         return data
 
 
@@ -418,6 +428,16 @@ def apply_tree(
                 raise ValueError(f"Selector key {k} not found in tree")
 
     return unflatten_dict({k: transform(k, v) for k, v in tree.items()})
+
+
+def _insert_at_offset(x: np.ndarray, target_dim: int, offset: int) -> np.ndarray:
+    """Place x's last-axis values at [offset : offset + d] in a zero array of size target_dim."""
+    real_dim = x.shape[-1]
+    assert offset + real_dim <= target_dim, f"offset({offset}) + dim({real_dim}) > target({target_dim})"
+    out_shape = x.shape[:-1] + (target_dim,)
+    out = np.zeros(out_shape, dtype = x.dtype)
+    out[..., offset : offset + real_dim] = x
+    return out
 
 
 def pad_to_dim(x: np.ndarray, target_dim: int, axis: int = -1, value: float = 0.0) -> np.ndarray:

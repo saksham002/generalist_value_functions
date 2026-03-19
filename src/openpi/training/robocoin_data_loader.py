@@ -40,6 +40,13 @@ from openpi.models.tokenizer import Gemma3Tokenizer, PaligemmaTokenizer
 import pdb
 
 logger = logging.getLogger(__name__)
+
+
+def extract_embodiment(repo_id: str | bytes) -> str:
+    """Extract embodiment name from a RoboCOIN repo_id (e.g. 'RoboCOIN/Split_aloha_plate_storage' -> 'Split_aloha')."""
+    if isinstance(repo_id, bytes):
+        repo_id = repo_id.decode("utf-8")
+    return "_".join(repo_id.split("/")[-1].split("_", 2)[:2])
 # Disable GPU for TensorFlow (we only use it for data loading)
 # tf.config.experimental.set_visible_devices([], "GPU")
 
@@ -96,6 +103,8 @@ class RoboCOINDataLoaderConfig:
     filter_n: int | None = None
     mask_50fps: bool = False
     dont_mask_actions: bool = False
+    use_chunk_wise_delta: bool = False
+    critic_mode: bool = True
 
 
 # =============================================================================
@@ -138,7 +147,6 @@ class AddTrajectoryKeys:
         action = episode["action"]
 
         if self.use_eef:
-            eef_state = episode["eef_sim_pose_state"]
             eef_action = episode["eef_sim_pose_action"]
         
         cam_keys = [f"observation/image/cam_{i}" for i in range(self.max_cameras)]
@@ -152,9 +160,6 @@ class AddTrajectoryKeys:
 
         episode["next_observation/state"] = tf.gather(state, next_indices)
         
-        if self.use_eef:
-            episode["next_eef_sim_pose_state"] = tf.gather(eef_state, next_indices)
-            
         for cam_key in cam_keys:
             if cam_key in episode:
                 episode[f"next_{cam_key}"] = tf.gather(episode[cam_key], next_indices)
@@ -249,6 +254,9 @@ class MainTransform:
         td_n: int | None = None,
         split: str = "train",
         mask_50fps: bool = False,
+        dont_mask_actions: bool = False,
+        use_chunk_wise_delta: bool = False,
+        critic_mode: bool = True,
     ):
         self.max_cameras = max_cameras
         self.use_eef = use_eef
@@ -256,6 +264,9 @@ class MainTransform:
         self.td_n = td_n
         self.split = split
         self.mask_50fps = mask_50fps
+        self.dont_mask_actions = dont_mask_actions
+        self.use_chunk_wise_delta = use_chunk_wise_delta
+        self.critic_mode = critic_mode
 
     @staticmethod
     def _construct_eef_repr(data: tf.Tensor, eef_data: tf.Tensor) -> tf.Tensor:
@@ -271,32 +282,18 @@ class MainTransform:
         )
 
     def _process_state(self, raw_frame: dict) -> dict:
-        """Process state and next_state with optional EEF representation."""
+        """Process state and next_state. Always uses joint-angle state (observation/state)."""
         if "observation/state" not in raw_frame:
             raise ValueError("Missing required key 'observation/state' in frame")
-        
-        state = tf.cast(raw_frame.pop("observation/state"), tf.float32)
 
-        if self.use_eef:
-            if "eef_sim_pose_state" not in raw_frame:
-                raise ValueError("use_eef=True but 'eef_sim_pose_state' not found in frame")
-            eef_state = tf.cast(raw_frame.pop("eef_sim_pose_state"), tf.float32)
-            processed_state = self._construct_eef_repr(state, eef_state)
-        else:
-            processed_state = state
+        processed_state = tf.cast(raw_frame.pop("observation/state"), tf.float32)
+        raw_frame.pop("eef_sim_pose_state", None)
 
         if "next_observation/state" not in raw_frame:
             raise ValueError("Missing required key 'next_observation/state' in frame")
-        
-        next_state = tf.cast(raw_frame.pop("next_observation/state"), tf.float32)
-        
-        if self.use_eef:
-            if "next_eef_sim_pose_state" not in raw_frame:
-                raise ValueError("use_eef=True but 'next_eef_sim_pose_state' not found in frame")
-            next_eef = tf.cast(raw_frame.pop("next_eef_sim_pose_state"), tf.float32)
-            processed_next_state = self._construct_eef_repr(next_state, next_eef)
-        else:
-            processed_next_state = next_state
+
+        processed_next_state = tf.cast(raw_frame.pop("next_observation/state"), tf.float32)
+        raw_frame.pop("next_eef_sim_pose_state", None)
 
         return {"state": processed_state, "next_state": processed_next_state}
 
@@ -335,6 +332,10 @@ class MainTransform:
         if "next_action_mask" not in raw_frame:
             raise ValueError("Missing required key 'next_action_mask' in frame")
         next_action_mask = raw_frame.pop("next_action_mask")
+
+        if self.use_chunk_wise_delta:
+            actions = actions - actions[:1, :]
+            next_actions = next_actions - next_actions[:1, :]
 
         return {
             "actions": actions,
@@ -384,6 +385,22 @@ class MainTransform:
         )
         loss_mask = tf.logical_and(loss_mask, tf.logical_not(is_static_or_abnormal))
 
+        if not self.critic_mode:
+            # Policy mode: concatenate all valid non-static/non-abnormal subtasks
+            valid_mask = tf.range(5) < first_null
+            texts_lower = tf.strings.lower(texts)
+            include_mask = (
+                valid_mask
+                & tf.not_equal(texts_lower, b"static")
+                & tf.not_equal(texts_lower, b"abnormal")
+            )
+            texts_stripped = tf.strings.regex_replace(texts, r"\.\s*$", "")
+            selected_texts = tf.boolean_mask(texts_stripped, include_mask)
+            prompt = tf.strings.reduce_join(selected_texts, separator = ", ")
+            loss_mask = tf.logical_and(loss_mask, tf.not_equal(tf.strings.length(prompt), 0))
+        else:
+            prompt = sampled_text
+
         frame["steps_to_subtask_end"] = selected_steps
         frame["sampled_index"] = sampled_idx
         frame["loss_mask"] = loss_mask
@@ -393,7 +410,7 @@ class MainTransform:
         frame["action_mask"] = frame["action_mask"][sampled_idx]
         frame["next_action_mask"] = frame["next_action_mask"][sampled_idx]
 
-        frame["subtask_text"] = sampled_text
+        frame["prompt"] = prompt
 
         # TODO: make fps->exponent_per_step and fps->valid_action_fraction mappings configurable
         fps = tf.cast(raw_frame["fps"], tf.int32)
@@ -438,7 +455,7 @@ class MainTransform:
             frame["next_image"] = next_imgs["images"]
             frame["next_image_mask"] = next_imgs["masks"]
 
-        # Pass through metadata (subtask_1..5 needed for validation extras in PostBatchTransform)
+        # Pass through metadata (subtask_1..5 needed for validation extras in RoboCOINPostTFTransform)
         for key in ["episode_index", "_frame_index", "_traj_index",
                     "repo_id", "fps",
                     "subtask_1", "subtask_2", "subtask_3", "subtask_4", "subtask_5"]:
@@ -457,8 +474,24 @@ class MainTransform:
         frame["action_mask"] = tf.where(is_30fps, tf.logical_and(frame["action_mask"], fps_mask_30), frame["action_mask"])
         frame["next_action_mask"] = tf.where(is_30fps, tf.logical_and(frame["next_action_mask"], fps_mask_30), frame["next_action_mask"])
 
-        if self.split != "val":
-            frame.pop("repo_id", None)
+        if self.dont_mask_actions:
+            for actions_key, mask_key in [("actions", "action_mask"), ("next_actions", "next_action_mask")]:
+                actions = frame[actions_key]
+                action_mask = frame[mask_key]
+
+                last_valid_idx = tf.reduce_sum(tf.cast(action_mask, tf.int32)) - 1
+                last_valid_idx = tf.maximum(last_valid_idx, 0)
+                last_valid = actions[last_valid_idx]
+
+                noise = tf.random.normal(tf.shape(actions), stddev = 0.005)
+                replacement = last_valid[None, :] + noise
+
+                actions = tf.where(action_mask[:, None], actions, replacement)
+                action_mask = tf.ones_like(action_mask)
+                action_mask = tf.where(is_30fps, tf.logical_and(action_mask, fps_mask_30), action_mask)
+
+                frame[actions_key] = actions
+                frame[mask_key] = action_mask
 
         return frame
 
@@ -486,28 +519,40 @@ class FilterLastN:
 # =============================================================================
 
 
-class PostBatchTransform:
-    """NumPy transform applied after batching for tokenization and normalization."""
+class RoboCOINPostTFTransform:
+    """Minimal post-TF batched transform: normalization, clipping, validation extras, metadata cleanup.
+
+    Per-sample operations (chunk-wise delta, dont_mask_actions) have been moved to MainTransform.
+    Per-sample model transforms (TokenizePrompt, PadStatesAndActions) are applied separately via
+    IterableTransformedDataset when critic_mode=False. When critic_mode=True, tokenization with
+    state=None is handled here since critics don't need discrete state input or action padding.
+    """
 
     def __init__(
         self,
         tokenizer: PaligemmaTokenizer | Gemma3Tokenizer,
-        max_token_len: int = DEFAULT_MAX_TOKEN_LEN,
         state_norm_stats: dict[str, Any] | None = None,
         use_quantile_norm: bool = False,
         use_eef: bool = False,
         split: str = "train",
-        dont_mask_actions: bool = False,
+        critic_mode: bool = True,
     ):
         self.use_eef = use_eef
         self.split = split
-        self.dont_mask_actions = dont_mask_actions
+        self.critic_mode = critic_mode
         self.tokenizer = tokenizer
+        self.use_quantile_norm = use_quantile_norm
 
-        self._normalize_fn = _transforms.Normalize(state_norm_stats, use_quantiles=use_quantile_norm)
-
-        if dont_mask_actions:
-            self._rng = np.random.default_rng(seed=86)
+        # Detect embodiment-keyed norm stats: first value is a dict (of NormStats), not a NormStats
+        if state_norm_stats is not None and state_norm_stats and not isinstance(next(iter(state_norm_stats.values())), _transforms.NormStats):
+            self._normalize_fn = None
+            self._embodiment_normalize_fns = {
+                emb: _transforms.Normalize(emb_stats, use_quantiles = use_quantile_norm)
+                for emb, emb_stats in state_norm_stats.items()
+            }
+        else:
+            self._normalize_fn = _transforms.Normalize(state_norm_stats, use_quantiles = use_quantile_norm)
+            self._embodiment_normalize_fns = None
 
     @staticmethod
     def _generate_negative_subtask_text(subtask_text: str) -> str:
@@ -519,7 +564,7 @@ class PostBatchTransform:
             return "Place the knife on the board"
         if "Pass the plate" in subtask_text:
             return "Rotate the plate with the right gripper"
-        return PostBatchTransform._swap_left_right_text(subtask_text)
+        return RoboCOINPostTFTransform._swap_left_right_text(subtask_text)
 
     @staticmethod
     def _swap_left_right_text(text: str) -> str:
@@ -573,40 +618,45 @@ class PostBatchTransform:
         return mirror
 
 
+    def _normalize_per_embodiment(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Normalize state/action keys per-embodiment using embodiment-specific norm stats."""
+        repo_ids = batch["repo_id"]
+        embodiments = np.array([extract_embodiment(rid) for rid in repo_ids])
+        norm_keys = ("state", "actions", "next_state", "next_actions")
+
+        for key in norm_keys:
+            if key in batch and not batch[key].flags.writeable:
+                batch[key] = batch[key].copy()
+
+        for emb in np.unique(embodiments):
+            indices = np.where(embodiments == emb)[0]
+            normalize_fn = self._embodiment_normalize_fns[emb]
+            sub_batch = {k: batch[k][indices] for k in norm_keys if k in batch}
+            sub_batch = normalize_fn(sub_batch)
+            for key in sub_batch:
+                batch[key][indices] = sub_batch[key]
+
+        return batch
+
     def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
-        """Tokenize prompts, apply validation extras, normalize."""
-        batch_size = batch["subtask_text"].shape[0]
-
-        # Tokenize the already-selected subtask text
-        tokenized_prompts = []
-        tokenized_masks = []
-        for i in range(batch_size):
-            text = self._decode_text(batch["subtask_text"][i])
-            tokens, mask = self.tokenizer.tokenize(text, state=None)
-            tokenized_prompts.append(tokens)
-            tokenized_masks.append(mask)
-
-        batch["tokenized_prompt"] = np.stack(tokenized_prompts, axis=0)
-        batch["tokenized_prompt_mask"] = np.stack(tokenized_masks, axis=0)
-
+        """Apply validation extras, normalize, clip, tokenize (critic only), cleanup metadata."""
         if self.split == "val":
+            batch_size = next(v.shape[0] for v in jax.tree.leaves(batch) if hasattr(v, "shape") and len(v.shape) > 0)
             self._process_validation_extras(batch, batch_size)
 
-        # Clean up subtask keys
-        batch.pop("subtask_text", None)
         for i in range(1, 6):
             batch.pop(f"subtask_{i}", None)
 
-        # Apply normalization
-        batch = self._normalize_fn(batch)
+        # Normalize
+        if self._embodiment_normalize_fns is not None:
+            batch = self._normalize_per_embodiment(batch)
+        else:
+            batch = self._normalize_fn(batch)
 
-        # Clip normalized values to [-5, 5]
-        for key in ("state", "actions"):
+        clip_bound = 1.0 if self.use_quantile_norm else 5.0
+        for key in ("state", "actions", "next_state", "next_actions"):
             if key in batch:
-                batch[key] = np.clip(batch[key], -5.0, 5.0)
-
-        if self.dont_mask_actions:
-            self._replace_masked_actions(batch)
+                batch[key] = np.clip(batch[key], -clip_bound, clip_bound)
 
         # Mirror state/actions after normalization (for counterfactual validation)
         if "mirror_image" in batch:
@@ -617,32 +667,32 @@ class PostBatchTransform:
             if batch_actions is not None and batch_actions.shape[-1] == 14:
                 batch["mirror_actions"] = self._mirror_14d_array(batch_actions)
 
+        # Critic mode: tokenize here (with state=None) since model_transforms is empty.
+        # Non-critic mode: decode bytes→str so downstream TokenizePrompt works.
+        if self.critic_mode:
+            self._batch_tokenize(batch)
+            batch.pop("prompt", None)
+        elif "prompt" in batch:
+            batch["prompt"] = np.array([self._decode_text(p) for p in batch["prompt"]], dtype = object)
+
+        if self.split != "val":
+            batch.pop("repo_id", None)
+        batch.pop("fps", None)
+
         return batch
 
-    def _replace_masked_actions(self, batch: dict) -> None:
-        """Replace subtask-masked action positions with last valid action plus standard normal noise.
-
-        Applied to both current and next action chunks so that Q(s,a) and Q(s',a')
-        see the same masking convention.
-        """
-        fps = batch["fps"]
-        for actions_key, mask_key in [("actions", "action_mask"), ("next_actions", "next_action_mask")]:
-            actions = batch[actions_key].copy()
-            action_mask = batch[mask_key].copy()
-            batch_size, action_horizon, _ = actions.shape
-
-            last_valid_idx = action_mask.sum(axis = -1) - 1
-            last_valid_actions = actions[np.arange(batch_size), last_valid_idx]
-
-            noise = (0.005 * self._rng.standard_normal(actions.shape)).astype(actions.dtype)
-            replacement = last_valid_actions[:, None, :] + noise
-
-            actions[~action_mask] = replacement[~action_mask]
-            action_mask[:] = True
-            action_mask[fps == 30, 3 * action_horizon // 5 :] = False
-
-            batch[actions_key] = actions
-            batch[mask_key] = action_mask
+    def _batch_tokenize(self, batch: dict[str, Any]) -> None:
+        """Tokenize the prompt key for critic mode (state=None, no discrete state input)."""
+        batch_size = batch["prompt"].shape[0]
+        tokenized_prompts = []
+        tokenized_masks = []
+        for i in range(batch_size):
+            text = self._decode_text(batch["prompt"][i])
+            tokens, mask = self.tokenizer.tokenize(text, state = None)
+            tokenized_prompts.append(tokens)
+            tokenized_masks.append(mask)
+        batch["tokenized_prompt"] = np.stack(tokenized_prompts, axis = 0)
+        batch["tokenized_prompt_mask"] = np.stack(tokenized_masks, axis = 0)
 
     def _process_validation_extras(self, batch: dict, batch_size: int) -> None:
         subtask_1_texts = [self._decode_text(batch["subtask_1"][i]) for i in range(batch_size)]
@@ -702,7 +752,10 @@ def create_robocoin_data_loader(
     except ImportError:
         raise ImportError("dlimp is required for RoboCOIN data loading. Install with: pip install dlimp")
 
-    logger.info(f"Config: {config}")
+    config_fields = {f.name: getattr(config, f.name) for f in dataclasses.fields(config)}
+    if "state_norm_stats" in config_fields and config_fields["state_norm_stats"] is not None:
+        config_fields["state_norm_stats"] = f"<{len(config_fields['state_norm_stats'])} keys>"
+    logger.info(f"Config: {config_fields}")
     logger.info(f"Building DLIMP dataset: {config.dataset_name}")
     logger.info(f"Data directory: {config.data_dir}")
     logger.info(f"Batch size: {config.batch_size}")
@@ -748,6 +801,9 @@ def create_robocoin_data_loader(
             td_n=config.td_n,
             split=config.split,
             mask_50fps=config.mask_50fps,
+            dont_mask_actions=config.dont_mask_actions,
+            use_chunk_wise_delta=config.use_chunk_wise_delta,
+            critic_mode=config.critic_mode,
         ).map
     )
 
@@ -761,14 +817,13 @@ def create_robocoin_data_loader(
     dataset = dataset.with_ram_budget(1)
     dataset = dataset.prefetch(config.prefetch_buffer_size)
 
-    post_batch_transform = PostBatchTransform(
-        max_token_len=config.max_token_len,
+    post_batch_transform = RoboCOINPostTFTransform(
+        tokenizer=tokenizer,
         state_norm_stats=config.state_norm_stats,
         use_quantile_norm=config.use_quantile_norm,
         use_eef=config.use_eef,
         split=config.split,
-        dont_mask_actions=config.dont_mask_actions,
-        tokenizer=tokenizer,
+        critic_mode=config.critic_mode,
     )
 
     # Wrap iterator to apply post-batch transform
@@ -795,8 +850,10 @@ def create_robocoin_data_loader(
 
 class RoboCOINDataLoader:
     """Data loader wrapper compatible with the openpi data loader interface.
-    
+
     Handles sharding similarly to RLDSDataLoader for multi-device training.
+    When model_transforms is provided, applies per-sample transforms (e.g. TokenizePrompt,
+    PadStatesAndActions) to each batch before sharding — same pattern as RLDS/DROID pipelines.
     """
 
     def __init__(
@@ -806,10 +863,12 @@ class RoboCOINDataLoader:
         tokenizer: PaligemmaTokenizer | Gemma3Tokenizer,
         sharding: jax.sharding.Sharding | None = None,
         num_batches: int | None = None,
+        model_transforms: list[_transforms.DataTransformFn] | None = None,
     ):
         self.config = config
         self._tokenizer = tokenizer
         self._num_batches = num_batches if num_batches is not None else config.num_batches
+        self._model_transform = _transforms.compose(model_transforms) if model_transforms else None
 
         if sharding is None:
             # Use data parallel sharding by default (same as RLDSDataLoader)
@@ -827,6 +886,16 @@ class RoboCOINDataLoader:
             return x
         return jax.make_array_from_process_local_data(self._sharding, arr)
 
+    def _apply_per_sample_transforms(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Split batch → apply per-sample model_transforms → re-stack."""
+        batch_size = next(
+            v.shape[0] for v in jax.tree.leaves(batch) if hasattr(v, "shape") and len(v.shape) > 0
+        )
+        samples = [jax.tree.map(lambda x: x[i], batch) for i in range(batch_size)]  # noqa: B023
+        transformed = [self._model_transform(s) for s in samples]
+        stacked = jax.tree.map(lambda *x: np.stack(x, axis = 0), *transformed)
+        return stacked
+
     def __iter__(self) -> Iterator[dict[str, Any]]:
         num_items = 0
         while True:
@@ -838,6 +907,8 @@ class RoboCOINDataLoader:
                     batch = next(data_iter)
                 except StopIteration:
                     break  # Exhausted the dataset, create new iterator
+                if self._model_transform is not None:
+                    batch = self._apply_per_sample_transforms(batch)
                 num_items += 1
                 yield jax.tree.map(
                     self._to_sharded_array_or_passthrough, batch

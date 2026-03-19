@@ -551,7 +551,10 @@ def create_data_loader(
         framework: The framework to use ("jax" or "pytorch").
     """
     data_config = config.data.create(config.assets_dirs, config.model)
-    logging.info(f"data_config: {data_config}")
+    config_fields = {f.name: getattr(data_config, f.name) for f in dataclasses.fields(data_config)}
+    if "norm_stats" in config_fields and config_fields["norm_stats"]:
+        config_fields["norm_stats"] = f"<{len(config_fields['norm_stats'])} keys>"
+    logging.info(f"data_config: {config_fields}")
 
     # Check for minari dataset first (fastest option for in-memory datasets)
     if data_config.minari_dataset_id is not None:
@@ -805,12 +808,16 @@ def create_robocoin_data_loader(
         use_quantile_norm=data_config.use_quantile_norm,
     )
 
-    # Create the RoboCOIN data loader with sharding
+    # Create the RoboCOIN data loader with sharding.
+    # Pass model_transforms for per-sample application (e.g. TokenizePrompt, PadStatesAndActions)
+    # before sharding — same split-transform-restack pattern as RLDS/DROID pipelines.
+    model_transforms_list = list(data_config.model_transforms.inputs) if data_config.model_transforms.inputs else None
     robocoin_loader = RoboCOINDataLoader(
         robocoin_config,
         sharding=sharding,
         num_batches=num_batches,
         tokenizer=tokenizer,
+        model_transforms=model_transforms_list,
     )
 
     return DataLoaderImpl(data_config, robocoin_loader)
@@ -1126,7 +1133,7 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            if self._data_config.rl_mode:
+            if self._data_config.critic_mode:
                 # RL mode: yield raw batch dict for value function training
                 yield batch
             else:

@@ -12,27 +12,39 @@ set -e
 
 # Check if a TPU VM name is provided
 if [ $# -lt 2 ]; then
-    echo "Usage: $0 <tpu-vm-name> <tpu-ip> [config_name] [extra_train_args] [sync_source]"
+    echo "Usage: $0 <tpu-vm-name> <tpu-ip> [config_name] [extra_args] [sync_source] [run_script]"
     echo ""
     echo "Arguments:"
     echo "  tpu-vm-name    Name of the TPU VM (e.g., v5e-tpu-64-0)"
     echo "  tpu-ip         IP address of the TPU VM for rsync"
     echo "  config_name    (optional) Training config name (default: robocoin_paligemma_v_mc)"
-    echo "  train_args     (optional) Extra training args as comma-separated key=value pairs"
+    echo "  extra_args     (optional) Extra args as comma-separated key=value pairs"
     echo "  sync_source    (optional) Where code is synced from: local|hpc (default: local)"
+    echo "  run_script   (optional) Script name without scripts/ prefix and .py suffix (default: train_value_function)"
     echo ""
     echo "Example:"
     echo "  $0 v5e-tpu-64-0 34.90.176.237"
     echo "  $0 v5e-tpu-64-0 34.90.176.237 robocoin_paligemma_v_mc_ce"
     echo "  $0 v5e-tpu-64-0 34.90.176.237 robocoin_paligemma_v_mc num_train_steps=50000,lr=1e-5"
     echo "  $0 v5e-tpu-64-0 34.90.176.237 robocoin_paligemma_v_mc \"\" hpc"
+    echo "  $0 v5e-tpu-64-0 34.90.176.237 robocoin_bimanual_pi05 \"\" hpc train"
+    echo ""
+    echo "Evaluation mode (run_script=evaluate_value_function):"
+    echo "  Set these env vars before launching:"
+    echo "    EVAL_EPISODES   Space-separated repo_idx,ep_idx pairs (e.g., '3,270 0,15')"
+    echo "    EVAL_CACHE_DIR  NFS path for cached episode pickles"
+    echo "    EVAL_STEP       Checkpoint step to evaluate (e.g., 50000)"
+    echo ""
+    echo "  Example:"
+    echo "    EVAL_EPISODES='3,270 0,15' EVAL_CACHE_DIR='/nfs/aidm_nfs/saksham3/eval_cache' EVAL_STEP=50000 \\"
+    echo "      $0 v5e-0 34.90.166.195 robocoin_bimanual_paligemma_q_sarsa_chunk_wise '' local evaluate_value_function"
     exit 1
 fi
 
 TPU_VM_NAME=$1
 TPU_IP=$2
 CONFIG_NAME=${3:-robocoin_paligemma_v_mc}
-TRAIN_ARGS=${4:-}
+EXTRA_ARGS=${4:-}
 SYNC_SOURCE=${5:-local}
 
 if [[ "$SYNC_SOURCE" != "local" && "$SYNC_SOURCE" != "hpc" ]]; then
@@ -63,7 +75,7 @@ LOCAL_DIR="${REPO_ROOT}/"
 NFS_DIR="/nfs/aidm_nfs/${NFS_USER}/batch_value_learning"
 DEST_DIR="${TPU_IP}:${NFS_DIR}"
 
-TRAIN_SCRIPT="${NFS_DIR}/scripts/train_value_function.py"
+RUN_SCRIPT="${NFS_DIR}/scripts/${6:-train_value_function}.py"
 
 # Cache file for TPU name/zone mapping
 CACHE_FILE="$HOME/.cache/tpus"
@@ -103,7 +115,7 @@ echo "TPU_VM_NAME: $TPU_VM_NAME"
 echo "TPU_IP: $TPU_IP"
 echo "ZONE: $ZONE"
 echo "CONFIG_NAME: $CONFIG_NAME"
-echo "TRAIN_ARGS: $TRAIN_ARGS"
+echo "EXTRA_ARGS: $EXTRA_ARGS"
 echo "SYNC_SOURCE: $SYNC_SOURCE"
 echo "Number of workers: ${NUM_WORKERS:-unknown}"
 echo "============================================"
@@ -144,8 +156,8 @@ tpc upload --project=$PROJECT --zone=$ZONE --name=$TPU_VM_NAME --upload_path="${
 # Step 3b: Launch the pod configuration
 echo "[Step 3b] Launching training job..."
 export CONFIG_NAME
-export TRAIN_ARGS
-export TRAIN_SCRIPT
+export EXTRA_ARGS
+export RUN_SCRIPT
 export NFS_USER
 POD_NAME=$TPU_VM_NAME tpc launch pod_config.py --project=$PROJECT
 

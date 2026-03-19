@@ -1,12 +1,12 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
 import etils.epath as epath
 import flax.nnx as nnx
-from flax.training import common_utils
 import flax.traverse_util as traverse_util
 import jax
 import jax.experimental
@@ -24,6 +24,7 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
+from openpi.training.time_utils import Timer
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
@@ -48,7 +49,7 @@ def init_logging():
 
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
-    if not enabled:
+    if not enabled or jax.process_index() != 0:
         wandb.init(mode="disabled")
         return
 
@@ -57,12 +58,13 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(id=run_id, resume="must", project=config.project_name, group=config.wandb_group)
     else:
         wandb.init(
-            name=config.exp_name,
+            name=config.exp_name or config.name,
             config=dataclasses.asdict(config),
             project=config.project_name,
+            group=config.wandb_group,
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
@@ -136,6 +138,7 @@ def init_train_state(
 @at.typecheck
 def train_step(
     config: _config.TrainConfig,
+    lr_schedule: optax.Schedule,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
@@ -147,8 +150,15 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        chunked_loss = model.compute_loss(rng, observation, actions, train=True)  # (b, ah)
+        batch_size = chunked_loss.shape[0]
+        action_horizon = chunked_loss.shape[1]
+        mask = jnp.ones((batch_size, action_horizon))
+        if observation.action_mask is not None:
+            mask = mask * observation.action_mask
+        if observation.loss_mask is not None:
+            mask = mask * observation.loss_mask[:, None]
+        return jnp.sum(chunked_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
@@ -183,15 +193,36 @@ def train_step(
             lambda _, x: x.value.ndim > 1,
         ),
     )
+    observation, actions = batch
+    batch_stats = {
+        "batch/obs_mean": jnp.mean(observation.state),
+        "batch/obs_std": jnp.std(observation.state),
+        "batch/obs_min": jnp.min(observation.state),
+        "batch/obs_max": jnp.max(observation.state),
+        "batch/action_mean": jnp.mean(actions),
+        "batch/action_std": jnp.std(actions),
+        "batch/action_min": jnp.min(actions),
+        "batch/action_max": jnp.max(actions),
+    }
+
     info = {
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        "learning_rate": lr_schedule(state.step),
+        **batch_stats,
     }
+
+    if observation.loss_mask is not None:
+        info["batch/loss_mask_valid_fraction"] = jnp.mean(observation.loss_mask)
+
     return new_state, info
 
 
 def main(config: _config.TrainConfig):
+    if os.environ.get("PLATFORM", "gpu") == "tpu":
+        jax.distributed.initialize()
+
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -241,8 +272,10 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
+    lr_schedule = config.lr_schedule.create()
+
     ptrain_step = jax.jit(
-        functools.partial(train_step, config),
+        functools.partial(train_step, config, lr_schedule),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
@@ -256,22 +289,35 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
-    infos = []
+    timer = Timer()
+
     for step in pbar:
-        with sharding.set_mesh(mesh):
+        with timer.context("train_step_compute"), sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
+
+        with timer.context("train_step_sync"):
+            jax.block_until_ready(train_state)
+            jax.block_until_ready(info)
+
         if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            info = jax.device_get(info)
+            total_times = timer.get_total_times(reset = False)
+            avg_times = timer.get_average_times(reset = True)
+            timing_info = {f"average_times/{k}": v for k, v in avg_times.items()}
+            timing_info.update({f"total_times/{k}": v for k, v in total_times.items()})
+            info.update(timing_info)
+
+            info = {k: float(v) for k, v in info.items()}
+            info_str = ", ".join(f"{k}={v:.4f}" for k, v in info.items())
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
-        batch = next(data_iter)
+            wandb.log(info, step = step)
+
+        with timer.context("data_fetch"):
+            batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            with timer.context("checkpoint_save"):
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

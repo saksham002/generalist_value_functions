@@ -90,12 +90,9 @@ def mc_objective(
     td_error = pred - transition.mc_return
 
     info = {
-        "predicted_value_mean": jnp.mean(pred),
-        "predicted_value_std": jnp.std(pred),
-        "target_value_mean": jnp.mean(transition.mc_return),
-        "target_value_std": jnp.std(transition.mc_return),
-        "td_error_mean": jnp.mean(td_error),
-        "td_error_std": jnp.std(td_error),
+        "predicted_value": pred,
+        "target_value": transition.mc_return,
+        "td_error": td_error,
     }
     return loss, info
 
@@ -145,18 +142,13 @@ def sarsa_objective(
     pred = head(features)
     td_error = pred - target
 
-    # MC loss for comparison: how well does V(s) match the true MC return?
-    mc_error = pred - transition.mc_return
-    mc_loss = jnp.mean(jnp.square(mc_error))
+    mc_loss = jnp.square(pred - transition.mc_return)
 
     info = {
-        "predicted_value_mean": jnp.mean(pred),
-        "predicted_value_std": jnp.std(pred),
-        "target_value_mean": jnp.mean(target),
-        "target_value_std": jnp.std(target),
-        "td_error_mean": jnp.mean(td_error),
-        "td_error_std": jnp.std(td_error),
-        "next_value_mean": jnp.mean(target_value),
+        "predicted_value": pred,
+        "target_value": target,
+        "next_value": target_value,
+        "td_error": td_error,
         "mc_loss": mc_loss,
         "effective_discount": jnp.mean(effective_discount),
     }

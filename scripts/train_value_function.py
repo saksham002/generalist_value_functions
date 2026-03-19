@@ -388,6 +388,7 @@ def init_wandb(
             name=run_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
+            group=config.wandb_group,
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
@@ -606,40 +607,84 @@ def value_function_train_step(
         ),
     )
 
-    # Batch statistics
+    # Batch statistics — filter by loss_mask if present so stats reflect only valid samples.
     obs_state = transition.observation.state
+    if loss_mask is not None:
+        valid_idx = loss_mask.astype(jnp.bool_)
+        obs_valid = obs_state[valid_idx]
+        action_valid = transition.action[valid_idx]
+        reward_valid = transition.reward[valid_idx]
+        mc_return_valid = transition.mc_return[valid_idx]
+        termination_valid = transition.termination[valid_idx].astype(jnp.float32)
+        truncation_valid = transition.truncation[valid_idx].astype(jnp.float32)
+    else:
+        obs_valid = obs_state
+        action_valid = transition.action
+        reward_valid = transition.reward
+        mc_return_valid = transition.mc_return
+        termination_valid = transition.termination.astype(jnp.float32)
+        truncation_valid = transition.truncation.astype(jnp.float32)
+
     batch_stats = {
         # Observation stats
-        "batch/obs_mean": jnp.mean(obs_state),
-        "batch/obs_std": jnp.std(obs_state),
-        "batch/obs_min": jnp.min(obs_state),
-        "batch/obs_max": jnp.max(obs_state),
+        "batch/obs_mean": jnp.mean(obs_valid),
+        "batch/obs_std": jnp.std(obs_valid),
+        "batch/obs_min": jnp.min(obs_valid),
+        "batch/obs_max": jnp.max(obs_valid),
         # Action stats
-        "batch/action_mean": jnp.mean(transition.action),
-        "batch/action_std": jnp.std(transition.action),
-        "batch/action_min": jnp.min(transition.action),
-        "batch/action_max": jnp.max(transition.action),
+        "batch/action_mean": jnp.mean(action_valid),
+        "batch/action_std": jnp.std(action_valid),
+        "batch/action_min": jnp.min(action_valid),
+        "batch/action_max": jnp.max(action_valid),
         # Reward stats
-        "batch/reward_mean": jnp.mean(transition.reward),
-        "batch/reward_std": jnp.std(transition.reward),
-        "batch/reward_min": jnp.min(transition.reward),
-        "batch/reward_max": jnp.max(transition.reward),
+        "batch/reward_mean": jnp.mean(reward_valid),
+        "batch/reward_std": jnp.std(reward_valid),
+        "batch/reward_min": jnp.min(reward_valid),
+        "batch/reward_max": jnp.max(reward_valid),
         # MC return stats
-        "batch/mc_return_mean": jnp.mean(transition.mc_return),
-        "batch/mc_return_std": jnp.std(transition.mc_return),
-        "batch/mc_return_min": jnp.min(transition.mc_return),
-        "batch/mc_return_max": jnp.max(transition.mc_return),
+        "batch/mc_return_mean": jnp.mean(mc_return_valid),
+        "batch/mc_return_std": jnp.std(mc_return_valid),
+        "batch/mc_return_min": jnp.min(mc_return_valid),
+        "batch/mc_return_max": jnp.max(mc_return_valid),
         # Termination stats
-        "batch/termination_mean": jnp.mean(transition.termination.astype(jnp.float32)),
-        "batch/termination_std": jnp.std(transition.termination.astype(jnp.float32)),
-        "batch/termination_min": jnp.min(transition.termination.astype(jnp.float32)),
-        "batch/termination_max": jnp.max(transition.termination.astype(jnp.float32)),
+        "batch/termination_mean": jnp.mean(termination_valid),
+        "batch/termination_std": jnp.std(termination_valid),
+        "batch/termination_min": jnp.min(termination_valid),
+        "batch/termination_max": jnp.max(termination_valid),
         # Truncation stats
-        "batch/truncation_mean": jnp.mean(transition.truncation.astype(jnp.float32)),
-        "batch/truncation_std": jnp.std(transition.truncation.astype(jnp.float32)),
-        "batch/truncation_min": jnp.min(transition.truncation.astype(jnp.float32)),
-        "batch/truncation_max": jnp.max(transition.truncation.astype(jnp.float32)),
+        "batch/truncation_mean": jnp.mean(truncation_valid),
+        "batch/truncation_std": jnp.std(truncation_valid),
+        "batch/truncation_min": jnp.min(truncation_valid),
+        "batch/truncation_max": jnp.max(truncation_valid),
     }
+
+    # Compute masked summary stats from per-sample arrays returned by the objective.
+    valid_mask = loss_mask.astype(jnp.bool_) if loss_mask is not None else jnp.ones(transition.reward.shape[0], dtype = jnp.bool_)
+    num_valid = jnp.maximum(jnp.sum(valid_mask.astype(jnp.float32)), 1.0)
+
+    def _masked_mean(x):
+        return jnp.sum(x * valid_mask.astype(x.dtype)) / num_valid
+
+    def _masked_std(x):
+        mean = _masked_mean(x)
+        return jnp.sqrt(_masked_mean(jnp.square(x - mean)))
+
+    value_stats = {}
+    for key in ("predicted_value", "target_value", "td_error"):
+        if key in value_info:
+            arr = value_info.pop(key)
+            value_stats[f"{key}_mean"] = _masked_mean(arr)
+            value_stats[f"{key}_std"] = _masked_std(arr)
+
+    if "next_value" in value_info:
+        next_val = value_info.pop("next_value")
+        non_terminal = ~transition.termination & valid_mask
+        num_non_terminal = jnp.maximum(jnp.sum(non_terminal.astype(jnp.float32)), 1.0)
+        value_stats["next_value_mean"] = jnp.sum(next_val * non_terminal.astype(next_val.dtype)) / num_non_terminal
+
+    if "mc_loss" in value_info:
+        mc_loss_arr = value_info.pop("mc_loss")
+        value_stats["mc_loss"] = _masked_mean(mc_loss_arr)
 
     info = {
         "loss": loss,
@@ -648,6 +693,7 @@ def value_function_train_step(
         "target_param_norm": optax.global_norm(target_params),
         "learning_rate": lr_schedule(state.step),
         **value_info,
+        **value_stats,
         **batch_stats,
     }
 
@@ -655,6 +701,8 @@ def value_function_train_step(
         info["batch/loss_mask_valid_fraction"] = jnp.mean(loss_mask.astype(jnp.float32))
     if "steps_to_subtask_end" in batch:
         steps = jnp.asarray(batch["steps_to_subtask_end"]).astype(jnp.float32)
+        if loss_mask is not None:
+            steps = steps[loss_mask.astype(jnp.bool_)]
         info["batch/steps_to_subtask_end_mean"] = jnp.mean(steps)
         info["batch/steps_to_subtask_end_std"] = jnp.std(steps)
         info["batch/steps_to_subtask_end_min"] = jnp.min(steps)
@@ -2170,7 +2218,7 @@ def main(config: _config.TrainConfig):
         if (step + 1) % effective_save_interval == 0 or step + 1 == effective_num_train_steps:
             with timer.context("checkpoint_save"):
                 state_to_save = training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
-                _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step)
+                _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step + 1)
 
         # Generate validation plots (all workers participate for FSDP, only worker 0 creates plots/logs)
         if (step + 1) % effective_plot_interval == 0 or step + 1 == effective_num_train_steps:

@@ -31,6 +31,10 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # Offset within the action_dim vector where real action values are placed.
+    action_dim_offset: int = 0
+    # Static mask over action dims — True at dims carrying real values, False at padding.
+    action_dim_mask: tuple[bool, ...] | None = None
 
     def __post_init__(self):
         if self.max_token_len is None:
