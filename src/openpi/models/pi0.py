@@ -179,7 +179,10 @@ class Pi0(_model.BaseModel):
             action_expert_tokens = action_time_tokens
             adarms_cond = None
         tokens.append(action_expert_tokens)
-        input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
+        if obs.action_mask is not None:
+            input_mask.append(obs.action_mask)
+        else:
+            input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens
         ar_mask += [True] + ([False] * (self.action_horizon - 1))
         tokens = jnp.concatenate(tokens, axis=1)
@@ -274,7 +277,8 @@ class Pi0(_model.BaseModel):
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-            return x_t + dt * v_t, time + dt
+            x_next = x_t + dt * v_t
+            return x_next, time + dt
 
         def cond(carry):
             x_t, time = carry
@@ -289,26 +293,12 @@ class Pi0(_model.BaseModel):
         rng: at.KeyArrayLike,
         observation: _model.Observation,
         gt_actions: _model.Actions,
-        *,
-        action_mean: at.Float[at.Array, "ad"],
-        action_std: at.Float[at.Array, "ad"],
-        use_quantile_unnorm: bool = False,
-        action_q01: at.Float[at.Array, "ad"] | None = None,
-        action_q99: at.Float[at.Array, "ad"] | None = None,
     ) -> dict[str, at.Array]:
-        """Sample actions via ODE and compute L1/L2 in unnormalized action space."""
+        """Sample actions via ODE and compute L1/MSE in normalized action space."""
         sampled = self.sample_actions(rng, observation)  # (b, ah, ad)
 
-        # Unnormalize
-        if use_quantile_unnorm:
-            sampled_unnorm = (sampled + 1.0) / 2.0 * (action_q99 - action_q01) + action_q01
-            gt_unnorm = (gt_actions + 1.0) / 2.0 * (action_q99 - action_q01) + action_q01
-        else:
-            sampled_unnorm = sampled * action_std + action_mean
-            gt_unnorm = gt_actions * action_std + action_mean
-
-        abs_diff = jnp.abs(sampled_unnorm - gt_unnorm)  # (b, ah, ad)
-        sq_diff = jnp.square(sampled_unnorm - gt_unnorm)  # (b, ah, ad)
+        abs_diff = jnp.abs(sampled - gt_actions)  # (b, ah, ad)
+        sq_diff = jnp.square(sampled - gt_actions)  # (b, ah, ad)
 
         # Mask over action dims and reduce to (b, ah)
         if self.action_dim_mask is not None:

@@ -615,11 +615,13 @@ def value_function_train_step(
         "batch/obs_std": jnp.std(obs_state),
         "batch/obs_min": jnp.min(obs_state),
         "batch/obs_max": jnp.max(obs_state),
+        "batch/obs_out_of_range_frac": jnp.mean((jnp.abs(obs_state) >= 1.0).astype(jnp.float32)),
         # Action stats
         "batch/action_mean": jnp.mean(transition.action),
         "batch/action_std": jnp.std(transition.action),
         "batch/action_min": jnp.min(transition.action),
         "batch/action_max": jnp.max(transition.action),
+        "batch/action_out_of_range_frac": jnp.mean((jnp.abs(transition.action) >= 1.0).astype(jnp.float32)),
         # Reward stats
         "batch/reward_mean": jnp.mean(transition.reward),
         "batch/reward_std": jnp.std(transition.reward),
@@ -654,16 +656,17 @@ def value_function_train_step(
         return jnp.sqrt(_masked_mean(jnp.square(x - mean)))
 
     value_stats = {}
+    non_terminal = ~transition.termination & valid_mask
+    num_non_terminal = jnp.maximum(jnp.sum(non_terminal.astype(jnp.float32)), 1.0)
+
     for key in ("predicted_value", "target_value", "td_error"):
         if key in value_info:
             arr = value_info.pop(key)
-            value_stats[f"{key}_mean"] = _masked_mean(arr)
+            value_stats[f"{key}_mean"] = jnp.sum(arr * non_terminal.astype(arr.dtype)) / num_non_terminal
             value_stats[f"{key}_std"] = _masked_std(arr)
 
     if "next_value" in value_info:
         next_val = value_info.pop("next_value")
-        non_terminal = ~transition.termination & valid_mask
-        num_non_terminal = jnp.maximum(jnp.sum(non_terminal.astype(jnp.float32)), 1.0)
         value_stats["next_value_mean"] = jnp.sum(next_val * non_terminal.astype(next_val.dtype)) / num_non_terminal
 
     if "mc_loss" in value_info:

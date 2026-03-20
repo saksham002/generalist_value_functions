@@ -254,7 +254,6 @@ class MainTransform:
         td_n: int | None = None,
         split: str = "train",
         mask_50fps: bool = False,
-        dont_mask_actions: bool = False,
         use_chunk_wise_delta: bool = False,
         critic_mode: bool = True,
     ):
@@ -264,7 +263,6 @@ class MainTransform:
         self.td_n = td_n
         self.split = split
         self.mask_50fps = mask_50fps
-        self.dont_mask_actions = dont_mask_actions
         self.use_chunk_wise_delta = use_chunk_wise_delta
         self.critic_mode = critic_mode
 
@@ -377,29 +375,31 @@ class MainTransform:
             loss_mask = tf.logical_and(loss_mask, tf.equal(tf.cast(raw_frame["fps"], tf.int32), 30))
 
         texts = tf.stack([raw_frame[f"subtask_{i}"] for i in range(1, 6)])
-        sampled_text = texts[sampled_idx]
-        sampled_text_lower = tf.strings.lower(sampled_text)
-        is_static_or_abnormal = tf.logical_or(
-            tf.equal(sampled_text_lower, b"static"),
-            tf.equal(sampled_text_lower, b"abnormal"),
+        texts_stripped = tf.strings.regex_replace(texts, r"\.\s*$", "")
+        texts_lower = tf.strings.lower(texts_stripped)
+        valid_mask = tf.range(5) < first_null
+        include_mask = (
+            valid_mask
+            & tf.not_equal(texts_lower, b"static")
+            & tf.not_equal(texts_lower, b"abnormal")
         )
-        loss_mask = tf.logical_and(loss_mask, tf.logical_not(is_static_or_abnormal))
 
-        if not self.critic_mode:
+        if self.critic_mode:
+            prompt = texts[sampled_idx]
+        else:
             # Policy mode: concatenate all valid non-static/non-abnormal subtasks
-            valid_mask = tf.range(5) < first_null
-            texts_lower = tf.strings.lower(texts)
-            include_mask = (
-                valid_mask
-                & tf.not_equal(texts_lower, b"static")
-                & tf.not_equal(texts_lower, b"abnormal")
-            )
-            texts_stripped = tf.strings.regex_replace(texts, r"\.\s*$", "")
             selected_texts = tf.boolean_mask(texts_stripped, include_mask)
             prompt = tf.strings.reduce_join(selected_texts, separator = ", ")
-            loss_mask = tf.logical_and(loss_mask, tf.not_equal(tf.strings.length(prompt), 0))
-        else:
-            prompt = sampled_text
+
+            # Use the subtask with minimum steps_to_subtask_end among included subtasks
+            # for action masks and reward computation (closest deadline governs the chunk).
+            masked_steps = tf.where(include_mask, steps_all, tf.int32.max)
+            min_idx = tf.argmin(masked_steps, output_type = tf.int32)
+            selected_steps = steps_all[min_idx]
+            selected_steps_f = tf.cast(selected_steps, tf.float32)
+            sampled_idx = min_idx
+
+        loss_mask = tf.logical_and(loss_mask, include_mask[sampled_idx])
 
         frame["steps_to_subtask_end"] = selected_steps
         frame["sampled_index"] = sampled_idx
@@ -474,25 +474,6 @@ class MainTransform:
         frame["action_mask"] = tf.where(is_30fps, tf.logical_and(frame["action_mask"], fps_mask_30), frame["action_mask"])
         frame["next_action_mask"] = tf.where(is_30fps, tf.logical_and(frame["next_action_mask"], fps_mask_30), frame["next_action_mask"])
 
-        if self.dont_mask_actions:
-            for actions_key, mask_key in [("actions", "action_mask"), ("next_actions", "next_action_mask")]:
-                actions = frame[actions_key]
-                action_mask = frame[mask_key]
-
-                last_valid_idx = tf.reduce_sum(tf.cast(action_mask, tf.int32)) - 1
-                last_valid_idx = tf.maximum(last_valid_idx, 0)
-                last_valid = actions[last_valid_idx]
-
-                noise = tf.random.normal(tf.shape(actions), stddev = 0.005)
-                replacement = last_valid[None, :] + noise
-
-                actions = tf.where(action_mask[:, None], actions, replacement)
-                action_mask = tf.ones_like(action_mask)
-                action_mask = tf.where(is_30fps, tf.logical_and(action_mask, fps_mask_30), action_mask)
-
-                frame[actions_key] = actions
-                frame[mask_key] = action_mask
-
         return frame
 
 
@@ -522,7 +503,7 @@ class FilterLastN:
 class RoboCOINPostTFTransform:
     """Minimal post-TF batched transform: normalization, clipping, validation extras, metadata cleanup.
 
-    Per-sample operations (chunk-wise delta, dont_mask_actions) have been moved to MainTransform.
+    Per-sample chunk-wise delta is handled by MainTransform.
     Per-sample model transforms (TokenizePrompt, PadStatesAndActions) are applied separately via
     IterableTransformedDataset when critic_mode=False. When critic_mode=True, tokenization with
     state=None is handled here since critics don't need discrete state input or action padding.
@@ -536,12 +517,17 @@ class RoboCOINPostTFTransform:
         use_eef: bool = False,
         split: str = "train",
         critic_mode: bool = True,
+        dont_mask_actions: bool = False,
     ):
         self.use_eef = use_eef
         self.split = split
         self.critic_mode = critic_mode
+        self.dont_mask_actions = dont_mask_actions
         self.tokenizer = tokenizer
         self.use_quantile_norm = use_quantile_norm
+
+        if dont_mask_actions:
+            self._rng = np.random.default_rng(seed = 86)
 
         # Detect embodiment-keyed norm stats: first value is a dict (of NormStats), not a NormStats
         if state_norm_stats is not None and state_norm_stats and not isinstance(next(iter(state_norm_stats.values())), _transforms.NormStats):
@@ -653,10 +639,13 @@ class RoboCOINPostTFTransform:
         else:
             batch = self._normalize_fn(batch)
 
-        clip_bound = 1.0 if self.use_quantile_norm else 5.0
+        clip_bound = 1.25 if self.use_quantile_norm else 5.0
         for key in ("state", "actions", "next_state", "next_actions"):
             if key in batch:
                 batch[key] = np.clip(batch[key], -clip_bound, clip_bound)
+
+        if self.dont_mask_actions:
+            self._replace_masked_actions(batch)
 
         # Mirror state/actions after normalization (for counterfactual validation)
         if "mirror_image" in batch:
@@ -693,6 +682,32 @@ class RoboCOINPostTFTransform:
             tokenized_masks.append(mask)
         batch["tokenized_prompt"] = np.stack(tokenized_prompts, axis = 0)
         batch["tokenized_prompt_mask"] = np.stack(tokenized_masks, axis = 0)
+
+    def _replace_masked_actions(self, batch: dict) -> None:
+        """Replace subtask-masked action positions with last valid action plus standard normal noise.
+
+        Applied to both current and next action chunks so that Q(s,a) and Q(s',a')
+        see the same masking convention.
+        """
+        fps = batch["fps"]
+        for actions_key, mask_key in [("actions", "action_mask"), ("next_actions", "next_action_mask")]:
+            actions = batch[actions_key].copy()
+            action_mask = batch[mask_key].copy()
+            batch_size, action_horizon, _ = actions.shape
+
+            last_valid_idx = action_mask.sum(axis = -1) - 1
+            last_valid_actions = actions[np.arange(batch_size), last_valid_idx]
+
+            noise_scale = 0.002 if self.use_quantile_norm else 0.005
+            noise = (noise_scale * self._rng.standard_normal(actions.shape)).astype(actions.dtype)
+            replacement = last_valid_actions[:, None, :] + noise
+
+            actions[~action_mask] = replacement[~action_mask]
+            action_mask[:] = True
+            action_mask[fps == 30, 3 * action_horizon // 5 :] = False
+
+            batch[actions_key] = actions
+            batch[mask_key] = action_mask
 
     def _process_validation_extras(self, batch: dict, batch_size: int) -> None:
         subtask_1_texts = [self._decode_text(batch["subtask_1"][i]) for i in range(batch_size)]
@@ -801,7 +816,6 @@ def create_robocoin_data_loader(
             td_n=config.td_n,
             split=config.split,
             mask_50fps=config.mask_50fps,
-            dont_mask_actions=config.dont_mask_actions,
             use_chunk_wise_delta=config.use_chunk_wise_delta,
             critic_mode=config.critic_mode,
         ).map
@@ -824,6 +838,7 @@ def create_robocoin_data_loader(
         use_eef=config.use_eef,
         split=config.split,
         critic_mode=config.critic_mode,
+        dont_mask_actions=config.dont_mask_actions,
     )
 
     # Wrap iterator to apply post-batch transform

@@ -230,7 +230,6 @@ def train_step(
 
 
 def compute_sampling_loss(
-    sampling_loss_kwargs: dict,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
@@ -239,7 +238,7 @@ def compute_sampling_loss(
     model = nnx.merge(state.model_def, state.params)
     model.eval()
     observation, gt_actions = batch
-    return model.compute_sampling_loss(rng, observation, gt_actions, **sampling_loss_kwargs)
+    return model.compute_sampling_loss(rng, observation, gt_actions)
 
 
 def main(config: _config.TrainConfig):
@@ -304,24 +303,8 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
-    # Sampling loss: unnormalize actions and compute L1/L2 every log_interval
-    data_config = data_loader.data_config()
-    action_norm_stats = data_config.norm_stats.get("actions") if data_config.norm_stats else None
-    use_quantile_unnorm = data_config.use_quantile_norm
-    sampling_loss_kwargs = {}
-    if action_norm_stats is not None:
-        sampling_loss_kwargs["action_mean"] = jnp.array(action_norm_stats.mean)
-        sampling_loss_kwargs["action_std"] = jnp.array(action_norm_stats.std)
-        sampling_loss_kwargs["use_quantile_unnorm"] = use_quantile_unnorm
-        if use_quantile_unnorm:
-            sampling_loss_kwargs["action_q01"] = jnp.array(action_norm_stats.q01)
-            sampling_loss_kwargs["action_q99"] = jnp.array(action_norm_stats.q99)
-    else:
-        sampling_loss_kwargs["action_mean"] = jnp.zeros(config.model.action_dim)
-        sampling_loss_kwargs["action_std"] = jnp.ones(config.model.action_dim)
-
     pcompute_sampling_loss = jax.jit(
-        functools.partial(compute_sampling_loss, sampling_loss_kwargs),
+        compute_sampling_loss,
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=replicated_sharding,
     )
