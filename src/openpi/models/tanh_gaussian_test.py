@@ -22,12 +22,14 @@ def test_tanh_gaussian_sampling():
         state=jnp.zeros((1, 4)),
     )
 
+    transition = _model.wrap_observation_as_transition(obs)
+
     # Stochastic sampling
-    actions_stochastic = model.sample_actions(rng, obs, deterministic=False)
+    actions_stochastic = model.sample_actions(rng, transition, deterministic=False)
     assert actions_stochastic.shape == (1, 1, 2)
 
     # Deterministic sampling
-    actions_deterministic = model.sample_actions(rng, obs, deterministic=True)
+    actions_deterministic = model.sample_actions(rng, transition, deterministic=True)
     assert actions_deterministic.shape == (1, 1, 2)
 
     # Check that deterministic actions are within bounds
@@ -52,7 +54,8 @@ def test_tanh_gaussian_bounds_none():
         state=jnp.zeros((1, 4)),
     )
 
-    actions_deterministic = model.sample_actions(rng, obs, deterministic=True)
+    transition = _model.wrap_observation_as_transition(obs)
+    actions_deterministic = model.sample_actions(rng, transition, deterministic=True)
     assert actions_deterministic.shape == (1, 1, 2)
     # Tanh outputs are in [-1, 1]
     assert jnp.all(actions_deterministic >= -1.0)

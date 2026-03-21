@@ -53,6 +53,15 @@ class FakeQFunction(BaseValueFunction):
             return state_sum + self.action_weight * action_sum
         return state_sum
 
+    def compute_target_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b"]:
+        return self.compute_value(observation, action, take_min_over_ensemble = take_min_over_ensemble)
+
     def compute_loss(self, transition, *, train=False, rng=None):
         raise NotImplementedError("FakeQFunction doesn't support training")
 
@@ -98,9 +107,12 @@ class FakePolicy(_model.BaseModel):
     def action_distribution(
         self,
         rng: at.KeyArrayLike,
-        observation: _model.Observation,
+        transition,
+        *,
+        compute_next_action: bool = False,
     ) -> distrax.Distribution:
         """Return deterministic distribution centered at scaled state mean."""
+        observation = transition.next_observation if compute_next_action else transition.observation
         batch_size = observation.state.shape[0]
         # Action = state_mean * scale, broadcast to action shape
         state_mean = jnp.mean(observation.state, axis=-1, keepdims=True)
@@ -112,8 +124,9 @@ class FakePolicy(_model.BaseModel):
 
         return distrax.Deterministic(loc=actions_flat)
 
-    def sample_actions(self, rng, observation, **kwargs):
-        dist = self.action_distribution(rng, observation)
+    def sample_actions(self, rng, transition, *, compute_next_action = False, **kwargs):
+        observation = transition.next_observation if compute_next_action else transition.observation
+        dist = self.action_distribution(rng, transition, compute_next_action = compute_next_action)
         batch_size = observation.state.shape[0]
         return dist.sample(seed=rng).reshape(batch_size, self.action_horizon, self.action_dim)
 
@@ -458,6 +471,15 @@ class FakeVFunction(BaseValueFunction):
         del action, take_min_over_ensemble
         return jnp.sum(observation.state, axis=-1)
 
+    def compute_target_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b"]:
+        return self.compute_value(observation, action, take_min_over_ensemble = take_min_over_ensemble)
+
     def compute_loss(self, transition, *, train=False, rng=None):
         raise NotImplementedError("FakeVFunction doesn't support training")
 
@@ -630,6 +652,15 @@ class FakeMultiQFunction(BaseValueFunction):
             return state_sum + self.action_weight * action_sum
         return state_sum
 
+    def compute_target_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b n"]:
+        return self.compute_value(observation, action, take_min_over_ensemble = take_min_over_ensemble)
+
     def compute_loss(self, transition, *, train=False, rng=None):
         raise NotImplementedError("FakeMultiQFunction doesn't support training")
 
@@ -652,6 +683,15 @@ class FakeMultiVFunction(BaseValueFunction):
         """Return sum(state, axis=-1)."""
         del action, take_min_over_ensemble
         return jnp.sum(observation.state, axis=-1)  # [batch, n]
+
+    def compute_target_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b n"]:
+        return self.compute_value(observation, action, take_min_over_ensemble = take_min_over_ensemble)
 
     def compute_loss(self, transition, *, train=False, rng=None):
         raise NotImplementedError("FakeMultiVFunction doesn't support training")

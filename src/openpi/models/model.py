@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import abc
 from collections.abc import Sequence
 import dataclasses
 import enum
 import logging
 import pathlib
-from typing import Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 import augmax
 import distrax
@@ -22,6 +24,9 @@ from openpi.models_pytorch import pi0_pytorch
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
 
+if TYPE_CHECKING:
+    from openpi.value_functions import base_value_functions as _base_vf
+
 logger = logging.getLogger("openpi")
 
 # Type variable for array types (JAX arrays, PyTorch tensors, or numpy arrays)
@@ -37,6 +42,7 @@ class ModelType(enum.Enum):
     MLP = "mlp"
     MLP_CRITIC = "mlp_critic"
     TANH_GAUSSIAN = "tanh_gaussian"
+    BEST_OF_N = "best_of_n"
 
 
 # The model always expects these images
@@ -301,14 +307,23 @@ class BaseModel(nnx.Module, abc.ABC):
     ) -> at.Float[at.Array, "*b ah"]: ...
 
     @abc.abstractmethod
-    def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
+    def sample_actions(
+        self,
+        rng: at.KeyArrayLike,
+        transition: _base_vf.Transition,
+        *,
+        compute_next_action: bool = False,
+        **kwargs,
+    ) -> Actions: ...
 
     def action_distribution(
         self,
         rng: at.KeyArrayLike,
-        observation: Observation,
+        transition: _base_vf.Transition,
+        *,
+        compute_next_action: bool = False,
     ) -> distrax.Distribution:
-        """Return the action distribution for the given observation.
+        """Return the action distribution for the given transition's observation.
 
         Default implementation returns a deterministic distribution
         centered at sample_actions output. Models with stochastic policies
@@ -316,15 +331,38 @@ class BaseModel(nnx.Module, abc.ABC):
 
         Args:
             rng: Random key for sampling (used by sample_actions).
-            observation: Observation to condition on.
+            transition: Transition whose observation (or next_observation) to condition on.
+            compute_next_action: If True, condition on next_observation.
 
         Returns:
             A distrax.Distribution over actions (flattened to [batch, action_horizon * action_dim]).
         """
-        actions = self.sample_actions(rng, observation)
+        actions = self.sample_actions(rng, transition, compute_next_action = compute_next_action)
         batch_size = actions.shape[0]
         actions_flat = actions.reshape(batch_size, -1)
         return distrax.Deterministic(loc=actions_flat)
+
+
+def wrap_observation_as_transition(observation: Observation) -> _base_vf.Transition:
+    """Wrap a bare Observation into a minimal Transition for policy interface compatibility.
+
+    Use this at call sites that only have an Observation but need to call
+    BaseModel.sample_actions / action_distribution (which now require Transition).
+    """
+    from openpi.value_functions import base_value_functions as _base_vf_mod
+
+    batch_shape = observation.state.shape[:-1]
+    return _base_vf_mod.Transition(
+        observation = observation,
+        action = jnp.zeros((*batch_shape, 1, 1)),
+        reward = jnp.zeros(batch_shape),
+        next_observation = None,
+        next_action = None,
+        mc_return = None,
+        termination = jnp.zeros(batch_shape),
+        truncation = None,
+        td_discount = None,
+    )
 
 
 def restore_params(

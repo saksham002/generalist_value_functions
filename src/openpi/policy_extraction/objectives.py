@@ -24,6 +24,8 @@ from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.value_functions.base_value_functions import BaseValueFunction
 
+_wrap = _model.wrap_observation_as_transition
+
 # Type alias for objective functions
 PolicyObjective = Callable[..., tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]]
 
@@ -53,7 +55,7 @@ def ddpg_objective(
     Returns:
         Tuple of (per_sample_loss, info_dict).
     """
-    dist = policy.action_distribution(rng, observation)
+    dist = policy.action_distribution(rng, _wrap(observation))
     actions_flat = dist.sample(seed=rng)
 
     batch_size = observation.state.shape[0]
@@ -99,7 +101,7 @@ def bc_regularization_objective(
     Returns:
         Tuple of (per_sample_loss, info_dict).
     """
-    dist = policy.action_distribution(rng, observation)
+    dist = policy.action_distribution(rng, _wrap(observation))
     actions_flat = dist.sample(seed=rng)
 
     batch_size = observation.state.shape[0]
@@ -141,7 +143,7 @@ def entropy_objective(
         Tuple of (per_sample_loss, info_dict).
         The loss is log_prob, so minimizing -loss maximizes entropy.
     """
-    dist = policy.action_distribution(rng, observation)
+    dist = policy.action_distribution(rng, _wrap(observation))
     actions, log_prob = dist.sample_and_log_prob(seed=rng)
     batch_size = observation.state.shape[0]
     assert log_prob.shape == (batch_size,), f"Expected log_prob shape ({batch_size},), got {log_prob.shape}"
@@ -276,7 +278,7 @@ def awr_objective(
     weights = jnp.minimum(weights, clip_exp)
     weights = jax.lax.stop_gradient(weights)
 
-    dist = policy.action_distribution(rng, observation)
+    dist = policy.action_distribution(rng, _wrap(observation))
     actions_flat = data_action.reshape(batch_size, -1)
     log_prob = dist.log_prob(actions_flat)
 
@@ -503,7 +505,7 @@ def awr_multi_objective(
 
     flat_action = data_action.reshape(flat_size, policy.action_horizon, policy.action_dim)
 
-    dist = policy.action_distribution(rng, flat_obs)
+    dist = policy.action_distribution(rng, _wrap(flat_obs))
     actions_flat = flat_action.reshape(flat_size, -1)
     log_prob = dist.log_prob(actions_flat)
 

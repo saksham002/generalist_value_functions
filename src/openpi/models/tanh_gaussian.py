@@ -5,6 +5,8 @@ other maximum entropy RL algorithms. The policy outputs a diagonal Gaussian
 distribution that is then squashed through tanh to bound actions.
 """
 
+from __future__ import annotations
+
 import dataclasses
 
 import distrax
@@ -16,6 +18,7 @@ import tyro
 
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
+from openpi.value_functions import base_value_functions as _base_vf
 
 
 @dataclasses.dataclass(frozen=True)
@@ -199,21 +202,24 @@ class TanhGaussian(_model.BaseModel):
     def action_distribution(
         self,
         rng: at.KeyArrayLike,
-        observation: _model.Observation,
+        transition: _base_vf.Transition,
         *,
+        compute_next_action: bool = False,
         train: bool = False,
     ) -> distrax.Distribution:
         """Return the tanh-squashed Gaussian distribution over actions.
 
         Args:
             rng: Random key (unused, but required by interface).
-            observation: Observation containing state.
+            transition: Transition whose observation (or next_observation) to condition on.
+            compute_next_action: If True, condition on next_observation.
             train: Whether to use dropout.
 
         Returns:
             A distrax.Transformed distribution with MultivariateNormalDiag base
             and Tanh (+ optional affine scaling) bijectors.
         """
+        observation = transition.next_observation if compute_next_action else transition.observation
         mean, log_std = self._forward(observation.state, train=train)
         std = jnp.exp(log_std)
 
@@ -251,21 +257,25 @@ class TanhGaussian(_model.BaseModel):
     def sample_actions(
         self,
         rng: at.KeyArrayLike,
-        observation: _model.Observation,
+        transition: _base_vf.Transition,
+        *,
+        compute_next_action: bool = False,
         **kwargs,
     ) -> _model.Actions:
         """Sample actions from the policy.
 
         Args:
             rng: Random key for sampling.
-            observation: Observation containing state.
+            transition: Transition whose observation (or next_observation) to condition on.
+            compute_next_action: If True, condition on next_observation.
             **kwargs: Additional arguments. Supports 'deterministic' (bool).
 
         Returns:
             Sampled actions of shape [batch, action_horizon, action_dim].
         """
         deterministic = kwargs.get("deterministic", False)
-        dist = self.action_distribution(rng, observation)
+        observation = transition.next_observation if compute_next_action else transition.observation
+        dist = self.action_distribution(rng, transition, compute_next_action = compute_next_action)
 
         actions_flat = dist.bijector.forward(dist.distribution.loc) if deterministic else dist.sample(seed=rng)
 
@@ -292,7 +302,8 @@ class TanhGaussian(_model.BaseModel):
         Returns:
             Per-timestep NLL loss of shape [batch, action_horizon].
         """
-        dist = self.action_distribution(rng, observation, train=train)
+        transition = _model.wrap_observation_as_transition(observation)
+        dist = self.action_distribution(rng, transition, train=train)
 
         batch_size = actions.shape[0]
         actions_flat = actions.reshape(batch_size, -1)
