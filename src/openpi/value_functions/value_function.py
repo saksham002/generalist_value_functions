@@ -8,15 +8,19 @@ parameters it needs.
 from __future__ import annotations
 
 import dataclasses
+from typing import Literal
 
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing_extensions import override
 
+from openpi.models import best_of_n as _best_of_n
 from openpi.models import model as _model
 from openpi.policy_extraction.temperature import Temperature
 from openpi.shared import array_typing as at
+from openpi.shared.action_bounds import ActionBounds
 from openpi.value_functions import value_function_objectives as _objectives
 from openpi.value_functions.base_value_functions import BaseMultiValueFunction
 from openpi.value_functions.base_value_functions import BaseMultiValueFunctionConfig
@@ -270,6 +274,20 @@ class ValueFunction(BaseValueFunction):
             val = jnp.min(val, axis=0)
         return val
 
+    @override
+    def compute_target_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b"]:
+        """For value functions without target network, return the same as compute_value."""
+        result = self.compute_value(observation, action, take_min_over_ensemble = take_min_over_ensemble)
+        if isinstance(result, tuple):
+            return result[0]
+        return result
+
 
 class MCValueFunction(ValueFunction):
     """Monte-Carlo value function."""
@@ -281,7 +299,9 @@ class MCValueFunction(ValueFunction):
         *,
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
+        policy: _model.BaseModel | None = None,
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
+        del policy
         return _objectives.mc_objective(self.network, self.head, transition, rng=rng)
 
 
@@ -309,14 +329,31 @@ class SARSAValueFunction(ValueFunction):
         self.tau = tau
 
     @override
+    def compute_target_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b"]:
+        """Compute target value using target network."""
+        target_out = self.target_network.compute_features(observation, action)
+        target_features = target_out[0] if isinstance(target_out, tuple) else target_out
+        val = self.target_head(target_features)
+        if take_min_over_ensemble and val.ndim > 1:
+            val = jnp.min(val, axis=0)
+        return val
+
+    @override
     def compute_loss(
         self,
         transition: Transition,
         *,
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
+        policy: _model.BaseModel | None = None,
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
-        del train
+        del train, policy
         return _objectives.sarsa_objective(
             self.network,
             self.head,
@@ -405,18 +442,37 @@ class IQLValueFunction(BaseValueFunction):
         return self.v_head(features)
 
     @override
+    def compute_target_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b"]:
+        """Compute target Q(s, a) if action provided, else target V(s)."""
+        if action is not None:
+            features = self.target_q_network.compute_features(observation, action)
+            val = self.target_q_head(features)
+            if take_min_over_ensemble and val.ndim > 1:
+                val = jnp.min(val, axis=0)
+            return val
+        features = self.target_v_network.compute_features(observation, None)
+        return self.target_v_head(features)
+
+    @override
     def compute_loss(
         self,
         transition: Transition,
         *,
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
+        policy: _model.BaseModel | None = None,
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
         """Compute combined Q + V loss.
 
         Returns the sum of Q and V losses for gradient computation.
         """
-        del train, rng
+        del train, rng, policy
         q_loss, v_loss, info = _objectives.iql_objective(
             self.q_network,
             self.q_head,
@@ -469,12 +525,28 @@ class SACValueFunction(ValueFunction):
         self.tau = tau
 
     @override
+    def compute_target_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b"]:
+        """Compute target value using target network."""
+        features = self.target_network.compute_features(observation, action)
+        val = self.target_head(features)
+        if take_min_over_ensemble and val.ndim > 1:
+            val = jnp.min(val, axis=0)
+        return val
+
+    @override
     def compute_loss(
         self,
         transition: Transition,
         *,
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
+        policy: _model.BaseModel | None = None,
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
         raise NotImplementedError("SACValueFunction requires policy and temperature. Use compute_sac_loss() instead.")
 
@@ -504,6 +576,244 @@ class SACValueFunction(ValueFunction):
         """Polyak averaging for target network."""
         _polyak_update(self.target_network, self.network, self.tau)
         _polyak_update(self.target_head, self.head, self.tau)
+
+
+@dataclasses.dataclass(frozen=True)
+class CQLValueFunctionConfig(BaseValueFunctionConfig):
+    """CQL config with Q-network and target Q-network.
+
+    Supports any network config implementing the create/feature_dim protocol.
+    """
+
+    q_network_config: MLPNetworkConfig | PaliGemmaNetworkConfig | EnsembleNetworkConfig
+    q_head_config: HeadConfig | EnsembleHeadConfig
+
+    # Number of actions in the action chunk. None means V(s), not Q(s,a).
+    action_horizon: int | None = None
+
+    discount: float = 0.99
+    tau: float = 0.005
+
+    action_bounds: ActionBounds = dataclasses.field(
+        default_factory = lambda: ActionBounds.from_uniform(-1.0, 1.0, action_dim = 1, is_normalized = True)
+    )
+    cql_alpha: float = 1.0
+    cql_temp: float = 1.0
+    cql_n_actions: int = 4
+    cql_action_sample_method: Literal["uniform", "normal"] = "uniform"
+    cql_importance_sample: bool = True
+    only_use_next_actions_for_cql: bool = False
+    cql_max_target_backup: bool = False
+    cql_clip_diff_min: float = -np.inf
+    cql_clip_diff_max: float = np.inf
+    use_calql: bool = False
+    use_calql_on_random_actions: bool = True
+
+    @property
+    def weight_dtype(self) -> str:
+        """Dtype for model weights, derived from the network config."""
+        if isinstance(self.q_network_config, PaliGemmaNetworkConfig):
+            return self.q_network_config.dtype
+        return "float32"
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> CQLValueFunction:
+        rng = jax.random.key(rng) if isinstance(rng, int) else rng
+        net_rng, head_rng = jax.random.split(rng, 2)
+
+        if isinstance(self.q_network_config, PaliGemmaNetworkConfig):
+            q_network = self.q_network_config.create(net_rng, action_horizon = self.action_horizon)
+            target_q_network = self.q_network_config.create(net_rng, action_horizon = self.action_horizon)
+        else:
+            q_network = self.q_network_config.create(net_rng)
+            target_q_network = self.q_network_config.create(net_rng)
+        q_head = self.q_head_config.create(q_network.feature_dim, head_rng)
+        target_q_head = self.q_head_config.create(target_q_network.feature_dim, head_rng)
+
+        return CQLValueFunction(
+            q_network=q_network,
+            q_head=q_head,
+            target_q_network=target_q_network,
+            target_q_head=target_q_head,
+            discount=self.discount,
+            tau=self.tau,
+            action_bounds=self.action_bounds,
+            cql_alpha=self.cql_alpha,
+            cql_temp=self.cql_temp,
+            cql_n_actions=self.cql_n_actions,
+            cql_action_sample_method=self.cql_action_sample_method,
+            cql_importance_sample=self.cql_importance_sample,
+            only_use_next_actions_for_cql=self.only_use_next_actions_for_cql,
+            cql_max_target_backup=self.cql_max_target_backup,
+            cql_clip_diff_min=self.cql_clip_diff_min,
+            cql_clip_diff_max=self.cql_clip_diff_max,
+            use_calql=self.use_calql,
+            use_calql_on_random_actions=self.use_calql_on_random_actions,
+        )
+
+    @override
+    def inputs_spec(
+        self, *, batch_size: int = 1
+    ) -> tuple[_model.Observation, _model.Actions, at.Float[at.Array, "*b"]]:
+        qc = self.q_network_config
+        with at.disable_typechecking():
+            obs = _model.Observation(
+                images={},
+                image_masks={},
+                state=jax.ShapeDtypeStruct([batch_size, qc.state_dim], jnp.float32),
+            )
+        target = jax.ShapeDtypeStruct([batch_size], jnp.float32)
+        action_horizon = self.action_horizon if self.action_horizon is not None else 1
+        actions = jax.ShapeDtypeStruct([batch_size, action_horizon, qc.action_dim], jnp.float32)
+        return obs, actions, target
+
+
+class CQLValueFunction(BaseValueFunction):
+    """CQL Q-function with target network and conservative penalty.
+
+    Policy is not owned by this class. Pass policy to compute_loss().
+    """
+
+    q_network: BaseValueNetwork
+    q_head: ValueHead
+    target_q_network: BaseValueNetwork
+    target_q_head: ValueHead
+    discount: float
+    tau: float
+
+    action_bounds: ActionBounds
+    cql_alpha: float
+    cql_temp: float
+    cql_n_actions: int
+    cql_action_sample_method: Literal["uniform", "normal"]
+    cql_importance_sample: bool
+    only_use_next_actions_for_cql: bool
+    cql_max_target_backup: bool
+    cql_clip_diff_min: float
+    cql_clip_diff_max: float
+    use_calql: bool
+    use_calql_on_random_actions: bool
+
+    def __init__(
+        self,
+        q_network: BaseValueNetwork,
+        q_head: ValueHead,
+        target_q_network: BaseValueNetwork,
+        target_q_head: ValueHead,
+        discount: float,
+        tau: float,
+        *,
+        action_bounds: ActionBounds,
+        cql_alpha: float,
+        cql_temp: float,
+        cql_n_actions: int,
+        cql_action_sample_method: Literal["uniform", "normal"],
+        cql_importance_sample: bool,
+        only_use_next_actions_for_cql: bool,
+        cql_max_target_backup: bool,
+        cql_clip_diff_min: float,
+        cql_clip_diff_max: float,
+        use_calql: bool,
+        use_calql_on_random_actions: bool,
+    ):
+        super().__init__()
+        self.q_network = q_network
+        self.q_head = q_head
+        self.target_q_network = target_q_network
+        self.target_q_head = target_q_head
+        self.discount = discount
+        self.tau = tau
+        self.action_bounds = action_bounds
+        self.cql_alpha = cql_alpha
+        self.cql_temp = cql_temp
+        self.cql_n_actions = cql_n_actions
+        self.cql_action_sample_method = cql_action_sample_method
+        self.cql_importance_sample = cql_importance_sample
+        self.only_use_next_actions_for_cql = only_use_next_actions_for_cql
+        self.cql_max_target_backup = cql_max_target_backup
+        self.cql_clip_diff_min = cql_clip_diff_min
+        self.cql_clip_diff_max = cql_clip_diff_max
+        self.use_calql = use_calql
+        self.use_calql_on_random_actions = use_calql_on_random_actions
+
+    @override
+    def compute_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b"]:
+        features = self.q_network.compute_features(observation, action)
+        val = self.q_head(features)
+        if take_min_over_ensemble and val.ndim > 1:
+            val = jnp.min(val, axis=0)
+        return val
+
+    @override
+    def compute_target_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b"]:
+        """Compute target Q-value using target network."""
+        features = self.target_q_network.compute_features(observation, action)
+        val = self.target_q_head(features)
+        if take_min_over_ensemble and val.ndim > 1:
+            val = jnp.min(val, axis=0)
+        return val
+
+    @override
+    def compute_loss(
+        self,
+        transition: Transition,
+        *,
+        train: bool = False,
+        rng: at.KeyArrayLike | None = None,
+        policy: _model.BaseModel | None = None,
+    ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
+        if policy is None:
+            raise ValueError("CQLValueFunction requires a policy for action sampling.")
+        if rng is None:
+            raise ValueError("CQLValueFunction requires rng for action sampling.")
+        del train
+        only_use_next_actions_for_cql = self.only_use_next_actions_for_cql
+        if isinstance(policy, _best_of_n.BestOfNWrapper) and policy.base_model is None:
+            only_use_next_actions_for_cql = True
+        q_loss, cql_loss, info = _objectives.cql_objective(
+            self.q_network,
+            self.q_head,
+            self.target_q_network,
+            self.target_q_head,
+            transition,
+            policy,
+            rng=rng,
+            discount=self.discount,
+            action_bounds=self.action_bounds,
+            cql_alpha=self.cql_alpha,
+            cql_temp=self.cql_temp,
+            cql_n_actions=self.cql_n_actions,
+            cql_action_sample_method=self.cql_action_sample_method,
+            cql_importance_sample=self.cql_importance_sample,
+            only_use_next_actions_for_cql=only_use_next_actions_for_cql,
+            cql_max_target_backup=self.cql_max_target_backup,
+            cql_clip_diff_min=self.cql_clip_diff_min,
+            cql_clip_diff_max=self.cql_clip_diff_max,
+            use_calql=self.use_calql,
+            use_calql_on_random_actions=self.use_calql_on_random_actions,
+            value_function=self,
+        )
+        total_loss = q_loss + self.cql_alpha * cql_loss
+        info["cql_alpha"] = jnp.array(self.cql_alpha)
+        return total_loss, info
+
+    @override
+    def post_step_update(self) -> None:
+        """Polyak averaging for target network."""
+        _polyak_update(self.target_q_network, self.q_network, self.tau)
+        _polyak_update(self.target_q_head, self.q_head, self.tau)
 
 
 # =============================================================================
@@ -704,7 +1014,9 @@ class MultiMCValueFunction(MultiValueFunction):
         *,
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
+        policy: _model.BaseModel | None = None,
     ) -> tuple[at.Float[at.Array, "*b n"], dict[str, at.Array]]:
+        del policy
         return _objectives.mc_objective(self.network, self.head, transition, rng=rng)
 
 
@@ -738,8 +1050,9 @@ class MultiSARSAValueFunction(MultiValueFunction):
         *,
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
+        policy: _model.BaseModel | None = None,
     ) -> tuple[at.Float[at.Array, "*b n"], dict[str, at.Array]]:
-        del train
+        del train, policy
         return _objectives.sarsa_objective(
             self.network,
             self.head,
@@ -829,9 +1142,10 @@ class MultiIQLValueFunction(BaseMultiValueFunction):
         *,
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
+        policy: _model.BaseModel | None = None,
     ) -> tuple[at.Float[at.Array, "*b n"], dict[str, at.Array]]:
         """Compute combined Q + V loss."""
-        del train, rng
+        del train, rng, policy
         q_loss, v_loss, info = _objectives.iql_objective(
             self.q_network,
             self.q_head,

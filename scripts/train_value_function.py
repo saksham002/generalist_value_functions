@@ -524,6 +524,7 @@ def value_function_train_step(
     config: _config.TrainConfig,
     lr_schedule: optax.Schedule,
     state: training_utils.TrainState,
+    policy_state: training_utils.TrainState | None,
     batch: dict[str, Any],
     rng: at.KeyArrayLike,
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
@@ -540,6 +541,7 @@ def value_function_train_step(
     """
     # pdb.set_trace()
     model = nnx.merge(state.model_def, state.params)
+    policy = None if policy_state is None else nnx.merge(policy_state.model_def, policy_state.params)
 
     if isinstance(config.model, _value_fn.BaseMultiValueFunctionConfig):
         transition = _value_fn.MultiTransition.from_batch(batch)
@@ -553,7 +555,7 @@ def value_function_train_step(
 
     def loss_fn(model: _value_fn.BaseValueFunction):
         # compute_loss returns (per_sample_loss, info_dict)
-        per_sample_loss, value_info = model.compute_loss(transition, train=True, rng=rng)
+        per_sample_loss, value_info = model.compute_loss(transition, train=True, rng=rng, policy=policy)
         if loss_mask is not None:
             # Masked mean: only average over examples with loss_mask=True
             masked_loss = per_sample_loss * loss_mask
@@ -2120,12 +2122,20 @@ def main(config: _config.TrainConfig):
         effective_log_interval = config.log_interval
         lr_schedule = config.lr_schedule.create()
 
-    ptrain_step = jax.jit(
-        functools.partial(value_function_train_step, config, lr_schedule),
-        in_shardings=(critic_sharding, data_sharding, replicated_sharding),
-        out_shardings=(critic_sharding, replicated_sharding),
-        donate_argnums=(0,),
-    )
+    if policy_state is not None:
+        ptrain_step = jax.jit(
+            functools.partial(value_function_train_step, config, lr_schedule),
+            in_shardings=(critic_sharding, policy_sharding, data_sharding, replicated_sharding),
+            out_shardings=(critic_sharding, replicated_sharding),
+            donate_argnums=(0,),
+        )
+    else:
+        ptrain_step = jax.jit(
+            functools.partial(value_function_train_step, config, lr_schedule),
+            in_shardings=(critic_sharding, None, data_sharding, replicated_sharding),
+            out_shardings=(critic_sharding, replicated_sharding),
+            donate_argnums=(0,),
+        )
 
     ppolicy_step = None
     if policy_state is not None:
@@ -2157,7 +2167,7 @@ def main(config: _config.TrainConfig):
         # Split rng for this step
         rng, step_rng = jax.random.split(rng)
         with timer.context("train_step_compute"), sharding.set_mesh(mesh):
-            critic_state, info = ptrain_step(critic_state, batch, step_rng)
+            critic_state, info = ptrain_step(critic_state, policy_state, batch, step_rng)
 
         with timer.context("train_step_sync"):
             jax.block_until_ready(critic_state)
@@ -2299,7 +2309,8 @@ def main(config: _config.TrainConfig):
                     )
 
                     # Deterministic evaluation: use the mode of the action distribution.
-                    actions = policy_model.sample_actions(step_rng, model_obs, deterministic=True)
+                    transition = _model.wrap_observation_as_transition(model_obs)
+                    actions = policy_model.sample_actions(step_rng, transition, deterministic=True)
                     # Take the first action in the horizon
                     # Shape: [num_envs, action_horizon, action_dim] -> [num_envs, action_dim]
                     actions = np.asarray(jax.device_get(actions[:, 0, :]))

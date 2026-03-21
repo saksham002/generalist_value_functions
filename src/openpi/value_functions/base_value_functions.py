@@ -40,6 +40,9 @@ class Transition:
     termination: at.Bool[at.Array, "*b"]
     truncation: at.Bool[at.Array, "*b"]
     td_discount: at.Float[at.Array, "*b"] | None
+    # Pre-computed counterfactual next actions for best-of-n TD backup
+    # Shape: [batch, num_samples, action_horizon, action_dim]
+    counterfactual_next_actions: at.Float[at.Array, "*b k ah ad"] | None = None
 
     @classmethod
     def from_batch(cls, batch: dict) -> "Transition":
@@ -51,6 +54,7 @@ class Transition:
         - reward, mc_return: Reward signals
         - termination, truncation: Episode boundary flags
         - tokenized_prompt, tokenized_prompt_mask: Optional text prompts
+        - (optional) counterfactual_next_actions: Pre-computed counterfactual actions for TD backup
         """
         # Use Observation.from_dict() for standard nested dict format
         observation = _model.Observation.from_dict(batch)
@@ -72,6 +76,10 @@ class Transition:
 
         next_observation = _model.Observation.from_dict(next_batch)
 
+        counterfactual_next_actions = batch.get("counterfactual_next_actions")
+        if counterfactual_next_actions is not None:
+            counterfactual_next_actions = jnp.asarray(counterfactual_next_actions)
+
         return cls(
             observation=observation,
             action=jnp.asarray(batch["actions"]),
@@ -82,6 +90,7 @@ class Transition:
             termination=jnp.asarray(batch["termination"]),
             truncation=jnp.asarray(batch["truncation"]),
             td_discount=jnp.asarray(batch["td_discount"]) if "td_discount" in batch else None,
+            counterfactual_next_actions=counterfactual_next_actions,
         )
 
 
@@ -238,12 +247,27 @@ class BaseValueFunction(nnx.Module, abc.ABC):
         """
 
     @abc.abstractmethod
+    def compute_target_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+    ) -> at.Float[at.Array, "*b"]:
+        """Compute the target value for each observation (and optionally action).
+
+        Implementations that do not maintain target networks should return
+        `compute_value` outputs.
+        """
+
+    @abc.abstractmethod
     def compute_loss(
         self,
         transition: Transition,
         *,
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
+        policy: _model.BaseModel | None = None,
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
         """Compute the loss for value function training.
 
@@ -257,6 +281,7 @@ class BaseValueFunction(nnx.Module, abc.ABC):
             transition: Full SARSA transition with (s, a, r, s', a', mc_return).
             train: Whether in training mode.
             rng: Random key for algorithms that need stochasticity (e.g., SAC).
+            policy: Optional policy for algorithms that need action sampling (e.g., CQL).
 
         Returns:
             Tuple of:
@@ -312,6 +337,7 @@ class BaseMultiValueFunction(nnx.Module, abc.ABC):
         *,
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
+        policy: _model.BaseModel | None = None,
     ) -> tuple[at.Float[at.Array, "*b n"], dict[str, at.Array]]:
         """Compute the loss for value function training.
 
@@ -319,6 +345,7 @@ class BaseMultiValueFunction(nnx.Module, abc.ABC):
             transition: Multi-transition with arrays of shape [batch, n, ...].
             train: Whether in training mode.
             rng: Random key for algorithms that need stochasticity.
+            policy: Optional policy for algorithms that need action sampling (e.g., CQL).
 
         Returns:
             Tuple of:

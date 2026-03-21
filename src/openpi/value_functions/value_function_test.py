@@ -33,6 +33,7 @@ def make_transition(batch_size: int, state_dim: int, action_dim: int = 4) -> Tra
         mc_return=jnp.ones(batch_size) * 0.5,
         termination=jnp.zeros(batch_size, dtype=bool),
         truncation=jnp.zeros(batch_size, dtype=bool),
+        td_discount=None,
     )
 
 
@@ -313,6 +314,7 @@ def make_multi_transition(
         mc_return=jnp.ones((batch_size, num_transitions_per_sample)) * 0.5,
         termination=jnp.zeros((batch_size, num_transitions_per_sample), dtype=bool),
         truncation=jnp.zeros((batch_size, num_transitions_per_sample), dtype=bool),
+        td_discount=None,
     )
 
 
@@ -490,6 +492,7 @@ class TestMultiMLPNetwork:
             mc_return=mc_return,
             termination=jnp.zeros((batch_size, num_transitions), dtype=bool),
             truncation=jnp.zeros((batch_size, num_transitions), dtype=bool),
+            td_discount=None,
         )
 
         loss_original, _ = model.compute_loss(transition)
@@ -506,6 +509,7 @@ class TestMultiMLPNetwork:
             mc_return=mc_return[perm],
             termination=jnp.zeros((batch_size, num_transitions), dtype=bool),
             truncation=jnp.zeros((batch_size, num_transitions), dtype=bool),
+            td_discount=None,
         )
 
         loss_permuted, _ = model.compute_loss(transition_permuted)
@@ -549,6 +553,7 @@ class TestMultiMLPNetwork:
             mc_return=mc_return,
             termination=jnp.zeros((batch_size, num_transitions), dtype=bool),
             truncation=jnp.zeros((batch_size, num_transitions), dtype=bool),
+            td_discount=None,
         )
 
         loss_original, _ = model.compute_loss(transition)
@@ -565,6 +570,7 @@ class TestMultiMLPNetwork:
             mc_return=mc_return[:, n_perm],
             termination=jnp.zeros((batch_size, num_transitions), dtype=bool),
             truncation=jnp.zeros((batch_size, num_transitions), dtype=bool),
+            td_discount=None,
         )
 
         loss_permuted, _ = model.compute_loss(transition_permuted)

@@ -51,6 +51,16 @@ class TestValueFunctionInputs:
         assert "prompt" in result
         assert result["prompt"] == "value_function_training"
 
+    def test_includes_counterfactual_next_actions(self):
+        """Test that cached next actions are passed through."""
+        data = make_value_function_example(obs_dim=29, action_dim=8)
+        data["counterfactual_next_actions"] = np.ones((6, 2, 8), dtype=np.float32)
+        transform = ValueFunctionInputs()
+        result = transform(data)
+
+        assert "counterfactual_next_actions" in result
+        assert result["counterfactual_next_actions"].shape == (6, 2, 8)
+
 
 class TestRegressionValueOutputs:
     """Tests for regression value output transform."""
