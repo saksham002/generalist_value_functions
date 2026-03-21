@@ -85,6 +85,22 @@ def test_tokenize_no_prompt():
         transform({})
 
 
+def test_resize_images_resizes_next_image():
+    transform = _transforms.ResizeImages(8, 8)
+    image = np.zeros((4, 6, 3), dtype = np.uint8)
+    next_image = np.zeros((5, 7, 3), dtype = np.uint8)
+
+    result = transform(
+        {
+            "image": {"cam": image},
+            "next_image": {"cam": next_image},
+        }
+    )
+
+    assert result["image"]["cam"].shape == (8, 8, 3)
+    assert result["next_image"]["cam"].shape == (8, 8, 3)
+
+
 def test_transform_dict():
     # Rename and remove keys.
     input = {"a": {"b": 1, "c": 2}}

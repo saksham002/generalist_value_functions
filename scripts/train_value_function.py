@@ -1883,6 +1883,8 @@ def main(config: _config.TrainConfig):
     # Initialize variables for all branches
     num_episodes = None
     val_dataloader = None
+    val_episode_indices: list[int] = []
+    val_episodes_cache_dir = None
 
     if data_config.minari_dataset_id is not None:
         val_dataset = _data_loader.create_numpy_dataset_from_minari(
@@ -1963,6 +1965,9 @@ def main(config: _config.TrainConfig):
         #     num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
         # ).tolist()
 
+        val_dataset = None
+    elif data_config.rlds_dataset_class == "robocoin":
+        logging.info("Skipping validation cache setup for RoboCOIN RLDS configs.")
         val_dataset = None
     else:
         # Non-RoboCOIN: use LeRobot dataset
@@ -2052,6 +2057,8 @@ def main(config: _config.TrainConfig):
                 data_config=data_config,
                 cache_dir=val_episodes_cache_dir,
             )
+        elif data_config.rlds_dataset_class == "robocoin":
+            logging.info("Skipping validation plotting for RoboCOIN RLDS configs.")
         else:
             plot_images = generate_validation_plots(
                 model=model,
@@ -2238,6 +2245,8 @@ def main(config: _config.TrainConfig):
                         data_config=data_config,
                         cache_dir=val_episodes_cache_dir,
                     )
+                elif data_config.rlds_dataset_class == "robocoin":
+                    logging.info("Skipping validation plotting for RoboCOIN RLDS configs.")
                 else:
                     plot_images = generate_validation_plots(
                         model=model,

@@ -33,9 +33,11 @@ except Exception:
 import openpi.shared.minari_utils as minari_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.latent_store as latent_store
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
+import openpi.training.rlds_dataset as rlds_dataset
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 import openpi.value_functions.base_value_functions as _value_functions_base
@@ -109,10 +111,19 @@ class DataConfig:
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
+    rlds_dataset_class: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
-    datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+    datasets: Sequence[rlds_dataset.RLDSDataset] = ()
+    robocoin_use_eef: bool = False
+    val_split: str = "test"
+    clip_normalized_bounds: dict[str, tuple[float, float]] | None = None
+    latent_store_dir: str | None = None
+    latent_views: tuple[latent_store.LatentViewConfig, ...] = ()
+    counterfactual_action_store_dir: str | None = None
+    max_num_demos: int | None = None
+    rlds_kwargs: dict[str, Any] = dataclasses.field(default_factory = dict)
 
     # RL training mode options (for value function training)
     critic_mode: bool = False  # If True, use value function training pipeline
@@ -546,7 +557,7 @@ class D4RLDataConfig(DataConfigFactory):
         repack_transform = _transforms.Group(inputs=[])
 
         if self.critic_mode:
-            # RL mode: use value function transforms
+            # Critic mode: use value function transforms
             # All RL fields are stored in the dataset (computed at conversion time)
             data_transforms = _transforms.Group(
                 inputs=[_value_transforms.ValueFunctionInputs()],
@@ -1111,6 +1122,124 @@ class RoboCOINDataConfig(DataConfigFactory):
             use_chunk_wise_delta=self.use_chunk_wise_delta,
             critic_mode=self.critic_mode,
             use_quantile_norm=self.use_quantile_norm,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RoboCoinRldsDataConfig(RoboCOINDataConfig):
+    """Data config for RoboCOIN using the RLDS dataset pipeline."""
+
+    rlds_data_dir: str = "gs://saksham-euw4/robocoin_bimanual"
+    datasets: Sequence[rlds_dataset.RLDSDataset] = (
+        rlds_dataset.RLDSDataset(name = "robocoin_bimanual", version = "1.0.0", weight = 1.0),
+    )
+    val_split: str = "val"
+    latent_store_dir: str | None = None
+    latent_views: tuple[latent_store.LatentViewConfig, ...] = ()
+    counterfactual_action_store_dir: str | None = None
+    max_num_demos: int | None = None
+    num_parallel_reads: int = -1
+    num_parallel_calls: int = -1
+
+    def __post_init__(self) -> None:
+        if self.latent_views and self.latent_store_dir is None:
+            raise ValueError("latent_views requires latent_store_dir to be set.")
+
+    def _create_clip_normalized_bounds(self) -> dict[str, tuple[float, float]]:
+        clip_bound = 1.25 if self.use_quantile_norm else 5.0
+        return {
+            "state": (-clip_bound, clip_bound),
+            "actions": (-clip_bound, clip_bound),
+            "next_state": (-clip_bound, clip_bound),
+            "next_actions": (-clip_bound, clip_bound),
+        }
+
+    def _get_critic_tokenizer(
+        self, model_config: _model.BaseModelConfig
+    ) -> _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | None:
+        network_config = None
+        if isinstance(model_config, _value_function.ValueFunctionConfig):
+            network_config = model_config.network_config
+        elif isinstance(model_config, _value_function.CQLValueFunctionConfig):
+            network_config = model_config.q_network_config
+        elif isinstance(model_config, _value_function.IQLValueFunctionConfig):
+            network_config = model_config.q_network_config
+
+        if isinstance(network_config, _paligemma_network.PaliGemmaNetworkConfig):
+            return network_config.get_tokenizer(max_len = self.max_token_len)
+        return None
+
+    def _create_model_transforms(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        if not self.critic_mode:
+            return ModelTransformFactory(default_prompt = None)(model_config)
+
+        tokenizer = self._get_critic_tokenizer(model_config)
+        transforms: list[_transforms.DataTransformFn] = []
+        if self.dont_mask_actions:
+            transforms.append(_transforms.ReplaceMaskedActions(use_quantile_norm = self.use_quantile_norm))
+        if tokenizer is not None:
+            transforms.extend(
+                [
+                    _transforms.ResizeImages(self.image_size[0], self.image_size[1]),
+                    _transforms.TokenizePrompt(tokenizer),
+                ]
+            )
+        return _transforms.Group(inputs = transforms, outputs = [])
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        assert not (not self.critic_mode and self.dont_mask_actions), (
+            "dont_mask_actions=True is incompatible with critic_mode=False (policy training): "
+            "synthetic action padding would corrupt the flow matching loss."
+        )
+        if not self.datasets:
+            raise ValueError("RoboCoinRldsDataConfig requires at least one RLDS dataset.")
+
+        raw_norm_stats = self._load_robocoin_norm_stats()
+        norm_stats = raw_norm_stats
+        data_transform_inputs: list[_transforms.DataTransformFn] = []
+        if (
+            raw_norm_stats is not None
+            and raw_norm_stats
+            and not isinstance(next(iter(raw_norm_stats.values())), _transforms.NormStats)
+        ):
+            data_transform_inputs.append(
+                _transforms.NormalizeByEmbodiment(raw_norm_stats, use_quantiles = self.use_quantile_norm)
+            )
+            norm_stats = {}
+
+        asset_id = self.assets.asset_id or self.datasets[0].name
+
+        return DataConfig(
+            repo_id = self.repo_id,
+            asset_id = asset_id,
+            norm_stats = norm_stats,
+            repack_transforms = _transforms.Group(inputs = []),
+            data_transforms = _transforms.Group(inputs = data_transform_inputs, outputs = []),
+            model_transforms = self._create_model_transforms(model_config),
+            use_quantile_norm = self.use_quantile_norm,
+            critic_mode = self.critic_mode,
+            discount = self.discount,
+            reward_scale = self.reward_scale,
+            reward_bias = self.reward_bias,
+            rlds_data_dir = self.rlds_data_dir,
+            rlds_dataset_class = "robocoin",
+            datasets = self.datasets,
+            robocoin_use_eef = self.use_eef,
+            val_split = self.val_split,
+            clip_normalized_bounds = self._create_clip_normalized_bounds(),
+            latent_store_dir = self.latent_store_dir,
+            latent_views = self.latent_views,
+            counterfactual_action_store_dir = self.counterfactual_action_store_dir,
+            max_num_demos = self.max_num_demos,
+            rlds_kwargs = {
+                "td_n": self.td_n,
+                "filter_n": self.filter_n,
+                "mask_50fps": self.mask_50fps,
+                "use_chunk_wise_delta": self.use_chunk_wise_delta,
+                "num_parallel_reads": self.num_parallel_reads,
+                "num_parallel_calls": self.num_parallel_calls,
+            },
         )
 
 
@@ -3002,7 +3131,7 @@ _CONFIGS = [
             td_n=50,
             use_eef=True,
             dont_mask_actions=True,
-            use_chunk_wise_delta=False,
+            use_chunk_wise_delta=True,
             use_quantile_norm=True,
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
@@ -3025,6 +3154,113 @@ _CONFIGS = [
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
     ),
+    # RoboCOIN Q(s,a) SARSA with bimanual dataset using the RLDS pipeline, chunk-wise delta actions, quantile norm.
+    TrainConfig(
+        name="robocoin_bimanual_paligemma_q_sarsa_chunk_wise_rlds",
+        model=_value_function.SARSAValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(224, 224),
+                max_token_len=48,
+                action_dim=14,
+                dtype="float32",
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCoinRldsDataConfig(
+            rlds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            datasets=(rlds_dataset.RLDSDataset(name = "robocoin_bimanual", version = "1.0.0", weight = 1.0),),
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            dont_mask_actions=True,
+            use_chunk_wise_delta=True,
+            use_quantile_norm=True,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=230_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=50_000,
+        save_interval=50_000,
+        fsdp_devices=16,
+        action_horizon=50,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
+    ),
+    # =========================================================================
+    # Reference: CQL + Best-of-N config (from main branch, cosmos backbone).
+    # Requires: best_of_n.py, action_bounds.py, rlds_dataset.py,
+    #           robocoin_rlds_dataset.py, counterfactual_action_store.py,
+    #           cosmos network, CosmosValueWeightLoader.
+    # =========================================================================
+    # TrainConfig(
+    #     name="cosmos_robocoin_td_learning_hl_gauss",
+    #     model=_value_function.CQLValueFunctionConfig(
+    #         q_network_config=_cosmos_network.CosmosValueNetworkConfig(
+    #             image_keys=("cam_0", "cam_1", "cam_2"),
+    #             image_height=224,
+    #             image_width=224,
+    #             cosmos_kwargs_path="...",
+    #             uncond_text_embeddings_path="...",
+    #             action_conditioned=True,
+    #             action_dim=14,
+    #             action_horizon=30,
+    #             fixed_timestep=0.0,
+    #         ),
+    #         q_head_config=_heads.CategoricalHeadConfig(
+    #             v_min=-500.0,
+    #             v_max=0.0,
+    #             num_bins=128,
+    #         ),
+    #         discount=0.998,
+    #         tau=0.005,
+    #         action_bounds=ActionBounds.from_uniform(-1.0, 1.0, action_dim=14, is_normalized=True),
+    #         cql_alpha=0.0,
+    #     ),
+    #     policy=_best_of_n.BestOfNWrapperConfig(
+    #         action_dim=14,
+    #         action_horizon=30,
+    #         base_model_config=None,
+    #         use_target_value=True,
+    #     ),
+    #     policy_extraction=_policy_extraction.NoopPolicyExtractionConfig(),
+    #     weight_loader=weight_loaders.CosmosValueWeightLoader("..."),
+    #     data=RoboCoinRldsDataConfig(
+    #         rlds_data_dir="...",
+    #         datasets=(rlds_dataset.RLDSDataset(name="robocoin", version="1.0.0", weight=1.0),),
+    #         discount=0.998,
+    #         reward_bias=-1.0,
+    #         use_eef=True,
+    #         counterfactual_action_store_dir="...",
+    #         max_num_demos=1,
+    #     ),
+    #     num_train_steps=500_000,
+    #     batch_size=1,
+    #     shuffle_buffer_size=5_000,
+    #     lr_schedule=_optimizer.CosineDecaySchedule(
+    #         peak_lr=5e-5,
+    #         decay_steps=500_000,
+    #         decay_lr=1e-6,
+    #         warmup_steps=1_000,
+    #     ),
+    #     optimizer=_optimizer.SGD(momentum=0.0),
+    #     freeze_filter=_nnx_utils.PathRegex(".*vae.*"),
+    #     plot_interval=10_000,
+    #     num_workers=0,
+    #     fsdp_devices=1,
+    # ),
     # RoboCOIN Q(s,a) SARSA with bimanual dataset, HL-Gauss head.
     TrainConfig(
         name="robocoin_bimanual_paligemma_q_sarsa_hl_gauss",

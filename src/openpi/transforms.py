@@ -146,6 +146,92 @@ class Normalize(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class Clip(DataTransformFn):
+    bounds: Mapping[str, tuple[float, float]]
+
+    def __call__(self, data: DataDict) -> DataDict:
+        for key, (low, high) in self.bounds.items():
+            if key in data:
+                data[key] = np.clip(data[key], low, high)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class NormalizeByEmbodiment(DataTransformFn):
+    norm_stats_by_embodiment: Mapping[str, at.PyTree[NormStats]]
+    use_quantiles: bool = False
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "_normalize_fns",
+            {
+                embodiment: Normalize(stats, use_quantiles = self.use_quantiles)
+                for embodiment, stats in self.norm_stats_by_embodiment.items()
+            },
+        )
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "embodiment" not in data:
+            raise ValueError("NormalizeByEmbodiment requires 'embodiment' in the sample.")
+
+        embodiment = data["embodiment"]
+        if isinstance(embodiment, bytes):
+            embodiment = embodiment.decode("utf-8")
+        if embodiment not in self._normalize_fns:
+            raise ValueError(
+                f"Missing normalization stats for embodiment '{embodiment}'. "
+                f"Available embodiments: {sorted(self._normalize_fns.keys())}"
+            )
+
+        normalize_fn = self._normalize_fns[embodiment]
+        keys_to_normalize = {
+            key: data[key]
+            for key in self.norm_stats_by_embodiment[embodiment]
+            if key in data
+        }
+        normalized = normalize_fn(keys_to_normalize)
+        return {**data, **normalized}
+
+
+@dataclasses.dataclass(frozen=True)
+class ReplaceMaskedActions(DataTransformFn):
+    use_quantile_norm: bool = False
+    rng: np.random.Generator = dataclasses.field(
+        default_factory = lambda: np.random.default_rng(seed = 86),
+        compare = False,
+        repr = False,
+    )
+
+    def __call__(self, data: DataDict) -> DataDict:
+        fps = int(np.asarray(data["fps"]).item())
+        noise_scale = 0.002 if self.use_quantile_norm else 0.005
+
+        for actions_key, mask_key in (("actions", "action_mask"), ("next_actions", "next_action_mask")):
+            actions = np.asarray(data[actions_key]).copy()
+            action_mask = np.asarray(data[mask_key], dtype = np.bool_).copy()
+
+            last_valid_idx = int(action_mask.sum()) - 1
+            if last_valid_idx < 0:
+                raise ValueError(f"{mask_key} must contain at least one valid action.")
+
+            last_valid_action = actions[last_valid_idx]
+            noise = (noise_scale * self.rng.standard_normal(actions.shape)).astype(actions.dtype)
+            replacement = last_valid_action[None, :] + noise
+
+            actions[~action_mask] = replacement[~action_mask]
+            action_mask[:] = True
+            if fps == 30:
+                action_horizon = action_mask.shape[0]
+                action_mask[3 * action_horizon // 5 :] = False
+
+            data[actions_key] = actions
+            data[mask_key] = action_mask
+
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class Unnormalize(DataTransformFn):
     norm_stats: at.PyTree[NormStats] | None
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
@@ -188,6 +274,10 @@ class ResizeImages(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        if "next_image" in data:
+            data["next_image"] = {
+                k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["next_image"].items()
+            }
         return data
 
 
@@ -261,6 +351,8 @@ class TokenizePrompt(DataTransformFn):
 
         if not isinstance(prompt, str):
             prompt = prompt.item()
+        if isinstance(prompt, bytes):
+            prompt = prompt.decode("utf-8")
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}

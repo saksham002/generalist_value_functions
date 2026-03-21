@@ -458,16 +458,42 @@ def create_rlds_dataset(
     action_horizon: int,
     batch_size: int,
     *,
+    split: str = "train",
     shuffle: bool = False,
+    return_trajectories: bool = False,
+    max_trajectories: int | None = None,
 ) -> Dataset:
-    # At the moment, we only support DROID for RLDS datasets.
+    if data_config.rlds_dataset_class == "robocoin":
+        from openpi.training.robocoin_rlds_dataset import RoboCoinRldsDataset
+
+        return RoboCoinRldsDataset(
+            data_dir = data_config.rlds_data_dir,
+            batch_size = batch_size,
+            split = split,
+            shuffle = shuffle,
+            action_chunk_size = action_horizon,
+            datasets = data_config.datasets,
+            critic_mode = data_config.critic_mode,
+            discount = data_config.discount,
+            reward_scale = data_config.reward_scale,
+            reward_bias = data_config.reward_bias,
+            use_eef = data_config.robocoin_use_eef,
+            latent_store_dir = data_config.latent_store_dir,
+            latent_views = data_config.latent_views,
+            counterfactual_action_store_dir = data_config.counterfactual_action_store_dir,
+            max_num_demos = data_config.max_num_demos,
+            return_trajectories = return_trajectories,
+            max_trajectories = max_trajectories,
+            **data_config.rlds_kwargs,
+        )
+
     return DroidRldsDataset(
-        data_dir=data_config.rlds_data_dir,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        action_chunk_size=action_horizon,
-        action_space=data_config.action_space,
-        datasets=data_config.datasets,
+        data_dir = data_config.rlds_data_dir,
+        batch_size = batch_size,
+        shuffle = shuffle,
+        action_chunk_size = action_horizon,
+        action_space = data_config.action_space,
+        datasets = data_config.datasets,
     )
 
 
@@ -497,6 +523,8 @@ def transform_dataset(
     input_transforms = list(data_config.repack_transforms.inputs)
     input_transforms.extend(data_config.data_transforms.inputs)
     input_transforms.append(_transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm))
+    if data_config.clip_normalized_bounds is not None:
+        input_transforms.append(_transforms.Clip(data_config.clip_normalized_bounds))
     input_transforms.extend(data_config.model_transforms.inputs)
 
     return TransformedDataset(dataset, input_transforms)
@@ -525,6 +553,7 @@ def transform_iterable_dataset(
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *([_transforms.Clip(data_config.clip_normalized_bounds)] if data_config.clip_normalized_bounds is not None else []),
             *data_config.model_transforms.inputs,
         ],
         is_batched=is_batched,
@@ -732,7 +761,7 @@ def create_rlds_data_loader(
     """
     if framework == "pytorch":
         raise NotImplementedError("PyTorch RLDS data loader is not supported yet")
-    dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle)
+    dataset = create_rlds_dataset(data_config, action_horizon, batch_size, split = "train", shuffle = shuffle)
     dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
 
     data_loader = RLDSDataLoader(
@@ -1134,7 +1163,7 @@ class DataLoaderImpl(DataLoader):
     def __iter__(self):
         for batch in self._data_loader:
             if self._data_config.critic_mode:
-                # RL mode: yield raw batch dict for value function training
+                # Critic mode: yield raw batch dict for value function training
                 yield batch
             else:
                 # Policy mode: yield (Observation, Actions) tuple
