@@ -214,7 +214,7 @@ def _select_best_action_chunk(
     *,
     real_action_start: int,
     real_action_dim: int,
-) -> tuple[np.ndarray, jax.Array]:
+) -> tuple[np.ndarray, jax.Array, np.ndarray]:
     transformed_policy_inputs, policy_observation = _preprocessing.prepare_policy_observation(
         policy_bundle,
         observation_pair.policy_inputs,
@@ -233,7 +233,7 @@ def _select_best_action_chunk(
 
     transition = _model.wrap_observation_as_transition(policy_observation)
     rng, sample_rng = jax.random.split(rng)
-    selected_actions = dual_wrapper.sample_actions(
+    selected_actions, candidate_values = dual_wrapper.sample_actions_with_values(
         sample_rng,
         transition,
         value_function = value_bundle.model,
@@ -251,12 +251,18 @@ def _select_best_action_chunk(
         real_action_start = real_action_start,
         real_action_dim = real_action_dim,
     )
-    return env_actions, rng
+    return env_actions, rng, np.asarray(candidate_values[0], dtype = np.float32)
+
+
+def _debug_policy_enabled() -> bool:
+    value = os.environ.get("DEBUG_POLICY", "")
+    return value.lower() not in ("", "0", "false", "no")
 
 
 def evaluate(args: EvalArgs) -> None:
     logging.basicConfig(level = logging.INFO, format = "%(asctime)s [%(levelname)s] %(message)s")
     np.random.seed(args.seed)
+    debug_policy = _debug_policy_enabled()
 
     policy_train_config = _policy_config_mod.get_config(args.policy_config)
     value_train_config = _value_config.get_config(args.value_config)
@@ -294,7 +300,7 @@ def evaluate(args: EvalArgs) -> None:
             prompt = detector.update(env_obs, step_idx)
             if planned_actions is None or planned_index >= len(planned_actions) or step_idx % args.query_freq == 0:
                 observation_pair = observation_factory.build(env_obs, prompt)
-                planned_actions, rng = _select_best_action_chunk(
+                planned_actions, rng, candidate_values = _select_best_action_chunk(
                     dual_wrapper,
                     policy_bundle,
                     value_bundle,
@@ -306,6 +312,9 @@ def evaluate(args: EvalArgs) -> None:
                 planned_index = 0
                 if args.trace_replans:
                     logging.info(f"[Episode {episode_idx}] step = {step_idx}, prompt = {prompt}")
+                if debug_policy and step_idx % 30 == 0:
+                    values_str = ", ".join(f"{value:.6f}" for value in candidate_values.tolist())
+                    logging.info(f"{prompt}: {values_str}")
 
             env_action = planned_actions[planned_index]
             env_obs, reward, terminated, truncated, _ = env.step(env_action)

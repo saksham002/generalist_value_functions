@@ -18,8 +18,7 @@ from openpi.value_functions import base_value_functions as _base_vf
 class DualObservationBestOfNWrapper(_best_of_n.BestOfNWrapper):
     """Best-of-N wrapper that can score with a separate critic observation."""
 
-    @override
-    def sample_actions(
+    def _sample_and_score_candidates(
         self,
         rng: at.KeyArrayLike,
         transition: _base_vf.Transition,
@@ -29,17 +28,11 @@ class DualObservationBestOfNWrapper(_best_of_n.BestOfNWrapper):
         critic_observation: _model.Observation | None = None,
         critic_action_transform: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
         **kwargs,
-    ) -> _model.Actions:
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
         if value_function is None:
             raise ValueError("value_function is required for DualObservationBestOfNWrapper")
         if critic_observation is None or critic_action_transform is None:
-            return super().sample_actions(
-                rng,
-                transition,
-                compute_next_action = compute_next_action,
-                value_function = value_function,
-                **kwargs,
-            )
+            raise ValueError("critic_observation and critic_action_transform are required for candidate scoring")
 
         observation = transition.next_observation if compute_next_action else transition.observation
         rng_sample, rng_select = jax.random.split(rng)
@@ -88,4 +81,56 @@ class DualObservationBestOfNWrapper(_best_of_n.BestOfNWrapper):
         else:
             raise ValueError(f"Unknown selection_mode: {self.selection_mode}")
 
-        return all_actions[jnp.arange(batch_size), indices]
+        return all_actions[jnp.arange(batch_size), indices], q_values
+
+    def sample_actions_with_values(
+        self,
+        rng: at.KeyArrayLike,
+        transition: _base_vf.Transition,
+        *,
+        compute_next_action: bool = False,
+        value_function: _base_vf.BaseValueFunction | _base_vf.BaseMultiValueFunction | None = None,
+        critic_observation: _model.Observation | None = None,
+        critic_action_transform: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
+        **kwargs,
+    ) -> tuple[_model.Actions, jnp.ndarray]:
+        return self._sample_and_score_candidates(
+            rng,
+            transition,
+            compute_next_action = compute_next_action,
+            value_function = value_function,
+            critic_observation = critic_observation,
+            critic_action_transform = critic_action_transform,
+            **kwargs,
+        )
+
+    @override
+    def sample_actions(
+        self,
+        rng: at.KeyArrayLike,
+        transition: _base_vf.Transition,
+        *,
+        compute_next_action: bool = False,
+        value_function: _base_vf.BaseValueFunction | _base_vf.BaseMultiValueFunction | None = None,
+        critic_observation: _model.Observation | None = None,
+        critic_action_transform: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
+        **kwargs,
+    ) -> _model.Actions:
+        if critic_observation is None or critic_action_transform is None:
+            return super().sample_actions(
+                rng,
+                transition,
+                compute_next_action = compute_next_action,
+                value_function = value_function,
+                **kwargs,
+            )
+        selected_actions, _ = self._sample_and_score_candidates(
+            rng,
+            transition,
+            compute_next_action = compute_next_action,
+            value_function = value_function,
+            critic_observation = critic_observation,
+            critic_action_transform = critic_action_transform,
+            **kwargs,
+        )
+        return selected_actions
