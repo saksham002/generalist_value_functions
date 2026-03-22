@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 import dataclasses
 import logging
+import os
 from typing import Any
 
 import augmax
@@ -456,7 +457,7 @@ class MainTransform:
             frame["next_image_mask"] = next_imgs["masks"]
 
         # Pass through metadata (subtask_1..5 needed for validation extras in RoboCOINPostTFTransform)
-        for key in ["episode_index", "_frame_index", "_traj_index",
+        for key in ["index", "episode_index", "_frame_index", "_traj_index",
                     "repo_id", "fps",
                     "subtask_1", "subtask_2", "subtask_3", "subtask_4", "subtask_5"]:
             if key in raw_frame:
@@ -664,6 +665,11 @@ class RoboCOINPostTFTransform:
         elif "prompt" in batch:
             batch["prompt"] = np.array([self._decode_text(p) for p in batch["prompt"]], dtype = object)
 
+        # if os.environ.get("OPENPI_ROBOCOIN_PARITY_KEEP_REPO_INDEX", "0") == "1" and "repo_id" in batch:
+        #     batch["repo_index"] = np.asarray(
+        #         [robocoin_repo_index.repo_id_to_index(repo_id) for repo_id in batch["repo_id"]],
+        #         dtype = np.int32,
+        #     )
         if self.split != "val":
             batch.pop("repo_id", None)
         batch.pop("fps", None)
@@ -775,8 +781,16 @@ def create_robocoin_data_loader(
     logger.info(f"Data directory: {config.data_dir}")
     logger.info(f"Batch size: {config.batch_size}")
 
-    builder = tfds.builder(config.dataset_name, data_dir=config.data_dir)
-    dataset = dl.DLataset.from_rlds(builder, split=config.split, shuffle=True, num_parallel_reads=8)
+    builder = tfds.builder(config.dataset_name, data_dir = config.data_dir)
+    dataset = dl.DLataset.from_rlds(
+        builder,
+        split = config.split,
+        shuffle = config.shuffle,
+        num_parallel_reads = 8,
+    )
+
+    if config.repeat:
+        dataset = dataset.repeat()
 
     def _drop_traj_metadata(episode: Any) -> Any:
         metadata = episode["traj_metadata"]["episode_metadata"]
@@ -787,38 +801,38 @@ def create_robocoin_data_loader(
 
     dataset = dataset.map(_drop_traj_metadata)
 
-    if config.repeat:
-        dataset = dataset.repeat()
-
     dataset = dataset.traj_map(
         AddTrajectoryKeys(
-            td_n=config.td_n,
-            max_cameras=config.max_cameras,
-            action_horizon=config.action_horizon,
-            use_eef=config.use_eef,
-        ).map
+            td_n = config.td_n,
+            max_cameras = config.max_cameras,
+            action_horizon = config.action_horizon,
+            use_eef = config.use_eef,
+        ).map,
+        num_parallel_calls = 8,
     )
 
-    dataset = dataset.flatten(num_parallel_calls=8)
+    dataset = dataset.flatten(num_parallel_calls = 8)
 
     dataset = dataset.frame_map(
         ImageResizeTransform(
-            target_size=config.image_size,
-            max_cameras=config.max_cameras,
-        ).map
+            target_size = config.image_size,
+            max_cameras = config.max_cameras,
+        ).map,
+        num_parallel_calls = 8,
     )
 
     dataset = dataset.frame_map(
         MainTransform(
-            max_cameras=config.max_cameras,
-            use_eef=config.use_eef,
-            discount=config.discount,
-            td_n=config.td_n,
-            split=config.split,
-            mask_50fps=config.mask_50fps,
-            use_chunk_wise_delta=config.use_chunk_wise_delta,
-            critic_mode=config.critic_mode,
-        ).map
+            max_cameras = config.max_cameras,
+            use_eef = config.use_eef,
+            discount = config.discount,
+            td_n = config.td_n,
+            split = config.split,
+            mask_50fps = config.mask_50fps,
+            use_chunk_wise_delta = config.use_chunk_wise_delta,
+            critic_mode = config.critic_mode,
+        ).map,
+        num_parallel_calls = 8,
     )
 
     if config.filter_n is not None:
@@ -928,4 +942,3 @@ class RoboCOINDataLoader:
                 yield jax.tree.map(
                     self._to_sharded_array_or_passthrough, batch
                 )
-

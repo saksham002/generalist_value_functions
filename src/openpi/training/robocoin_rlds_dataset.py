@@ -121,9 +121,9 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             actions = tf.cast(traj["action"], tf.float32)
         state = tf.cast(traj["observation/state"], tf.float32)
         traj_len = tf.shape(state)[0]
-        fps = tf.repeat(traj["traj_metadata"]["episode_metadata"]["fps"], traj_len)
-        repo_id = tf.repeat(traj["traj_metadata"]["episode_metadata"]["repo_id"], traj_len)
-        embodiment = tf.repeat(self._extract_embodiment(traj["traj_metadata"]["episode_metadata"]["repo_id"]), traj_len)
+        fps = traj["traj_metadata"]["episode_metadata"]["fps"]
+        repo_id = traj["traj_metadata"]["episode_metadata"]["repo_id"]
+        embodiment = tf.repeat(self._extract_embodiment(repo_id[0])[None], traj_len)
 
         observation = {"state": state}
         if self._include_images:
@@ -145,7 +145,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             "repo_id": repo_id,
             "embodiment": embodiment,
         }
-        for key in ("episode_index", "_frame_index", "_traj_index"):
+        for key in ("index", "episode_index", "_frame_index", "_traj_index"):
             if key in traj:
                 result[key] = traj[key]
 
@@ -268,6 +268,9 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
 
         frame = super().frame_transforms(frame)
 
+        images, image_masks = self._restructure_images(frame)
+        next_images, next_image_masks = self._restructure_images(frame, prefix = "next_")
+
         frame["state"] = tf.cast(frame["observation"]["state"], tf.float32)
         frame["next_state"] = tf.cast(frame["next_observation"]["state"], tf.float32)
         del frame["observation"]
@@ -279,8 +282,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             frame["actions"] = frame["actions"] - frame["actions"][:1, :]
             frame["next_actions"] = frame["next_actions"] - frame["next_actions"][:1, :]
 
-        images, image_masks = self._restructure_images(frame)
-        next_images, next_image_masks = self._restructure_images(frame, prefix = "next_")
         if images:
             frame["image"] = images
             frame["image_mask"] = image_masks

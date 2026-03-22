@@ -24,6 +24,7 @@ except Exception:
 import openpi.shared.rl_utils as rl_utils
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+import openpi.training.rlds_dataset as rlds_dataset
 import openpi.training.samplers as samplers
 import openpi.transforms as _transforms
 
@@ -580,6 +581,11 @@ def create_data_loader(
         framework: The framework to use ("jax" or "pytorch").
     """
     data_config = config.data.create(config.assets_dirs, config.model)
+    action_horizon = config.action_horizon
+    if action_horizon is None:
+        action_horizon = config.model.action_horizon
+    if action_horizon is None:
+        raise ValueError("Action horizon must be set on either TrainConfig or the model config.")
     config_fields = {f.name: getattr(data_config, f.name) for f in dataclasses.fields(data_config)}
     if "norm_stats" in config_fields and config_fields["norm_stats"]:
         config_fields["norm_stats"] = f"<{len(config_fields['norm_stats'])} keys>"
@@ -619,7 +625,7 @@ def create_data_loader(
 
         robocoin_config = dc.replace(
             data_config.robocoin_data_config,
-            action_horizon = config.action_horizon or 5,
+            action_horizon = action_horizon,
         )
         data_config = dc.replace(data_config, robocoin_data_config = robocoin_config)
 
@@ -640,7 +646,7 @@ def create_data_loader(
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,
-            action_horizon=config.model.action_horizon,
+            action_horizon=action_horizon,
             batch_size=config.batch_size,
             sharding=sharding,
             shuffle=shuffle,
@@ -1109,26 +1115,26 @@ def _worker_init_fn(worker_id: int) -> None:
 
 
 class RLDSDataLoader:
-    """Shallow wrapper around the DROID data loader to make it compatible with openpi.
+    """Shallow wrapper around RLDS data loaders to make them compatible with openpi.
 
-    All batching already happens in the DROID dataset, so we don't need to do anything here.
+    All batching already happens in the RLDS dataset, so we don't need to do anything here.
+    Supports multi-host training - each process loads its shard and batches are combined.
     """
 
     def __init__(
         self,
-        dataset: DroidRldsDataset,
+        dataset: DroidRldsDataset | rlds_dataset.BaseRldsDataset,
         *,
         sharding: jax.sharding.Sharding | None = None,
         num_batches: int | None = None,
+        dataset_size: int | None = None,
     ):
         self._dataset = dataset
         self._num_batches = num_batches
-
-        if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
+        self._dataset_size = dataset_size
 
         if sharding is None:
-            # Use data parallel sharding by default.
+            # Use data parallel sharding by default across all devices (including multi-host).
             sharding = jax.sharding.NamedSharding(
                 jax.sharding.Mesh(jax.devices(), ("B",)),
                 jax.sharding.PartitionSpec("B"),
@@ -1136,6 +1142,11 @@ class RLDSDataLoader:
 
         self._sharding = sharding
         self._num_batches = num_batches
+
+    @property
+    def dataset_size(self) -> int | None:
+        """Return the number of samples in the dataset, or None if not precomputed."""
+        return self._dataset_size
 
     def __iter__(self):
         num_items = 0
@@ -1149,6 +1160,12 @@ class RLDSDataLoader:
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
+                batch = {
+                    key: value
+                    for key, value in batch.items()
+                    if not np.issubdtype(np.asarray(value).dtype, np.str_)
+                    and not np.issubdtype(np.asarray(value).dtype, np.bytes_)
+                }
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
 
 
@@ -1159,6 +1176,11 @@ class DataLoaderImpl(DataLoader):
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
+
+    @property
+    def dataset_size(self) -> int | None:
+        """Return the number of samples in the dataset, or None if unknown."""
+        return self._data_loader.dataset_size
 
     def __iter__(self):
         for batch in self._data_loader:

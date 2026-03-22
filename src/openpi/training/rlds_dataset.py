@@ -254,8 +254,7 @@ class BaseRldsDataset:
             # Training mode: streaming with flattening
             all_datasets = [prepare_single_dataset(dataset_cfg, for_trajectories=False) for dataset_cfg in datasets]
             weights = [dataset.weight for dataset in datasets]
-
-            final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=weights)
+            final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights = weights)
             if shuffle:
                 final_dataset = final_dataset.shuffle(shuffle_buffer_size)
             final_dataset = final_dataset.batch(local_batch_size)

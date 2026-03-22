@@ -40,6 +40,7 @@ dependencies = [
     "transformers==4.53.2",
     "rich>=14.0.0",
     "polars>=1.30.0",
+    "umap-learn>=0.5.0",
     "distrax>=0.1.5",
     "ipdb>=0.13.13",
     "mujoco==3.1.6",
@@ -75,7 +76,7 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+# override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
 # Allow resolving for macOS (without CUDA) and Linux
 environments = [
     "sys_platform == 'darwin'",
@@ -85,7 +86,7 @@ environments = [
 [tool.uv.sources]
 openpi-client = { workspace = true }
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
-dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
+dlimp = { git = "https://github.com/maxsobolmark/dlimp" }
 
 [tool.uv.workspace]
 members = ["packages/*"]

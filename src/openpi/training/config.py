@@ -230,6 +230,17 @@ class ModelTransformFactory(GroupFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class DecodeRoboCoinPromptBytes:
+    """Decode RoboCOIN prompt bytes before generic tokenization."""
+
+    def __call__(self, data: _transforms.DataDict) -> _transforms.DataDict:
+        prompt = data["prompt"]
+        if isinstance(prompt, bytes):
+            data["prompt"] = prompt.decode("utf-8")
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
@@ -1138,8 +1149,9 @@ class RoboCoinRldsDataConfig(RoboCOINDataConfig):
     latent_views: tuple[latent_store.LatentViewConfig, ...] = ()
     counterfactual_action_store_dir: str | None = None
     max_num_demos: int | None = None
-    num_parallel_reads: int = -1
-    num_parallel_calls: int = -1
+    shuffle_buffer_size: int = 250_000
+    num_parallel_reads: int = 8
+    num_parallel_calls: int = 8
 
     def __post_init__(self) -> None:
         if self.latent_views and self.latent_store_dir is None:
@@ -1171,7 +1183,14 @@ class RoboCoinRldsDataConfig(RoboCOINDataConfig):
 
     def _create_model_transforms(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         if not self.critic_mode:
-            return ModelTransformFactory(default_prompt = None)(model_config)
+            base_transforms = ModelTransformFactory(default_prompt = None)(model_config)
+            return _transforms.Group(
+                inputs = (
+                    DecodeRoboCoinPromptBytes(),
+                    *base_transforms.inputs,
+                ),
+                outputs = base_transforms.outputs,
+            )
 
         tokenizer = self._get_critic_tokenizer(model_config)
         transforms: list[_transforms.DataTransformFn] = []
@@ -1181,6 +1200,7 @@ class RoboCoinRldsDataConfig(RoboCOINDataConfig):
             transforms.extend(
                 [
                     _transforms.ResizeImages(self.image_size[0], self.image_size[1]),
+                    DecodeRoboCoinPromptBytes(),
                     _transforms.TokenizePrompt(tokenizer),
                 ]
             )
@@ -1237,6 +1257,7 @@ class RoboCoinRldsDataConfig(RoboCOINDataConfig):
                 "filter_n": self.filter_n,
                 "mask_50fps": self.mask_50fps,
                 "use_chunk_wise_delta": self.use_chunk_wise_delta,
+                "shuffle_buffer_size": self.shuffle_buffer_size,
                 "num_parallel_reads": self.num_parallel_reads,
                 "num_parallel_calls": self.num_parallel_calls,
             },
@@ -3104,7 +3125,6 @@ _CONFIGS = [
         plot_interval=50_000,
         save_interval=50_000,
         fsdp_devices=16,
-        action_horizon=50,
         num_val_trajectories=10,
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
@@ -3130,7 +3150,7 @@ _CONFIGS = [
             discount=0.999,
             td_n=50,
             use_eef=True,
-            dont_mask_actions=True,
+            dont_mask_actions=False,
             use_chunk_wise_delta=True,
             use_quantile_norm=True,
         ),
@@ -3170,14 +3190,15 @@ _CONFIGS = [
         ),
         data=RoboCoinRldsDataConfig(
             rlds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            datasets=(rlds_dataset.RLDSDataset(name = "robocoin_bimanual", version = "1.0.0", weight = 1.0),),
+            datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
             norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
             discount=0.999,
             td_n=50,
             use_eef=True,
-            dont_mask_actions=True,
+            dont_mask_actions=False,
             use_chunk_wise_delta=True,
             use_quantile_norm=True,
+            shuffle_buffer_size=50_000,
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
         num_train_steps=230_000,
@@ -3469,6 +3490,47 @@ _CONFIGS = [
             use_chunk_wise_delta=True,
             use_quantile_norm=True,
             filter_n=5,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=230_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        save_interval=50_000,
+        fsdp_devices=16,
+    ),
+    TrainConfig(
+        name="robocoin_bimanual_pi05_rlds",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=96,
+            pi05=True,
+            action_dim_offset=14,
+            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
+            dtype="float32",
+        ),
+        data=RoboCoinRldsDataConfig(
+            rlds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
+            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            critic_mode=False,
+            use_chunk_wise_delta=True,
+            use_quantile_norm=True,
+            filter_n=5,
+            shuffle_buffer_size=50_000,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=230_000,
