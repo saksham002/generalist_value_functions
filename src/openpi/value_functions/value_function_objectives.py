@@ -466,7 +466,7 @@ def _sample_policy_actions(
     flat_transition, batch_size, num_transitions = _flatten_transition_for_policy(transition)
     flat_batch = batch_size if num_transitions is None else batch_size * num_transitions
 
-    dist = policy.action_distribution(rng, flat_transition, compute_next_action = compute_next_action)
+    dist = policy.action_distribution(rng, flat_transition, compute_next_action = compute_next_action, value_function = value_function)
 
     if num_actions is None:
         actions_flat, log_prob_flat = dist.sample_and_log_prob(seed=rng)

@@ -322,6 +322,7 @@ class BaseModel(nnx.Module, abc.ABC):
         transition: _base_vf.Transition,
         *,
         compute_next_action: bool = False,
+        **kwargs,
     ) -> distrax.Distribution:
         """Return the action distribution for the given transition's observation.
 
@@ -352,11 +353,17 @@ def wrap_observation_as_transition(observation: Observation) -> _base_vf.Transit
     from openpi.value_functions import base_value_functions as _base_vf_mod
 
     batch_shape = observation.state.shape[:-1]
+    state_dim = observation.state.shape[-1]
+    dummy_obs = Observation(
+        images = {},
+        image_masks = {},
+        state = jnp.zeros((*batch_shape, state_dim)),
+    )
     return _base_vf_mod.Transition(
         observation = observation,
         action = jnp.zeros((*batch_shape, 1, 1)),
         reward = jnp.zeros(batch_shape),
-        next_observation = None,
+        next_observation = dummy_obs,
         next_action = None,
         mc_return = None,
         termination = jnp.zeros(batch_shape),

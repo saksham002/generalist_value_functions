@@ -206,6 +206,7 @@ class TanhGaussian(_model.BaseModel):
         *,
         compute_next_action: bool = False,
         train: bool = False,
+        **kwargs,
     ) -> distrax.Distribution:
         """Return the tanh-squashed Gaussian distribution over actions.
 

@@ -20,7 +20,7 @@ def test_pi0_model():
     loss = nnx_utils.module_jit(model.compute_loss)(key, obs, act)
     assert loss.shape == (batch_size, config.action_horizon)
 
-    actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
+    actions = nnx_utils.module_jit(model.sample_actions)(key, _model.wrap_observation_as_transition(obs), num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
 
 
@@ -35,7 +35,7 @@ def test_pi0_lora_model():
     loss = nnx_utils.module_jit(model.compute_loss)(key, obs, act)
     assert loss.shape == (batch_size, config.action_horizon)
 
-    actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
+    actions = nnx_utils.module_jit(model.sample_actions)(key, _model.wrap_observation_as_transition(obs), num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
 
 
