@@ -86,6 +86,9 @@ class CommonArgs:
     stride: int = 1
     """Stride for computing counterfactual actions. stride=5 means compute at steps 0, 5, 10, etc."""
 
+    debug_metrics: bool = False
+    """If True, compute extra normalized-space diagnostics such as sampling loss."""
+
 
 @dataclasses.dataclass
 class LaunchArgs(CommonArgs):
@@ -272,7 +275,18 @@ def run_worker(args: WorkerArgs) -> None:
     _nnx_utils.replace_state_from_pure_dict_numeric_key_compat(_state, policy_params)
     model = nnx.merge(_graphdef, _state)
     data_config_for_policy = config.data.create(config.assets_dirs, policy_model_config)
-    norm_stats = _checkpoints.load_norm_stats(checkpoint_dir_path / "assets", data_config_for_policy.asset_id)
+    norm_stats = None
+    if hasattr(config.data, "_load_robocoin_norm_stats") and config.data.norm_stats_path is not None:
+        try:
+            norm_stats = config.data._load_robocoin_norm_stats()
+            logger.info(f"Loaded norm stats from config path {config.data.norm_stats_path}")
+        except FileNotFoundError:
+            logger.info(
+                f"Norm stats not found at config path {config.data.norm_stats_path}, "
+                "falling back to checkpoint assets."
+            )
+    if norm_stats is None:
+        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir_path / "assets", data_config_for_policy.asset_id)
 
     import openpi.policies.policy as _policy
     import openpi.transforms as _transforms
@@ -292,7 +306,7 @@ def run_worker(args: WorkerArgs) -> None:
         ],
         output_transforms=[
             *data_config_for_policy.model_transforms.outputs,
-            _transforms.Unnormalize(norm_stats, use_quantiles=data_config_for_policy.use_quantile_norm),
+            _transforms.Unnormalize(norm_stats, use_quantiles = data_config_for_policy.use_quantile_norm),
             *data_config_for_policy.data_transforms.outputs,
         ],
         metadata=config.policy_metadata,
@@ -327,6 +341,8 @@ def run_worker(args: WorkerArgs) -> None:
         strided_idx: int
         state: np.ndarray
         transformed: dict[str, Any]
+        gt_actions: np.ndarray | None
+        action_mask: np.ndarray | None
         encoded_images: jax.Array | None
         written_samples: int = 0
 
@@ -364,6 +380,44 @@ def run_worker(args: WorkerArgs) -> None:
             return jnp.pad(x, pad_width)
 
         return jax.tree.map(pad_array, tree)
+
+    def _construct_eef_repr_np(action: np.ndarray, eef_action: np.ndarray) -> np.ndarray:
+        return np.concatenate(
+            [
+                eef_action[..., :6],
+                action[..., 6:7],
+                eef_action[..., 6:12],
+                action[..., 13:14],
+            ],
+            axis = -1,
+        ).astype(np.float32)
+
+    def _select_policy_subtask(
+        step: dict[str, Any], subtask_texts: list[str], fps: int
+    ) -> tuple[str | None, int, np.ndarray]:
+        first_null_index_val = int(step["first_null_index"])
+        if first_null_index_val == 0:
+            return None, 0, np.zeros(action_horizon, dtype = np.bool_)
+
+        steps_all = np.asarray(step["steps_to_subtask_end"], dtype = np.int32)
+        include_subtasks = np.zeros(max_subtasks, dtype = np.bool_)
+        for idx, text in enumerate(subtask_texts[:first_null_index_val]):
+            lowered = text.rstrip(". ").strip().lower()
+            include_subtasks[idx] = lowered not in {"static", "abnormal"}
+
+        policy_prompt = _build_policy_prompt(subtask_texts, first_null_index_val)
+        if policy_prompt is None:
+            return None, 0, np.zeros(action_horizon, dtype = np.bool_)
+
+        masked_steps = np.where(include_subtasks, steps_all, np.iinfo(np.int32).max)
+        sampled_idx = int(np.argmin(masked_steps))
+        selected_steps = int(steps_all[sampled_idx])
+        action_mask = np.arange(action_horizon, dtype = np.int32) <= selected_steps
+        if fps == 30:
+            valid_30fps_actions = 3 * action_horizon // 5
+            action_mask &= np.arange(action_horizon, dtype = np.int32) < valid_30fps_actions
+
+        return policy_prompt, sampled_idx, action_mask
 
     # Get action dimensions from policy model config
     action_horizon = policy_model_config.action_horizon
@@ -440,6 +494,23 @@ def run_worker(args: WorkerArgs) -> None:
             if hasattr(repo_id, "numpy"):
                 repo_id = repo_id.numpy()
             embodiment = extract_embodiment(repo_id)
+            fps = int(episode["episode_metadata"]["fps"])
+            episode_actions = None
+            if args.debug_metrics:
+                episode_actions = []
+                for step in episode["steps"]:
+                    step_action = step["action"]
+                    if hasattr(step_action, "numpy"):
+                        step_action = step_action.numpy()
+                    step_action = np.asarray(step_action, dtype = np.float32)
+                    if data_config_for_policy.robocoin_use_eef:
+                        step_eef_action = step["eef_sim_pose_action"]
+                        if hasattr(step_eef_action, "numpy"):
+                            step_eef_action = step_eef_action.numpy()
+                        step_eef_action = np.asarray(step_eef_action, dtype = np.float32)
+                        step_action = _construct_eef_repr_np(step_action, step_eef_action)
+                    episode_actions.append(step_action)
+                episode_actions = np.asarray(episode_actions, dtype = np.float32)
 
             # Allocate output array (strided dimensions if stride > 1)
             num_strided_positions = (num_steps + args.stride - 1) // args.stride
@@ -447,6 +518,12 @@ def run_worker(args: WorkerArgs) -> None:
                 (num_strided_positions, args.num_samples, action_horizon, action_dim),
                 dtype=np.float32,
             )
+            episode_valid_frames = 0
+            episode_sampling_l1_sum = 0.0
+            episode_sampling_mse_sum = 0.0
+            episode_sampling_num_valid = 0.0
+            episode_cov_trace_sum = 0.0
+            episode_cov_trace_num_valid = 0.0
 
             if not any(int(step["first_null_index"]) > 0 for step in episode["steps"]):
                 # No valid subtasks for this episode, leave all zeros
@@ -491,9 +568,6 @@ def run_worker(args: WorkerArgs) -> None:
 
                 for strided_idx, step_idx in enumerate(range(0, num_steps, args.stride)):
                     step = episode["steps"][step_idx]
-                    first_null_index_val = int(step["first_null_index"])
-                    if first_null_index_val == 0:
-                        continue
 
                     subtask_texts = []
                     for si in range(1, max_subtasks + 1):
@@ -504,9 +578,10 @@ def run_worker(args: WorkerArgs) -> None:
                             text = text.decode("utf-8")
                         subtask_texts.append(text)
 
-                    policy_prompt = _build_policy_prompt(subtask_texts, first_null_index_val)
+                    policy_prompt, sampled_idx, action_mask = _select_policy_subtask(step, subtask_texts, fps)
                     if policy_prompt is None:
                         continue
+                    episode_valid_frames += 1
 
                     first_transformed_for_step = None
 
@@ -540,10 +615,32 @@ def run_worker(args: WorkerArgs) -> None:
                         "embodiment": embodiment,
                     }
 
-                    with episode_timer.context("input_transform"):
-                        transformed = input_transform(obs_dict)
+                    transform_with_actions = dict(obs_dict)
+                    if args.debug_metrics:
+                        gt_action_indices = np.minimum(
+                            step_idx + np.arange(action_horizon, dtype = np.int32),
+                            num_steps - 1,
+                        )
+                        gt_actions = episode_actions[gt_action_indices].copy()
+                        if data_config.rlds_kwargs["use_chunk_wise_delta"]:
+                            gt_actions = gt_actions - gt_actions[:1, :]
+                        transform_with_actions["actions"] = gt_actions
+                        transform_with_actions["action_mask"] = action_mask
 
-                    transformed = {k: v for k, v in transformed.items() if not isinstance(v, str)}
+                    with episode_timer.context("input_transform"):
+                        transformed = input_transform(transform_with_actions)
+
+                    gt_actions_transformed = None
+                    action_mask_transformed = None
+                    if args.debug_metrics:
+                        gt_actions_transformed = np.asarray(transformed["actions"], dtype = np.float32)
+                        action_mask_transformed = np.asarray(transformed["action_mask"], dtype = np.bool_)
+
+                    transformed = {
+                        k: v
+                        for k, v in transformed.items()
+                        if not isinstance(v, str) and k not in ("embodiment", "actions")
+                    }
                     first_transformed_for_step = transformed
                     if encode_images_jit is not None:
                         transformed = {k: v for k, v in transformed.items() if k != "image"}
@@ -553,6 +650,8 @@ def run_worker(args: WorkerArgs) -> None:
                         strided_idx=strided_idx,
                         state=step_state,
                         transformed=transformed,
+                        gt_actions=gt_actions_transformed,
+                        action_mask=action_mask_transformed,
                         encoded_images=None,
                     )
                     pending_requests.append(request)
@@ -588,7 +687,7 @@ def run_worker(args: WorkerArgs) -> None:
                     batched_inputs = _pad_batch_to_size(batched_inputs, actual_batch_size, args.samples_per_batch)
 
                     observation = _model.Observation.from_dict(batched_inputs)
-                    transition = Transition(observation=observation)
+                    transition = _model.wrap_observation_as_transition(observation)
 
                     rng, sample_rng = jax.random.split(rng)
                     call_kwargs = sample_kwargs
@@ -651,6 +750,7 @@ def run_worker(args: WorkerArgs) -> None:
                     with episode_timer.context("output_transform"):
                         transformed_outputs = output_transform(
                             {
+                                "embodiment": embodiment,
                                 "state": batch_states,
                                 "actions": actions_np,
                                 "next_state": batch_states,
@@ -661,6 +761,34 @@ def run_worker(args: WorkerArgs) -> None:
 
                     offset = 0
                     for request, n in batch_requests:
+                        request_actions = actions_np[offset : offset + n]
+                        if args.debug_metrics:
+                            gt_actions_broadcast = np.broadcast_to(
+                                request.gt_actions[None, ...],
+                                request_actions.shape,
+                            )
+                            abs_diff = np.abs(request_actions - gt_actions_broadcast)
+                            sq_diff = np.square(request_actions - gt_actions_broadcast)
+
+                            if getattr(model, "action_dim_mask", None) is not None:
+                                dim_mask = np.asarray(model.action_dim_mask, dtype = np.float32)[None, None, :]
+                                dim_mask_den = max(float(np.sum(dim_mask)), 1.0)
+                                l1_per_step = np.sum(abs_diff * dim_mask, axis = -1) / dim_mask_den
+                                mse_per_step = np.sum(sq_diff * dim_mask, axis = -1) / dim_mask_den
+                            else:
+                                l1_per_step = np.mean(abs_diff, axis = -1)
+                                mse_per_step = np.mean(sq_diff, axis = -1)
+
+                            step_mask = request.action_mask.astype(np.float32)[None, :]
+                            episode_sampling_l1_sum += float(np.sum(l1_per_step * step_mask))
+                            episode_sampling_mse_sum += float(np.sum(mse_per_step * step_mask))
+                            episode_sampling_num_valid += float(np.sum(step_mask) * n)
+
+                        centered = request_actions - np.mean(request_actions, axis = 0, keepdims = True)
+                        cov_trace_per_timestep = np.sum(np.mean(np.square(centered), axis = 0), axis = -1)
+                        episode_cov_trace_sum += float(np.mean(cov_trace_per_timestep))
+                        episode_cov_trace_num_valid += 1.0
+
                         start = request.written_samples - n
                         end = request.written_samples
                         all_actions[request.strided_idx, start:end] = output_actions[
@@ -680,12 +808,18 @@ def run_worker(args: WorkerArgs) -> None:
                 worker_times[key] += value
             timed_episode_count += 1
             logger.info(
-                "Worker %d shard %d episode_index=%d num_steps=%d valid_subtasks=%d elapsed=%.2fs",
+                "Worker %d shard %d episode_index=%d num_steps=%d valid_frames=%d "
+                "sampling_l1=%.6f sampling_mse=%.6f cov_trace_per_timestep=%.6f "
+                "debug_metrics=%s elapsed=%.2fs",
                 args.worker_id,
                 shard_idx,
                 rlds_episode_index,
                 num_steps,
-                first_null_index_val,
+                episode_valid_frames,
+                episode_sampling_l1_sum / max(episode_sampling_num_valid, 1.0),
+                episode_sampling_mse_sum / max(episode_sampling_num_valid, 1.0),
+                episode_cov_trace_sum / max(episode_cov_trace_num_valid, 1.0),
+                args.debug_metrics,
                 episode_elapsed,
             )
             logger.info(
@@ -777,11 +911,11 @@ def run_launch(args: LaunchArgs) -> None:
     def _make_wrap_cmd(inner_cmd: str) -> str:
         return (
             f'bash -lc "'
-            f"source /home/jsobolma/bashrc_max && "
+            f"source ~/.bashrc && "
             f"export CURL_CA_BUNDLE=\\$(python3 -c 'import certifi; print(certifi.where())' 2>/dev/null || echo /etc/ssl/certs/ca-bundle.crt) && "
             f"export REQUESTS_CA_BUNDLE=\\$CURL_CA_BUNDLE && "
             f"export SSL_CERT_FILE=\\$CURL_CA_BUNDLE && "
-            f"cd ~/dev/batch_value_learning && {inner_cmd}"
+            f"cd ~/projects/AIRe/robocoin/batch_value_learning && {inner_cmd}"
             f'"'
         )
 
@@ -797,6 +931,8 @@ def run_launch(args: LaunchArgs) -> None:
     ]
     if args.max_episodes is not None:
         extra_worker_args += ["--max-episodes", str(args.max_episodes)]
+    if args.debug_metrics:
+        extra_worker_args += ["--debug-metrics"]
 
     extra_args_str = " ".join(extra_worker_args)
 
@@ -815,7 +951,7 @@ def run_launch(args: LaunchArgs) -> None:
             worker_cmd += f" {extra_args_str}"
 
         wrap_cmd = _make_wrap_cmd(worker_cmd)
-        log_pattern = str(log_dir / f"ca_store_worker_{worker_id}-%j.log")
+        log_pattern = str(log_dir / f"ca_store_worker_{worker_id}.log")
 
         sbatch_cmd = [
             "sbatch",
@@ -841,8 +977,7 @@ def run_launch(args: LaunchArgs) -> None:
         else:
             job_id = _submit_sbatch(sbatch_cmd)
             job_ids.append(job_id)
-            resolved_log = log_pattern.replace("%j", job_id)
-            logger.info(f"Worker {worker_id}: submitted job {job_id} (log: {resolved_log})")
+            logger.info(f"Worker {worker_id}: submitted job {job_id} (log: {log_pattern})")
 
     if args.auto_merge and not args.dry_run:
         merge_cmd = (
@@ -856,7 +991,7 @@ def run_launch(args: LaunchArgs) -> None:
 
         merge_wrap = _make_wrap_cmd(merge_cmd)
         dep_str = ":".join(job_ids)
-        merge_log_pattern = str(log_dir / "ca_store_merge-%j.log")
+        merge_log_pattern = str(log_dir / "ca_store_merge.log")
 
         merge_partition = worker_partitions[0]
         merge_sbatch_cmd = [

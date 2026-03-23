@@ -68,10 +68,12 @@ def test_robocoin_rlds_data_config_chunk_wise_create(monkeypatch):
         "filter_n": None,
         "mask_50fps": False,
         "use_chunk_wise_delta": True,
-        "num_parallel_reads": -1,
-        "num_parallel_calls": -1,
+        "shuffle_buffer_size": 250_000,
+        "num_parallel_reads": 8,
+        "num_parallel_calls": 8,
     }
-    assert isinstance(data_config.data_transforms.inputs[0], _config._transforms.NormalizeByEmbodiment)
+    assert data_config.data_transforms.inputs == []
     assert isinstance(data_config.model_transforms.inputs[0], _config._transforms.ReplaceMaskedActions)
     assert isinstance(data_config.model_transforms.inputs[1], _config._transforms.ResizeImages)
-    assert isinstance(data_config.model_transforms.inputs[2], _config._transforms.TokenizePrompt)
+    assert isinstance(data_config.model_transforms.inputs[2], _config.DecodeRoboCoinPromptBytes)
+    assert isinstance(data_config.model_transforms.inputs[3], _config._transforms.TokenizePrompt)

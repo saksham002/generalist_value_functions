@@ -127,12 +127,34 @@ class Normalize(DataTransformFn):
         if self.norm_stats is None:
             return data
 
+        norm_stats = self._select_norm_stats(data)
         return apply_tree(
             data,
-            self.norm_stats,
+            norm_stats,
             self._normalize_quantile if self.use_quantiles else self._normalize,
             strict=self.strict,
         )
+
+    def _select_norm_stats(self, data: DataDict) -> at.PyTree[NormStats]:
+        if not self.norm_stats:
+            return self.norm_stats
+
+        first_value = next(iter(self.norm_stats.values()))
+        if isinstance(first_value, NormStats):
+            return self.norm_stats
+
+        if "embodiment" not in data:
+            raise ValueError("Embodiment-keyed normalization requires 'embodiment' in the sample.")
+
+        embodiment = data["embodiment"]
+        if isinstance(embodiment, bytes):
+            embodiment = embodiment.decode("utf-8")
+        if embodiment not in self.norm_stats:
+            raise ValueError(
+                f"Missing normalization stats for embodiment '{embodiment}'. "
+                f"Available embodiments: {sorted(self.norm_stats.keys())}"
+            )
+        return self.norm_stats[embodiment]
 
     def _normalize(self, x, stats: NormStats):
         mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
@@ -154,44 +176,6 @@ class Clip(DataTransformFn):
             if key in data:
                 data[key] = np.clip(data[key], low, high)
         return data
-
-
-@dataclasses.dataclass(frozen=True)
-class NormalizeByEmbodiment(DataTransformFn):
-    norm_stats_by_embodiment: Mapping[str, at.PyTree[NormStats]]
-    use_quantiles: bool = False
-
-    def __post_init__(self):
-        object.__setattr__(
-            self,
-            "_normalize_fns",
-            {
-                embodiment: Normalize(stats, use_quantiles = self.use_quantiles)
-                for embodiment, stats in self.norm_stats_by_embodiment.items()
-            },
-        )
-
-    def __call__(self, data: DataDict) -> DataDict:
-        if "embodiment" not in data:
-            raise ValueError("NormalizeByEmbodiment requires 'embodiment' in the sample.")
-
-        embodiment = data["embodiment"]
-        if isinstance(embodiment, bytes):
-            embodiment = embodiment.decode("utf-8")
-        if embodiment not in self._normalize_fns:
-            raise ValueError(
-                f"Missing normalization stats for embodiment '{embodiment}'. "
-                f"Available embodiments: {sorted(self._normalize_fns.keys())}"
-            )
-
-        normalize_fn = self._normalize_fns[embodiment]
-        keys_to_normalize = {
-            key: data[key]
-            for key in self.norm_stats_by_embodiment[embodiment]
-            if key in data
-        }
-        normalized = normalize_fn(keys_to_normalize)
-        return {**data, **normalized}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -245,13 +229,35 @@ class Unnormalize(DataTransformFn):
         if self.norm_stats is None:
             return data
 
+        norm_stats = self._select_norm_stats(data)
         # Make sure that all the keys in the norm stats are present in the data.
         return apply_tree(
             data,
-            self.norm_stats,
+            norm_stats,
             self._unnormalize_quantile if self.use_quantiles else self._unnormalize,
             strict=True,
         )
+
+    def _select_norm_stats(self, data: DataDict) -> at.PyTree[NormStats]:
+        if not self.norm_stats:
+            return self.norm_stats
+
+        first_value = next(iter(self.norm_stats.values()))
+        if isinstance(first_value, NormStats):
+            return self.norm_stats
+
+        if "embodiment" not in data:
+            raise ValueError("Embodiment-keyed unnormalization requires 'embodiment' in the sample.")
+
+        embodiment = data["embodiment"]
+        if isinstance(embodiment, bytes):
+            embodiment = embodiment.decode("utf-8")
+        if embodiment not in self.norm_stats:
+            raise ValueError(
+                f"Missing normalization stats for embodiment '{embodiment}'. "
+                f"Available embodiments: {sorted(self.norm_stats.keys())}"
+            )
+        return self.norm_stats[embodiment]
 
     def _unnormalize(self, x, stats: NormStats):
         mean = pad_to_dim(stats.mean, x.shape[-1], axis=-1, value=0.0)

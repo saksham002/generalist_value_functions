@@ -1215,18 +1215,7 @@ class RoboCoinRldsDataConfig(RoboCOINDataConfig):
         if not self.datasets:
             raise ValueError("RoboCoinRldsDataConfig requires at least one RLDS dataset.")
 
-        raw_norm_stats = self._load_robocoin_norm_stats()
-        norm_stats = raw_norm_stats
-        data_transform_inputs: list[_transforms.DataTransformFn] = []
-        if (
-            raw_norm_stats is not None
-            and raw_norm_stats
-            and not isinstance(next(iter(raw_norm_stats.values())), _transforms.NormStats)
-        ):
-            data_transform_inputs.append(
-                _transforms.NormalizeByEmbodiment(raw_norm_stats, use_quantiles = self.use_quantile_norm)
-            )
-            norm_stats = {}
+        norm_stats = self._load_robocoin_norm_stats()
 
         asset_id = self.assets.asset_id or self.datasets[0].name
 
@@ -1235,7 +1224,7 @@ class RoboCoinRldsDataConfig(RoboCOINDataConfig):
             asset_id = asset_id,
             norm_stats = norm_stats,
             repack_transforms = _transforms.Group(inputs = []),
-            data_transforms = _transforms.Group(inputs = data_transform_inputs, outputs = []),
+            data_transforms = _transforms.Group(inputs = [], outputs = []),
             model_transforms = self._create_model_transforms(model_config),
             use_quantile_norm = self.use_quantile_norm,
             critic_mode = self.critic_mode,

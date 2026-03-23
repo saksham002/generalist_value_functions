@@ -10,15 +10,56 @@ Value functions can be configured to be action-conditioned (Q-function) or not
 import abc
 import dataclasses
 
+from flax import struct
 import flax.nnx as nnx
 import jax.numpy as jnp
+import numpy as np
 from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 
 
-@dataclasses.dataclass(frozen=True)
+def _convert_images_to_float(images: dict) -> dict:
+    """Convert uint8 images to float32 in [-1, 1] range."""
+    result = {}
+    for key, img in images.items():
+        img_arr = jnp.asarray(img)
+        if img_arr.dtype == np.uint8:
+            result[key] = img_arr.astype(jnp.float32) / 127.5 - 1.0
+        else:
+            result[key] = img_arr
+    return result
+
+
+def _extract_observations_from_batch(batch: dict) -> tuple[_model.Observation, _model.Observation]:
+    """Extract observation and next_observation from a batch dictionary."""
+    images = _convert_images_to_float(batch.get("image", {}))
+    image_masks = {k: jnp.asarray(v) for k, v in batch.get("image_mask", {}).items()}
+    next_images = _convert_images_to_float(batch.get("next_image", {}))
+    next_image_masks = {k: jnp.asarray(v) for k, v in batch.get("next_image_mask", {}).items()}
+
+    observation = _model.Observation(
+        images = images,
+        image_masks = image_masks,
+        state = jnp.asarray(batch["state"]),
+        tokenized_prompt = batch.get("tokenized_prompt"),
+        tokenized_prompt_mask = batch.get("tokenized_prompt_mask"),
+        action_mask = batch.get("action_mask"),
+        loss_mask = batch.get("loss_mask"),
+    )
+    next_observation = _model.Observation(
+        images = next_images,
+        image_masks = next_image_masks,
+        state = jnp.asarray(batch["next_state"]),
+        tokenized_prompt = batch.get("next_tokenized_prompt", batch.get("tokenized_prompt")),
+        tokenized_prompt_mask = batch.get("next_tokenized_prompt_mask", batch.get("tokenized_prompt_mask")),
+        action_mask = batch.get("next_action_mask"),
+    )
+    return observation, next_observation
+
+
+@struct.dataclass
 class Transition:
     """A transition (o, a, r, o', a') plus MC return for value function training.
 
@@ -32,14 +73,14 @@ class Transition:
     """
 
     observation: _model.Observation
-    action: at.Float[at.Array, "*b action_dim"]
-    reward: at.Float[at.Array, "*b"]
-    next_observation: _model.Observation
-    next_action: at.Float[at.Array, "*b action_dim"]
-    mc_return: at.Float[at.Array, "*b"]
-    termination: at.Bool[at.Array, "*b"]
-    truncation: at.Bool[at.Array, "*b"]
-    td_discount: at.Float[at.Array, "*b"] | None
+    action: at.Float[at.Array, "*b action_dim"] | None = None
+    reward: at.Float[at.Array, "*b"] | None = None
+    next_observation: _model.Observation | None = None
+    next_action: at.Float[at.Array, "*b action_dim"] | None = None
+    mc_return: at.Float[at.Array, "*b"] | None = None
+    termination: at.Bool[at.Array, "*b"] | None = None
+    truncation: at.Bool[at.Array, "*b"] | None = None
+    td_discount: at.Float[at.Array, "*b"] | None = None
     # Pre-computed counterfactual next actions for best-of-n TD backup
     # Shape: [batch, num_samples, action_horizon, action_dim]
     counterfactual_next_actions: at.Float[at.Array, "*b k ah ad"] | None = None
@@ -56,26 +97,7 @@ class Transition:
         - tokenized_prompt, tokenized_prompt_mask: Optional text prompts
         - (optional) counterfactual_next_actions: Pre-computed counterfactual actions for TD backup
         """
-        # Use Observation.from_dict() for standard nested dict format
-        observation = _model.Observation.from_dict(batch)
-
-        # Build next_observation from next_* keys
-        next_batch = {
-            "image": batch.get("next_image", {}),
-            "image_mask": batch.get("next_image_mask", {}),
-            "state": batch["next_state"],
-        }
-        # Use same prompt for next observation (task doesn't change within episode)
-        if "tokenized_prompt" in batch:
-            next_batch["tokenized_prompt"] = batch.get("next_tokenized_prompt", batch["tokenized_prompt"])
-        if "tokenized_prompt_mask" in batch:
-            next_batch["tokenized_prompt_mask"] = batch.get("next_tokenized_prompt_mask", batch["tokenized_prompt_mask"])
-        # Copy next_action_mask for Q(s,a) models
-        if "next_action_mask" in batch:
-            next_batch["action_mask"] = batch["next_action_mask"]
-
-        next_observation = _model.Observation.from_dict(next_batch)
-
+        observation, next_observation = _extract_observations_from_batch(batch)
         counterfactual_next_actions = batch.get("counterfactual_next_actions")
         if counterfactual_next_actions is not None:
             counterfactual_next_actions = jnp.asarray(counterfactual_next_actions)
@@ -89,12 +111,12 @@ class Transition:
             mc_return=jnp.asarray(batch["mc_return"]),
             termination=jnp.asarray(batch["termination"]),
             truncation=jnp.asarray(batch["truncation"]),
-            td_discount=jnp.asarray(batch["td_discount"]) if "td_discount" in batch else None,
+            td_discount = jnp.asarray(batch["td_discount"]) if "td_discount" in batch else None,
             counterfactual_next_actions=counterfactual_next_actions,
         )
 
 
-@dataclasses.dataclass(frozen=True)
+@struct.dataclass
 class MultiTransition:
     """A sequence of transitions for multi-state value functions.
 
@@ -103,14 +125,14 @@ class MultiTransition:
     """
 
     observation: _model.Observation
-    action: at.Float[at.Array, "*b n action_dim"]
-    reward: at.Float[at.Array, "*b n"]
-    next_observation: _model.Observation
-    next_action: at.Float[at.Array, "*b n action_dim"]
-    mc_return: at.Float[at.Array, "*b n"]
-    termination: at.Bool[at.Array, "*b n"]
-    truncation: at.Bool[at.Array, "*b n"]
-    td_discount: at.Float[at.Array, "*b n"] | None
+    action: at.Float[at.Array, "*b n action_dim"] | None = None
+    reward: at.Float[at.Array, "*b n"] | None = None
+    next_observation: _model.Observation | None = None
+    next_action: at.Float[at.Array, "*b n action_dim"] | None = None
+    mc_return: at.Float[at.Array, "*b n"] | None = None
+    termination: at.Bool[at.Array, "*b n"] | None = None
+    truncation: at.Bool[at.Array, "*b n"] | None = None
+    td_discount: at.Float[at.Array, "*b n"] | None = None
 
     @classmethod
     def from_batch(cls, batch: dict) -> "MultiTransition":
@@ -123,25 +145,7 @@ class MultiTransition:
         - state: [batch, n, state_dim]
         - tokenized_prompt, tokenized_prompt_mask: Text prompts [batch, L] (shared across n)
         """
-        # Use Observation.from_dict() for standard nested dict format
-        observation = _model.Observation.from_dict(batch)
-
-        # Build next_observation from next_* keys
-        next_batch = {
-            "image": batch.get("next_image", {}),
-            "image_mask": batch.get("next_image_mask", {}),
-            "state": batch["next_state"],
-        }
-        # Use same prompt for next observation (task doesn't change within episode)
-        if "tokenized_prompt" in batch:
-            next_batch["tokenized_prompt"] = batch.get("next_tokenized_prompt", batch["tokenized_prompt"])
-        if "tokenized_prompt_mask" in batch:
-            next_batch["tokenized_prompt_mask"] = batch.get("next_tokenized_prompt_mask", batch["tokenized_prompt_mask"])
-        # Copy next_action_mask for Q(s,a) models
-        if "next_action_mask" in batch:
-            next_batch["action_mask"] = batch["next_action_mask"]
-
-        next_observation = _model.Observation.from_dict(next_batch)
+        observation, next_observation = _extract_observations_from_batch(batch)
 
         return cls(
             observation=observation,
@@ -152,7 +156,7 @@ class MultiTransition:
             mc_return=jnp.asarray(batch["mc_return"]),
             termination=jnp.asarray(batch["termination"]),
             truncation=jnp.asarray(batch["truncation"]),
-            td_discount=jnp.asarray(batch["td_discount"]) if "td_discount" in batch else None,
+            td_discount = jnp.asarray(batch["td_discount"]) if "td_discount" in batch else None,
         )
 
 
