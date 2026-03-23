@@ -182,16 +182,15 @@ def run_worker(args: WorkerArgs) -> None:
     - Apply output transforms to unnormalize actions
     - Store as [num_steps, num_samples, action_horizon, action_dim]
     """
-    import io
-
     import jax
     import jax.numpy as jnp
-    from PIL import Image
     import tensorflow as tf
     import tensorflow_datasets as tfds
 
     import openpi.models.model as _model
+    from openpi.robocoin_utils.utils import extract_embodiment
     import openpi.training.counterfactual_action_store as ca_store
+    from openpi.training.robocoin_data_loader import RLDS_TO_STANDARD_CAMERA_MAP
     from openpi.training.time_utils import Timer
     from openpi.value_functions.base_value_functions import Transition
 
@@ -284,6 +283,11 @@ def run_worker(args: WorkerArgs) -> None:
             _transforms.InjectDefaultPrompt(None),
             *data_config_for_policy.data_transforms.inputs,
             _transforms.Normalize(norm_stats, use_quantiles=data_config_for_policy.use_quantile_norm),
+            *(
+                [_transforms.Clip(data_config_for_policy.clip_normalized_bounds)]
+                if data_config_for_policy.clip_normalized_bounds is not None
+                else []
+            ),
             *data_config_for_policy.model_transforms.inputs,
         ],
         output_transforms=[
@@ -432,18 +436,10 @@ def run_worker(args: WorkerArgs) -> None:
             rlds_episode_index = get_rlds_episode_index(episode)
             num_steps = len(episode["steps"])
 
-            # Extract first_null_index (same across all steps in an episode)
-            first_null_index_val = int(episode["steps"][0]["first_null_index"])
-
-            # Extract subtask texts
-            subtask_texts = []
-            for si in range(1, max_subtasks + 1):
-                text = episode["steps"][0][f"subtask_{si}"]
-                if hasattr(text, "numpy"):
-                    text = text.numpy()
-                if isinstance(text, bytes):
-                    text = text.decode("utf-8")
-                subtask_texts.append(text)
+            repo_id = episode["episode_metadata"]["repo_id"]
+            if hasattr(repo_id, "numpy"):
+                repo_id = repo_id.numpy()
+            embodiment = extract_embodiment(repo_id)
 
             # Allocate output array (strided dimensions if stride > 1)
             num_strided_positions = (num_steps + args.stride - 1) // args.stride
@@ -452,7 +448,7 @@ def run_worker(args: WorkerArgs) -> None:
                 dtype=np.float32,
             )
 
-            if first_null_index_val == 0:
+            if not any(int(step["first_null_index"]) > 0 for step in episode["steps"]):
                 # No valid subtasks for this episode, leave all zeros
                 pass
             else:
@@ -495,6 +491,24 @@ def run_worker(args: WorkerArgs) -> None:
 
                 for strided_idx, step_idx in enumerate(range(0, num_steps, args.stride)):
                     step = episode["steps"][step_idx]
+                    first_null_index_val = int(step["first_null_index"])
+                    if first_null_index_val == 0:
+                        continue
+
+                    subtask_texts = []
+                    for si in range(1, max_subtasks + 1):
+                        text = step[f"subtask_{si}"]
+                        if hasattr(text, "numpy"):
+                            text = text.numpy()
+                        if isinstance(text, bytes):
+                            text = text.decode("utf-8")
+                        subtask_texts.append(text)
+
+                    policy_prompt = _build_policy_prompt(subtask_texts, first_null_index_val)
+                    if policy_prompt is None:
+                        continue
+
+                    first_transformed_for_step = None
 
                     # Extract observation data once per step (shared across subtasks)
                     step_state = step["observation/state"]
@@ -513,35 +527,36 @@ def run_worker(args: WorkerArgs) -> None:
                             img_data = step[cam_key]
                             if hasattr(img_data, "numpy"):
                                 img_data = img_data.numpy()
-                            raw_bytes = bytes(img_data) if not isinstance(img_data, bytes) else img_data
                             cam_name = cam_key.split("/")[-1]
-                            decoded_images[cam_name] = np.array(Image.open(io.BytesIO(raw_bytes)))
+                            standard_cam_name = RLDS_TO_STANDARD_CAMERA_MAP[cam_name]
+                            decoded_images[standard_cam_name] = np.asarray(
+                                tf.io.decode_image(img_data, expand_animations = False, dtype = tf.uint8).numpy()
+                            )
 
-                    policy_prompt = _build_policy_prompt(subtask_texts, first_null_index_val)
-                    if policy_prompt is not None:
-                        obs_dict: dict[str, Any] = {
-                            "image": dict(decoded_images),
-                            "state": step_state,
-                            "prompt": policy_prompt,
-                        }
+                    obs_dict: dict[str, Any] = {
+                        "image": dict(decoded_images),
+                        "state": step_state,
+                        "prompt": policy_prompt,
+                        "embodiment": embodiment,
+                    }
 
-                        with episode_timer.context("input_transform"):
-                            transformed = input_transform(obs_dict)
+                    with episode_timer.context("input_transform"):
+                        transformed = input_transform(obs_dict)
 
-                        transformed = {k: v for k, v in transformed.items() if not isinstance(v, str)}
-                        first_transformed_for_step = transformed
-                        if encode_images_jit is not None:
-                            transformed = {k: v for k, v in transformed.items() if k != "image"}
+                    transformed = {k: v for k, v in transformed.items() if not isinstance(v, str)}
+                    first_transformed_for_step = transformed
+                    if encode_images_jit is not None:
+                        transformed = {k: v for k, v in transformed.items() if k != "image"}
 
-                        request = PendingRequest(
-                            step_idx=step_idx,
-                            strided_idx=strided_idx,
-                            state=step_state,
-                            transformed=transformed,
-                            encoded_images=None,
-                        )
-                        pending_requests.append(request)
-                        step_requests.setdefault(step_idx, []).append(request)
+                    request = PendingRequest(
+                        step_idx=step_idx,
+                        strided_idx=strided_idx,
+                        state=step_state,
+                        transformed=transformed,
+                        encoded_images=None,
+                    )
+                    pending_requests.append(request)
+                    step_requests.setdefault(step_idx, []).append(request)
 
                     if first_transformed_for_step is not None and encode_images_jit is not None:
                         step_encoding_inputs.append((step_idx, first_transformed_for_step))

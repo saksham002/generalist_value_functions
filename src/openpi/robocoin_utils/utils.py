@@ -14,6 +14,13 @@ from openpi.models import model as _model
 from openpi.value_functions.networks.base_networks import BaseValueNetwork
 
 
+def extract_embodiment(repo_id: str | bytes) -> str:
+    """Extract embodiment name from a RoboCOIN repo identifier."""
+    if isinstance(repo_id, bytes):
+        repo_id = repo_id.decode("utf-8")
+    return "_".join(repo_id.split("/")[-1].split("_", 2)[:2])
+
+
 def detokenize_prompt(token_ids: np.ndarray, mask: np.ndarray) -> str:
     """Decode a token ID vector back to text using the PaliGemma SentencePiece model.
 

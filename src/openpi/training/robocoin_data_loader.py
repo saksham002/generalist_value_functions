@@ -37,17 +37,11 @@ import tensorflow as tf
 from openpi import transforms as _transforms
 from openpi.models.model import IMAGE_KEYS
 from openpi.models.tokenizer import Gemma3Tokenizer, PaligemmaTokenizer
+from openpi.robocoin_utils.utils import extract_embodiment
 
 import pdb
 
 logger = logging.getLogger(__name__)
-
-
-def extract_embodiment(repo_id: str | bytes) -> str:
-    """Extract embodiment name from a RoboCOIN repo_id (e.g. 'RoboCOIN/Split_aloha_plate_storage' -> 'Split_aloha')."""
-    if isinstance(repo_id, bytes):
-        repo_id = repo_id.decode("utf-8")
-    return "_".join(repo_id.split("/")[-1].split("_", 2)[:2])
 # Disable GPU for TensorFlow (we only use it for data loading)
 # tf.config.experimental.set_visible_devices([], "GPU")
 
