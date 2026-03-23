@@ -1,5 +1,4 @@
 import dataclasses
-import os
 
 import numpy as np
 import pytest
@@ -9,100 +8,75 @@ from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
 
 
-os.environ["OPENPI_ROBOCOIN_PARITY_KEEP_REPO_INDEX"] = "1"
-
-
 SEED = 86
-NUM_BATCHES_TO_SCAN = 500
-LEGACY_CONFIG_NAME = "robocoin_bimanual_paligemma_q_sarsa_chunk_wise"
-RLDS_CONFIG_NAME = "robocoin_bimanual_paligemma_q_sarsa_chunk_wise_rlds"
+SARSA_RLDS_CONFIG_NAME = "robocoin_bimanual_paligemma_q_sarsa_chunk_wise_rlds"
+PI05_RLDS_CONFIG_NAME = "robocoin_bimanual_pi05_rlds"
 
 
 def _make_train_config(config_name: str) -> _config.TrainConfig:
     config = _config.get_config(config_name)
-    return dataclasses.replace(config, batch_size = 4, seed = SEED, num_workers = 0)
+    return dataclasses.replace(config, batch_size = 256, seed = SEED, num_workers = 0)
 
 
-def _index_sample(tree, index: int):
-    if isinstance(tree, dict):
-        return {key: _index_sample(value, index) for key, value in tree.items()}
-    return np.asarray(tree)[index]
+def _action_horizon(config: _config.TrainConfig) -> int:
+    action_horizon = config.action_horizon
+    if action_horizon is None:
+        action_horizon = config.model.action_horizon
+    if action_horizon is None:
+        raise ValueError("Action horizon must be set on either TrainConfig or the model config.")
+    return action_horizon
 
 
-def _sample_key(sample) -> tuple[int, int]:
-    return int(np.asarray(sample["repo_index"]).item()), int(np.asarray(sample["index"]).item())
-
-
-def _collect_samples(config_name: str) -> dict[tuple[int, int], dict]:
-    tf.random.set_seed(SEED)
-    np.random.seed(SEED)
-
-    loader = _data_loader.create_data_loader(
-        _make_train_config(config_name),
+def _make_rlds_raw_loader(config_name: str):
+    config = _make_train_config(config_name)
+    data_config = config.data.create(config.assets_dirs, config.model)
+    dataset = _data_loader.create_rlds_dataset(
+        data_config,
+        _action_horizon(config),
+        config.batch_size,
+        split = "train",
         shuffle = False,
-        num_batches = NUM_BATCHES_TO_SCAN,
+    )
+    dataset = _data_loader.transform_iterable_dataset(dataset, data_config, is_batched = True)
+    return _data_loader.RLDSDataLoader(dataset, num_batches = 1)
+
+
+def _print_batch_structure(batch, path: str = "") -> None:
+    if isinstance(batch, dict):
+        for key in sorted(batch.keys()):
+            _print_batch_structure(batch[key], path = f"{path}.{key}" if path else key)
+        return
+    arr = np.asarray(batch)
+    print(f"  {path}: shape={arr.shape}, dtype={arr.dtype}")
+
+
+def _assert_normalized_bounds(batch: dict, key: str) -> None:
+    values = np.asarray(batch[key], dtype = np.float32)
+    abs_values = np.abs(values)
+    min_value = float(np.min(values))
+    max_value = float(np.max(values))
+    fraction_above_one = float(np.mean(abs_values > 1.0))
+
+    print(
+        f"  stats[{key}]: min={min_value:.4f}, max={max_value:.4f}, "
+        f"frac_abs_gt_1={fraction_above_one:.4%}"
     )
 
-    samples: dict[tuple[int, int], dict] = {}
-    for batch in loader:
-        batch_size = next(np.asarray(value).shape[0] for value in batch.values() if hasattr(value, "shape"))
-        for sample_index in range(batch_size):
-            sample = _index_sample(batch, sample_index)
-            key = _sample_key(sample)
-            if key in samples:
-                raise ValueError(f"Duplicate sample for key={key}")
-            samples[key] = sample
-    return samples
-
-
-def _assert_batch_equal(lhs, rhs, path: str = "batch") -> None:
-    if isinstance(lhs, dict):
-        assert isinstance(rhs, dict), f"{path}: expected dict, got {type(rhs)}"
-        lhs_keys = set(lhs.keys()) - {"_traj_index"}
-        rhs_keys = set(rhs.keys()) - {"_traj_index"}
-        assert lhs_keys == rhs_keys, f"{path}: key mismatch {sorted(lhs_keys)} != {sorted(rhs_keys)}"
-        for key in sorted(lhs_keys):
-            _assert_batch_equal(lhs[key], rhs[key], path = f"{path}.{key}")
-        return
-
-    lhs_array = np.asarray(lhs)
-    rhs_array = np.asarray(rhs)
-
-    assert lhs_array.shape == rhs_array.shape, f"{path}: shape mismatch {lhs_array.shape} != {rhs_array.shape}"
-    assert lhs_array.dtype == rhs_array.dtype, f"{path}: dtype mismatch {lhs_array.dtype} != {rhs_array.dtype}"
-    np.testing.assert_array_equal(lhs_array, rhs_array, err_msg = path)
-
-
-def _count_steps_buckets(samples: list[dict]) -> tuple[int, int]:
-    less_than_30 = 0
-    at_least_30_less_than_60 = 0
-    for sample in samples:
-        steps_to_subtask_end = int(np.asarray(sample["steps_to_subtask_end"]).item())
-        if steps_to_subtask_end < 30:
-            less_than_30 += 1
-        elif steps_to_subtask_end < 60:
-            at_least_30_less_than_60 += 1
-    return less_than_30, at_least_30_less_than_60
+    assert min_value >= -1.25, f"{key} min out of range: {min_value}"
+    assert max_value <= 1.25, f"{key} max out of range: {max_value}"
+    assert fraction_above_one < 0.05, f"{key} has too many values with |x| > 1: {fraction_above_one:.4%}"
 
 
 @pytest.mark.manual
-def test_robocoin_legacy_and_rlds_train_batches_match_exactly():
-    legacy_samples = _collect_samples(LEGACY_CONFIG_NAME)
-    rlds_samples = _collect_samples(RLDS_CONFIG_NAME)
+@pytest.mark.parametrize("config_name", [PI05_RLDS_CONFIG_NAME, SARSA_RLDS_CONFIG_NAME])
+def test_robocoin_rlds_batch_structure(config_name: str):
+    tf.random.set_seed(SEED)
+    np.random.seed(SEED)
 
-    matched_keys = sorted(set(legacy_samples) & set(rlds_samples))
-    assert matched_keys, "No overlapping (repo_index, index) pairs found across the scanned batches."
+    loader = _make_rlds_raw_loader(config_name)
+    batch = next(iter(loader))
 
-    compared_samples = [legacy_samples[key] for key in matched_keys]
-    less_than_30_count, at_least_30_less_than_60_count = _count_steps_buckets(compared_samples)
-    sample_keys = sorted(set(next(iter(compared_samples)).keys()) - {"_traj_index"})
-
-    print(f"legacy collected samples: {len(legacy_samples)}")
-    print(f"rlds collected samples: {len(rlds_samples)}")
-    print(f"matched data points compared exactly: {len(matched_keys)}")
-    print(f"compared sample keys: {sample_keys}")
-    print(f"matched data points with steps_to_subtask_end < 30: {less_than_30_count}")
-    print(f"matched data points with 30 <= steps_to_subtask_end < 60: {at_least_30_less_than_60_count}")
-
-    for key in matched_keys:
-        _assert_batch_equal(legacy_samples[key], rlds_samples[key], path = f"sample[{key}]")
+    print(f"\nRLDS batch keys and shapes (config={config_name}):")
+    _print_batch_structure(batch)
+    _assert_normalized_bounds(batch, "state")
+    _assert_normalized_bounds(batch, "actions")

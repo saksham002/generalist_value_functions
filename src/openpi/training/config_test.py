@@ -49,7 +49,6 @@ def test_robocoin_rlds_data_config_chunk_wise_create(monkeypatch):
 
     data_config = data_config_factory.create(pathlib.Path("."), model_config)
 
-    assert data_config.robocoin_data_config is None
     assert data_config.rlds_dataset_class == "robocoin"
     assert data_config.rlds_data_dir == "gs://saksham-euw4/robocoin_bimanual"
     assert data_config.datasets[0].name == "robocoin_bimanual"

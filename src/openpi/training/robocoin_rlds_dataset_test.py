@@ -6,7 +6,6 @@ import numpy as np
 import PIL.Image
 import tensorflow as tf
 
-import openpi.training.robocoin_data_loader as robocoin_data_loader
 import openpi.training.robocoin_rlds_dataset as robocoin_rlds_dataset
 
 
@@ -76,33 +75,6 @@ def _make_mock_trajectory(traj_len: int = 12) -> dict:
     }
 
 
-def _make_legacy_trajectory(traj_len: int = 12) -> dict:
-    trajectory = _make_mock_trajectory(traj_len = traj_len)
-    fps = tf.repeat(tf.cast(trajectory["traj_metadata"]["episode_metadata"]["fps"], tf.int32), traj_len)
-    repo_id = tf.repeat(trajectory["traj_metadata"]["episode_metadata"]["repo_id"], traj_len)
-    return {
-        "action": trajectory["action"],
-        "eef_sim_pose_action": trajectory["eef_sim_pose_action"],
-        "observation/state": trajectory["observation/state"],
-        "observation/image/cam_0": trajectory["observation/image/cam_0"],
-        "observation/image/cam_1": trajectory["observation/image/cam_1"],
-        "observation/image/cam_2": trajectory["observation/image/cam_2"],
-        "subtask_1": trajectory["subtask_1"],
-        "subtask_2": trajectory["subtask_2"],
-        "subtask_3": trajectory["subtask_3"],
-        "subtask_4": trajectory["subtask_4"],
-        "subtask_5": trajectory["subtask_5"],
-        "steps_to_subtask_end": trajectory["steps_to_subtask_end"],
-        "first_null_index": trajectory["first_null_index"],
-        "episode_index": trajectory["episode_index"],
-        "_frame_index": trajectory["_frame_index"],
-        "_traj_index": trajectory["_traj_index"],
-        "_len": tf.repeat(tf.constant(traj_len, dtype = tf.int32), traj_len),
-        "fps": fps,
-        "repo_id": repo_id,
-    }
-
-
 def _make_frame_for_transforms(
     *,
     first_null_index: int = 4,
@@ -124,55 +96,6 @@ def _make_frame_for_transforms(
         },
         "actions": tf.constant(np.arange(140).reshape(10, 14), dtype = tf.float32),
         "next_actions": tf.constant(np.arange(140, 280).reshape(10, 14), dtype = tf.float32),
-        "action_mask": tf.constant(
-            [
-                [True] * 10,
-                [True] * 5 + [False] * 5,
-                [True] * 4 + [False] * 6,
-                [True] * 3 + [False] * 7,
-                [False] * 10,
-            ],
-            dtype = tf.bool,
-        ),
-        "next_action_mask": tf.constant(
-            [
-                [True] * 10,
-                [True] * 5 + [False] * 5,
-                [True] * 4 + [False] * 6,
-                [True] * 3 + [False] * 7,
-                [False] * 10,
-            ],
-            dtype = tf.bool,
-        ),
-        "subtask_1": tf.constant(b"pick up the cup."),
-        "subtask_2": tf.constant(b"place on table"),
-        "subtask_3": tf.constant(b"static"),
-        "subtask_4": tf.constant(b"abnormal"),
-        "subtask_5": tf.constant(b"null"),
-        "steps_to_subtask_end": tf.constant(list(steps_to_subtask_end), dtype = tf.int32),
-        "first_null_index": tf.constant(first_null_index, dtype = tf.int32),
-        "fps": tf.constant(fps, dtype = tf.int32),
-        "repo_id": tf.constant(b"RoboCOIN/Split_aloha_plate_storage"),
-    }
-
-
-def _make_legacy_frame_for_transforms(
-    *,
-    first_null_index: int = 4,
-    steps_to_subtask_end: list[int] | tuple[int, ...] = (9, 4, 3, 2, 0),
-    fps: int = 30,
-) -> dict:
-    return {
-        "observation/state": tf.constant(np.arange(14), dtype = tf.float32),
-        "next_observation/state": tf.constant(np.arange(14) + 100, dtype = tf.float32),
-        "observation/image/cam_0": tf.constant(VALID_JPEG_BYTES),
-        "observation/image/cam_1": tf.constant(VALID_JPEG_BYTES),
-        "observation/image/cam_2": tf.constant(VALID_JPEG_BYTES),
-        "next_observation/image/cam_0": tf.constant(VALID_JPEG_BYTES),
-        "next_observation/image/cam_1": tf.constant(VALID_JPEG_BYTES),
-        "next_observation/image/cam_2": tf.constant(VALID_JPEG_BYTES),
-        "action_chunk": tf.constant(np.arange(140).reshape(10, 14), dtype = tf.float32),
-        "next_action_chunk": tf.constant(np.arange(140, 280).reshape(10, 14), dtype = tf.float32),
         "action_mask": tf.constant(
             [
                 [True] * 10,
@@ -261,20 +184,6 @@ class TestTrajectoryTransforms:
             [True, True, True, True, True, False, False, False, False, False],
         )
 
-    def test_prepare_trajectory_matches_add_trajectory_keys(self):
-        dataset = _make_robocoin_dataset_for_unit_tests(critic_mode = True, td_n = 10)
-        prepared = dataset._prepare_trajectory(_make_mock_trajectory(traj_len = 20), dataset_cfg = None)  # noqa: SLF001
-
-        legacy = robocoin_data_loader.AddTrajectoryKeys(td_n = 10, action_horizon = 10).map(
-            _make_legacy_trajectory(traj_len = 20)
-        )
-
-        np.testing.assert_array_equal(prepared["next_observation"]["state"].numpy(), legacy["next_observation/state"].numpy())
-        np.testing.assert_array_equal(prepared["next_actions_raw"].numpy(), legacy["next_action_chunk"].numpy()[:, 0])
-        np.testing.assert_array_equal(prepared["action_mask"].numpy(), legacy["action_mask"].numpy())
-        np.testing.assert_array_equal(prepared["next_action_mask"].numpy(), legacy["next_action_mask"].numpy())
-
-
 class TestFrameTransforms:
     def test_critic_mode_selects_sampled_subtask_and_computes_td_fields(self):
         dataset = _make_robocoin_dataset_for_unit_tests(critic_mode = True, td_n = 10)
@@ -323,41 +232,6 @@ class TestFrameTransforms:
         result = dataset.frame_transforms(_make_frame_for_transforms(fps = 50))
 
         assert not bool(result["loss_mask"].numpy())
-
-    def test_critic_mode_matches_main_transform(self):
-        dataset = _make_robocoin_dataset_for_unit_tests(critic_mode = True, td_n = 10)
-        legacy_transform = robocoin_data_loader.MainTransform(
-            max_cameras = 3,
-            use_eef = False,
-            discount = 0.99,
-            td_n = 10,
-            critic_mode = True,
-        )
-
-        tf.random.set_seed(86)
-        result = dataset.frame_transforms(_make_frame_for_transforms())
-        tf.random.set_seed(86)
-        legacy_result = legacy_transform.map(_make_legacy_frame_for_transforms())
-
-        for key in (
-            "state",
-            "next_state",
-            "actions",
-            "next_actions",
-            "action_mask",
-            "next_action_mask",
-            "prompt",
-            "steps_to_subtask_end",
-            "sampled_index",
-            "loss_mask",
-            "mc_return",
-            "td_discount",
-            "termination",
-            "reward",
-            "truncation",
-        ):
-            np.testing.assert_array_equal(result[key].numpy(), legacy_result[key].numpy())
-
 
 class TestFiltering:
     def test_frame_filter_uses_fps_aware_filter_n(self):

@@ -9,7 +9,7 @@ import tensorflow_datasets as tfds
 from openpi.robocoin_utils.utils import extract_embodiment
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
-from openpi.training.robocoin_data_loader import RLDS_TO_STANDARD_CAMERA_MAP
+from openpi.robocoin_utils.utils import RLDS_TO_STANDARD_CAMERA_MAP
 import openpi.transforms as _transforms
 
 

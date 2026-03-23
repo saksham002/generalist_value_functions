@@ -19,8 +19,6 @@ import numpy as np
 import orbax.checkpoint as ocp
 import safetensors
 import torch
-
-from openpi.models_pytorch import pi0_pytorch
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
 
@@ -269,6 +267,8 @@ class BaseModelConfig(abc.ABC):
 
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
+        from openpi.models_pytorch import pi0_pytorch
+
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
         safetensors.torch.load_model(model, weight_path)
         return model
