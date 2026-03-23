@@ -43,7 +43,6 @@ import openpi.training.weight_loaders as _weight_loaders
 import openpi.transforms as _transforms
 import openpi.value_functions.base_value_functions as _value_fn
 import openpi.value_functions.value_function as _value_fn_impl
-from openpi.training.robocoin_data_loader import RoboCOINDataLoaderConfig, create_robocoin_data_loader
 from openpi.robocoin_utils.utils import (
     cache_val_episodes,
     count_subtask_segments,
@@ -331,13 +330,10 @@ def log_memory_debug(step: int, data_loader=None, force_gc: bool = False, log_to
     )
     
     # Log data loader buffer stats if available
-    # Navigate through wrapper chain: DataLoaderImpl -> RoboCOINDataLoader -> AsyncBatchPrefetcher
     prefetcher = None
     if data_loader is not None:
-        # Try direct buffer access first
         if hasattr(data_loader, 'buffer'):
             prefetcher = data_loader
-        # Try DataLoaderImpl._data_loader (RoboCOINDataLoader)._iterator (AsyncBatchPrefetcher)
         elif hasattr(data_loader, '_data_loader'):
             inner = data_loader._data_loader
             if hasattr(inner, '_iterator') and inner._iterator is not None:
@@ -1843,20 +1839,6 @@ def main(config: _config.TrainConfig):
     init_wandb(config, resuming=wandb_resuming, enabled=config.wandb_enabled, ft_config=ft_config)
     logging.info(f"Initialized checkpoint manager with resuming={resuming}, config.resume={config.resume}")
 
-    if ft_config is not None and isinstance(config.data, _config.RoboCOINDataConfig):
-        logging.info(f"Fine-tune mode: applying overrides from '{ft_config.name}' (val_only={ft_config.val_only})")
-        import dataclasses as dc
-
-        data_overrides = {}
-        if ft_config.data_dir is not None:
-            data_overrides["tfds_data_dir"] = ft_config.data_dir
-        if ft_config.dataset_name is not None:
-            data_overrides["dataset_name"] = ft_config.dataset_name
-        if ft_config.norm_stats_path is not None:
-            data_overrides["norm_stats_path"] = ft_config.norm_stats_path
-        if data_overrides:
-            config = dc.replace(config, data = dc.replace(config.data, **data_overrides))
-
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
@@ -1902,70 +1884,6 @@ def main(config: _config.TrainConfig):
             reward_bias=data_config.reward_bias,
         )
         val_dataloader = None
-    elif data_config.robocoin_data_config is not None:
-        # RoboCOIN: get num_episodes from TFDS builder metadata
-        import tensorflow_datasets as tfds
-        
-        robocoin_config = data_config.robocoin_data_config
-        builder = tfds.builder(robocoin_config.dataset_name, data_dir=robocoin_config.data_dir)
-        num_episodes = builder.info.splits["val"].num_examples
-        logging.info(f"RoboCOIN: {num_episodes} episodes in validation set")
-        
-        # Select validation episode indices for RoboCOIN
-        val_rng = np.random.default_rng(config.seed)
-        val_episode_indices = val_rng.choice(
-            num_episodes, size=min(effective_num_val_trajectories, num_episodes), replace=False
-        ).tolist()
-        logging.info(f"Selected validation episodes: {val_episode_indices}")
-
-        # Cache validation episodes to disk - only worker 0 collects and caches
-        val_episodes_cache_dir = effective_validation_cache_dir if effective_validation_cache_dir is not None else str(config.checkpoint_dir / "val_episodes")
-
-        if jax.process_index() == 0:
-            logging.info("Worker 0: Collecting validation episodes for caching")
-
-            import dataclasses as dc
-            from openpi.models.tokenizer import create_tokenizer
-
-            val_loader_config = dc.replace(
-                robocoin_config,
-                split="val",
-                batch_size=64,
-                prefetch_buffer_size=2,
-                shuffle=False,
-                repeat=False,
-                action_horizon = config.action_horizon or 5,
-                state_norm_stats = data_config.norm_stats,
-                use_quantile_norm = data_config.use_quantile_norm,
-            )
-            num_images = val_loader_config.max_cameras if config.backbone_variant == "gemma3" else 0
-            val_tokenizer = create_tokenizer(config.backbone_variant, val_loader_config.max_token_len, num_images = num_images)
-            val_dataloader = create_robocoin_data_loader(val_loader_config, tokenizer = val_tokenizer)
-
-            generate_validation_plots_dlimp(
-                model=None,  # Not needed for save_only
-                val_dataloader=val_dataloader,
-                val_episode_indices=val_episode_indices,
-                step=0,
-                action_conditioned=False,  # Not used for save_only
-                data_config=data_config,
-                cache_dir=val_episodes_cache_dir,
-                save_only=True,
-                include_repos=effective_include_repos,
-            )
-            del val_dataloader
-            logging.info("Validation episodes cached successfully")
-        else:
-            logging.info(f"Worker {jax.process_index()}: Skipping validation cache collection (worker 0 handles this)")
-        
-        # val_dataloader = None
-        # num_episodes = 100
-        # val_rng = np.random.default_rng(config.seed)
-        # val_episode_indices = val_rng.choice(
-        #     num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
-        # ).tolist()
-
-        val_dataset = None
     elif data_config.rlds_dataset_class == "robocoin":
         logging.info("Skipping validation cache setup for RoboCOIN RLDS configs.")
         val_dataset = None
@@ -2047,17 +1965,7 @@ def main(config: _config.TrainConfig):
         step = int(critic_state.step)
         model = nnx.merge(critic_state.model_def, critic_state.params)
 
-        if data_config.robocoin_data_config is not None:
-            generate_validation_plots_dlimp(
-                model=model,
-                val_dataloader=None,
-                val_episode_indices=val_episode_indices,
-                step=step,
-                action_conditioned=action_conditioned,
-                data_config=data_config,
-                cache_dir=val_episodes_cache_dir,
-            )
-        elif data_config.rlds_dataset_class == "robocoin":
+        if data_config.rlds_dataset_class == "robocoin":
             logging.info("Skipping validation plotting for RoboCOIN RLDS configs.")
         else:
             plot_images = generate_validation_plots(
@@ -2233,19 +2141,7 @@ def main(config: _config.TrainConfig):
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
-                # Use dlimp-based validation for RoboCOIN, standard for others
-                if data_config.robocoin_data_config is not None:
-                    # Inference runs on all workers; rendering/logging dispatched to background thread on worker 0.
-                    generate_validation_plots_dlimp(
-                        model=model,
-                        val_dataloader=None,
-                        val_episode_indices=val_episode_indices,
-                        step=step,
-                        action_conditioned=action_conditioned,
-                        data_config=data_config,
-                        cache_dir=val_episodes_cache_dir,
-                    )
-                elif data_config.rlds_dataset_class == "robocoin":
+                if data_config.rlds_dataset_class == "robocoin":
                     logging.info("Skipping validation plotting for RoboCOIN RLDS configs.")
                 else:
                     plot_images = generate_validation_plots(

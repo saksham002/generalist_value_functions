@@ -155,10 +155,6 @@ class DataConfig:
     # Keys to skip during normalization/unnormalization
     skip_normalize_keys: tuple[str, ...] = ()
 
-    # RoboCOIN-specific data loader config (if set, uses DLIMP-based loader)
-    # This is set by RoboCOINDataConfig.create() and detected by create_data_loader()
-    robocoin_data_config: Any | None = None
-
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -800,346 +796,18 @@ class MultiTransitionLegacyD4RLDataConfig(LegacyD4RLDataConfig):
 
 
 @dataclasses.dataclass(frozen=True)
-class RoboCOINDataConfig(DataConfigFactory):
-    """Data config for RoboCOIN TFDS dataset with images, text, and state.
-
-    This config enables DLIMP-based data loading for the RoboCOIN dataset,
-    which contains robot manipulation trajectories with:
-    - Camera images (up to 3 views)
-    - Proprioceptive state
-    - Task descriptions (text prompts)
-    - Actions
-    - Rewards
-
-    Uses the custom DLIMP data loader for efficient image-heavy data loading.
-
-    Normalization:
-    - use_quantile_norm=False: z-score using mean/std keys from norm_stats.json
-    - use_quantile_norm=True: min-max using min/max keys from norm_stats.json
-    """
-
-    # Path to TFDS data directory
-    tfds_data_dir: str = "/data/group_data/rl/saksham3/"
-    # Dataset name and version
-    dataset_name: str = "robocoin:1.0.0"
-    # Maximum number of camera views
-    max_cameras: int = 3
-    # Target image size (H, W)
-    image_size: tuple[int, int] = (224, 224)
-    # Maximum state dimension (for padding)
-    max_state_dim: int = 118
-    # Maximum action dimension (for padding)
-    max_action_dim: int = 54
-    # Discount factor for MC return computation
-    discount: float = 0.99
-    # Reward transformation: r' = reward_scale * r + reward_bias
-    reward_scale: float = 1.0
-    reward_bias: float = 0.0
-    # Local (per-host) shuffle buffer size for frame-level shuffling
-    local_shuffle_buffer_size: int = 50000
-    # TD-n parameter for temporal difference learning
-    # - None: MC (Monte Carlo) learning - uses full episode return
-    # - int: TD-n learning - bootstraps with value at t + td_n
-    td_n: int | None = None
-
-    # Whether to use end-effector position state instead of joint angles.
-    # If True, constructs 14-D state as: [eef_sim_pose_state[:6], state[6], eef_sim_pose_state[6:12], state[13]]
-    # where eef_sim_pose_state is 12-D (6 left EEF + 6 right EEF) and state[6], state[13] are grippers.
-    # Requires "eef_sim_pose_state" key in norm_stats.json for normalization of EEF components.
-    use_eef: bool = False
-
-    # Path to norm_stats.json file (RoboCOIN-specific format)
-    # Expected format: {"observation.state": {"mean": [...], "std": [...], "min": [...], "max": [...]}}
-    # For use_eef=True, also requires: {"eef_sim_pose_state": {"mean": [...], "std": [...], ...}}
-    # Supports both local paths and GCS paths (gs://...)
-    norm_stats_path: str | None = "gs://saksham-euw4/robocoin/norm_stats/norm_stats.json"
-
-    # Normalization method:
-    # - False: z-score normalization using mean/std keys
-    # - True: min-max normalization using min/max keys (mapped to q01/q99 for quantile transform)
-    use_quantile_norm: bool = False
-
-    # Maximum token length for prompt tokenization.
-    max_token_len: int = 48
-
-    # If set, filter out frames where the sampled subtask's steps_to_subtask_end < filter_n
-    filter_n: int | None = None
-
-    # If True, mask out 50fps samples (loss_mask = False for fps != 30)
-    mask_50fps: bool = False
-
-    # If True, action_mask is set to all True and positions that would have been
-    # masked are replaced with the last valid action plus Gaussian noise (std=0.005).
-    dont_mask_actions: bool = False
-
-    # If True, subtract the first action in the chunk from all actions (chunk-wise delta).
-    # Uses action_diff / eef_sim_pose_action_diff norm stats keys instead of action / eef_sim_pose_action.
-    use_chunk_wise_delta: bool = False
-
-    # When False, DataLoaderImpl returns (Observation, Actions) tuples for policy training.
-    # When True, returns raw dicts for value function / RL training.
-    critic_mode: bool = True
-
-    # Override repo_id from parent - not used for RoboCOIN
-    repo_id: str = "robocoin"
-
-    def _build_norm_stats_from_raw(self, data: dict) -> dict[str, _transforms.NormStats]:
-        """Build a dict of NormStats from raw JSON data (flat format with keys like 'observation.state')."""
-        import numpy as np
-
-        norm_stats = {}
-
-        if "observation.state" not in data:
-            raise ValueError(f"norm_stats.json requires 'observation.state' key, but found: {list(data.keys())}")
-
-        state_stats = data["observation.state"]
-
-        if self.use_quantile_norm:
-            q_lo, q_hi = "q01", "q99"
-            if q_lo not in state_stats or q_hi not in state_stats:
-                raise ValueError(
-                    f"use_quantile_norm=True requires '{q_lo}' and '{q_hi}' keys in norm_stats, "
-                    f"but found: {list(state_stats.keys())}"
-                )
-            q01_arr = np.array(state_stats[q_lo])
-            q99_arr = np.array(state_stats[q_hi])
-            norm_stats["state"] = _transforms.NormStats(
-                mean=np.zeros_like(q01_arr),
-                std=np.ones_like(q01_arr),
-                q01=q01_arr,
-                q99=q99_arr,
-            )
-        else:
-            if "mean" not in state_stats or "std" not in state_stats:
-                raise ValueError(
-                    f"use_quantile_norm=False requires 'mean' and 'std' keys in norm_stats, "
-                    f"but found: {list(state_stats.keys())}"
-                )
-            mean_arr = np.array(state_stats["mean"])
-            norm_stats["state"] = _transforms.NormStats(
-                mean=mean_arr,
-                std=np.array(state_stats["std"]),
-                q01=np.zeros_like(mean_arr),
-                q99=np.ones_like(mean_arr),
-            )
-
-        action_key = "action_diff" if self.use_chunk_wise_delta else "action"
-        eef_action_key = "eef_sim_pose_action_diff" if self.use_chunk_wise_delta else "eef_sim_pose_action"
-        ax = -1 if self.use_chunk_wise_delta else 0
-
-        if action_key in data:
-            action_stats = data[action_key]
-
-            if self.use_eef:
-                if eef_action_key not in data:
-                    raise ValueError(f"use_eef=True requires '{eef_action_key}' key in norm_stats.json, but found: {list(data.keys())}")
-                eef_action_stats = data[eef_action_key]
-
-                if self.use_quantile_norm:
-                    q_lo, q_hi = "q01", "q99"
-                    combined_action_q01 = np.concatenate(
-                        [
-                            np.array(eef_action_stats[q_lo])[..., :6],
-                            np.array(action_stats[q_lo])[..., 6:7],
-                            np.array(eef_action_stats[q_lo])[..., 6:12],
-                            np.array(action_stats[q_lo])[..., 13:14],
-                        ],
-                        axis = ax,
-                    )
-                    combined_action_q99 = np.concatenate(
-                        [
-                            np.array(eef_action_stats[q_hi])[..., :6],
-                            np.array(action_stats[q_hi])[..., 6:7],
-                            np.array(eef_action_stats[q_hi])[..., 6:12],
-                            np.array(action_stats[q_hi])[..., 13:14],
-                        ],
-                        axis = ax,
-                    )
-                    norm_stats["actions"] = _transforms.NormStats(
-                        mean=np.zeros_like(combined_action_q01),
-                        std=np.ones_like(combined_action_q01),
-                        q01=combined_action_q01,
-                        q99=combined_action_q99,
-                    )
-                else:
-                    combined_action_mean = np.concatenate(
-                        [
-                            np.array(eef_action_stats["mean"])[..., :6],
-                            np.array(action_stats["mean"])[..., 6:7],
-                            np.array(eef_action_stats["mean"])[..., 6:12],
-                            np.array(action_stats["mean"])[..., 13:14],
-                        ],
-                        axis = ax,
-                    )
-                    combined_action_std = np.concatenate(
-                        [
-                            np.array(eef_action_stats["std"])[..., :6],
-                            np.array(action_stats["std"])[..., 6:7],
-                            np.array(eef_action_stats["std"])[..., 6:12],
-                            np.array(action_stats["std"])[..., 13:14],
-                        ],
-                        axis = ax,
-                    )
-                    norm_stats["actions"] = _transforms.NormStats(
-                        mean=combined_action_mean,
-                        std=combined_action_std,
-                        q01=np.zeros_like(combined_action_mean),
-                        q99=np.ones_like(combined_action_mean),
-                    )
-            elif self.use_quantile_norm:
-                q_lo, q_hi = "q01", "q99"
-                q01_arr = np.array(action_stats[q_lo])
-                q99_arr = np.array(action_stats[q_hi])
-                norm_stats["actions"] = _transforms.NormStats(
-                    mean=np.zeros_like(q01_arr),
-                    std=np.ones_like(q01_arr),
-                    q01=q01_arr,
-                    q99=q99_arr,
-                )
-            else:
-                mean_arr = np.array(action_stats["mean"])
-                norm_stats["actions"] = _transforms.NormStats(
-                    mean=mean_arr,
-                    std=np.array(action_stats["std"]),
-                    q01=np.zeros_like(mean_arr),
-                    q99=np.ones_like(mean_arr),
-                )
-
-        if "state" in norm_stats:
-            norm_stats["next_state"] = norm_stats["state"]
-        if "actions" in norm_stats:
-            norm_stats["next_actions"] = norm_stats["actions"]
-
-        return norm_stats
-
-    def _load_robocoin_norm_stats(self) -> dict[str, _transforms.NormStats] | dict[str, dict[str, _transforms.NormStats]] | None:
-        """Load normalization stats from RoboCOIN-specific JSON format.
-
-        Supports two formats:
-        - Flat: top-level keys are stat keys (e.g. 'observation.state', 'action').
-          Returns dict[str, NormStats].
-        - Embodiment-keyed: top-level keys are embodiment names, each mapping to a flat dict.
-          Returns dict[str, dict[str, NormStats]] (embodiment -> stat key -> NormStats).
-
-        Supports both local paths and GCS paths (gs://...).
-        """
-        if self.norm_stats_path is None:
-            return None
-
-        import json
-
-        path_str = self.norm_stats_path
-
-        if path_str.startswith("gs://"):
-            import tensorflow as tf
-
-            if not tf.io.gfile.exists(path_str):
-                raise FileNotFoundError(
-                    f"RoboCOIN norm_stats file not found at GCS path: {path_str}\n"
-                    f"Please upload the norm_stats.json file or set norm_stats_path=None to skip normalization."
-                )
-
-            with tf.io.gfile.GFile(path_str, "r") as f:
-                data = json.load(f)
-        else:
-            path = pathlib.Path(path_str)
-            if not path.exists():
-                raise FileNotFoundError(
-                    f"RoboCOIN norm_stats file not found at: {path}\n"
-                    f"Please create the norm_stats.json file or set norm_stats_path=None to skip normalization."
-                )
-
-            with open(path) as f:
-                data = json.load(f)
-
-        # Detect embodiment-keyed format: first value is a dict containing 'observation.state'
-        first_value = next(iter(data.values()))
-        if isinstance(first_value, dict) and "observation.state" in first_value:
-            norm_stats = {emb: self._build_norm_stats_from_raw(emb_data) for emb, emb_data in data.items()}
-            logging.info(f"Loaded embodiment-keyed RoboCOIN norm_stats from {path_str}, embodiments: {list(norm_stats.keys())}")
-            return norm_stats
-
-        norm_stats = self._build_norm_stats_from_raw(data)
-        logging.info(f"Loaded RoboCOIN norm_stats from {path_str}, keys: {list(norm_stats.keys())}")
-        return norm_stats if norm_stats else None
-
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        assert not (not self.critic_mode and self.dont_mask_actions), (
-            "dont_mask_actions=True is incompatible with critic_mode=False (policy training): "
-            "synthetic action padding would corrupt the flow matching loss."
-        )
-        if self.critic_mode:
-            data_transforms = _transforms.Group(
-                inputs=[_value_transforms.ValueFunctionInputs()],
-                outputs=[],
-            )
-            # Critics don't need discrete state tokenization or action padding.
-            # Tokenization (with state=None) is handled in RoboCOINPostTFTransform.
-            model_transforms = _transforms.Group(inputs=[], outputs=[])
-        else:
-            data_transforms = _transforms.Group(inputs=[], outputs=[])
-            # Policy training: use standard model transforms (TokenizePrompt + PadStatesAndActions).
-            model_transforms = ModelTransformFactory(default_prompt = None)(model_config)
-
-        # Use dataset name as asset_id
-        asset_id = self.dataset_name.replace(":", "_").replace("/", "_")
-
-        # Load RoboCOIN-specific norm stats
-        norm_stats = self._load_robocoin_norm_stats()
-
-        # Create the RoboCOIN data loader config
-        robocoin_loader_config = self.get_data_loader_config()
-
-        # Store RoboCOIN-specific config in a way the data loader can access
-        # The training script will detect robocoin_data_config and use the custom loader
-        return DataConfig(
-            repo_id=None,  # Not using LeRobot
-            asset_id=asset_id,
-            norm_stats=norm_stats,
-            repack_transforms=_transforms.Group(inputs=[]),
-            data_transforms=data_transforms,
-            model_transforms=model_transforms,
-            use_quantile_norm=self.use_quantile_norm,
-            critic_mode=self.critic_mode,
-            discount=self.discount,
-            reward_scale=self.reward_scale,
-            reward_bias=self.reward_bias,
-            # Store RoboCOIN loader config for detection by create_data_loader
-            robocoin_data_config=robocoin_loader_config,
-        )
-
-    def get_data_loader_config(self):
-        """Return the RoboCOINDataLoaderConfig for the custom data loader."""
-        from openpi.training.robocoin_data_loader import RoboCOINDataLoaderConfig
-
-        return RoboCOINDataLoaderConfig(
-            data_dir=self.tfds_data_dir,
-            dataset_name=self.dataset_name,
-            max_cameras=self.max_cameras,
-            max_state_dim=self.max_state_dim,
-            max_action_dim=self.max_action_dim,
-            image_size=self.image_size,
-            max_token_len=self.max_token_len,
-            discount=self.discount,
-            reward_scale=self.reward_scale,
-            reward_bias=self.reward_bias,
-            local_shuffle_buffer_size=self.local_shuffle_buffer_size,
-            td_n=self.td_n,
-            use_eef=self.use_eef,
-            filter_n=self.filter_n,
-            mask_50fps=self.mask_50fps,
-            dont_mask_actions=self.dont_mask_actions,
-            use_chunk_wise_delta=self.use_chunk_wise_delta,
-            critic_mode=self.critic_mode,
-            use_quantile_norm=self.use_quantile_norm,
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class RoboCoinRldsDataConfig(RoboCOINDataConfig):
+class RoboCoinRldsDataConfig(DataConfigFactory):
     """Data config for RoboCOIN using the RLDS dataset pipeline."""
 
+    repo_id: str = "robocoin"
+    assets: AssetsConfig = dataclasses.field(
+        default_factory = lambda: AssetsConfig(
+            assets_dir = "gs://saksham-euw4/robocoin_bimanual/norm_stats",
+            asset_id = "embodiment_wise",
+        )
+    )
+
+    # RLDS dataset loading
     rlds_data_dir: str = "gs://saksham-euw4/robocoin_bimanual"
     datasets: Sequence[rlds_dataset.RLDSDataset] = (
         rlds_dataset.RLDSDataset(name = "robocoin_bimanual", version = "1.0.0", weight = 1.0),
@@ -1153,9 +821,116 @@ class RoboCoinRldsDataConfig(RoboCOINDataConfig):
     num_parallel_reads: int = 8
     num_parallel_calls: int = 8
 
+    # Image and model
+    image_size: tuple[int, int] = (224, 224)
+    max_token_len: int = 48
+
+    # RL training
+    discount: float = 0.99
+    reward_scale: float = 1.0
+    reward_bias: float = 0.0
+    critic_mode: bool = True
+
+    # Data pipeline options
+    td_n: int | None = None
+    use_eef: bool = False
+    use_quantile_norm: bool = False
+    filter_n: int | None = None
+    mask_50fps: bool = False
+    dont_mask_actions: bool = False
+    use_chunk_wise_delta: bool = False
+
     def __post_init__(self) -> None:
         if self.latent_views and self.latent_store_dir is None:
             raise ValueError("latent_views requires latent_store_dir to be set.")
+
+    @override
+    def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict | None:
+        """Load norm stats, handling both standard openpi format and RoboCOIN-specific format.
+
+        Standard format: {"norm_stats": {"state": {"mean": [...], ...}, ...}}
+        RoboCOIN format: {"embodiment": {"observation.state": {"mean": [...], ...}, "action": {...}, ...}, ...}
+
+        For RoboCOIN format, converts key names (observation.state → state, action → actions) and applies
+        EEF combining / chunk-wise delta selection based on config flags.
+        """
+        if asset_id is None:
+            return None
+
+        import json
+
+        path = epath.Path(str(assets_dir / asset_id)) / "norm_stats.json"
+        if not path.exists():
+            logging.info(f"Norm stats not found at {path}, skipping.")
+            return None
+
+        data = json.loads(path.read_text())
+
+        if "norm_stats" in data:
+            return _normalize.deserialize_json(path.read_text())
+
+        # RoboCOIN format: top-level keys are embodiment names
+        result = {}
+        for embodiment, emb_data in data.items():
+            if not isinstance(emb_data, dict) or "observation.state" not in emb_data:
+                continue
+            result[embodiment] = self._convert_robocoin_stats(emb_data)
+
+        if not result:
+            return None
+
+        logging.info(f"Loaded embodiment-keyed RoboCOIN norm_stats from {path}, embodiments: {list(result.keys())}")
+        return result
+
+    def _convert_robocoin_stats(self, data: dict) -> dict[str, _transforms.NormStats]:
+        """Convert a single embodiment's RoboCOIN-format stats to NormStats dict."""
+        import numpy as np
+
+        norm_stats: dict[str, _transforms.NormStats] = {}
+
+        state_stats = data["observation.state"]
+        norm_stats["state"] = _transforms.NormStats(
+            mean = np.array(state_stats["mean"]),
+            std = np.array(state_stats["std"]),
+            q01 = np.array(state_stats["q01"]),
+            q99 = np.array(state_stats["q99"]),
+        )
+
+        action_key = "action_diff" if self.use_chunk_wise_delta else "action"
+        eef_action_key = "eef_sim_pose_action_diff" if self.use_chunk_wise_delta else "eef_sim_pose_action"
+        ax = -1 if self.use_chunk_wise_delta else 0
+
+        if action_key in data:
+            action_stats = data[action_key]
+
+            if self.use_eef:
+                eef_action_stats = data[eef_action_key]
+                combined = {}
+                for stat_key in ("mean", "std", "q01", "q99"):
+                    combined[stat_key] = np.concatenate(
+                        [
+                            np.array(eef_action_stats[stat_key])[..., :6],
+                            np.array(action_stats[stat_key])[..., 6:7],
+                            np.array(eef_action_stats[stat_key])[..., 6:12],
+                            np.array(action_stats[stat_key])[..., 13:14],
+                        ],
+                        axis = ax,
+                    )
+                norm_stats["actions"] = _transforms.NormStats(**combined)
+            else:
+                norm_stats["actions"] = _transforms.NormStats(
+                    mean = np.array(action_stats["mean"]),
+                    std = np.array(action_stats["std"]),
+                    q01 = np.array(action_stats["q01"]),
+                    q99 = np.array(action_stats["q99"]),
+                )
+
+        if "state" in norm_stats:
+            norm_stats["next_state"] = norm_stats["state"]
+        if "actions" in norm_stats:
+            norm_stats["next_actions"] = norm_stats["actions"]
+
+        return norm_stats
 
     def _create_clip_normalized_bounds(self) -> dict[str, tuple[float, float]]:
         clip_bound = 1.25 if self.use_quantile_norm else 5.0
@@ -1215,9 +990,8 @@ class RoboCoinRldsDataConfig(RoboCOINDataConfig):
         if not self.datasets:
             raise ValueError("RoboCoinRldsDataConfig requires at least one RLDS dataset.")
 
-        norm_stats = self._load_robocoin_norm_stats()
-
         asset_id = self.assets.asset_id or self.datasets[0].name
+        norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
 
         return DataConfig(
             repo_id = self.repo_id,
@@ -2878,292 +2652,6 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
-    #
-    # RoboCOIN PaliGemma V(s) value function configs.
-    #
-    TrainConfig(
-        name="debug_robocoin_paligemma",
-        model=_value_function.MCValueFunctionConfig(
-            network_config=_paligemma_network.PaliGemmaNetworkConfig(
-                state_dim=14,  # Proprioceptive state dimension for RoboCOIN
-                num_cameras=3,  # cam_0, cam_1, cam_2
-                image_size=(224, 224),
-                max_token_len=48,  # Max tokens for subtask text
-            ),
-            head_config=_heads.RegressionHeadConfig(),
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin:1.0.0",
-            discount=0.999,
-            local_shuffle_buffer_size=50000,
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json"
-        ),
-        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=5,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=120_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,  # DLIMP handles its own parallelism
-        log_interval=100,
-        plot_interval=200_000,
-        save_interval=200_000,
-        fsdp_devices=16,
-        # wandb_enabled=False,
-        validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache/",
-    ),
-    # RoboCOIN V(s) with MC regression, EEF state, bimanual dataset.
-    TrainConfig(
-        name="robocoin_bimanual_paligemma_v_mc",
-        model=_value_function.MCValueFunctionConfig(
-            network_config=_paligemma_network.PaliGemmaNetworkConfig(
-                state_dim=14,
-                num_cameras=3,
-                image_size=(224, 224),
-                max_token_len=48,
-            ),
-            head_config=_heads.RegressionHeadConfig(),
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
-            discount=0.999,
-            use_eef=True,
-        ),
-        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=120_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=120_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        plot_interval=10_000,
-        save_interval=10_000,
-        fsdp_devices=16,
-        num_val_trajectories=10,
-        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
-    ),
-    # RoboCOIN V(s) with MC objective and HL-Gauss head (101 bins), EEF state, bimanual dataset.
-    TrainConfig(
-        name="robocoin_bimanual_paligemma_v_mc_hl_gauss",
-        model=_value_function.MCValueFunctionConfig(
-            network_config=_paligemma_network.PaliGemmaNetworkConfig(
-                state_dim=14,
-                num_cameras=3,
-                image_size=(224, 224),
-                max_token_len=48,
-            ),
-            head_config=_heads.CategoricalHeadConfig(
-                v_min=0.0,
-                v_max=1.0,
-                num_bins=101,
-                sigma=0.0075,
-            ),
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
-            discount=0.999,
-            use_eef=True,
-        ),
-        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=230_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=230_000,
-            decay_lr=1e-5,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        plot_interval=30_000,
-        save_interval=30_000,
-        fsdp_devices=16,
-        num_val_trajectories=10,
-        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
-    ),
-    # RoboCOIN TD-15 value function config (regression loss).
-    TrainConfig(
-        name="robocoin_paligemma_v_td15",
-        model=_value_function.SARSAValueFunctionConfig(
-            network_config=_paligemma_network.PaliGemmaNetworkConfig(
-                state_dim=14,  # Proprioceptive state dimension for RoboCOIN
-                num_cameras=3,  # cam_0, cam_1, cam_2
-                image_size=(224, 224),
-                max_token_len=48,  # Max tokens for subtask text
-            ),
-            head_config=_heads.RegressionHeadConfig(),
-            discount=0.99**15,  # Effective discount for 15-step return
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="/data/group_data/rl/saksham3/",
-            dataset_name="robocoin:1.0.0",
-            discount=0.99,
-            td_n=15,  # TD-15: bootstrap with value at t + 15
-            use_eef=True,
-        ),
-        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=30_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=30_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,  # DLIMP handles its own parallelism
-        log_interval=100,
-        plot_interval=5_000,
-        fsdp_devices=16,
-        validation_cache_dir="/nfs/aidm_nfs/saksham/robocoin/val_episodes_cache/",
-    ),
-    # RoboCOIN Q(s,a) SARSA with bimanual dataset, regression head.
-    TrainConfig(
-        name="debug_robocoin_bimanual_paligemma_q_sarsa",
-        model=_value_function.SARSAValueFunctionConfig(
-            network_config=_paligemma_network.PaliGemmaNetworkConfig(
-                state_dim=14,
-                num_cameras=3,
-                image_size=(224, 224),
-                max_token_len=48,
-                action_dim=14,
-                no_state=True,
-            ),
-            head_config=_heads.RegressionHeadConfig(),
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="gs://saksham-euw4",
-            dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin/norm_stats/norm_stats.json",
-            discount=0.999,
-            td_n=50,
-            use_eef=True,
-            dont_mask_actions=True,
-        ),
-        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=30_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=30_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=1,
-        plot_interval=200_000,
-        save_interval=200_000,
-        fsdp_devices=16,
-        action_horizon=50,
-        num_val_trajectories=10,
-        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
-    ),
-    TrainConfig(
-        name="robocoin_bimanual_paligemma_q_sarsa",
-        model=_value_function.SARSAValueFunctionConfig(
-            network_config=_paligemma_network.PaliGemmaNetworkConfig(
-                state_dim=14,
-                num_cameras=3,
-                image_size=(224, 224),
-                max_token_len=48,
-                action_dim=14,
-                no_state=True,
-            ),
-            head_config=_heads.RegressionHeadConfig(),
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
-            discount=0.999,
-            td_n=50,
-            use_eef=True,
-            dont_mask_actions=True,
-        ),
-        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=230_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=230_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        plot_interval=50_000,
-        save_interval=50_000,
-        fsdp_devices=16,
-        action_horizon=50,
-        num_val_trajectories=10,
-        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
-    ),
-    # RoboCOIN Q(s,a) SARSA with bimanual dataset, chunk-wise delta actions, quantile norm.
-    TrainConfig(
-        name="robocoin_bimanual_paligemma_q_sarsa_chunk_wise",
-        model=_value_function.SARSAValueFunctionConfig(
-            network_config=_paligemma_network.PaliGemmaNetworkConfig(
-                state_dim=14,
-                num_cameras=3,
-                image_size=(224, 224),
-                max_token_len=48,
-                action_dim=14,
-                dtype="float32",
-            ),
-            head_config=_heads.RegressionHeadConfig(),
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
-            discount=0.999,
-            td_n=50,
-            use_eef=True,
-            dont_mask_actions=False,
-            use_chunk_wise_delta=True,
-            use_quantile_norm=True,
-        ),
-        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=230_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=230_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        plot_interval=50_000,
-        save_interval=50_000,
-        fsdp_devices=16,
-        action_horizon=50,
-        num_val_trajectories=10,
-        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
-    ),
     # RoboCOIN Q(s,a) SARSA with bimanual dataset using the RLDS pipeline, chunk-wise delta actions, quantile norm.
     TrainConfig(
         name="robocoin_bimanual_paligemma_q_sarsa_chunk_wise_rlds",
@@ -3181,7 +2669,6 @@ _CONFIGS = [
         data=RoboCoinRldsDataConfig(
             rlds_data_dir="gs://saksham-euw4/robocoin_bimanual",
             datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
             discount=0.999,
             td_n=50,
             use_eef=True,
@@ -3272,230 +2759,6 @@ _CONFIGS = [
     #     num_workers=0,
     #     fsdp_devices=1,
     # ),
-    # RoboCOIN Q(s,a) SARSA with bimanual dataset, HL-Gauss head.
-    TrainConfig(
-        name="robocoin_bimanual_paligemma_q_sarsa_hl_gauss",
-        model=_value_function.SARSAValueFunctionConfig(
-            network_config=_paligemma_network.PaliGemmaNetworkConfig(
-                state_dim=14,
-                num_cameras=3,
-                image_size=(224, 224),
-                max_token_len=48,
-                action_dim=14,
-            ),
-            head_config=_heads.CategoricalHeadConfig(
-                v_min=0.0,
-                v_max=1.0,
-                num_bins=101,
-                sigma=0.0075,
-            ),
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
-            discount=0.999,
-            td_n=50,
-            use_eef=True,
-            dont_mask_actions=True,
-        ),
-        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
-        num_train_steps=230_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=230_000,
-            decay_lr=1e-5,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        plot_interval=30_000,
-        save_interval=30_000,
-        fsdp_devices=16,
-        action_horizon=50,
-        num_val_trajectories=10,
-        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
-    ),
-    # =========================================================================
-    # RoboCOIN Gemma 3 value function configs
-    # =========================================================================
-    TrainConfig(
-        name="debug_robocoin_gemma3",
-        model=_value_function.MCValueFunctionConfig(
-            network_config=_paligemma_network.PaliGemmaNetworkConfig(
-                state_dim=14,
-                num_cameras=3,
-                image_size=(896, 896),
-                max_token_len=48,
-                paligemma_variant="gemma3_dummy",
-                dtype="float32",
-            ),
-            head_config=_heads.RegressionHeadConfig(),
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin:1.0.0",
-            image_size = (896, 896),
-            discount=0.999,
-            local_shuffle_buffer_size=50000,
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
-        ),
-        weight_loader=weight_loaders.NoOpWeightLoader(),
-        num_train_steps=120_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=120_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        plot_interval=200_000,
-        save_interval=200_000,
-        fsdp_devices=16,
-        backbone_variant="gemma3",
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache/",
-    ),
-    TrainConfig(
-        name="robocoin_bimanual_gemma3_q_sarsa_gpu",
-        model=_value_function.SARSAValueFunctionConfig(
-            network_config=_paligemma_network.PaliGemmaNetworkConfig(
-                state_dim=14,
-                num_cameras=3,
-                image_size=(896, 896),
-                max_token_len=48,
-                paligemma_variant="gemma3_4b",
-                action_dim=14,
-                no_state=True,
-            ),
-            head_config=_heads.RegressionHeadConfig(),
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
-            image_size = (896, 896),
-            local_shuffle_buffer_size=50_000,
-            discount=0.999,
-            td_n=50,
-            use_eef=True,
-            dont_mask_actions=True,
-        ),
-        weight_loader=weight_loaders.Gemma3WeightLoader(),
-        num_train_steps=230_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=230_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        plot_interval=50_000,
-        save_interval=50_000,
-        fsdp_devices=8,
-        backbone_variant="gemma3",
-        action_horizon=50,
-        num_val_trajectories=10,
-        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir="/data/user_data/saksham3/robocoin/val_episodes_cache_50_896/",
-    ),
-    TrainConfig(
-        name="robocoin_bimanual_gemma3_q_sarsa",
-        model=_value_function.SARSAValueFunctionConfig(
-            network_config=_paligemma_network.PaliGemmaNetworkConfig(
-                state_dim=14,
-                num_cameras=3,
-                image_size=(896, 896),
-                max_token_len=48,
-                paligemma_variant="gemma3_4b",
-                action_dim=14,
-                no_state=True,
-            ),
-            head_config=_heads.RegressionHeadConfig(),
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/norm_stats.json",
-            image_size = (896, 896),
-            local_shuffle_buffer_size=5_000,
-            discount=0.999,
-            td_n=50,
-            use_eef=True,
-            dont_mask_actions=True,
-        ),
-        weight_loader=weight_loaders.Gemma3WeightLoader(),
-        num_train_steps=230_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=230_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        plot_interval=50_000,
-        save_interval=50_000,
-        fsdp_devices=16,
-        backbone_variant="gemma3",
-        action_horizon=50,
-        num_val_trajectories=10,
-        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50_896/",
-    ),
-    # =============================================================================
-    # RoboCOIN π₀.5 policy training
-    # =============================================================================
-    TrainConfig(
-        name="robocoin_bimanual_pi05",
-        model=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b",
-            action_expert_variant="gemma_300m",
-            action_dim=32,
-            action_horizon=50,
-            max_token_len=96,
-            pi05=True,
-            action_dim_offset=14,
-            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
-            dtype="float32",
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
-            discount=0.999,
-            td_n=50,
-            use_eef=True,
-            critic_mode=False,
-            use_chunk_wise_delta=True,
-            use_quantile_norm=True,
-            filter_n=5,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=230_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=230_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        save_interval=50_000,
-        fsdp_devices=16,
-    ),
     TrainConfig(
         name="robocoin_bimanual_pi05_rlds",
         model=pi0_config.Pi0Config(
@@ -3510,9 +2773,12 @@ _CONFIGS = [
             dtype="float32",
         ),
         data=RoboCoinRldsDataConfig(
-            rlds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            rlds_data_dir="/data/group_data/rl/datasets",
+            assets=AssetsConfig(
+                assets_dir = "/data/group_data/rl/saksham3/robocoin/norm_stats",
+                asset_id = "embodiment_wise",
+            ),
             datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
             discount=0.999,
             td_n=50,
             use_eef=True,
@@ -3521,90 +2787,6 @@ _CONFIGS = [
             use_quantile_norm=True,
             filter_n=5,
             shuffle_buffer_size=50_000,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=230_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=230_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        save_interval=50_000,
-        fsdp_devices=16,
-        action_horizon=50,
-    ),
-    # =============================================================================
-    # RoboCOIN π₀.5 policy training (test, no chunk-wise delta)
-    # =============================================================================
-    TrainConfig(
-        name="robocoin_bimanual_pi05_test",
-        model=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b",
-            action_expert_variant="gemma_300m",
-            action_dim=32,
-            action_horizon=50,
-            max_token_len=96,
-            pi05=True,
-            action_dim_offset=14,
-            action_dim_mask=(True,) * 32,
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
-            discount=0.999,
-            td_n=50,
-            use_eef=True,
-            critic_mode=False,
-            use_quantile_norm=True,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=230_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-5,
-            decay_steps=230_000,
-            decay_lr=1e-6,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        save_interval=50_000,
-        fsdp_devices=16,
-        action_horizon=50,
-    ),
-    # =============================================================================
-    # RoboCOIN π₀.5 policy training (no state input ablation)
-    # =============================================================================
-    TrainConfig(
-        name="robocoin_bimanual_pi05_no_state",
-        model=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b",
-            action_expert_variant="gemma_300m",
-            action_dim=32,
-            action_horizon=50,
-            max_token_len=96,
-            pi05=True,
-            discrete_state_input=False,
-            action_dim_offset=14,
-            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
-        ),
-        data=RoboCOINDataConfig(
-            tfds_data_dir="gs://saksham-euw4/robocoin_bimanual",
-            dataset_name="robocoin:1.0.0",
-            norm_stats_path="gs://saksham-euw4/robocoin_bimanual/norm_stats/embodiment_wise_stats.json",
-            discount=0.999,
-            td_n=50,
-            use_eef=True,
-            critic_mode=False,
-            use_chunk_wise_delta=True,
-            use_quantile_norm=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=230_000,

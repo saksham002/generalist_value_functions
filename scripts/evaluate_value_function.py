@@ -33,9 +33,8 @@ import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.sharding as sharding
-from openpi.training.robocoin_data_loader import create_robocoin_data_loader
-
 logger = logging.getLogger()
+logger.warning("evaluate_value_function.py: This script has not been ported to the RLDS pipeline and will not work.")
 
 
 

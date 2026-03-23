@@ -43,7 +43,6 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 import openpi.transforms as _transforms
 import openpi.value_functions.base_value_functions as _value_fn
-from openpi.training.robocoin_data_loader import RoboCOINDataLoaderConfig, create_robocoin_data_loader
 
 
 def init_logging():
@@ -405,13 +404,10 @@ def log_memory_debug(step: int, data_loader=None, force_gc: bool = False, log_to
     )
     
     # Log data loader buffer stats if available
-    # Navigate through wrapper chain: DataLoaderImpl -> RoboCOINDataLoader -> AsyncBatchPrefetcher
     prefetcher = None
     if data_loader is not None:
-        # Try direct buffer access first
         if hasattr(data_loader, 'buffer'):
             prefetcher = data_loader
-        # Try DataLoaderImpl._data_loader (RoboCOINDataLoader)._iterator (AsyncBatchPrefetcher)
         elif hasattr(data_loader, '_data_loader'):
             inner = data_loader._data_loader
             if hasattr(inner, '_iterator') and inner._iterator is not None:
@@ -2000,72 +1996,6 @@ def main(config: _config.TrainConfig):
             reward_bias=data_config.reward_bias,
         )
         val_dataloader = None
-    elif data_config.robocoin_data_config is not None:
-        # RoboCOIN: get num_episodes from TFDS builder metadata
-        # import tensorflow_datasets as tfds
-        
-        # robocoin_config = data_config.robocoin_data_config
-        # builder = tfds.builder(robocoin_config.dataset_name, data_dir=robocoin_config.data_dir)
-        # num_episodes = builder.info.splits["val"].num_examples
-        # logging.info(f"RoboCOIN: {num_episodes} episodes in validation set")
-        
-        # # Select validation episode indices for RoboCOIN
-        # val_rng = np.random.default_rng(config.seed)
-        # val_episode_indices = val_rng.choice(
-        #     num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
-        # ).tolist()
-        # logging.info(f"Selected validation episodes: {val_episode_indices}")
-        
-        # # Cache validation episodes to disk - only worker 0 collects and caches
-        # val_episodes_cache_dir = config.validation_cache_dir if config.validation_cache_dir is not None else str(config.checkpoint_dir / "val_episodes")
-        
-        # if jax.process_index() == 0:
-        #     logging.info("Worker 0: Collecting validation episodes for caching")
-            
-        #     val_loader_config = RoboCOINDataLoaderConfig(
-        #         data_dir=robocoin_config.data_dir,
-        #         dataset_name=robocoin_config.dataset_name,
-        #         split="val",
-        #         batch_size=256,  # Full batch size for single host
-        #         shuffle=False,
-        #         repeat=False,
-        #         seed=config.seed,
-        #         max_cameras=robocoin_config.max_cameras,
-        #         max_state_dim=robocoin_config.max_state_dim,
-        #         max_action_dim=robocoin_config.max_action_dim,
-        #         image_size=robocoin_config.image_size,
-        #         discount=robocoin_config.discount,
-        #         td_n=robocoin_config.td_n,
-        #         state_norm_stats=data_config.norm_stats,
-        #         use_quantile_norm=data_config.use_quantile_norm,
-        #         use_eef=robocoin_config.use_eef,
-        #         action_horizon=robocoin_config.action_horizon,
-        #     )
-        #     val_dataloader = create_robocoin_data_loader(val_loader_config)
-            
-        #     generate_validation_plots_dlimp(
-        #         model=None,  # Not needed for save_only
-        #         val_dataloader=val_dataloader,
-        #         val_episode_indices=val_episode_indices,
-        #         step=0,
-        #         action_conditioned=False,  # Not used for save_only
-        #         data_config=data_config,
-        #         cache_dir=val_episodes_cache_dir,
-        #         save_only=True,
-        #     )
-        #     del val_dataloader
-        #     logging.info("Validation episodes cached successfully")
-        # else:
-        #     logging.info(f"Worker {jax.process_index()}: Skipping validation cache collection (worker 0 handles this)")
-        
-        val_dataloader = None
-        num_episodes = 100
-        val_rng = np.random.default_rng(config.seed)
-        val_episode_indices = val_rng.choice(
-            num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
-        ).tolist()
-
-        val_dataset = None
     else:
         # Non-RoboCOIN: use LeRobot dataset
         from lerobot.common.datasets import lerobot_dataset
@@ -2242,7 +2172,7 @@ def main(config: _config.TrainConfig):
                     jax.block_until_ready(policy_info)
                 info.update(policy_info)
 
-        time.sleep(0.8)
+        # sleep(0.8)
 
         rss_gb = psutil.Process().memory_info().rss / 1024 / 1024 / 1024
         if rss_gb > 180:
@@ -2263,8 +2193,8 @@ def main(config: _config.TrainConfig):
             # wandb.log(info, step=step)
             
             # Memory debugging: log every 100 steps, force GC every 500 steps
-            force_gc = (step % 500 == 0)
-            # force_gc = False
+            # force_gc = (step % 500 == 0)
+            force_gc = False
             log_memory_debug(step, data_loader=data_loader, force_gc=force_gc, log_to_wandb=jax.process_index() == 0)
 
         # Break down data loading into components
@@ -2289,20 +2219,7 @@ def main(config: _config.TrainConfig):
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
-                # Use dlimp-based validation for RoboCOIN, standard for others
-                if data_config.robocoin_data_config is not None:
-                    # Load validation episodes from cache (created during initialization)
-                    plot_images = generate_validation_plots_dlimp(
-                        model=model,
-                        val_dataloader=None,  # Not needed - load from cache
-                        val_episode_indices=val_episode_indices,
-                        step=step,
-                        action_conditioned=action_conditioned,
-                        data_config=data_config,
-                        cache_dir=val_episodes_cache_dir,
-                    )
-                else:
-                    plot_images = generate_validation_plots(
+                plot_images = generate_validation_plots(
                         model=model,
                         dataset=val_dataset,
                         val_episode_indices=val_episode_indices,
@@ -2373,7 +2290,8 @@ def main(config: _config.TrainConfig):
                     )
 
                     # Deterministic evaluation: use the mode of the action distribution.
-                    actions = policy_model.sample_actions(step_rng, model_obs, deterministic=True)
+                    transition = _model.wrap_observation_as_transition(model_obs)
+                    actions = policy_model.sample_actions(step_rng, transition, deterministic=True)
                     # Take the first action in the horizon
                     # Shape: [num_envs, action_horizon, action_dim] -> [num_envs, action_dim]
                     actions = np.asarray(jax.device_get(actions[:, 0, :]))

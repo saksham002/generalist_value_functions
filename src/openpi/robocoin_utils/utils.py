@@ -14,6 +14,13 @@ from openpi.models import model as _model
 from openpi.value_functions.networks.base_networks import BaseValueNetwork
 
 
+RLDS_TO_STANDARD_CAMERA_MAP = {
+    "cam_0": "base_0_rgb",
+    "cam_1": "left_wrist_0_rgb",
+    "cam_2": "right_wrist_0_rgb",
+}
+
+
 def extract_embodiment(repo_id: str | bytes) -> str:
     """Extract embodiment name from a RoboCOIN repo identifier."""
     if isinstance(repo_id, bytes):

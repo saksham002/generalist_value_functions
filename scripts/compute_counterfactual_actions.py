@@ -193,7 +193,7 @@ def run_worker(args: WorkerArgs) -> None:
     import openpi.models.model as _model
     from openpi.robocoin_utils.utils import extract_embodiment
     import openpi.training.counterfactual_action_store as ca_store
-    from openpi.training.robocoin_data_loader import RLDS_TO_STANDARD_CAMERA_MAP
+    from openpi.robocoin_utils.utils import RLDS_TO_STANDARD_CAMERA_MAP
     from openpi.training.time_utils import Timer
     from openpi.value_functions.base_value_functions import Transition
 
@@ -275,18 +275,7 @@ def run_worker(args: WorkerArgs) -> None:
     _nnx_utils.replace_state_from_pure_dict_numeric_key_compat(_state, policy_params)
     model = nnx.merge(_graphdef, _state)
     data_config_for_policy = config.data.create(config.assets_dirs, policy_model_config)
-    norm_stats = None
-    if hasattr(config.data, "_load_robocoin_norm_stats") and config.data.norm_stats_path is not None:
-        try:
-            norm_stats = config.data._load_robocoin_norm_stats()
-            logger.info(f"Loaded norm stats from config path {config.data.norm_stats_path}")
-        except FileNotFoundError:
-            logger.info(
-                f"Norm stats not found at config path {config.data.norm_stats_path}, "
-                "falling back to checkpoint assets."
-            )
-    if norm_stats is None:
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir_path / "assets", data_config_for_policy.asset_id)
+    norm_stats = _checkpoints.load_norm_stats(checkpoint_dir_path / "assets", data_config_for_policy.asset_id)
 
     import openpi.policies.policy as _policy
     import openpi.transforms as _transforms
@@ -392,6 +381,17 @@ def run_worker(args: WorkerArgs) -> None:
             axis = -1,
         ).astype(np.float32)
 
+    def _read_existing_shard_metadata(shard_path: epath.Path) -> dict[str, int]:
+        import tensorflow as tf
+
+        episode_count = 0
+        for _ in tf.data.TFRecordDataset([str(shard_path)]):
+            episode_count += 1
+        return {
+            "episode_count": episode_count,
+            "num_bytes": int(shard_path.stat().length),
+        }
+
     def _select_policy_subtask(
         step: dict[str, Any], subtask_texts: list[str], fps: int
     ) -> tuple[str | None, int, np.ndarray]:
@@ -472,11 +472,41 @@ def run_worker(args: WorkerArgs) -> None:
         split_spec = f"{args.split}[{start_pos}:{start_pos + num_episodes}]"
         dataset = source_builder.as_dataset(split=split_spec)
 
+        shard_path = (
+            worker_dir
+            / ca_store.COUNTERFACTUAL_ACTION_STORE_DATASET_NAME
+            / ca_store.VERSION
+            / ca_store.get_shard_filename(args.split, shard_idx)
+        )
+        if shard_path.exists():
+            existing_metadata = _read_existing_shard_metadata(shard_path)
+            if existing_metadata["episode_count"] == num_episodes:
+                shard_metadata[shard_idx] = existing_metadata
+                total_written += existing_metadata["episode_count"]
+                logger.info(
+                    "Worker %d shard %d: skipping existing shard %s (%d/%d episodes, %d bytes)",
+                    args.worker_id,
+                    shard_idx,
+                    shard_path,
+                    existing_metadata["episode_count"],
+                    num_episodes,
+                    existing_metadata["num_bytes"],
+                )
+                continue
+            logger.warning(
+                "Worker %d shard %d: existing shard %s has %d episodes, expected %d; recomputing shard.",
+                args.worker_id,
+                shard_idx,
+                shard_path,
+                existing_metadata["episode_count"],
+                num_episodes,
+            )
+
         shard_writer = ca_store.CounterfactualActionStoreTFDSShardWriter(
-            output_dir=str(worker_dir),
-            shard_idx=shard_idx,
-            manifest=manifest,
-            split=args.split,
+            output_dir = str(worker_dir),
+            shard_idx = shard_idx,
+            manifest = manifest,
+            split = args.split,
         )
 
         for raw_episode in tqdm.tqdm(dataset, total=num_episodes, desc=f"Worker {args.worker_id} Shard {shard_idx}"):

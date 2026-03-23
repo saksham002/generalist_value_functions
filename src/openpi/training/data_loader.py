@@ -617,32 +617,6 @@ def create_data_loader(
             framework=framework,
         )
 
-    # Check for RoboCOIN dataset (DLIMP-based image+text+state loader)
-    if data_config.robocoin_data_config is not None:
-        import dataclasses as dc
-
-        from openpi.models.tokenizer import create_tokenizer
-
-        robocoin_config = dc.replace(
-            data_config.robocoin_data_config,
-            action_horizon = action_horizon,
-        )
-        data_config = dc.replace(data_config, robocoin_data_config = robocoin_config)
-
-        # num_images unused for PaliGemma, used for Gemma3
-        num_images = robocoin_config.max_cameras if config.backbone_variant == "gemma3" else 0
-        tokenizer = create_tokenizer(config.backbone_variant, robocoin_config.max_token_len, num_images = num_images)
-        return create_robocoin_data_loader(
-            data_config,
-            batch_size=config.batch_size,
-            sharding=sharding,
-            shuffle=shuffle,
-            num_batches=num_batches,
-            seed=config.seed,
-            framework=framework,
-            tokenizer=tokenizer,
-        )
-
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,
@@ -777,85 +751,6 @@ def create_rlds_data_loader(
     )
 
     return DataLoaderImpl(data_config, data_loader)
-
-
-def create_robocoin_data_loader(
-    data_config: _config.DataConfig,
-    batch_size: int,
-    *,
-    sharding: jax.sharding.Sharding | None = None,
-    shuffle: bool = False,
-    num_batches: int | None = None,
-    seed: int = 0,
-    framework: str = "jax",
-    tokenizer = None,
-) -> DataLoader:
-    """Create a DLIMP-based data loader for RoboCOIN image+text+state data.
-
-    This loader is optimized for the RoboCOIN dataset which contains:
-    - Camera images (up to 3 views)
-    - Text prompts (subtask descriptions)
-    - Proprioceptive state
-    - Actions and rewards
-
-    Args:
-        data_config: The data configuration (must have robocoin_data_config set).
-        batch_size: The batch size.
-        sharding: The sharding to use for the data loader.
-        shuffle: Whether to shuffle the data.
-        num_batches: Determines the number of batches to return.
-        seed: Random seed for shuffling.
-        framework: The framework to use ("jax" or "pytorch").
-
-    Returns:
-        DataLoader wrapping the RoboCOIN DLIMP dataset.
-    """
-    if framework == "pytorch":
-        raise NotImplementedError("PyTorch RoboCOIN data loader is not supported yet")
-
-    from openpi.training.robocoin_data_loader import RoboCOINDataLoader
-
-    # Get the RoboCOIN loader config from data_config
-    robocoin_config = data_config.robocoin_data_config
-
-    # For distributed training, divide batch_size by the number of hosts.
-    # local_shuffle_buffer_size is already per-host (specified directly in config).
-    process_count = jax.process_count()
-    local_batch_size = batch_size // process_count
-    
-    if process_count > 1:
-        # Set TensorFlow random seed per host
-        tf.random.set_seed(seed + jax.process_index())
-        logging.info(
-            f"Distributed training: {process_count} hosts, "
-            f"local_batch_size={local_batch_size} (global={batch_size}), "
-            f"local_shuffle_buffer_size={robocoin_config.local_shuffle_buffer_size}"
-        )
-
-    # Update config with batch_size, shuffle, and normalization settings
-    import dataclasses as dc
-    robocoin_config = dc.replace(
-        robocoin_config,
-        batch_size=local_batch_size,
-        shuffle=shuffle,
-        seed=seed + jax.process_index(),  # Different seed per host
-        state_norm_stats=data_config.norm_stats,
-        use_quantile_norm=data_config.use_quantile_norm,
-    )
-
-    # Create the RoboCOIN data loader with sharding.
-    # Pass model_transforms for per-sample application (e.g. TokenizePrompt, PadStatesAndActions)
-    # before sharding — same split-transform-restack pattern as RLDS/DROID pipelines.
-    model_transforms_list = list(data_config.model_transforms.inputs) if data_config.model_transforms.inputs else None
-    robocoin_loader = RoboCOINDataLoader(
-        robocoin_config,
-        sharding=sharding,
-        num_batches=num_batches,
-        tokenizer=tokenizer,
-        model_transforms=model_transforms_list,
-    )
-
-    return DataLoaderImpl(data_config, robocoin_loader)
 
 
 def create_numpy_data_loader(
