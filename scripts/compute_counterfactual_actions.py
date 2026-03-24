@@ -199,8 +199,11 @@ def run_worker(args: WorkerArgs) -> None:
 
     tf.config.set_visible_devices([], "GPU")
 
-    if args.worker_id < 0 or args.worker_id >= args.num_workers:
-        raise ValueError(f"worker_id={args.worker_id} out of range [0, {args.num_workers}).")
+    worker_id = args.worker_id
+    num_workers = args.num_workers
+
+    if worker_id < 0 or worker_id >= num_workers:
+        raise ValueError(f"worker_id={worker_id} out of range [0, {num_workers}).")
 
     if not args.checkpoint_dir:
         raise ValueError("--checkpoint-dir is required.")
@@ -220,20 +223,20 @@ def run_worker(args: WorkerArgs) -> None:
     num_shards = len(shard_info)
 
     # Distribute shards across workers (round-robin)
-    my_shards = [i for i in range(num_shards) if i % args.num_workers == args.worker_id]
+    my_shards = [i for i in range(num_shards) if i % num_workers == worker_id]
     my_episode_count = sum(shard_info[i][1] for i in my_shards)
 
     logger.info(
-        f"Worker {args.worker_id}/{args.num_workers}: assigned {len(my_shards)} shards "
+        f"Worker {worker_id}/{num_workers}: assigned {len(my_shards)} shards "
         f"({my_episode_count} episodes total)"
     )
 
     output_dir = epath.Path(args.output_dir)
-    worker_dir = output_dir / "_workers" / f"worker_{args.worker_id}"
+    worker_dir = output_dir / "_workers" / f"worker_{worker_id}"
     done_marker = worker_dir / "_DONE"
 
     if done_marker.exists():
-        logger.info(f"Worker {args.worker_id}: already completed, skipping.")
+        logger.info(f"Worker {worker_id}: already completed, skipping.")
         return
 
     # Load policy. For value function training configs, the checkpoint stores params
@@ -485,7 +488,7 @@ def run_worker(args: WorkerArgs) -> None:
                 total_written += existing_metadata["episode_count"]
                 logger.info(
                     "Worker %d shard %d: skipping existing shard %s (%d/%d episodes, %d bytes)",
-                    args.worker_id,
+                    worker_id,
                     shard_idx,
                     shard_path,
                     existing_metadata["episode_count"],
@@ -495,7 +498,7 @@ def run_worker(args: WorkerArgs) -> None:
                 continue
             logger.warning(
                 "Worker %d shard %d: existing shard %s has %d episodes, expected %d; recomputing shard.",
-                args.worker_id,
+                worker_id,
                 shard_idx,
                 shard_path,
                 existing_metadata["episode_count"],
@@ -509,7 +512,7 @@ def run_worker(args: WorkerArgs) -> None:
             split = args.split,
         )
 
-        for raw_episode in tqdm.tqdm(dataset, total=num_episodes, desc=f"Worker {args.worker_id} Shard {shard_idx}"):
+        for raw_episode in tqdm.tqdm(dataset, total=num_episodes, desc=f"Worker {worker_id} Shard {shard_idx}"):
             episode_start_time = time.perf_counter()
             episode_timer = Timer()
 
@@ -841,7 +844,7 @@ def run_worker(args: WorkerArgs) -> None:
                 "Worker %d shard %d episode_index=%d num_steps=%d valid_frames=%d "
                 "sampling_l1=%.6f sampling_mse=%.6f cov_trace_per_timestep=%.6f "
                 "debug_metrics=%s elapsed=%.2fs",
-                args.worker_id,
+                worker_id,
                 shard_idx,
                 rlds_episode_index,
                 num_steps,
@@ -854,7 +857,7 @@ def run_worker(args: WorkerArgs) -> None:
             )
             logger.info(
                 "Worker %d shard %d episode_index=%d timing: %s",
-                args.worker_id,
+                worker_id,
                 shard_idx,
                 rlds_episode_index,
                 format_timing(episode_times),
@@ -883,17 +886,17 @@ def run_worker(args: WorkerArgs) -> None:
         average_times = {key: value / timed_episode_count for key, value in worker_times.items()}
         logger.info(
             "Worker %d timing totals across %d episodes: %s",
-            args.worker_id,
+            worker_id,
             timed_episode_count,
             format_timing(dict(worker_times)),
         )
         logger.info(
             "Worker %d timing averages per episode: %s",
-            args.worker_id,
+            worker_id,
             format_timing(average_times),
         )
 
-    logger.info(f"Worker {args.worker_id}: done. Wrote {total_written} episodes across {len(shard_metadata)} shards.")
+    logger.info(f"Worker {worker_id}: done. Wrote {total_written} episodes across {len(shard_metadata)} shards.")
 
 
 # =============================================================================
