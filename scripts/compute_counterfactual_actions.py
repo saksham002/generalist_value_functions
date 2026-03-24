@@ -97,6 +97,9 @@ class LaunchArgs(CommonArgs):
     partition: str = "preempt"
     """SLURM partition."""
 
+    qos: str | None = None
+    """Optional SLURM QoS."""
+
     partition_split: str | None = None
     """Split workers across partitions. Format: 'partition1:count1,partition2:count2,...'."""
 
@@ -323,6 +326,8 @@ def run_worker(args: WorkerArgs) -> None:
     from openpi.shared import nnx_utils
 
     sample_actions_jit = nnx_utils.module_jit(model.sample_actions)
+    has_prefix_cache = hasattr(model, "compute_prefix_cache")
+    compute_prefix_cache_jit = nnx_utils.module_jit(model.compute_prefix_cache) if has_prefix_cache else None
     encode_images_jit = nnx_utils.module_jit(model.encode_images) if hasattr(model, "encode_images") else None
     profiled_batches = 0
     seen_sampling_batches = 0
@@ -649,6 +654,7 @@ def run_worker(args: WorkerArgs) -> None:
                     }
 
                     transform_with_actions = dict(obs_dict)
+                    transform_with_actions["action_mask"] = action_mask
                     if args.debug_metrics:
                         gt_action_indices = np.minimum(
                             step_idx + np.arange(action_horizon, dtype = np.int32),
@@ -658,7 +664,6 @@ def run_worker(args: WorkerArgs) -> None:
                         if data_config.rlds_kwargs["use_chunk_wise_delta"]:
                             gt_actions = gt_actions - gt_actions[:1, :]
                         transform_with_actions["actions"] = gt_actions
-                        transform_with_actions["action_mask"] = action_mask
 
                     with episode_timer.context("input_transform"):
                         transformed = input_transform(transform_with_actions)
@@ -667,7 +672,7 @@ def run_worker(args: WorkerArgs) -> None:
                     action_mask_transformed = None
                     if args.debug_metrics:
                         gt_actions_transformed = np.asarray(transformed["actions"], dtype = np.float32)
-                        action_mask_transformed = np.asarray(transformed["action_mask"], dtype = np.bool_)
+                        action_mask_transformed = action_mask.astype(np.bool_)
 
                     transformed = {
                         k: v
@@ -722,8 +727,28 @@ def run_worker(args: WorkerArgs) -> None:
                     observation = _model.Observation.from_dict(batched_inputs)
                     transition = _model.wrap_observation_as_transition(observation)
 
+                    # Compute prefix KV cache from unique observations, then repeat to match sample counts.
+                    prefix_cache = None
+                    if compute_prefix_cache_jit is not None:
+                        unique_batch_size = args.samples_per_batch // args.num_samples
+                        unique_inputs = _concat_tree(
+                            [_repeat_tree(request.transformed, 1) for request, _ in batch_requests]
+                        )
+                        unique_inputs = _pad_batch_to_size(unique_inputs, len(batch_requests), unique_batch_size)
+                        unique_obs = _model.Observation.from_dict(unique_inputs)
+                        raw_cache = compute_prefix_cache_jit(unique_obs)
+                        raw_kv_cache, raw_prefix_mask = raw_cache
+                        repeated_kv_cache = jax.tree.map(
+                            lambda x: jnp.repeat(x, args.num_samples, axis = 1),
+                            raw_kv_cache,
+                        )
+                        repeated_prefix_mask = jnp.repeat(raw_prefix_mask, args.num_samples, axis = 0)
+                        prefix_cache = (repeated_kv_cache, repeated_prefix_mask)
+
                     rng, sample_rng = jax.random.split(rng)
                     call_kwargs = sample_kwargs
+                    if prefix_cache is not None:
+                        call_kwargs = {**call_kwargs, "prefix_cache": prefix_cache}
                     if batch_requests[0][0].encoded_images is not None:
                         batch_encoded_images = jnp.concatenate(
                             [
@@ -1003,6 +1028,8 @@ def run_launch(args: LaunchArgs) -> None:
             "--wrap",
             wrap_cmd,
         ]
+        if args.qos is not None:
+            sbatch_cmd.extend(["--qos", args.qos])
 
         if args.dry_run:
             logger.info(f"[DRY RUN] Worker {worker_id}: {' '.join(sbatch_cmd)}")
@@ -1043,6 +1070,8 @@ def run_launch(args: LaunchArgs) -> None:
             "--wrap",
             merge_wrap,
         ]
+        if args.qos is not None:
+            merge_sbatch_cmd.extend(["--qos", args.qos])
         merge_job_id = _submit_sbatch(merge_sbatch_cmd)
         logger.info(f"Merge job submitted: {merge_job_id} (depends on workers: {dep_str})")
 

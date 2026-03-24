@@ -353,6 +353,8 @@ def main() -> int:
         logger.info("Disabled classifier-free guidance for sampling (guidance=0.0).")
 
     sample_actions_jit = nnx_utils.module_jit(model.sample_actions)
+    has_prefix_cache = hasattr(model, "compute_prefix_cache")
+    compute_prefix_cache_jit = nnx_utils.module_jit(model.compute_prefix_cache) if has_prefix_cache else None
     encode_images_jit = nnx_utils.module_jit(model.encode_images) if hasattr(model, "encode_images") else None
     profiled_batches = 0
     seen_sampling_batches = 0
@@ -467,6 +469,7 @@ def main() -> int:
 
             episode_actions = None
             if args.debug_metrics:
+                logger.info("Episode %d fps=%d", rlds_episode_index, fps)
                 episode_actions = []
                 for step in episode["steps"]:
                     step_action = step["action"]
@@ -583,6 +586,7 @@ def main() -> int:
                     }
 
                     transform_with_actions = dict(obs_dict)
+                    transform_with_actions["action_mask"] = action_mask
                     if args.debug_metrics:
                         gt_action_indices = np.minimum(
                             step_idx + np.arange(action_horizon, dtype = np.int32),
@@ -592,16 +596,14 @@ def main() -> int:
                         if data_config.rlds_kwargs["use_chunk_wise_delta"]:
                             gt_actions = gt_actions - gt_actions[:1, :]
                         transform_with_actions["actions"] = gt_actions
-                        transform_with_actions["action_mask"] = action_mask
 
                     with episode_timer.context("input_transform"):
                         transformed = input_transform(transform_with_actions)
 
                     gt_actions_transformed = None
-                    action_mask_transformed = None
+                    action_mask_transformed = np.asarray(transformed["action_mask"], dtype = np.bool_)
                     if args.debug_metrics:
                         gt_actions_transformed = np.asarray(transformed["actions"], dtype = np.float32)
-                        action_mask_transformed = np.asarray(transformed["action_mask"], dtype = np.bool_)
 
                     transformed = {
                         k: v
@@ -656,6 +658,28 @@ def main() -> int:
                         row_ids = np.full(args.samples_per_batch, -1, dtype = np.int32)
                         row_ids[:actual_batch_size] = np.arange(actual_batch_size, dtype = np.int32)
 
+                    # Compute prefix KV cache from unique observations, then repeat to match sample counts.
+                    local_prefix_cache = None
+                    if compute_prefix_cache_jit is not None:
+                        unique_batch_size = args.samples_per_batch // args.num_samples
+                        local_unique_batch_size = local_samples_per_batch // args.num_samples
+                        unique_inputs = _concat_tree(
+                            [_repeat_tree(request.transformed, 1) for request, _ in batch_requests]
+                        )
+                        unique_inputs = _pad_batch_to_size(unique_inputs, len(batch_requests), unique_batch_size)
+                        unique_local_start = process_index * local_unique_batch_size
+                        unique_local_end = unique_local_start + local_unique_batch_size
+                        local_unique_inputs = _slice_tree_axis0(unique_inputs, unique_local_start, unique_local_end)
+                        local_unique_obs = _model.Observation.from_dict(local_unique_inputs)
+                        local_raw_cache = compute_prefix_cache_jit(local_unique_obs)
+                        raw_kv_cache, raw_prefix_mask = local_raw_cache
+                        repeated_kv_cache = jax.tree.map(
+                            lambda x: jnp.repeat(x, args.num_samples, axis = 1),
+                            raw_kv_cache,
+                        )
+                        repeated_prefix_mask = jnp.repeat(raw_prefix_mask, args.num_samples, axis = 0)
+                        local_prefix_cache = (repeated_kv_cache, repeated_prefix_mask)
+
                     local_start = process_index * local_samples_per_batch
                     local_end = local_start + local_samples_per_batch
                     local_inputs = _slice_tree_axis0(batched_inputs, local_start, local_end)
@@ -666,6 +690,8 @@ def main() -> int:
                     rng, sample_rng = jax.random.split(rng)
                     local_sample_rng = jax.random.fold_in(sample_rng, process_index)
                     call_kwargs = sample_kwargs
+                    if local_prefix_cache is not None:
+                        call_kwargs = {**call_kwargs, "prefix_cache": local_prefix_cache}
 
                     if batch_requests[0][0].encoded_images is not None:
                         batch_encoded_images = jnp.concatenate(

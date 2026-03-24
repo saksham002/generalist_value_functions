@@ -225,6 +225,20 @@ class Pi0(_model.BaseModel):
             return jnp.sum(sq_err * dim_mask, axis = -1) / jnp.sum(dim_mask)
         return jnp.mean(sq_err, axis = -1)
 
+    def compute_prefix_cache(
+        self, observation: _model.Observation
+    ) -> tuple[at.Array, at.Array]:
+        """Compute and return the prefix KV cache for the given observation.
+
+        Returns (kv_cache, prefix_mask).
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        return kv_cache, prefix_mask
+
     @override
     def sample_actions(
         self,
@@ -234,9 +248,9 @@ class Pi0(_model.BaseModel):
         compute_next_action: bool = False,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        prefix_cache: tuple[at.Array, at.Array] | None = None,
     ) -> _model.Actions:
         observation = transition.next_observation if compute_next_action else transition.observation
-        observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
@@ -245,10 +259,11 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        if prefix_cache is not None:
+            kv_cache, prefix_mask = prefix_cache
+        else:
+            kv_cache, prefix_mask = self.compute_prefix_cache(observation)
+        prefix_seq_len = prefix_mask.shape[1]
 
         def step(carry):
             x_t, time = carry
@@ -267,7 +282,7 @@ class Pi0(_model.BaseModel):
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
-                prefix_tokens.shape[1] + suffix_tokens.shape[1],
+                prefix_seq_len + suffix_tokens.shape[1],
             )
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
