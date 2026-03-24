@@ -48,11 +48,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gpu = [
+    "jax[cuda12]==0.5.3",
+]
+tpu = [
+    "jax[tpu]==0.5.3",
+    "libtpu==0.0.11.4",
+]
 # Legacy D4RL support - may conflict with gymnasium, use with caution
 legacy_d4rl = [
     "cython<3",
     "gym==0.23.1",
-    "d4rl @ git+https://github.com/Farama-Foundation/D4RL.git",
+    "d4rl @ git+https://github.com/maxsobolmark/D4RL.git",
     "mujoco-py<2.2,>=2.1",
 ]
 
@@ -76,11 +83,22 @@ rlds = [
 ]
 
 [tool.uv]
-# override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "tensorflow-probability==0.23.0"]
+dependency-metadata = [
+    { name = "dlimp", version = "0.0.1", requires-dist = ["tensorflow-cpu==2.15.0", "tensorflow-datasets>=4.9.2"] },
+]
 # Allow resolving for macOS (without CUDA) and Linux
 environments = [
     "sys_platform == 'darwin'",
     "sys_platform == 'linux'",
+]
+find-links = ["https://storage.googleapis.com/jax-releases/libtpu_releases.html"]
+prerelease = "allow"
+conflicts = [
+    [
+        { extra = "tpu" },
+        { extra = "gpu" },
+    ],
 ]
 
 [tool.uv.sources]

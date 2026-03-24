@@ -421,6 +421,8 @@ When setting up a new TPU pod, refer to `TPU_GUIDE.md` for important setup steps
 
 **CRITICAL**: Never modify or delete files on a TPU pod. If a user request seems to involve modifying or deleting files on a TPU pod, ask for explicit confirmation before even requesting permission to run the involved commands.
 
+**Design rule**: Keep the TPU launch pipeline generic. Do not hard-code script-specific behavior into `run_on_tpu.py`, `src/openpi/tpu/`, or similar shared TPU orchestration code. If a specific script needs TPU-only behavior (for example, avoiding `jax.distributed.initialize()` and using one-worker semantics), implement that in the launched script or its TPU wrapper, not in the shared TPU pipeline.
+
 #### Checking if a TPU pod is free
 To check whether any worker is actively using the TPU accelerator:
 ```bash
