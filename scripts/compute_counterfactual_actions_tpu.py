@@ -277,6 +277,11 @@ def main() -> int:
         raise ValueError(
             f"Per-host sampling batch size must be positive, got {local_samples_per_batch}."
         )
+    assert local_samples_per_batch % args.num_samples == 0, (
+        f"local_samples_per_batch={local_samples_per_batch} must be divisible by "
+        f"num_samples={args.num_samples}. Increase --samples-per-batch to at least "
+        f"{args.num_samples * process_count}."
+    )
 
     tf.config.set_visible_devices([], "GPU")
 
@@ -710,7 +715,7 @@ def main() -> int:
                             args.samples_per_batch,
                         )
                         local_encoded_images = batch_encoded_images[local_start:local_end]
-                        call_kwargs = {**sample_kwargs, "encoded_images": local_encoded_images}
+                        call_kwargs = {**call_kwargs, "encoded_images": local_encoded_images}
 
                     should_profile_batch = (
                         args.profile_log_dir is not None

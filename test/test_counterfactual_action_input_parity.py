@@ -59,6 +59,26 @@ def _sample_key(sample) -> tuple[str, int, int]:
     )
 
 
+def _compute_action_mask(
+    step: dict, subtask_texts: list[str], first_null_index: int, fps: int, action_horizon: int,
+) -> np.ndarray:
+    max_subtasks = 5
+    steps_all = np.asarray(step["steps_to_subtask_end"], dtype = np.int32)
+    include_subtasks = np.zeros(max_subtasks, dtype = np.bool_)
+    for idx, text in enumerate(subtask_texts[:first_null_index]):
+        lowered = text.rstrip(". ").strip().lower()
+        include_subtasks[idx] = lowered not in {"static", "abnormal"}
+
+    masked_steps = np.where(include_subtasks, steps_all, np.iinfo(np.int32).max)
+    sampled_idx = int(np.argmin(masked_steps))
+    selected_steps = int(steps_all[sampled_idx])
+    action_mask = np.arange(action_horizon, dtype = np.int32) <= selected_steps
+    if fps == 30:
+        valid_30fps_actions = 3 * action_horizon // 5
+        action_mask &= np.arange(action_horizon, dtype = np.int32) < valid_30fps_actions
+    return action_mask
+
+
 def _build_policy_prompt(subtask_texts: list[str], first_null_index: int) -> str | None:
     valid_subtask_texts = []
     for text in subtask_texts[:first_null_index]:
@@ -135,6 +155,7 @@ def _collect_training_samples() -> dict[tuple[str, int, int], dict]:
                 "state": sample["state"],
                 "tokenized_prompt": sample["tokenized_prompt"],
                 "tokenized_prompt_mask": sample["tokenized_prompt_mask"],
+                "action_mask": sample["action_mask"],
             }
     return samples
 
@@ -204,12 +225,17 @@ def _collect_counterfactual_samples() -> dict[tuple[str, int, int], dict]:
                     tf.io.decode_image(image_bytes, expand_animations = False, dtype = tf.uint8).numpy()
                 )
 
+            fps = int(episode["episode_metadata"]["fps"])
+            action_horizon = _action_horizon(config)
+            action_mask = _compute_action_mask(step, subtask_texts, first_null_index, fps, action_horizon)
+
             transformed = input_transform(
                 {
                     "image": decoded_images,
                     "state": state,
                     "prompt": prompt,
                     "embodiment": embodiment,
+                    "action_mask": action_mask,
                 }
             )
             transformed = {key: value for key, value in transformed.items() if not isinstance(value, str)}
@@ -222,6 +248,7 @@ def _collect_counterfactual_samples() -> dict[tuple[str, int, int], dict]:
                 "state": transformed["state"],
                 "tokenized_prompt": transformed["tokenized_prompt"],
                 "tokenized_prompt_mask": transformed["tokenized_prompt_mask"],
+                "action_mask": transformed["action_mask"],
             }
 
             if len(samples) >= batch_budget:

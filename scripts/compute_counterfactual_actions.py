@@ -159,6 +159,9 @@ class WorkerArgs(CommonArgs):
     profile_skip_batches: int = 0
     """Number of initial sampling batches to skip before starting JAX tracing."""
 
+    only_shard: int | None = None
+    """If set, process only this shard index and skip all others."""
+
 
 @dataclasses.dataclass
 class MergeArgs(CommonArgs):
@@ -227,6 +230,10 @@ def run_worker(args: WorkerArgs) -> None:
 
     # Distribute shards across workers (round-robin)
     my_shards = [i for i in range(num_shards) if i % num_workers == worker_id]
+    if args.only_shard is not None:
+        if args.only_shard < 0 or args.only_shard >= num_shards:
+            raise ValueError(f"--only-shard={args.only_shard} out of range [0, {num_shards}).")
+        my_shards = [args.only_shard]
     my_episode_count = sum(shard_info[i][1] for i in my_shards)
 
     logger.info(
@@ -669,10 +676,9 @@ def run_worker(args: WorkerArgs) -> None:
                         transformed = input_transform(transform_with_actions)
 
                     gt_actions_transformed = None
-                    action_mask_transformed = None
+                    action_mask_transformed = action_mask.astype(np.bool_)
                     if args.debug_metrics:
                         gt_actions_transformed = np.asarray(transformed["actions"], dtype = np.float32)
-                        action_mask_transformed = action_mask.astype(np.bool_)
 
                     transformed = {
                         k: v
@@ -764,7 +770,7 @@ def run_worker(args: WorkerArgs) -> None:
                         batch_encoded_images = _pad_batch_to_size(
                             batch_encoded_images, actual_batch_size, args.samples_per_batch
                         )
-                        call_kwargs = {**sample_kwargs, "encoded_images": batch_encoded_images}
+                        call_kwargs = {**call_kwargs, "encoded_images": batch_encoded_images}
 
                     should_profile_batch = (
                         args.profile_log_dir is not None
