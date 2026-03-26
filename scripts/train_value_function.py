@@ -1630,22 +1630,27 @@ def generate_validation_plots_dlimp(
     cache_dir: str | None = None,
     save_only: bool = False,
     include_repos: tuple[str, ...] = (),
+    input_transform = None,
 ) -> dict:
-    """Generate validation plots for RoboCOIN using a dlimp dataloader.
+    """Generate validation plots for RoboCOIN.
 
-    Supports caching validation episodes to disk: on the first call with
-    save_only=True episodes are collected and saved; subsequent calls load
-    from cache instead of re-iterating the dataloader.
+    Supports caching validation episodes to disk: on the first call
+    episodes are collected, transformed, and saved; subsequent calls load
+    from cache instead of re-iterating the dataset.
 
     Args:
         model: The value function model.
-        val_dataloader: RoboCOIN dataloader with repeat=False, shuffle=False.
+        val_dataloader: RLDS trajectory dataset (return_trajectories=True),
+            or None when loading from an existing cache.
         val_episode_indices: List of episode indices to plot (used for count only).
         step: Current training step.
         action_conditioned: Whether the model is action-conditioned (Q vs V).
         data_config: Data configuration.
         cache_dir: Directory to save/load cached validation episodes.
         save_only: If True, only save episodes to disk and return empty dict.
+        include_repos: Repo IDs that must be included in the validation set.
+        input_transform: Composed transform pipeline (Normalize + ResizeImages + TokenizePrompt)
+            applied to each frame before caching. Required on first call.
 
     Returns:
         Empty dict (plots are logged asynchronously by a background thread).
@@ -1655,7 +1660,10 @@ def generate_validation_plots_dlimp(
         f"include_repos ({len(include_repos)}) must be < num_val_trajectories ({num_val_trajectories})"
     )
 
-    traj_frames = cache_val_episodes(val_dataloader, num_val_trajectories, cache_dir, include_repos, save_only)
+    traj_frames = cache_val_episodes(
+        val_dataloader, num_val_trajectories, cache_dir, include_repos, save_only,
+        input_transform = input_transform,
+    )
     if save_only:
         return {}
 
@@ -1826,8 +1834,8 @@ def main(config: _config.TrainConfig):
     ft_config = _config.get_fine_tune_config(config.fine_tune) if config.fine_tune is not None else None
 
     if ft_config is not None:
-        import dataclasses as dc
-        ft_config = dc.replace(ft_config, overwrite = config.overwrite, resume = config.resume)
+        ft_config = dataclasses.replace(ft_config, overwrite = config.overwrite, resume = config.resume)
+        config = ft_config.apply_overrides(config)
 
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         config.checkpoint_dir,
@@ -1858,10 +1866,6 @@ def main(config: _config.TrainConfig):
     # Create validation data_config (same overridden config.data)
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    effective_include_repos = ft_config.include_repos if (ft_config is not None and ft_config.include_repos is not None) else config.include_repos
-    effective_num_val_trajectories = ft_config.num_val_trajectories if (ft_config is not None and ft_config.num_val_trajectories is not None) else config.num_val_trajectories
-    effective_validation_cache_dir = ft_config.validation_cache_dir if (ft_config is not None and ft_config.validation_cache_dir is not None) else config.validation_cache_dir
-
     # Initialize variables for all branches
     num_episodes = None
     val_dataloader = None
@@ -1885,7 +1889,24 @@ def main(config: _config.TrainConfig):
         )
         val_dataloader = None
     elif data_config.rlds_dataset_class == "robocoin":
-        logging.info("Skipping validation cache setup for RoboCOIN RLDS configs.")
+        action_horizon = config.action_horizon or config.model.action_horizon
+        val_trajectory_dataset = _data_loader.create_rlds_dataset(
+            data_config,
+            action_horizon,
+            config.batch_size,
+            split = data_config.val_split,
+            shuffle = False,
+            return_trajectories = True,
+        )
+        val_input_transform = _transforms.compose([
+            *data_config.repack_transforms.inputs,
+            *data_config.data_transforms.inputs,
+            _transforms.Normalize(data_config.norm_stats, use_quantiles = data_config.use_quantile_norm),
+            *([_transforms.Clip(data_config.clip_normalized_bounds)] if data_config.clip_normalized_bounds is not None else []),
+            *data_config.model_transforms.inputs,
+        ])
+        val_episode_indices = list(range(config.num_val_trajectories))
+        val_episodes_cache_dir = config.validation_cache_dir
         val_dataset = None
     else:
         # Non-RoboCOIN: use LeRobot dataset
@@ -1902,7 +1923,7 @@ def main(config: _config.TrainConfig):
         if hasattr(val_dataset, "episode_starts") and hasattr(val_dataset, "episode_ends"):
             episode_lengths = val_dataset.episode_ends - val_dataset.episode_starts
             valid_episode_indices = np.where(episode_lengths >= min_episode_length)[0]
-            if len(valid_episode_indices) < effective_num_val_trajectories:
+            if len(valid_episode_indices) < config.num_val_trajectories:
                 logging.warning(
                     f"Only {len(valid_episode_indices)} episodes with >= {min_episode_length} frames, "
                     f"using all of them for validation"
@@ -1910,11 +1931,11 @@ def main(config: _config.TrainConfig):
                 val_episode_indices = valid_episode_indices.tolist()
             else:
                 val_episode_indices = val_rng.choice(
-                    valid_episode_indices, size=effective_num_val_trajectories, replace=False
+                    valid_episode_indices, size=config.num_val_trajectories, replace=False
                 ).tolist()
         else:
             val_episode_indices = val_rng.choice(
-                num_episodes, size=min(effective_num_val_trajectories, num_episodes), replace=False
+                num_episodes, size=min(config.num_val_trajectories, num_episodes), replace=False
             ).tolist()
         logging.info(f"Selected validation episodes: {val_episode_indices}")
         
@@ -1966,7 +1987,17 @@ def main(config: _config.TrainConfig):
         model = nnx.merge(critic_state.model_def, critic_state.params)
 
         if data_config.rlds_dataset_class == "robocoin":
-            logging.info("Skipping validation plotting for RoboCOIN RLDS configs.")
+            generate_validation_plots_dlimp(
+                model = model,
+                val_dataloader = val_trajectory_dataset,
+                val_episode_indices = val_episode_indices,
+                step = step,
+                action_conditioned = action_conditioned,
+                data_config = data_config,
+                cache_dir = val_episodes_cache_dir,
+                include_repos = config.include_repos,
+                input_transform = val_input_transform,
+            )
         else:
             plot_images = generate_validation_plots(
                 model=model,
@@ -1996,46 +2027,11 @@ def main(config: _config.TrainConfig):
     is_fine_tuning = ft_config is not None and not ft_config.val_only
 
     if is_fine_tuning:
-        effective_num_train_steps = pretrained_step + ft_config.num_train_steps
-        effective_save_interval = ft_config.save_interval
-        effective_plot_interval = ft_config.plot_interval
-        effective_keep_period = ft_config.keep_period
-        effective_log_interval = ft_config.log_interval
-
-        # Create a fresh optimizer with the fine-tune LR schedule
-        ft_lr_schedule_config = ft_config.lr_schedule
-        ft_tx = _optimizer.create_optimizer(config.optimizer, ft_lr_schedule_config, weight_decay_mask = None)
-        ft_opt_state = ft_tx.init(critic_state.params.filter(config.trainable_filter))
-
-        critic_state = critic_state.replace(tx = ft_tx, opt_state = ft_opt_state)
-        critic_sharding = sharding.fsdp_sharding(critic_state, mesh)
-
-        # LR schedule for logging: 0-indexed relative to pretrained_step
-        ft_lr_schedule_fn = ft_lr_schedule_config.create()
-
-        def lr_schedule(step, _base = pretrained_step, _fn = ft_lr_schedule_fn):
-            return _fn(step - _base)
-
-        # Save fine-tune checkpoints under <pretrained_checkpoint_dir>/<ft_config_name>/
-        ft_checkpoint_dir = config.checkpoint_dir / ft_config.name
-        checkpoint_manager, _ = _checkpoints.initialize_checkpoint_dir(
-            ft_checkpoint_dir,
-            keep_period = effective_keep_period,
-            overwrite = ft_config.overwrite,
-            resume = ft_config.resume,
+        config, critic_state, critic_sharding, checkpoint_manager = ft_config.initialize(
+            config, pretrained_step, critic_state, mesh,
         )
 
-        logging.info(
-            f"Fine-tuning: {ft_config.num_train_steps} steps from pretrained step {pretrained_step}, "
-            f"total steps = {effective_num_train_steps}, checkpoint_dir = {ft_checkpoint_dir}"
-        )
-    else:
-        effective_num_train_steps = config.num_train_steps
-        effective_save_interval = config.save_interval
-        effective_plot_interval = config.plot_interval
-        effective_keep_period = config.keep_period
-        effective_log_interval = config.log_interval
-        lr_schedule = config.lr_schedule.create()
+    lr_schedule = config.lr_schedule.create()
 
     if policy_state is not None:
         ptrain_step = jax.jit(
@@ -2067,9 +2063,9 @@ def main(config: _config.TrainConfig):
 
     start_step = int(critic_state.step)
     pbar = tqdm.tqdm(
-        range(start_step, effective_num_train_steps),
+        range(start_step, config.num_train_steps),
         initial=start_step,
-        total=effective_num_train_steps,
+        total=config.num_train_steps,
         dynamic_ncols=True,
     )
 
@@ -2101,7 +2097,7 @@ def main(config: _config.TrainConfig):
                     jax.block_until_ready(policy_info)
                 info.update(policy_info)
 
-        if step % effective_log_interval == 0:
+        if step % config.log_interval == 0:
             info = jax.device_get(info)
             # Add timing info to logged metrics (average and total)
             total_times = timer.get_total_times(reset=False)
@@ -2131,18 +2127,28 @@ def main(config: _config.TrainConfig):
             else:
                 batch = raw_batch
 
-        if (step + 1) % effective_save_interval == 0 or step + 1 == effective_num_train_steps:
+        if (step + 1) % config.save_interval == 0 or step + 1 == config.num_train_steps:
             with timer.context("checkpoint_save"):
                 state_to_save = training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
                 _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step + 1)
 
         # Generate validation plots (all workers participate for FSDP, only worker 0 creates plots/logs)
-        if (step + 1) % effective_plot_interval == 0 or step + 1 == effective_num_train_steps:
+        if (step + 1) % config.plot_interval == 0 or step + 1 == config.num_train_steps:
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
                 if data_config.rlds_dataset_class == "robocoin":
-                    logging.info("Skipping validation plotting for RoboCOIN RLDS configs.")
+                    generate_validation_plots_dlimp(
+                        model = model,
+                        val_dataloader = val_trajectory_dataset,
+                        val_episode_indices = val_episode_indices,
+                        step = step,
+                        action_conditioned = action_conditioned,
+                        data_config = data_config,
+                        cache_dir = val_episodes_cache_dir,
+                        include_repos = config.include_repos,
+                        input_transform = val_input_transform,
+                    )
                 else:
                     plot_images = generate_validation_plots(
                         model=model,
@@ -2160,7 +2166,7 @@ def main(config: _config.TrainConfig):
                             logging.warning(f"No validation plots generated at step {step}")
             
         # Policy evaluation (only on worker 0)
-        if eval_enabled and ((step + 1) % config.eval_interval == 0 or step + 1 == effective_num_train_steps):
+        if eval_enabled and ((step + 1) % config.eval_interval == 0 or step + 1 == config.num_train_steps):
             with timer.context("policy_eval"):
                 policy_model = nnx.merge(policy_state.model_def, policy_state.params)
 

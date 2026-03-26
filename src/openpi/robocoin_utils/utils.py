@@ -217,26 +217,68 @@ def count_subtask_segments(frames: list[dict], prefix: str = "") -> tuple[int, i
     return count, split_frame_idx, labeled_segments
 
 
+_CACHE_KEYS = {
+    "state", "image", "image_mask", "actions", "action_mask",
+    "tokenized_prompt", "tokenized_prompt_mask",
+    "mc_return", "loss_mask", "fps",
+    "repo_id", "episode_index", "_frame_index",
+}
+
+
+def _unstack_trajectory(traj: dict, t: int) -> dict:
+    """Extract a single frame at timestep t from a stacked trajectory dict."""
+    frame: dict = {}
+    for key, value in traj.items():
+        if isinstance(value, dict):
+            frame[key] = {k: np.asarray(v[t]) for k, v in value.items()}
+        else:
+            frame[key] = np.asarray(value[t])
+    return frame
+
+
+def _extract_cache_frame(frame: dict, prompt_text: str) -> dict:
+    """Keep only plotting-relevant keys and add subtask_1_text from the original prompt."""
+    cached: dict = {}
+    for key in _CACHE_KEYS:
+        if key in frame:
+            cached[key] = frame[key]
+    cached["subtask_1_text"] = prompt_text
+    return cached
+
+
+def _decode_repo_id(raw) -> str:
+    raw = np.asarray(raw)
+    if raw.ndim > 0:
+        raw = raw.item()
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8")
+    return str(raw)
+
+
 def cache_val_episodes(
-    val_dataloader,
+    trajectory_iter,
     num_val_trajectories: int,
     cache_dir: str | None,
     include_repos: tuple[str, ...],
     save_only: bool,
+    input_transform = None,
 ) -> dict[int, list[dict]]:
     """Load or collect validation episodes, optionally caching them to disk.
 
-    On first call (no cache), iterates the dataloader, collects frames for
-    num_val_trajectories unique-repo-id trajectories, and optionally saves them
-    to per-trajectory pickle files under cache_dir.  On subsequent calls the
-    cache is loaded instead of re-iterating the dataloader.
+    Iterates an RLDS trajectory dataset (return_trajectories=True), applies
+    input_transform to each frame, and caches the transformed frames as
+    per-trajectory pickle files. On subsequent calls the cache is loaded
+    instead of re-iterating the dataset.
 
     Args:
-        val_dataloader: RoboCOIN dataloader with repeat=False, shuffle=False.
+        trajectory_iter: RLDS dataset yielding full trajectories (stacked dicts),
+            or None when loading from an existing cache.
         num_val_trajectories: Number of unique-repo trajectories to collect.
         cache_dir: Directory to save/load cached trajectories. None disables caching.
         include_repos: Repo IDs that must be included (up to len(include_repos) slots reserved).
         save_only: If True, collect and cache episodes then return {}.
+        input_transform: Composed transform pipeline (Normalize + ResizeImages + TokenizePrompt)
+            applied to each frame before caching. Required when collecting, ignored when loading.
 
     Returns:
         Dict mapping traj_idx -> sorted list of frame dicts, or {} if save_only=True.
@@ -259,103 +301,65 @@ def cache_val_episodes(
                     traj_frames[traj_idx] = pickle.load(f)
         logger.info(f"Loaded {len(traj_frames)} trajectories from cache")
     elif not cache_exists:
-        active_trajs: set[int] = set()
-        saved_traj_count = 0
+        assert trajectory_iter is not None, "No cache found and no trajectory iterator provided."
+        assert input_transform is not None, "input_transform is required when collecting trajectories."
+
         seen_repo_ids: set[str] = set()
         seen_required_repo_ids: set[str] = set()
         num_non_required_slots = num_val_trajectories - len(include_repos)
-        logger.info(f"Collecting validation frames for first {num_val_trajectories} unique repo_id trajectories")
+        collected_count = 0
+        logger.info(f"Collecting validation trajectories for {num_val_trajectories} unique repo_ids")
 
         if cache_dir:
             os.makedirs(cache_dir, exist_ok = True)
 
-        for batch in val_dataloader:
-            traj_indices = batch.get("_traj_index", None)
-            if traj_indices is None:
-                logger.warning("Batch missing _traj_index, cannot identify trajectories")
+        for traj in trajectory_iter:
+            repo_id = _decode_repo_id(traj["repo_id"][0])
+
+            if repo_id in seen_repo_ids:
                 continue
 
-            if hasattr(traj_indices, "device"):
-                traj_indices = np.asarray(traj_indices)
+            is_required = repo_id in include_repos and repo_id not in seen_required_repo_ids
+            if not is_required and num_non_required_slots <= 0:
+                continue
 
-            unique_batch_trajs = set(int(t) for t in traj_indices)
+            # Un-stack trajectory, apply transforms, keep only cache keys
+            traj_len = len(traj["repo_id"])
+            frames = []
+            for t in range(traj_len):
+                frame = _unstack_trajectory(traj, t)
+                prompt_text = frame["prompt"]
+                if isinstance(prompt_text, bytes):
+                    prompt_text = prompt_text.decode("utf-8")
+                elif hasattr(prompt_text, "item"):
+                    prompt_text = prompt_text.item()
+                    if isinstance(prompt_text, bytes):
+                        prompt_text = prompt_text.decode("utf-8")
+                frame = input_transform(frame)
+                frames.append(_extract_cache_frame(frame, prompt_text))
 
-            completed_trajs = active_trajs - unique_batch_trajs
-            for traj_idx in completed_trajs:
-                if traj_idx in traj_frames:
-                    frames = traj_frames[traj_idx]
-                    if frames:
-                        frames.sort(key=lambda f: f["_frame_index"])
+            frames.sort(key = lambda f: int(f["_frame_index"]))
 
-                    if cache_dir:
-                        cache_file = os.path.join(cache_dir, f"traj_{traj_idx}.pkl")
-                        with open(cache_file, "wb") as f:
-                            pickle.dump(frames, f)
-                        logger.info(f"Saved traj {traj_idx} ({len(frames)} frames) to {cache_file}")
+            if cache_dir:
+                cache_file = os.path.join(cache_dir, f"traj_{collected_count}.pkl")
+                with open(cache_file, "wb") as f:
+                    pickle.dump(frames, f)
+                logger.info(f"Cached traj {collected_count} (repo {repo_id}, {traj_len} frames) to {cache_file}")
 
-                    del traj_frames[traj_idx]
-                    saved_traj_count += 1
+            if not save_only:
+                traj_frames[collected_count] = frames
 
-                active_trajs.discard(traj_idx)
+            seen_repo_ids.add(repo_id)
+            if is_required:
+                seen_required_repo_ids.add(repo_id)
+            else:
+                num_non_required_slots -= 1
+            collected_count += 1
 
-            if saved_traj_count >= num_val_trajectories:
-                logger.info(f"Saved {saved_traj_count} trajectories, breaking early")
+            if collected_count >= num_val_trajectories:
                 break
 
-            batch_size = traj_indices.shape[0]
-            for i in range(batch_size):
-                traj_idx = int(traj_indices[i])
-
-                if traj_idx not in traj_frames and traj_idx not in active_trajs:
-                    sample_repo_id = batch["repo_id"][i]
-                    if isinstance(sample_repo_id, bytes):
-                        sample_repo_id = sample_repo_id.decode("utf-8")
-                    if sample_repo_id in seen_repo_ids:
-                        continue
-
-                    is_required = sample_repo_id in include_repos and sample_repo_id not in seen_required_repo_ids
-                    if not is_required and num_non_required_slots == 0:
-                        continue
-
-                    traj_frames[traj_idx] = []
-                    active_trajs.add(traj_idx)
-                    seen_repo_ids.add(sample_repo_id)
-                    if is_required:
-                        seen_required_repo_ids.add(sample_repo_id)
-                    else:
-                        num_non_required_slots -= 1
-
-                if traj_idx not in active_trajs:
-                    continue
-
-                frame = {}
-                for key, value in batch.items():
-                    if isinstance(value, dict):
-                        frame[key] = {}
-                        for sub_key, sub_value in value.items():
-                            frame[key][sub_key] = np.asarray(sub_value[i])
-                    else:
-                        frame[key] = np.asarray(value[i])
-
-                traj_frames[traj_idx].append(frame)
-
-        # Save any remaining active trajectories that were still in-progress when the dataloader ended
-        for traj_idx in list(active_trajs):
-            if saved_traj_count >= num_val_trajectories:
-                break
-            if traj_idx in traj_frames:
-                frames = traj_frames[traj_idx]
-                if frames:
-                    frames.sort(key = lambda f: f["_frame_index"])
-                if cache_dir:
-                    cache_file = os.path.join(cache_dir, f"traj_{traj_idx}.pkl")
-                    with open(cache_file, "wb") as f:
-                        pickle.dump(frames, f)
-                    logger.info(f"Saved remaining traj {traj_idx} ({len(frames)} frames) to {cache_file}")
-                del traj_frames[traj_idx]
-                saved_traj_count += 1
-
-        logger.info(f"Total trajectories saved: {saved_traj_count}, unique repo_ids: {len(seen_repo_ids)}")
+        logger.info(f"Collected {collected_count} trajectories, unique repo_ids: {len(seen_repo_ids)}")
 
     if save_only:
         return {}

@@ -6,7 +6,7 @@ import dataclasses
 import difflib
 import logging
 import pathlib
-from typing import Any, Literal, Protocol, TypeAlias
+from typing import Any, ClassVar, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -869,6 +869,12 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
         if "norm_stats" in data:
             return _normalize.deserialize_json(path.read_text())
 
+        # Flat single-embodiment RoboCOIN format: "observation.state" is a top-level key
+        if "observation.state" in data:
+            result = self._convert_robocoin_stats(data)
+            logging.info(f"Loaded flat single-embodiment RoboCOIN norm_stats from {path}")
+            return result
+
         # RoboCOIN format: top-level keys are embodiment names
         result = {}
         for embodiment, emb_data in data.items():
@@ -1075,31 +1081,144 @@ class FineTuneConfig:
     data_dir: str | None = None
     dataset_name: str | None = None
     norm_stats_path: str | None = None
+    assets: AssetsConfig | None = None
 
     # Validation overrides
     include_repos: tuple[str, ...] | None = None
     validation_cache_dir: str | None = None
     num_val_trajectories: int | None = None
 
-    # Training schedule (0-indexed internally relative to pretrained step)
-    num_train_steps: int = 0
-    lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(
-        default_factory = _optimizer.CosineDecaySchedule
-    )
+    # Training schedule overrides (num_train_steps is relative to pretrained step)
+    num_train_steps: int | None = None
+    lr_schedule: _optimizer.LRScheduleConfig | None = None
 
     # If True, skip training: load checkpoint, run validation, exit.
     val_only: bool = False
 
-    # Save/plot intervals for fine-tuning
-    save_interval: int = 50
-    plot_interval: int = 50
-    keep_period: int | None = 50
-    log_interval: int = 1
+    # Interval / checkpoint overrides
+    save_interval: int | None = None
+    plot_interval: int | None = None
+    keep_period: int | None = None
+    log_interval: int | None = None
 
     # If true, will overwrite the fine-tune checkpoint directory if it already exists.
     overwrite: bool = False
     # If true, will resume fine-tuning from the last fine-tune checkpoint.
     resume: bool = False
+
+    # Fields that map 1:1 from FineTuneConfig to TrainConfig for apply_overrides.
+    _TRAIN_CONFIG_FIELDS: ClassVar[tuple[str, ...]] = (
+        "save_interval", "plot_interval", "keep_period", "log_interval",
+        "include_repos", "validation_cache_dir", "num_val_trajectories",
+    )
+
+    def apply_overrides(self, config: "TrainConfig", pretrained_step: int | None = None) -> "TrainConfig":
+        """Apply all non-None overrides from this FineTuneConfig to the given TrainConfig.
+
+        Handles data overrides (data_dir, dataset_name, norm_stats_path, assets),
+        direct field overrides (save_interval, log_interval, etc.), and — when
+        pretrained_step is provided — num_train_steps (offset to absolute) and
+        lr_schedule (wrapped with step offset).
+        """
+        config = self._apply_data_overrides(config)
+
+        replacements: dict[str, Any] = {}
+        for field in self._TRAIN_CONFIG_FIELDS:
+            value = getattr(self, field)
+            if value is not None:
+                replacements[field] = value
+
+        if pretrained_step is not None:
+            if self.num_train_steps is not None:
+                replacements["num_train_steps"] = pretrained_step + self.num_train_steps
+            if self.lr_schedule is not None:
+                replacements["lr_schedule"] = _optimizer.OffsetSchedule(
+                    base = self.lr_schedule, offset = pretrained_step,
+                )
+
+        if replacements:
+            config = dataclasses.replace(config, **replacements)
+            logging.info("Applied FineTuneConfig overrides: %s", list(replacements.keys()))
+
+        return config
+
+    def initialize(
+        self,
+        config: "TrainConfig",
+        pretrained_step: int,
+        train_state: Any,
+        mesh: Any,
+    ) -> tuple["TrainConfig", Any, Any, Any]:
+        """Full fine-tuning initialization: apply overrides, create optimizer, and checkpoint manager.
+
+        Returns (config, train_state, train_state_sharding, checkpoint_manager).
+        """
+        import openpi.training.checkpoints as _checkpoints
+        import openpi.training.sharding as _sharding
+
+        config = self.apply_overrides(config, pretrained_step = pretrained_step)
+
+        ft_tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask = None)
+        ft_opt_state = ft_tx.init(train_state.params.filter(config.trainable_filter))
+        train_state = train_state.replace(tx = ft_tx, opt_state = ft_opt_state)
+        train_state_sharding = _sharding.fsdp_sharding(train_state, mesh)
+
+        ft_checkpoint_dir = config.checkpoint_dir / self.name
+        checkpoint_manager, _ = _checkpoints.initialize_checkpoint_dir(
+            ft_checkpoint_dir,
+            keep_period = config.keep_period,
+            overwrite = self.overwrite,
+            resume = self.resume,
+        )
+
+        logging.info(
+            "Fine-tuning: %s steps from pretrained step %s, total steps = %s, checkpoint_dir = %s",
+            config.num_train_steps - pretrained_step,
+            pretrained_step,
+            config.num_train_steps,
+            ft_checkpoint_dir,
+        )
+
+        return config, train_state, train_state_sharding, checkpoint_manager
+
+    def _apply_data_overrides(self, config: "TrainConfig") -> "TrainConfig":
+        """Apply data_dir, dataset_name, norm_stats_path, and assets overrides."""
+        if self.data_dir is None and self.dataset_name is None and self.norm_stats_path is None and self.assets is None:
+            return config
+
+        data_factory = config.data
+        if not isinstance(data_factory, RoboCoinRldsDataConfig):
+            raise TypeError(
+                f"FineTuneConfig data overrides are only supported for RoboCoinRldsDataConfig, "
+                f"got {type(data_factory).__name__}"
+            )
+
+        replacements: dict[str, Any] = {}
+
+        if self.data_dir is not None:
+            replacements["rlds_data_dir"] = self.data_dir
+
+        if self.dataset_name is not None:
+            parts = self.dataset_name.split(":")
+            if len(parts) != 2:
+                raise ValueError(
+                    f"dataset_name must be in 'name:version' format, got '{self.dataset_name}'"
+                )
+            name, version = parts
+            base_dataset = data_factory.datasets[0]
+            new_dataset = dataclasses.replace(base_dataset, name = name, version = version)
+            replacements["datasets"] = (new_dataset,)
+
+        if self.assets is not None:
+            replacements["assets"] = self.assets
+        elif self.norm_stats_path is not None:
+            norm_path = pathlib.PurePosixPath(self.norm_stats_path)
+            asset_id = norm_path.parent.name
+            assets_dir = str(norm_path.parent.parent)
+            replacements["assets"] = AssetsConfig(assets_dir = assets_dir, asset_id = asset_id)
+
+        new_data = dataclasses.replace(data_factory, **replacements)
+        return dataclasses.replace(config, data = new_data)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2155,6 +2274,19 @@ def _make_antmaze_large_diverse_v2_legacy_configs_safe() -> list[TrainConfig]:
 
 _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
     FineTuneConfig(
+        name = "real_hang_pi05_finetune",
+        data_dir = "gs://saksham-euw4/hdf5/",
+        dataset_name = "real_hang:1.0.0",
+        assets = AssetsConfig(
+            assets_dir = "gs://saksham-euw4/hdf5/real_hang",
+            asset_id = "norm_stats",
+        ),
+        num_train_steps = 50_000,
+        save_interval = 10_000,
+        keep_period = 10_000,
+        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
+    ),
+    FineTuneConfig(
         name = "real_hang_val_only",
         data_dir = "gs://saksham-euw4/hdf5/",
         dataset_name = "real_hang:1.0.0",
@@ -2672,7 +2804,7 @@ _CONFIGS = [
             discount=0.999,
             td_n=50,
             use_eef=True,
-            dont_mask_actions=False,
+            dont_mask_actions=True,
             use_chunk_wise_delta=True,
             use_quantile_norm=True,
             shuffle_buffer_size=50_000,
@@ -2695,7 +2827,7 @@ _CONFIGS = [
         action_horizon=50,
         num_val_trajectories=10,
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_rlds/",
     ),
     # =========================================================================
     # Reference: CQL + Best-of-N config (from main branch, cosmos backbone).
@@ -2768,16 +2900,12 @@ _CONFIGS = [
             action_horizon=50,
             max_token_len=96,
             pi05=True,
+            discrete_state_input=False,
             action_dim_offset=14,
             action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
             dtype="float32",
         ),
         data=RoboCoinRldsDataConfig(
-            rlds_data_dir="/data/group_data/rl/datasets",
-            assets=AssetsConfig(
-                assets_dir = "/data/group_data/rl/saksham3/robocoin/norm_stats",
-                asset_id = "embodiment_wise",
-            ),
             datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
             discount=0.999,
             td_n=50,
@@ -2803,47 +2931,6 @@ _CONFIGS = [
         save_interval=50_000,
         fsdp_devices=16,
         action_horizon=50,
-    ),
-    TrainConfig(
-        name = "robocoin_bimanual_pi05_rlds_gcs",
-        model = pi0_config.Pi0Config(
-            paligemma_variant = "gemma_2b",
-            action_expert_variant = "gemma_300m",
-            action_dim = 32,
-            action_horizon = 50,
-            max_token_len = 96,
-            pi05 = True,
-            action_dim_offset = 14,
-            action_dim_mask = (False,) * 14 + (True,) * 14 + (False,) * 4,
-            dtype = "float32",
-        ),
-        data = RoboCoinRldsDataConfig(
-            rlds_data_dir = "gs://saksham-euw4/robocoin_bimanual",
-            datasets = (rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
-            discount = 0.999,
-            td_n = 50,
-            use_eef = True,
-            critic_mode = False,
-            use_chunk_wise_delta = True,
-            use_quantile_norm = True,
-            filter_n = 5,
-            shuffle_buffer_size = 50_000,
-        ),
-        weight_loader = weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps = 230_000,
-        batch_size = 256,
-        lr_schedule = _optimizer.CosineDecaySchedule(
-            warmup_steps = 1000,
-            peak_lr = 1e-5,
-            decay_steps = 230_000,
-            decay_lr = 1e-6,
-        ),
-        optimizer = _optimizer.AdamW(weight_decay = 1e-6),
-        num_workers = 0,
-        log_interval = 100,
-        save_interval = 50_000,
-        fsdp_devices = 16,
-        action_horizon = 50,
     ),
 ]
 

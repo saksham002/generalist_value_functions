@@ -48,20 +48,30 @@ def init_logging():
     logger.handlers[0].setFormatter(formatter)
 
 
-def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
+def init_wandb(
+    config: _config.TrainConfig,
+    *,
+    resuming: bool,
+    log_code: bool = False,
+    enabled: bool = True,
+    ft_config: _config.FineTuneConfig | None = None,
+    checkpoint_dir: epath.Path | None = None,
+):
     if not enabled or jax.process_index() != 0:
         wandb.init(mode="disabled")
         return
 
-    ckpt_dir = config.checkpoint_dir
+    ckpt_dir = checkpoint_dir if checkpoint_dir is not None else config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
         wandb.init(id=run_id, resume="must", project=config.project_name, group=config.wandb_group)
     else:
+        base_name = config.exp_name if config.exp_name else config.name
+        run_name = f"{base_name}/{ft_config.name}" if ft_config is not None else base_name
         wandb.init(
-            name=config.exp_name or config.name,
+            name=run_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
             group=config.wandb_group,
@@ -262,13 +272,24 @@ def main(config: _config.TrainConfig):
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    ft_config = _config.get_fine_tune_config(config.fine_tune) if config.fine_tune is not None else None
+    if ft_config is not None:
+        ft_config = dataclasses.replace(ft_config, overwrite = config.overwrite, resume = config.resume)
+        config = ft_config.apply_overrides(config)
+
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         config.checkpoint_dir,
-        keep_period=config.keep_period,
-        overwrite=config.overwrite,
-        resume=config.resume,
+        keep_period = config.keep_period,
+        overwrite = config.overwrite,
+        resume = config.resume,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    wandb_resuming = resuming and ft_config is None
+    init_wandb(
+        config,
+        resuming = wandb_resuming,
+        enabled = config.wandb_enabled,
+        ft_config = ft_config,
+    )
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -293,6 +314,14 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+
+    pretrained_step = int(train_state.step)
+    is_fine_tuning = ft_config is not None and not ft_config.val_only
+
+    if is_fine_tuning:
+        config, train_state, train_state_sharding, checkpoint_manager = ft_config.initialize(
+            config, pretrained_step, train_state, mesh,
+        )
 
     lr_schedule = config.lr_schedule.create()
 

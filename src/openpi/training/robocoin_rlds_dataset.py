@@ -242,6 +242,8 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
 
     def _restructure_images(self, frame: dict[str, Any], prefix: str = "") -> tuple[dict[str, Any], dict[str, Any]]:
         """Move camera images from observation dicts into the standard image/image_mask format."""
+        import tensorflow as tf
+
         images = {}
         masks = {}
         image_name_map = {
@@ -258,7 +260,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
                 continue
             image_key = image_name_map[key]
             images[image_key] = value
-            masks[image_key] = True
+            masks[image_key] = tf.constant(True)
 
         return images, masks
 
@@ -337,8 +339,13 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         frame["sampled_index"] = sampled_idx
         frame["loss_mask"] = loss_mask
 
-        frame["action_mask"] = frame["action_mask"][sampled_idx]
-        frame["next_action_mask"] = frame["next_action_mask"][sampled_idx]
+        if self._critic_mode:
+            frame["action_mask"] = frame["action_mask"][sampled_idx]
+            frame["next_action_mask"] = frame["next_action_mask"][sampled_idx]
+        else:
+            full_action_horizon = tf.shape(frame["action_mask"])[1]
+            frame["action_mask"] = tf.ones([full_action_horizon], dtype = tf.bool)
+            frame["next_action_mask"] = tf.ones([full_action_horizon], dtype = tf.bool)
 
         fps = tf.cast(frame["fps"], tf.int32)
         exponent_per_step = tf.cast(tf.where(tf.equal(fps, 30), 5, 3), tf.float32)

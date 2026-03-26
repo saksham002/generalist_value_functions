@@ -42,6 +42,24 @@ class CosineDecaySchedule(LRScheduleConfig):
 
 
 @dataclasses.dataclass(frozen=True)
+class OffsetSchedule:
+    """Wraps a base LR schedule with a step offset so that step 0 of the inner schedule
+    corresponds to `offset` of the outer schedule."""
+
+    base: LRScheduleConfig
+    offset: int
+
+    def create(self) -> optax.Schedule:
+        base_fn = self.base.create()
+        _offset = self.offset
+
+        def _schedule(step: at.Array) -> at.Array:
+            return base_fn(step - _offset)
+
+        return _schedule
+
+
+@dataclasses.dataclass(frozen=True)
 class RsqrtDecaySchedule(LRScheduleConfig):
     """Inverse square root decay schedule with warmup."""
 
