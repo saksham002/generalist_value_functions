@@ -231,8 +231,11 @@ class DecodeRoboCoinPromptBytes:
 
     def __call__(self, data: _transforms.DataDict) -> _transforms.DataDict:
         prompt = data["prompt"]
+        if hasattr(prompt, "item"):
+            prompt = prompt.item()
         if isinstance(prompt, bytes):
-            data["prompt"] = prompt.decode("utf-8")
+            prompt = prompt.decode("utf-8")
+        data["prompt"] = prompt
         return data
 
 
@@ -837,10 +840,14 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
     use_quantile_norm: bool = False
     filter_n: int | None = None
     mask_50fps: bool = False
-    dont_mask_actions: bool = False
+    mask_boundary_actions: bool = True
+    replace_boundary_actions: bool = False
     use_chunk_wise_delta: bool = False
+    state_dim: int = 14
 
     def __post_init__(self) -> None:
+        if self.mask_boundary_actions and self.replace_boundary_actions:
+            raise ValueError("At most one of mask_boundary_actions and replace_boundary_actions can be True.")
         if self.latent_views and self.latent_store_dir is None:
             raise ValueError("latent_views requires latent_store_dir to be set.")
 
@@ -895,12 +902,24 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
         norm_stats: dict[str, _transforms.NormStats] = {}
 
         state_stats = data["observation.state"]
-        norm_stats["state"] = _transforms.NormStats(
+        raw_state_stats = _transforms.NormStats(
             mean = np.array(state_stats["mean"]),
             std = np.array(state_stats["std"]),
             q01 = np.array(state_stats["q01"]),
             q99 = np.array(state_stats["q99"]),
         )
+        if self.state_dim == 14:
+            assert raw_state_stats.mean.shape[-1] == 14, (
+                f"state_dim=14 but norm stats have {raw_state_stats.mean.shape[-1]}D state"
+            )
+            norm_stats["state"] = raw_state_stats
+        elif self.state_dim == 16:
+            if raw_state_stats.mean.shape[-1] == 16:
+                norm_stats["state"] = raw_state_stats
+            else:
+                norm_stats["state"] = self._pad_state_norm_stats_14_to_16(raw_state_stats)
+        else:
+            raise ValueError(f"Unsupported state_dim={self.state_dim}, expected 14 or 16")
 
         action_key = "action_diff" if self.use_chunk_wise_delta else "action"
         eef_action_key = "eef_sim_pose_action_diff" if self.use_chunk_wise_delta else "eef_sim_pose_action"
@@ -937,6 +956,22 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
             norm_stats["next_actions"] = norm_stats["actions"]
 
         return norm_stats
+
+    @staticmethod
+    def _pad_14_to_16(x, fill_value):
+        """Pad 14D state vector to 16D: x[:7], fill, x[7:], fill."""
+        import numpy as np
+
+        return np.concatenate([x[..., :6], np.full((*x.shape[:-1], 1), fill_value), x[..., 6:13], np.full((*x.shape[:-1], 1), fill_value), x[..., 13:]], axis = -1)
+
+    def _pad_state_norm_stats_14_to_16(self, stats: _transforms.NormStats) -> _transforms.NormStats:
+        """Pad 14D norm stats to 16D with identity-like fill values."""
+        return _transforms.NormStats(
+            mean = self._pad_14_to_16(stats.mean, 0.0),
+            std = self._pad_14_to_16(stats.std, 1.0),
+            q01 = self._pad_14_to_16(stats.q01, -1.0),
+            q99 = self._pad_14_to_16(stats.q99, 1.0),
+        )
 
     def _create_clip_normalized_bounds(self) -> dict[str, tuple[float, float]]:
         clip_bound = 1.25 if self.use_quantile_norm else 5.0
@@ -975,7 +1010,7 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
 
         tokenizer = self._get_critic_tokenizer(model_config)
         transforms: list[_transforms.DataTransformFn] = []
-        if self.dont_mask_actions:
+        if self.replace_boundary_actions:
             transforms.append(_transforms.ReplaceMaskedActions(use_quantile_norm = self.use_quantile_norm))
         if tokenizer is not None:
             transforms.extend(
@@ -989,10 +1024,6 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        assert not (not self.critic_mode and self.dont_mask_actions), (
-            "dont_mask_actions=True is incompatible with critic_mode=False (policy training): "
-            "synthetic action padding would corrupt the flow matching loss."
-        )
         if not self.datasets:
             raise ValueError("RoboCoinRldsDataConfig requires at least one RLDS dataset.")
 
@@ -1025,10 +1056,12 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
                 "td_n": self.td_n,
                 "filter_n": self.filter_n,
                 "mask_50fps": self.mask_50fps,
+                "mask_boundary_actions": self.mask_boundary_actions or self.replace_boundary_actions,
                 "use_chunk_wise_delta": self.use_chunk_wise_delta,
                 "shuffle_buffer_size": self.shuffle_buffer_size,
                 "num_parallel_reads": self.num_parallel_reads,
                 "num_parallel_calls": self.num_parallel_calls,
+                "state_dim": self.state_dim,
             },
         )
 
@@ -1082,6 +1115,8 @@ class FineTuneConfig:
     dataset_name: str | None = None
     norm_stats_path: str | None = None
     assets: AssetsConfig | None = None
+    mask_boundary_actions: bool | None = None
+    replace_boundary_actions: bool | None = None
 
     # Validation overrides
     include_repos: tuple[str, ...] | None = None
@@ -1182,8 +1217,16 @@ class FineTuneConfig:
         return config, train_state, train_state_sharding, checkpoint_manager
 
     def _apply_data_overrides(self, config: "TrainConfig") -> "TrainConfig":
-        """Apply data_dir, dataset_name, norm_stats_path, and assets overrides."""
-        if self.data_dir is None and self.dataset_name is None and self.norm_stats_path is None and self.assets is None:
+        """Apply data_dir, dataset_name, norm_stats_path, assets, and action masking overrides."""
+        has_overrides = (
+            self.data_dir is not None
+            or self.dataset_name is not None
+            or self.norm_stats_path is not None
+            or self.assets is not None
+            or self.mask_boundary_actions is not None
+            or self.replace_boundary_actions is not None
+        )
+        if not has_overrides:
             return config
 
         data_factory = config.data
@@ -1216,6 +1259,11 @@ class FineTuneConfig:
             asset_id = norm_path.parent.name
             assets_dir = str(norm_path.parent.parent)
             replacements["assets"] = AssetsConfig(assets_dir = assets_dir, asset_id = asset_id)
+
+        if self.mask_boundary_actions is not None:
+            replacements["mask_boundary_actions"] = self.mask_boundary_actions
+        if self.replace_boundary_actions is not None:
+            replacements["replace_boundary_actions"] = self.replace_boundary_actions
 
         new_data = dataclasses.replace(data_factory, **replacements)
         return dataclasses.replace(config, data = new_data)
@@ -2281,9 +2329,9 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             assets_dir = "gs://saksham-euw4/hdf5/real_hang",
             asset_id = "norm_stats",
         ),
-        num_train_steps = 50_000,
-        save_interval = 10_000,
-        keep_period = 10_000,
+        num_train_steps = 200_000,
+        save_interval = 25_000,
+        keep_period = 25_000,
         lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
     ),
     FineTuneConfig(
@@ -2795,6 +2843,7 @@ _CONFIGS = [
                 max_token_len=48,
                 action_dim=14,
                 dtype="float32",
+                no_state=True,
             ),
             head_config=_heads.RegressionHeadConfig(),
         ),
@@ -2804,10 +2853,11 @@ _CONFIGS = [
             discount=0.999,
             td_n=50,
             use_eef=True,
-            dont_mask_actions=True,
             use_chunk_wise_delta=True,
             use_quantile_norm=True,
             shuffle_buffer_size=50_000,
+            mask_boundary_actions=False,
+            replace_boundary_actions=True,
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
         num_train_steps=230_000,
@@ -2821,7 +2871,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,
         log_interval=100,
-        plot_interval=50_000,
+        plot_interval=1000,
         save_interval=50_000,
         fsdp_devices=16,
         action_horizon=50,
@@ -2900,13 +2950,18 @@ _CONFIGS = [
             action_horizon=50,
             max_token_len=96,
             pi05=True,
-            discrete_state_input=False,
+            discrete_state_input=True,
             action_dim_offset=14,
             action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
             dtype="float32",
         ),
         data=RoboCoinRldsDataConfig(
+            rlds_data_dir="/data/group_data/rl/datasets",
             datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
+            assets=AssetsConfig(
+                assets_dir = "/data/group_data/rl/saksham3/robocoin/norm_stats",
+                asset_id = "embodiment_wise",
+            ),
             discount=0.999,
             td_n=50,
             use_eef=True,
@@ -2924,6 +2979,49 @@ _CONFIGS = [
             peak_lr=1e-5,
             decay_steps=230_000,
             decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        save_interval=50_000,
+        fsdp_devices=16,
+        action_horizon=50,
+    ),
+    # Same as robocoin_bimanual_pi05_rlds but with no boundary action masking
+    TrainConfig(
+        name="robocoin_bimanual_pi05_no_mask",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=96,
+            pi05=True,
+            discrete_state_input=False,
+            action_dim_offset=14,
+            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
+            dtype="float32",
+        ),
+        data=RoboCoinRldsDataConfig(
+            datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            critic_mode=False,
+            use_chunk_wise_delta=True,
+            use_quantile_norm=True,
+            filter_n=5,
+            shuffle_buffer_size=50_000,
+            mask_boundary_actions=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=230_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-5,
         ),
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,

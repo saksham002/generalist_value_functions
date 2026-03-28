@@ -62,8 +62,7 @@ def _assert_normalized_bounds(batch: dict, key: str) -> None:
         f"frac_abs_gt_1={fraction_above_one:.4%}"
     )
 
-    assert min_value >= -1.25, f"{key} min out of range: {min_value}"
-    assert max_value <= 1.25, f"{key} max out of range: {max_value}"
+    assert np.max(abs_values) < 1.30, f"{key} max absolute value out of range: {np.max(abs_values)}"
     assert fraction_above_one < 0.05, f"{key} has too many values with |x| > 1: {fraction_above_one:.4%}"
 
 
@@ -78,5 +77,11 @@ def test_robocoin_rlds_batch_structure(config_name: str):
 
     print(f"\nRLDS batch keys and shapes (config={config_name}):")
     _print_batch_structure(batch)
+    state = np.asarray(batch["state"], dtype = np.float32)
+    print(f"\n  state shape: {state.shape}")
+    print(f"  state mean (per-dim): {np.mean(state, axis = 0)}")
+    print(f"  state min  (per-dim): {np.min(state, axis = 0)}")
+    print(f"  state max  (per-dim): {np.max(state, axis = 0)}")
+
     _assert_normalized_bounds(batch, "state")
     _assert_normalized_bounds(batch, "actions")

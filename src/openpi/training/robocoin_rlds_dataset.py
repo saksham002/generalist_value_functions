@@ -54,7 +54,9 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         td_n: int | None = None,
         filter_n: int | None = None,
         mask_50fps: bool = False,
+        mask_boundary_actions: bool = True,
         use_chunk_wise_delta: bool = False,
+        state_dim: int = 14,
         include_images: bool = True,
         return_trajectories: bool = False,
         max_trajectories: int | None = None,
@@ -74,12 +76,17 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         self._td_n = td_n
         self._filter_n = filter_n
         self._mask_50fps = mask_50fps
+        self._mask_boundary_actions = mask_boundary_actions
         self._use_chunk_wise_delta = use_chunk_wise_delta
+        self._state_dim = state_dim
+        self._state_dim_checked = False
         logging.info(
             f"RoboCoinRldsDataset: critic_mode={critic_mode}, discount={discount}, "
             f"reward_scale={reward_scale}, reward_bias={reward_bias}, use_eef={use_eef}, "
             f"td_n={td_n}, filter_n={filter_n}, mask_50fps={mask_50fps}, "
-            f"use_chunk_wise_delta={use_chunk_wise_delta}"
+            f"mask_boundary_actions={mask_boundary_actions}, "
+            f"use_chunk_wise_delta={use_chunk_wise_delta}, "
+            f"state_dim={state_dim}"
         )
 
         super().__init__(
@@ -273,8 +280,34 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         images, image_masks = self._restructure_images(frame)
         next_images, next_image_masks = self._restructure_images(frame, prefix = "next_")
 
-        frame["state"] = tf.cast(frame["observation"]["state"], tf.float32)
-        frame["next_state"] = tf.cast(frame["next_observation"]["state"], tf.float32)
+        raw_state = tf.cast(frame["observation"]["state"], tf.float32)
+        raw_next_state = tf.cast(frame["next_observation"]["state"], tf.float32)
+
+        if self._state_dim == 14:
+            if not self._state_dim_checked:
+                tf.debugging.assert_equal(
+                    tf.shape(raw_state)[-1], 14,
+                    message = "state_dim=14 but raw state is not 14D",
+                )
+                self._state_dim_checked = True
+            frame["state"] = raw_state
+            frame["next_state"] = raw_next_state
+        elif self._state_dim == 16:
+            raw_dim = tf.shape(raw_state)[-1]
+            if not self._state_dim_checked:
+                tf.debugging.assert_rank(raw_state, 1)
+                self._state_dim_checked = True
+            frame["state"] = tf.cond(
+                tf.equal(raw_dim, 16),
+                lambda: raw_state,
+                lambda: tf.concat([raw_state[:6], [0.0], raw_state[6:13], [0.0], raw_state[13:]], axis = 0),
+            )
+            frame["next_state"] = tf.cond(
+                tf.equal(raw_dim, 16),
+                lambda: raw_next_state,
+                lambda: tf.concat([raw_next_state[:6], [0.0], raw_next_state[6:13], [0.0], raw_next_state[13:]], axis = 0),
+            )
+
         del frame["observation"]
         del frame["next_observation"]
 
@@ -339,13 +372,13 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         frame["sampled_index"] = sampled_idx
         frame["loss_mask"] = loss_mask
 
-        if self._critic_mode:
-            frame["action_mask"] = frame["action_mask"][sampled_idx]
-            frame["next_action_mask"] = frame["next_action_mask"][sampled_idx]
-        else:
-            full_action_horizon = tf.shape(frame["action_mask"])[1]
+        full_action_horizon = tf.shape(frame["action_mask"])[1]
+        if not self._mask_boundary_actions:
             frame["action_mask"] = tf.ones([full_action_horizon], dtype = tf.bool)
             frame["next_action_mask"] = tf.ones([full_action_horizon], dtype = tf.bool)
+        else:
+            frame["action_mask"] = frame["action_mask"][sampled_idx]
+            frame["next_action_mask"] = frame["next_action_mask"][sampled_idx]
 
         fps = tf.cast(frame["fps"], tf.int32)
         exponent_per_step = tf.cast(tf.where(tf.equal(fps, 30), 5, 3), tf.float32)
@@ -367,7 +400,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         frame["truncation"] = tf.constant(False)
 
         is_30fps = tf.equal(fps, 30)
-        action_horizon = tf.shape(frame["action_mask"])[0]
+        action_horizon = tf.shape(frame["action_mask"])[-1]
         valid_30fps_actions = 3 * action_horizon // 5
         fps_mask_30 = tf.sequence_mask(valid_30fps_actions, action_horizon)
         frame["action_mask"] = tf.where(is_30fps, tf.logical_and(frame["action_mask"], fps_mask_30), frame["action_mask"])
