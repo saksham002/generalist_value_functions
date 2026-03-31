@@ -555,6 +555,7 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             action_array = action  # [B, action_horizon, action_dim]
             assert action_array.shape[1] == self._action_horizon
             action_mask_array = observation.action_mask  # [B, action_horizon] or None
+            assert action_mask_array is None or jnp.any(action_mask_array, axis = -1).all(), "action_mask must not be all False for any sample"
 
         # Build embeddings and attention mask
         if self._is_gemma3:

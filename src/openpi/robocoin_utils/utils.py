@@ -28,6 +28,52 @@ def extract_embodiment(repo_id: str | bytes) -> str:
     return "_".join(repo_id.split("/")[-1].split("_", 2)[:2])
 
 
+def decode_text(text: str | bytes | np.ndarray | np.generic) -> str:
+    """Decode a scalar text-like value to a Python string."""
+    if hasattr(text, "item"):
+        text = text.item()
+    if isinstance(text, bytes):
+        return text.decode("utf-8")
+    return str(text)
+
+
+def swap_left_right_text(text: str) -> str:
+    """Swap left/right mentions in a task string."""
+    swapped = text.replace("left", "TEMP_LEFT_MARKER")
+    swapped = swapped.replace("right", "left")
+    return swapped.replace("TEMP_LEFT_MARKER", "right")
+
+
+def generate_negative_subtask_text(subtask_text: str) -> str:
+    """Generate the negative counterfactual text used for RoboCOIN validation."""
+    if "Place the plate" in subtask_text:
+        return "Place the plate on the dish rack"
+    if "Grab the knife" in subtask_text:
+        return "Grab the banana with your right hand"
+    if "Place the knife" in subtask_text:
+        return "Place the knife on the board"
+    if "Pass the plate" in subtask_text:
+        return "Rotate the plate with the right gripper"
+    return swap_left_right_text(subtask_text)
+
+
+def sample_random_actions(
+    actions: np.ndarray,
+    *,
+    use_quantile_norm: bool,
+    _traj_index: int | None = None,
+    frame_index: int | None = None,
+) -> np.ndarray:
+    """Sample deterministic per-frame random normalized actions for validation."""
+    clip_bound = 1.25 if use_quantile_norm else 5.0
+    if _traj_index is None or frame_index is None:
+        seed = 86
+    else:
+        seed = ((_traj_index + 1) * 1_000_003 + frame_index) % (2**32)
+    rng = np.random.default_rng(seed = seed)
+    return rng.uniform(-clip_bound, clip_bound, size = actions.shape).astype(actions.dtype, copy = False)
+
+
 def detokenize_prompt(token_ids: np.ndarray, mask: np.ndarray) -> str:
     """Decode a token ID vector back to text using the PaliGemma SentencePiece model.
 
@@ -118,10 +164,10 @@ def get_obs_and_action(
 
     Args:
         frame_dicts: List of frame dictionaries.
-        prefix: Key prefix (e.g., "", "mirror_", "negative_").
+        prefix: Key prefix (e.g., "", "negative_", "random_").
                 For prefix="", uses keys like "state", "image", "actions".
-                For prefix="mirror_", uses keys like "mirror_state", "mirror_image", "mirror_actions".
                 For prefix="negative_", only changes tokenized_prompt keys.
+                For prefix="random_", only changes the action key.
         action_conditioned: Whether to include actions and action_mask.
 
     Returns:
@@ -135,13 +181,13 @@ def get_obs_and_action(
         action_mask_key = "action_mask"
         prompt_key = "tokenized_negative_prompt"
         prompt_mask_key = "tokenized_negative_prompt_mask"
-    elif prefix == "mirror_":
-        state_key = "mirror_state"
-        image_key = "mirror_image"
-        actions_key = "mirror_actions"
-        action_mask_key = "action_mask"  # Same mask applies to mirrored actions
-        prompt_key = "mirror_tokenized_prompt"
-        prompt_mask_key = "mirror_tokenized_prompt_mask"
+    elif prefix == "random_":
+        state_key = "state"
+        image_key = "image"
+        actions_key = "random_actions"
+        action_mask_key = "action_mask"
+        prompt_key = "tokenized_prompt"
+        prompt_mask_key = "tokenized_prompt_mask"
     else:
         # Default (empty prefix)
         state_key = "state"
@@ -220,7 +266,9 @@ def count_subtask_segments(frames: list[dict], prefix: str = "") -> tuple[int, i
 _CACHE_KEYS = {
     "state", "image", "image_mask", "actions", "action_mask",
     "tokenized_prompt", "tokenized_prompt_mask",
-    "mc_return", "loss_mask", "fps",
+    "tokenized_negative_prompt", "tokenized_negative_prompt_mask",
+    "negative_subtask_1_text", "random_actions",
+    "mc_return", "include_subtask", "fps",
     "repo_id", "episode_index", "_frame_index",
 }
 
@@ -247,8 +295,11 @@ def _extract_cache_frame(frame: dict, prompt_text: str) -> dict:
 
 
 def _decode_repo_id(raw) -> str:
-    raw = np.asarray(raw)
-    if raw.ndim > 0:
+    if isinstance(raw, np.ndarray):
+        if raw.ndim != 0:
+            raise ValueError(f"Expected scalar repo_id, got shape {raw.shape}")
+        raw = raw.item()
+    elif isinstance(raw, np.generic):
         raw = raw.item()
     if isinstance(raw, bytes):
         return raw.decode("utf-8")
@@ -372,11 +423,16 @@ def predict_values(
     all_frames: list[tuple],
     ep_mc_returns: dict,
     action_conditioned: bool,
-) -> tuple[dict[str, list[float]], dict[str, list[float]], dict[str, list[float]], dict[str, list[np.ndarray]]]:
+) -> tuple[
+    dict[str, list[float]],
+    dict[str, list[float]],
+    dict[str, list[float]],
+    dict[str, list[np.ndarray]],
+]:
     """Run batched value function inference on collected validation frames.
 
     Performs three forward passes per batch where applicable: default prompt,
-    negative (counterfactual) prompt, and mirrored demonstration.
+    negative (counterfactual) prompt, and random actions.
 
     When the network's compute_value returns (val, attn_scores) (e.g. PaliGemma at
     inference), attention scores are collected alongside predictions and returned as
@@ -389,12 +445,17 @@ def predict_values(
         action_conditioned: Whether the model expects actions as input.
 
     Returns:
-        Tuple of (all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores).
+        Tuple of (
+            all_predictions,
+            all_predictions_neg,
+            all_predictions_random,
+            all_attn_scores,
+        ).
     """
     BATCH_SIZE = 64
     all_predictions: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_predictions_neg: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
-    all_predictions_mirror: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
+    all_predictions_random: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_attn_scores: dict[str, list[np.ndarray]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
 
     for batch_start in range(0, len(all_frames), BATCH_SIZE):
@@ -420,23 +481,23 @@ def predict_values(
             obs_neg, act_neg = get_obs_and_action(frame_dicts, prefix="negative_", action_conditioned=action_conditioned)
             pred_values_neg_np, _ = jax.device_get(_jitted_compute_value(model, obs_neg, act_neg))
 
-        pred_values_mirror_np = None
-        if "mirror_state" in frame_dicts[0]:
-            obs_mirror, act_mirror = get_obs_and_action(frame_dicts, prefix="mirror_", action_conditioned=action_conditioned)
-            pred_values_mirror_np, _ = jax.device_get(_jitted_compute_value(model, obs_mirror, act_mirror))
+        pred_values_random_np = None
+        if "random_actions" in frame_dicts[0]:
+            obs_random, act_random = get_obs_and_action(frame_dicts, prefix="random_", action_conditioned=action_conditioned)
+            pred_values_random_np, _ = jax.device_get(_jitted_compute_value(model, obs_random, act_random))
 
         for i, (ep_idx, _, _) in enumerate(batch_frames):
             all_predictions[ep_idx].append(float(pred_values_np[i]))
             all_attn_scores[ep_idx].append(attn_np[i])
             if pred_values_neg_np is not None:
                 all_predictions_neg[ep_idx].append(float(pred_values_neg_np[i]))
-            if pred_values_mirror_np is not None:
-                all_predictions_mirror[ep_idx].append(float(pred_values_mirror_np[i]))
+            if pred_values_random_np is not None:
+                all_predictions_random[ep_idx].append(float(pred_values_random_np[i]))
 
     total_predictions = sum(len(preds) for preds in all_predictions.values())
     logger.info(f"Computed {total_predictions} predictions")
 
-    return all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores
+    return all_predictions, all_predictions_neg, all_predictions_random, all_attn_scores
 
 
 @nnx.jit

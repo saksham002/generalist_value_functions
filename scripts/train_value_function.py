@@ -11,6 +11,7 @@ import functools
 import logging
 import platform as _platform
 import os
+import pickle
 import threading
 from typing import Any
 import pdb
@@ -442,6 +443,11 @@ def init_train_state(
             config.trainable_filter,
             lambda p: p.replace(p.value.astype(weight_dtype)),
         )
+        params = nnx_utils.state_map(
+            params,
+            nnx_utils.PathRegex(".*target_(network|head)/.*"),
+            lambda p: p.replace(p.value.astype(jnp.bfloat16)),
+        )
 
         return training_utils.TrainState(
             step=0,
@@ -544,21 +550,10 @@ def value_function_train_step(
     else:
         transition = _value_fn.Transition.from_batch(batch)
 
-    # Extract loss_mask if present (True = include, False = mask out)
-    loss_mask = batch.get("loss_mask", None)
-    if loss_mask is not None:
-        loss_mask = jnp.asarray(loss_mask)
-
     def loss_fn(model: _value_fn.BaseValueFunction):
         # compute_loss returns (per_sample_loss, info_dict)
         per_sample_loss, value_info = model.compute_loss(transition, train=True, rng=rng, policy=policy)
-        if loss_mask is not None:
-            # Masked mean: only average over examples with loss_mask=True
-            masked_loss = per_sample_loss * loss_mask
-            num_valid = jnp.maximum(jnp.sum(loss_mask), 1.0)  # Avoid div by zero
-            mean_loss = jnp.sum(masked_loss) / num_valid
-        else:
-            mean_loss = jnp.mean(per_sample_loss)
+        mean_loss = jnp.mean(per_sample_loss)
         return mean_loss, value_info
 
     diff_state = nnx.DiffState(0, config.trainable_filter)
@@ -642,26 +637,17 @@ def value_function_train_step(
         "batch/truncation_max": jnp.max(transition.truncation.astype(jnp.float32)),
     }
 
-    # Compute masked summary stats from per-sample arrays returned by the objective.
-    valid_mask = loss_mask.astype(jnp.bool_) if loss_mask is not None else jnp.ones(transition.reward.shape[0], dtype = jnp.bool_)
-    num_valid = jnp.maximum(jnp.sum(valid_mask.astype(jnp.float32)), 1.0)
-
-    def _masked_mean(x):
-        return jnp.sum(x * valid_mask.astype(x.dtype)) / num_valid
-
-    def _masked_std(x):
-        mean = _masked_mean(x)
-        return jnp.sqrt(_masked_mean(jnp.square(x - mean)))
+    batch_size = transition.reward.shape[0]
 
     value_stats = {}
-    non_terminal = ~transition.termination & valid_mask
+    non_terminal = ~transition.termination
     num_non_terminal = jnp.maximum(jnp.sum(non_terminal.astype(jnp.float32)), 1.0)
 
     for key in ("predicted_value", "target_value", "td_error"):
         if key in value_info:
             arr = value_info.pop(key)
             value_stats[f"{key}_mean"] = jnp.sum(arr * non_terminal.astype(arr.dtype)) / num_non_terminal
-            value_stats[f"{key}_std"] = _masked_std(arr)
+            value_stats[f"{key}_std"] = jnp.std(arr)
 
     if "next_value" in value_info:
         next_val = value_info.pop("next_value")
@@ -669,7 +655,7 @@ def value_function_train_step(
 
     if "mc_loss" in value_info:
         mc_loss_arr = value_info.pop("mc_loss")
-        value_stats["mc_loss"] = _masked_mean(mc_loss_arr)
+        value_stats["mc_loss"] = jnp.mean(mc_loss_arr)
 
     grads_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), grads)
     kernel_params_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), kernel_params)
@@ -686,8 +672,6 @@ def value_function_train_step(
         **batch_stats,
     }
 
-    if loss_mask is not None:
-        info["batch/loss_mask_valid_fraction"] = jnp.mean(loss_mask.astype(jnp.float32))
     if "steps_to_subtask_end" in batch:
         steps = jnp.asarray(batch["steps_to_subtask_end"]).astype(jnp.float32)
         info["batch/steps_to_subtask_end_mean"] = jnp.mean(steps)
@@ -1532,15 +1516,14 @@ def _create_attn_plot(
 def _render_and_log_plots(
     all_predictions: dict,
     all_predictions_neg: dict,
-    all_predictions_mirror: dict,
+    all_predictions_random: dict,
     all_attn_scores: dict,
     ep_mc_returns: dict,
-    ep_loss_masks: dict,
     ep_frame_images: dict,
     ep_fps: dict,
+    ep_include_masks: dict,
     ep_subtasks: dict,
     ep_negative_subtasks: dict,
-    ep_mirror_subtasks: dict,
     traj_to_repo_ep: dict,
     action_conditioned: bool,
     step: int,
@@ -1550,7 +1533,7 @@ def _render_and_log_plots(
         repo_id, ep_idx, part_suffix = traj_to_repo_ep[traj_idx]
         plot_key = f"val/{repo_id.removeprefix('RoboCOIN/')}_episode_{ep_idx}{part_suffix}"
         mc_returns = ep_mc_returns[traj_idx]
-        loss_masks = ep_loss_masks[traj_idx]
+        include_masks = ep_include_masks[traj_idx]
         predicted_values = all_predictions[traj_idx]
 
         if len(predicted_values) != len(mc_returns):
@@ -1559,19 +1542,19 @@ def _render_and_log_plots(
 
         filtered_mc_returns = []
         filtered_predictions = []
-        for mc, pred, mask in zip(mc_returns, predicted_values, loss_masks):
+        for mc, pred, mask in zip(mc_returns, predicted_values, include_masks):
             if mask:
                 filtered_mc_returns.append(mc)
                 filtered_predictions.append(pred)
 
         if len(filtered_mc_returns) == 0:
-            logging.warning(f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}): no frames with loss_mask=True")
+            logging.warning(f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}): no frames with include_subtask=True")
             continue
 
         subtasks = ep_subtasks.get(traj_idx, [])
-        logging.info(f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}): {len(filtered_predictions)}/{len(predicted_values)} frames after loss_mask filter, subtasks={subtasks}")
+        logging.info(f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}): {len(filtered_predictions)}/{len(predicted_values)} frames after include_subtask filter, subtasks={subtasks}")
 
-        ep_frame_images[traj_idx] = [img for img, mask in zip(ep_frame_images[traj_idx], loss_masks) if mask]
+        ep_frame_images[traj_idx] = [img for img, mask in zip(ep_frame_images[traj_idx], include_masks) if mask]
 
         images[plot_key] = _create_value_plot(
             filtered_mc_returns, filtered_predictions, ep_idx, step, " (RoboCOIN)",
@@ -1582,7 +1565,7 @@ def _render_and_log_plots(
         logging.info(f"Repo {repo_id}, episode {ep_idx} plot created")
 
         attn_scores = all_attn_scores.get(traj_idx, [])
-        filtered_attn = [s for s, mask in zip(attn_scores, loss_masks) if mask]
+        filtered_attn = [s for s, mask in zip(attn_scores, include_masks) if mask]
         if len(filtered_attn) == len(filtered_mc_returns) and len(filtered_attn) > 0:
             images[f"{plot_key}_attn"] = _create_attn_plot(
                 filtered_attn, ep_idx, step, repo_id.removeprefix("RoboCOIN/"), action_conditioned
@@ -1591,7 +1574,7 @@ def _render_and_log_plots(
         negative_subtasks = ep_negative_subtasks.get(traj_idx)
         predicted_values_neg = all_predictions_neg.get(traj_idx, [])
         if negative_subtasks and len(predicted_values_neg) == len(predicted_values):
-            filtered_predictions_neg = [pred for pred, mask in zip(predicted_values_neg, loss_masks) if mask]
+            filtered_predictions_neg = [pred for pred, mask in zip(predicted_values_neg, include_masks) if mask]
             if len(filtered_predictions_neg) == len(filtered_mc_returns) and len(filtered_predictions_neg) > 0:
                 images[f"{plot_key}_counterfactual_text"] = _create_value_plot(
                     filtered_mc_returns, filtered_predictions_neg, ep_idx, step, " (Counterfactual Text)",
@@ -1599,16 +1582,15 @@ def _render_and_log_plots(
                 )
                 logging.info(f"Repo {repo_id}, episode {ep_idx} counterfactual text plot created")
 
-        mirror_subtasks = ep_mirror_subtasks.get(traj_idx)
-        predicted_values_mirror = all_predictions_mirror.get(traj_idx, [])
-        if mirror_subtasks and len(predicted_values_mirror) == len(predicted_values):
-            filtered_predictions_mirror = [pred for pred, mask in zip(predicted_values_mirror, loss_masks) if mask]
-            if len(filtered_predictions_mirror) == len(filtered_mc_returns) and len(filtered_predictions_mirror) > 0:
-                images[f"{plot_key}_mirror_demo"] = _create_value_plot(
-                    filtered_mc_returns, filtered_predictions_mirror, ep_idx, step, " (Mirror Demonstration)",
-                    oracle_values = None, subtask_texts = mirror_subtasks,
+        predicted_values_random = all_predictions_random.get(traj_idx, [])
+        if len(predicted_values_random) == len(predicted_values):
+            filtered_predictions_random = [pred for pred, mask in zip(predicted_values_random, include_masks) if mask]
+            if len(filtered_predictions_random) == len(filtered_mc_returns) and len(filtered_predictions_random) > 0:
+                images[f"{plot_key}_random_actions"] = _create_value_plot(
+                    filtered_mc_returns, filtered_predictions_random, ep_idx, step, " (Random Actions)",
+                    oracle_values = None, subtask_texts = subtasks,
                 )
-                logging.info(f"Repo {repo_id}, episode {ep_idx} mirrored demonstration plot created")
+                logging.info(f"Repo {repo_id}, episode {ep_idx} random action plot created")
 
     if images:
         # Log without an explicit step, avoiding the "step must be monotonically
@@ -1616,56 +1598,44 @@ def _render_and_log_plots(
         # training steps have been logged.
         wandb.log(images)
     logging.info(f"Render thread finished: logged {len(images)} plots for step {step}")
-    del images, ep_frame_images, all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores
+    del images, ep_frame_images, all_predictions, all_predictions_neg, all_predictions_random, all_attn_scores
 
 
 def generate_validation_plots_dlimp(
     model: _value_fn.BaseValueFunction,
-    val_dataloader,
     val_episode_indices: list[int],
     step: int,
     *,
     action_conditioned: bool,
     data_config: _config.DataConfig,
-    cache_dir: str | None = None,
-    save_only: bool = False,
-    include_repos: tuple[str, ...] = (),
-    input_transform = None,
+    cache_dir: str,
 ) -> dict:
     """Generate validation plots for RoboCOIN.
 
-    Supports caching validation episodes to disk: on the first call
-    episodes are collected, transformed, and saved; subsequent calls load
-    from cache instead of re-iterating the dataset.
+    Loads pre-cached validation episodes from ``cache_dir`` (populated at
+    init time via ``cache_val_episodes``), runs value-function inference,
+    and logs plots to W&B asynchronously.
 
     Args:
         model: The value function model.
-        val_dataloader: RLDS trajectory dataset (return_trajectories=True),
-            or None when loading from an existing cache.
         val_episode_indices: List of episode indices to plot (used for count only).
         step: Current training step.
         action_conditioned: Whether the model is action-conditioned (Q vs V).
         data_config: Data configuration.
-        cache_dir: Directory to save/load cached validation episodes.
-        save_only: If True, only save episodes to disk and return empty dict.
-        include_repos: Repo IDs that must be included in the validation set.
-        input_transform: Composed transform pipeline (Normalize + ResizeImages + TokenizePrompt)
-            applied to each frame before caching. Required on first call.
+        cache_dir: Directory containing cached validation episodes.
 
     Returns:
         Empty dict (plots are logged asynchronously by a background thread).
     """
-    num_val_trajectories = len(val_episode_indices)
-    assert len(include_repos) < num_val_trajectories, (
-        f"include_repos ({len(include_repos)}) must be < num_val_trajectories ({num_val_trajectories})"
-    )
-
-    traj_frames = cache_val_episodes(
-        val_dataloader, num_val_trajectories, cache_dir, include_repos, save_only,
-        input_transform = input_transform,
-    )
-    if save_only:
-        return {}
+    traj_frames: dict[int, list[dict]] = {}
+    logging.info(f"Loading cached validation episodes from {cache_dir}")
+    for filename in os.listdir(cache_dir):
+        if filename.startswith("traj_") and filename.endswith(".pkl"):
+            traj_idx = int(filename.replace("traj_", "").replace(".pkl", ""))
+            cache_file = os.path.join(cache_dir, filename)
+            with open(cache_file, "rb") as f:
+                traj_frames[traj_idx] = pickle.load(f)
+    logging.info(f"Loaded {len(traj_frames)} trajectories from cache")
 
     # Build traj_idx -> (repo_id, episode_index) mapping for plot names
     traj_to_repo_ep: dict[int, tuple[str, int]] = {}
@@ -1714,18 +1684,16 @@ def generate_validation_plots_dlimp(
 
     all_frames = []
     ep_mc_returns = {}
-    ep_loss_masks = {}
     ep_frame_images = {}
     ep_fps = {}
+    ep_include_masks = {}
     ep_negative_subtasks = {}
-    ep_mirror_subtasks = {}
 
     for ep_idx, frames in traj_frames.items():
         if len(frames) == 0:
             continue
 
         ep_mc_returns[ep_idx] = [f["mc_return"] for f in frames]
-        ep_loss_masks[ep_idx] = [f["loss_mask"] for f in frames]
 
         ep_frame_images[ep_idx] = [
             np.stack([
@@ -1736,12 +1704,10 @@ def generate_validation_plots_dlimp(
             for f in frames
         ]
         ep_fps[ep_idx] = int(frames[0]["fps"])
+        ep_include_masks[ep_idx] = [bool(f.get("include_subtask", True)) for f in frames]
 
         _, _, negative_segments = count_subtask_segments(frames, prefix="negative_")
         ep_negative_subtasks[ep_idx] = negative_segments
-
-        _, _, mirror_segments = count_subtask_segments(frames, prefix="mirror_")
-        ep_mirror_subtasks[ep_idx] = mirror_segments
 
         for frame_idx, frame in enumerate(frames):
             all_frames.append((ep_idx, frame_idx, frame))
@@ -1752,7 +1718,7 @@ def generate_validation_plots_dlimp(
 
     logging.info(f"Processing {len(all_frames)} total frames across {len(ep_mc_returns)} episodes in batches of 64")
 
-    all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores = predict_values(
+    all_predictions, all_predictions_neg, all_predictions_random, all_attn_scores = predict_values(
         model, all_frames, ep_mc_returns, action_conditioned
     )
     del all_frames, traj_frames
@@ -1767,9 +1733,9 @@ def generate_validation_plots_dlimp(
         _render_thread = threading.Thread(
             target = _render_and_log_plots,
             args = (
-                all_predictions, all_predictions_neg, all_predictions_mirror, all_attn_scores,
-                ep_mc_returns, ep_loss_masks, ep_frame_images, ep_fps,
-                ep_subtasks, ep_negative_subtasks, ep_mirror_subtasks,
+                all_predictions, all_predictions_neg, all_predictions_random, all_attn_scores,
+                ep_mc_returns, ep_frame_images, ep_fps, ep_include_masks,
+                ep_subtasks, ep_negative_subtasks,
                 traj_to_repo_ep, action_conditioned, step,
             ),
             daemon = True,
@@ -1890,6 +1856,8 @@ def main(config: _config.TrainConfig):
         val_dataloader = None
     elif data_config.rlds_dataset_class == "robocoin":
         action_horizon = config.action_horizon or config.model.action_horizon
+        val_tokenizer = config.data._get_critic_tokenizer(config.model)
+        assert val_tokenizer is not None, "RoboCOIN validation variants require a critic tokenizer."
         val_trajectory_dataset = _data_loader.create_rlds_dataset(
             data_config,
             action_horizon,
@@ -1904,10 +1872,25 @@ def main(config: _config.TrainConfig):
             _transforms.Normalize(data_config.norm_stats, use_quantiles = data_config.use_quantile_norm),
             *([_transforms.Clip(data_config.clip_normalized_bounds)] if data_config.clip_normalized_bounds is not None else []),
             *data_config.model_transforms.inputs,
+            _config.AddRoboCoinValidationVariants(
+                val_tokenizer,
+                use_quantile_norm = data_config.use_quantile_norm,
+            ),
         ])
         val_episode_indices = list(range(config.num_val_trajectories))
         val_episodes_cache_dir = config.validation_cache_dir
         val_dataset = None
+
+        # Only process 0 writes the cache to avoid multi-worker NFS corruption.
+        if jax.process_index() == 0:
+            cache_val_episodes(
+                val_trajectory_dataset, config.num_val_trajectories, val_episodes_cache_dir,
+                include_repos = config.include_repos, save_only = True,
+                input_transform = val_input_transform,
+            )
+        if jax.process_count() > 1:
+            jax.experimental.multihost_utils.sync_global_devices("val_cache_write")
+        del val_trajectory_dataset, val_input_transform
     else:
         # Non-RoboCOIN: use LeRobot dataset
         from lerobot.common.datasets import lerobot_dataset
@@ -1989,14 +1972,11 @@ def main(config: _config.TrainConfig):
         if data_config.rlds_dataset_class == "robocoin":
             generate_validation_plots_dlimp(
                 model = model,
-                val_dataloader = val_trajectory_dataset,
                 val_episode_indices = val_episode_indices,
                 step = step,
                 action_conditioned = action_conditioned,
                 data_config = data_config,
                 cache_dir = val_episodes_cache_dir,
-                include_repos = config.include_repos,
-                input_transform = val_input_transform,
             )
         else:
             plot_images = generate_validation_plots(
@@ -2140,14 +2120,11 @@ def main(config: _config.TrainConfig):
                 if data_config.rlds_dataset_class == "robocoin":
                     generate_validation_plots_dlimp(
                         model = model,
-                        val_dataloader = val_trajectory_dataset,
                         val_episode_indices = val_episode_indices,
                         step = step,
                         action_conditioned = action_conditioned,
                         data_config = data_config,
                         cache_dir = val_episodes_cache_dir,
-                        include_repos = config.include_repos,
-                        input_transform = val_input_transform,
                     )
                 else:
                     plot_images = generate_validation_plots(

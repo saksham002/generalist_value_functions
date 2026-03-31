@@ -230,8 +230,14 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         offsets = tf.range(self._action_chunk_size, dtype = tf.int32)
         steps = tf.cast(mapped_traj["steps_to_subtask_end"], tf.int32)
         mapped_traj["action_mask"] = offsets[None, None, :] <= steps[:, :, None]
-        next_steps = tf.gather(steps, next_indices)
-        mapped_traj["next_action_mask"] = offsets[None, None, :] <= next_steps[:, :, None]
+        # Derive next_action_mask from the current steps minus the td offset.
+        # Subtask positions can change between timesteps (completed subtasks become
+        # "null"), so gathering steps_to_subtask_end at the future index is wrong.
+        if self._td_n is None:
+            td_n_native = 1
+        else:
+            td_n_native = tf.where(tf.equal(fps, 30), 3 * self._td_n // 5, self._td_n)
+        mapped_traj["next_action_mask"] = offsets[None, None, :] <= (steps - td_n_native)[:, :, None]
 
         if "counterfactual_actions" in mapped_traj:
             mapped_traj["counterfactual_next_actions"] = tf.gather(mapped_traj["counterfactual_actions"], next_indices)
@@ -335,9 +341,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
 
         selected_steps = steps_all[sampled_idx]
         selected_steps_f = tf.cast(selected_steps, tf.float32)
-        loss_mask = first_null_index > 0
-        if self._mask_50fps:
-            loss_mask = tf.logical_and(loss_mask, tf.equal(tf.cast(frame["fps"], tf.int32), 30))
 
         subtask_texts = tf.stack(
             [
@@ -357,28 +360,38 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             & tf.not_equal(lower_subtask_texts, b"abnormal")
         )
 
+        masked_steps = tf.where(include_subtasks, steps_all, tf.int32.max)
+        min_idx = tf.argmin(masked_steps, output_type = tf.int32)
+
         if self._critic_mode:
             frame["prompt"] = subtask_texts[sampled_idx]
+            # When counterfactual actions are cached, the policy generated them
+            # using the min-length valid subtask's mask. Use the same index for
+            # action_mask / next_action_mask so ReplaceMaskedActions and the
+            # network's attention mask are consistent with the cached actions.
+            if self._counterfactual_action_store_dir is not None:
+                mask_idx = min_idx
+            else:
+                mask_idx = sampled_idx
         else:
             selected_texts = tf.boolean_mask(stripped_subtask_texts, include_subtasks)
             frame["prompt"] = tf.strings.reduce_join(selected_texts, separator = ", ")
-            masked_steps = tf.where(include_subtasks, steps_all, tf.int32.max)
-            sampled_idx = tf.argmin(masked_steps, output_type = tf.int32)
+            sampled_idx = min_idx
+            mask_idx = min_idx
             selected_steps = steps_all[sampled_idx]
             selected_steps_f = tf.cast(selected_steps, tf.float32)
 
-        loss_mask = tf.logical_and(loss_mask, include_subtasks[sampled_idx])
+        frame["include_subtask"] = include_subtasks[sampled_idx]
         frame["steps_to_subtask_end"] = selected_steps
         frame["sampled_index"] = sampled_idx
-        frame["loss_mask"] = loss_mask
 
         full_action_horizon = tf.shape(frame["action_mask"])[1]
         if not self._mask_boundary_actions:
             frame["action_mask"] = tf.ones([full_action_horizon], dtype = tf.bool)
             frame["next_action_mask"] = tf.ones([full_action_horizon], dtype = tf.bool)
         else:
-            frame["action_mask"] = frame["action_mask"][sampled_idx]
-            frame["next_action_mask"] = frame["next_action_mask"][sampled_idx]
+            frame["action_mask"] = frame["action_mask"][mask_idx]
+            frame["next_action_mask"] = frame["next_action_mask"][mask_idx]
 
         fps = tf.cast(frame["fps"], tf.int32)
         exponent_per_step = tf.cast(tf.where(tf.equal(fps, 30), 5, 3), tf.float32)
@@ -426,11 +439,17 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         return tf.nest.map_structure(lambda x: tf.boolean_mask(x, mask), traj)
 
     def frame_filter(self, frame: dict) -> bool:
-        """Filter frames by the selected subtask horizon when filter_n is configured."""
+        """Filter out frames with invalid subtasks or insufficient horizon."""
         import tensorflow as tf
 
-        if self._filter_n is None:
-            return tf.constant(value = True)
-        fps = tf.cast(frame["fps"], tf.int32)
-        filter_n_native = tf.where(tf.equal(fps, 30), 3 * self._filter_n // 5, self._filter_n)
-        return frame["steps_to_subtask_end"] >= filter_n_native
+        keep = tf.constant(True)
+        if self._mask_50fps:
+            keep = tf.logical_and(keep, tf.equal(tf.cast(frame["fps"], tf.int32), 30))
+        keep = tf.logical_and(keep, frame["include_subtask"])
+
+        if self._filter_n is not None:
+            fps = tf.cast(frame["fps"], tf.int32)
+            filter_n_native = tf.where(tf.equal(fps, 30), 3 * self._filter_n // 5, self._filter_n)
+            keep = tf.logical_and(keep, frame["steps_to_subtask_end"] >= filter_n_native)
+
+        return keep

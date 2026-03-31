@@ -46,7 +46,6 @@ def _extract_observations_from_batch(batch: dict) -> tuple[_model.Observation, _
         tokenized_prompt = batch.get("tokenized_prompt"),
         tokenized_prompt_mask = batch.get("tokenized_prompt_mask"),
         action_mask = batch.get("action_mask"),
-        loss_mask = batch.get("loss_mask"),
     )
     next_observation = _model.Observation(
         images = next_images,
