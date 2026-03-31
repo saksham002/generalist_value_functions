@@ -94,6 +94,7 @@ def install_deps(
     zone: str,
     remote_dir: str,
     project: str,
+    nfs_mount_path: str = "/nfs/aidm_nfs",
 ) -> None:
     """Install Python dependencies on TPU using uv.
 
@@ -102,15 +103,16 @@ def install_deps(
         zone: GCP zone
         remote_dir: Remote directory containing pyproject.toml
         project: GCP project ID
+        nfs_mount_path: NFS mount path (e.g. /nfs/aidm_nfs)
     """
     logger.info("Installing dependencies on TPU %s", tpu_name)
     ssh_command(
         tpu_name,
         zone,
         (
-            "source /nfs/aidm_nfs/saksham3/uv/vla/bin/activate && "
-            'export PATH="/nfs/aidm_nfs/saksham3/uv/bin:$PATH" && '
-            'export UV_PROJECT_ENVIRONMENT="/nfs/aidm_nfs/saksham3/uv/vla" && '
+            f"source {nfs_mount_path}/saksham3/uv/vla/bin/activate && "
+            f'export PATH="{nfs_mount_path}/saksham3/uv/bin:$PATH" && '
+            f'export UV_PROJECT_ENVIRONMENT="{nfs_mount_path}/saksham3/uv/vla" && '
             f"cd {remote_dir} && uv sync --extra tpu --group rlds"
         ),
         project=project,
