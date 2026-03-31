@@ -11,6 +11,7 @@ from openpi.training import data_loader as _data_loader
 SEED = 86
 SARSA_RLDS_CONFIG_NAME = "robocoin_bimanual_paligemma_q_sarsa_chunk_wise_rlds"
 PI05_RLDS_CONFIG_NAME = "robocoin_bimanual_pi05_rlds"
+CQL_RLDS_CONFIG_NAME = "robocoin_bimanual_paligemma_cql_rlds"
 
 
 def _make_train_config(config_name: str) -> _config.TrainConfig:
@@ -67,7 +68,7 @@ def _assert_normalized_bounds(batch: dict, key: str) -> None:
 
 
 @pytest.mark.manual
-@pytest.mark.parametrize("config_name", [PI05_RLDS_CONFIG_NAME, SARSA_RLDS_CONFIG_NAME])
+@pytest.mark.parametrize("config_name", [PI05_RLDS_CONFIG_NAME, SARSA_RLDS_CONFIG_NAME, CQL_RLDS_CONFIG_NAME])
 def test_robocoin_rlds_batch_structure(config_name: str):
     tf.random.set_seed(SEED)
     np.random.seed(SEED)

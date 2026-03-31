@@ -309,13 +309,11 @@ def main():
 
         train_module.generate_validation_plots_dlimp(
             model = model,
-            val_dataloader = None,
             val_episode_indices = list(range(num_cached)),
             step = 0,
             action_conditioned = action_conditioned,
             data_config = data_config,
             cache_dir = args.cache_dir,
-            save_only = False,
         )
 
         # Wait for the background render thread to finish before closing wandb

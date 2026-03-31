@@ -38,6 +38,8 @@ def _make_robocoin_dataset_for_unit_tests(
     dataset._filter_n = filter_n  # noqa: SLF001
     dataset._mask_50fps = mask_50fps  # noqa: SLF001
     dataset._use_chunk_wise_delta = use_chunk_wise_delta  # noqa: SLF001
+    dataset._state_dim = state_dim  # noqa: SLF001
+    dataset._state_dim_checked = False  # noqa: SLF001
     dataset._image_obs_keys = ("cam_0", "cam_1", "cam_2")  # noqa: SLF001
     dataset._action_chunk_size = 10  # noqa: SLF001
     dataset._return_trajectories = False  # noqa: SLF001
@@ -196,7 +198,7 @@ class TestFrameTransforms:
         assert result["next_state"].shape == (14,)
         assert result["actions"].shape == (10, 14)
         assert result["next_actions"].shape == (10, 14)
-        assert bool(result["loss_mask"].numpy())
+        assert "include_subtask" in result
         np.testing.assert_allclose(result["td_discount"].numpy(), np.float32(0.99 ** 30), rtol = 1e-6)
         np.testing.assert_array_equal(result["action_mask"].numpy()[6:], [False, False, False, False])
 
@@ -215,30 +217,39 @@ class TestFrameTransforms:
         np.testing.assert_array_equal(result["actions"].numpy()[0], np.zeros(14, dtype = np.float32))
         np.testing.assert_array_equal(result["next_actions"].numpy()[0], np.zeros(14, dtype = np.float32))
 
-    def test_loss_mask_excludes_static_and_abnormal_selected_subtasks(self):
+    def test_include_subtask_excludes_static_and_abnormal_selected_subtasks(self):
         dataset = _make_robocoin_dataset_for_unit_tests(critic_mode = False)
         frame = _make_frame_for_transforms(first_null_index = 4, steps_to_subtask_end = (9, 4, 1, 0, 0))
         result = dataset.frame_transforms(frame)
 
-        assert bool(result["loss_mask"].numpy())
+        assert bool(result["include_subtask"].numpy())
 
         bad_frame = _make_frame_for_transforms(first_null_index = 1, steps_to_subtask_end = (1, 0, 0, 0, 0))
         bad_frame["subtask_1"] = tf.constant(b"static")
         bad_result = dataset.frame_transforms(bad_frame)
-        assert not bool(bad_result["loss_mask"].numpy())
-
-    def test_mask_50fps_marks_non_30fps_frames_invalid(self):
-        dataset = _make_robocoin_dataset_for_unit_tests(critic_mode = True, mask_50fps = True)
-        result = dataset.frame_transforms(_make_frame_for_transforms(fps = 50))
-
-        assert not bool(result["loss_mask"].numpy())
+        assert not bool(bad_result["include_subtask"].numpy())
 
 class TestFiltering:
     def test_frame_filter_uses_fps_aware_filter_n(self):
         dataset = _make_robocoin_dataset_for_unit_tests(filter_n = 10)
 
-        keep_frame = {"steps_to_subtask_end": tf.constant(6, dtype = tf.int32), "fps": tf.constant(30, dtype = tf.int32)}
-        drop_frame = {"steps_to_subtask_end": tf.constant(5, dtype = tf.int32), "fps": tf.constant(30, dtype = tf.int32)}
+        keep_frame = {"steps_to_subtask_end": tf.constant(6, dtype = tf.int32), "fps": tf.constant(30, dtype = tf.int32), "first_null_index": tf.constant(4, dtype = tf.int32), "include_subtask": tf.constant(True)}
+        drop_frame = {"steps_to_subtask_end": tf.constant(5, dtype = tf.int32), "fps": tf.constant(30, dtype = tf.int32), "first_null_index": tf.constant(4, dtype = tf.int32), "include_subtask": tf.constant(True)}
 
         assert bool(dataset.frame_filter(keep_frame).numpy())
         assert not bool(dataset.frame_filter(drop_frame).numpy())
+
+    def test_frame_filter_rejects_zero_first_null_index(self):
+        dataset = _make_robocoin_dataset_for_unit_tests()
+        frame = {"steps_to_subtask_end": tf.constant(10, dtype = tf.int32), "fps": tf.constant(30, dtype = tf.int32), "first_null_index": tf.constant(0, dtype = tf.int32), "include_subtask": tf.constant(True)}
+        assert not bool(dataset.frame_filter(frame).numpy())
+
+    def test_frame_filter_rejects_excluded_subtask(self):
+        dataset = _make_robocoin_dataset_for_unit_tests()
+        frame = {"steps_to_subtask_end": tf.constant(10, dtype = tf.int32), "fps": tf.constant(30, dtype = tf.int32), "first_null_index": tf.constant(4, dtype = tf.int32), "include_subtask": tf.constant(False)}
+        assert not bool(dataset.frame_filter(frame).numpy())
+
+    def test_frame_filter_rejects_50fps_when_mask_50fps_enabled(self):
+        dataset = _make_robocoin_dataset_for_unit_tests(mask_50fps = True)
+        frame = {"steps_to_subtask_end": tf.constant(10, dtype = tf.int32), "fps": tf.constant(50, dtype = tf.int32), "first_null_index": tf.constant(4, dtype = tf.int32), "include_subtask": tf.constant(True)}
+        assert not bool(dataset.frame_filter(frame).numpy())
