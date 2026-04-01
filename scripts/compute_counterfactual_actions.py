@@ -89,6 +89,10 @@ class CommonArgs:
     debug_metrics: bool = False
     """If True, compute extra normalized-space diagnostics such as sampling loss."""
 
+    reverse: bool = False
+    """If True, reverse shard processing order and skip metadata writes. Intended for running
+    a second set of workers that converge from the opposite end."""
+
 
 @dataclasses.dataclass
 class LaunchArgs(CommonArgs):
@@ -234,12 +238,17 @@ def run_worker(args: WorkerArgs) -> None:
         if args.only_shard < 0 or args.only_shard >= num_shards:
             raise ValueError(f"--only-shard={args.only_shard} out of range [0, {num_shards}).")
         my_shards = [args.only_shard]
+    if args.reverse:
+        my_shards = my_shards[::-1]
     my_episode_count = sum(shard_info[i][1] for i in my_shards)
 
     logger.info(
         f"Worker {worker_id}/{num_workers}: assigned {len(my_shards)} shards "
         f"({my_episode_count} episodes total)"
+        + (" [REVERSE order]" if args.reverse else "")
     )
+    if args.reverse:
+        logger.warning("--reverse mode: metadata files, manifest, and done marker will NOT be written.")
 
     output_dir = epath.Path(args.output_dir)
     worker_dir = output_dir / "_workers" / f"worker_{worker_id}"
@@ -427,7 +436,10 @@ def run_worker(args: WorkerArgs) -> None:
         masked_steps = np.where(include_subtasks, steps_all, np.iinfo(np.int32).max)
         sampled_idx = int(np.argmin(masked_steps))
         selected_steps = int(steps_all[sampled_idx])
-        action_mask = np.arange(action_horizon, dtype = np.int32) <= selected_steps
+        if data_config.rlds_kwargs["mask_boundary_actions"]:
+            action_mask = np.arange(action_horizon, dtype = np.int32) <= selected_steps
+        else:
+            action_mask = np.ones(action_horizon, dtype = np.bool_)
         if fps == 30:
             valid_30fps_actions = 3 * action_horizon // 5
             action_mask &= np.arange(action_horizon, dtype = np.int32) < valid_30fps_actions
@@ -471,7 +483,28 @@ def run_worker(args: WorkerArgs) -> None:
             parts.append(f"{key}={value:.2f}s ({100.0 * value / total_time:.1f}%)")
         return ", ".join(parts)
 
-    for shard_idx in my_shards:
+    for shard_list_pos, shard_idx in enumerate(my_shards):
+        # In reverse mode, stop early if the forward worker has caught up: if the 5th
+        # upcoming shard (in our reversed order) already exists, both ends have converged.
+        if args.reverse:
+            lookahead = 10
+            lookahead_pos = shard_list_pos + lookahead
+            if lookahead_pos < len(my_shards):
+                lookahead_shard_idx = my_shards[lookahead_pos]
+                lookahead_path = (
+                    worker_dir
+                    / ca_store.COUNTERFACTUAL_ACTION_STORE_DATASET_NAME
+                    / ca_store.VERSION
+                    / ca_store.get_shard_filename(args.split, lookahead_shard_idx)
+                )
+                if lookahead_path.exists():
+                    logger.info(
+                        "Worker %d: reverse lookahead shard %d (position +%d) already exists, "
+                        "forward worker has caught up. Stopping early.",
+                        worker_id, lookahead_shard_idx, lookahead,
+                    )
+                    break
+
         start_pos, num_episodes = shard_info[shard_idx]
 
         # Apply max_episodes limit
@@ -902,16 +935,17 @@ def run_worker(args: WorkerArgs) -> None:
             "num_bytes": shard_writer.total_bytes,
         }
 
-    # Save manifest
-    ca_store.save_manifest(manifest, str(worker_dir))
+    if not args.reverse:
+        # Save manifest
+        ca_store.save_manifest(manifest, str(worker_dir))
 
-    # Save shard metadata
-    shard_metadata_path = worker_dir / "shard_metadata.json"
-    with shard_metadata_path.open("w") as f:
-        json.dump(shard_metadata, f, indent=2)
+        # Save shard metadata
+        shard_metadata_path = worker_dir / "shard_metadata.json"
+        with shard_metadata_path.open("w") as f:
+            json.dump(shard_metadata, f, indent=2)
 
-    done_marker.parent.mkdir(parents=True, exist_ok=True)
-    done_marker.write_text(f"completed at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        done_marker.parent.mkdir(parents=True, exist_ok=True)
+        done_marker.write_text(f"completed at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
     if timed_episode_count > 0:
         average_times = {key: value / timed_episode_count for key, value in worker_times.items()}
@@ -997,6 +1031,8 @@ def run_launch(args: LaunchArgs) -> None:
         extra_worker_args += ["--max-episodes", str(args.max_episodes)]
     if args.debug_metrics:
         extra_worker_args += ["--debug-metrics"]
+    if args.reverse:
+        extra_worker_args += ["--reverse"]
 
     extra_args_str = " ".join(extra_worker_args)
 
@@ -1015,7 +1051,8 @@ def run_launch(args: LaunchArgs) -> None:
             worker_cmd += f" {extra_args_str}"
 
         wrap_cmd = _make_wrap_cmd(worker_cmd)
-        log_pattern = str(log_dir / f"ca_store_worker_{worker_id}.log")
+        log_suffix = "_reverse" if args.reverse else ""
+        log_pattern = str(log_dir / f"ca_store_worker_{worker_id}{log_suffix}.log")
 
         sbatch_cmd = [
             "sbatch",

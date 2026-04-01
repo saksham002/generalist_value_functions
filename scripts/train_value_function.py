@@ -445,7 +445,7 @@ def init_train_state(
         )
         params = nnx_utils.state_map(
             params,
-            nnx_utils.PathRegex(".*target_(network|head)/.*"),
+            nnx_utils.PathRegex(".*target_(q_)?(network|head)/.*"),
             lambda p: p.replace(p.value.astype(jnp.bfloat16)),
         )
 
@@ -586,7 +586,7 @@ def value_function_train_step(
         nnx.All(
             nnx.Param,
             nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
-            nnx.Not(nnx_utils.PathRegex(".*target_(network|head)/.*")),
+            nnx.Not(nnx_utils.PathRegex(".*target_(q_)?(network|head)/.*")),
             lambda _, x: x.value.ndim > 1,
         ),
     )
@@ -594,7 +594,7 @@ def value_function_train_step(
         model,
         nnx.All(
             nnx.Param,
-            nnx_utils.PathRegex(".*target_(network|head)/.*"),
+            nnx_utils.PathRegex(".*target_(q_)?(network|head)/.*"),
             nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
             lambda _, x: x.value.ndim > 1,
         ),
@@ -636,6 +636,11 @@ def value_function_train_step(
         "batch/truncation_min": jnp.min(transition.truncation.astype(jnp.float32)),
         "batch/truncation_max": jnp.max(transition.truncation.astype(jnp.float32)),
     }
+    if transition.counterfactual_next_actions is not None:
+        batch_stats["batch/counterfactual_next_actions_mean"] = jnp.mean(transition.counterfactual_next_actions)
+        batch_stats["batch/counterfactual_next_actions_std"] = jnp.std(transition.counterfactual_next_actions)
+        batch_stats["batch/counterfactual_next_actions_min"] = jnp.min(transition.counterfactual_next_actions)
+        batch_stats["batch/counterfactual_next_actions_max"] = jnp.max(transition.counterfactual_next_actions)
 
     batch_size = transition.reward.shape[0]
 
@@ -1115,9 +1120,14 @@ def _create_value_video(
     frame_images: list[np.ndarray],
     fps: int,
     subtask_texts: list[str] | None = None,
-) -> "wandb.Video":
-    """Create a wandb GIF with a 2x2 layout: left wrist (top-left), right wrist (bottom-left),
-    value plot (top-right), base camera (bottom-right). Subtask list shown below the plot."""
+    output_dir: str | None = None,
+    plot_key: str = "",
+) -> "wandb.Video | str":
+    """Create a 2x2 layout video: left wrist (top-left), right wrist (bottom-left),
+    value plot (top-right), base camera (bottom-right). Subtask list shown below the plot.
+
+    When output_dir is set, saves an MP4 to disk via imageio and returns the file path.
+    When output_dir is None, returns a wandb.Video (GIF)."""
     T = len(mc_returns)
     timesteps = np.arange(T)
     video_frames = []
@@ -1179,6 +1189,22 @@ def _create_value_video(
         video_frames.append(buf.copy())
 
     plt.close(fig)
+
+    if output_dir is not None:
+        import imageio
+
+        os.makedirs(output_dir, exist_ok = True)
+        sanitized_key = plot_key.replace("/", "_") if plot_key else f"ep{ep_idx}_step{step}"
+        out_path = os.path.join(output_dir, f"{sanitized_key}.mp4")
+        # Ensure dimensions are divisible by 16 (imageio macro_block_size)
+        h, w = video_frames[0].shape[:2]
+        h_crop = h - (h % 16)
+        w_crop = w - (w % 16)
+        cropped_frames = [frame[:h_crop, :w_crop] for frame in video_frames]
+        imageio.mimsave(out_path, cropped_frames, format = "mp4", fps = fps, codec = "libx264", quality = 8)
+        logging.info(f"Saved video to {out_path}")
+        return out_path
+
     video_array = np.stack(video_frames).transpose(0, 3, 1, 2)
     # GIF is used because wandb renders it inline. mp4 shows as "File type unknown" in the wandb UI.
     # GIF's 256-color palette quantization causes a visible quality drop (color jitter appearance),
@@ -1197,7 +1223,9 @@ def _create_value_plot(
     plot_video: bool = False,
     frame_images: list[np.ndarray] | None = None,
     fps: int = 10,
-) -> "wandb.Image | wandb.Video":
+    output_dir: str | None = None,
+    plot_key: str = "",
+) -> "wandb.Image | wandb.Video | str":
     """Create a matplotlib plot comparing MC returns vs predicted values.
 
     Args:
@@ -1211,9 +1239,14 @@ def _create_value_plot(
         plot_video: If True and frame_images are provided, returns a wandb.Video instead of wandb.Image.
         frame_images: Optional list of (3, 224, 224, 3) uint8 arrays (left wrist, right wrist, base_0) per timestep.
         fps: Frame rate of the episode, used when encoding the output video.
+        output_dir: If set, save to disk instead of returning a wandb object.
+        plot_key: Key used to derive the filename when saving to disk.
     """
     if plot_video and frame_images is not None and len(frame_images) == len(mc_returns):
-        return _create_value_video(mc_returns, predicted_values, ep_idx, step, suffix, oracle_values, frame_images, fps, subtask_texts)
+        return _create_value_video(
+            mc_returns, predicted_values, ep_idx, step, suffix, oracle_values, frame_images, fps, subtask_texts,
+            output_dir = output_dir, plot_key = plot_key,
+        )
 
     fig, ax = plt.subplots(figsize=(10, 6))
     timesteps = np.arange(len(mc_returns))
@@ -1265,6 +1298,15 @@ def _create_value_plot(
                  family='monospace', linespacing=1.5)
     else:
         plt.tight_layout()
+
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok = True)
+        sanitized_key = plot_key.replace("/", "_") if plot_key else f"ep{ep_idx}_step{step}"
+        out_path = os.path.join(output_dir, f"{sanitized_key}.png")
+        fig.savefig(out_path, dpi = 150, bbox_inches = "tight")
+        plt.close(fig)
+        logging.info(f"Saved plot to {out_path}")
+        return out_path
 
     img = wandb.Image(fig)
     plt.close(fig)
@@ -1489,7 +1531,9 @@ def _create_attn_plot(
     step: int,
     repo_id: str,
     action_conditioned: bool,
-) -> "wandb.Image":
+    output_dir: str | None = None,
+    plot_key: str = "",
+) -> "wandb.Image | str":
     """Create a line plot of per-modality CLS attention scores over time."""
     scores = np.stack(attn_scores, axis=0)  # [T, n_modalities]
     timesteps = np.arange(len(scores))
@@ -1508,6 +1552,16 @@ def _create_attn_plot(
     ax.legend(loc="upper right", fontsize=10)
     ax.grid(visible=True, alpha=0.3)
     plt.tight_layout()
+
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok = True)
+        sanitized_key = plot_key.replace("/", "_") if plot_key else f"attn_ep{ep_idx}_step{step}"
+        out_path = os.path.join(output_dir, f"{sanitized_key}.png")
+        fig.savefig(out_path, dpi = 150, bbox_inches = "tight")
+        plt.close(fig)
+        logging.info(f"Saved attention plot to {out_path}")
+        return out_path
+
     img = wandb.Image(fig)
     plt.close(fig)
     return img
@@ -1527,6 +1581,9 @@ def _render_and_log_plots(
     traj_to_repo_ep: dict,
     action_conditioned: bool,
     step: int,
+    *,
+    all_predictions_counterfactual: dict | None = None,
+    output_dir: str | None = None,
 ) -> None:
     images = {}
     for traj_idx in ep_mc_returns.keys():
@@ -1561,6 +1618,7 @@ def _render_and_log_plots(
             oracle_values = None, subtask_texts = subtasks,
             plot_video = True, frame_images = ep_frame_images[traj_idx],
             fps = ep_fps[traj_idx],
+            output_dir = output_dir, plot_key = plot_key,
         )
         logging.info(f"Repo {repo_id}, episode {ep_idx} plot created")
 
@@ -1568,7 +1626,8 @@ def _render_and_log_plots(
         filtered_attn = [s for s, mask in zip(attn_scores, include_masks) if mask]
         if len(filtered_attn) == len(filtered_mc_returns) and len(filtered_attn) > 0:
             images[f"{plot_key}_attn"] = _create_attn_plot(
-                filtered_attn, ep_idx, step, repo_id.removeprefix("RoboCOIN/"), action_conditioned
+                filtered_attn, ep_idx, step, repo_id.removeprefix("RoboCOIN/"), action_conditioned,
+                output_dir = output_dir, plot_key = f"{plot_key}_attn",
             )
 
         negative_subtasks = ep_negative_subtasks.get(traj_idx)
@@ -1579,6 +1638,7 @@ def _render_and_log_plots(
                 images[f"{plot_key}_counterfactual_text"] = _create_value_plot(
                     filtered_mc_returns, filtered_predictions_neg, ep_idx, step, " (Counterfactual Text)",
                     oracle_values = None, subtask_texts = negative_subtasks,
+                    output_dir = output_dir, plot_key = f"{plot_key}_counterfactual_text",
                 )
                 logging.info(f"Repo {repo_id}, episode {ep_idx} counterfactual text plot created")
 
@@ -1589,16 +1649,30 @@ def _render_and_log_plots(
                 images[f"{plot_key}_random_actions"] = _create_value_plot(
                     filtered_mc_returns, filtered_predictions_random, ep_idx, step, " (Random Actions)",
                     oracle_values = None, subtask_texts = subtasks,
+                    output_dir = output_dir, plot_key = f"{plot_key}_random_actions",
                 )
                 logging.info(f"Repo {repo_id}, episode {ep_idx} random action plot created")
 
-    if images:
+        predicted_values_counterfactual = all_predictions_counterfactual.get(traj_idx, []) if all_predictions_counterfactual is not None else []
+        if len(predicted_values_counterfactual) == len(predicted_values):
+            filtered_predictions_counterfactual = [
+                pred for pred, mask in zip(predicted_values_counterfactual, include_masks) if mask
+            ]
+            if len(filtered_predictions_counterfactual) == len(filtered_mc_returns) and len(filtered_predictions_counterfactual) > 0:
+                images[f"{plot_key}_counterfactual_actions"] = _create_value_plot(
+                    filtered_mc_returns, filtered_predictions_counterfactual, ep_idx, step, " (Counterfactual Actions)",
+                    oracle_values = None, subtask_texts = subtasks,
+                    output_dir = output_dir, plot_key = f"{plot_key}_counterfactual_actions",
+                )
+                logging.info(f"Repo {repo_id}, episode {ep_idx} counterfactual action plot created")
+
+    if output_dir is None and images:
         # Log without an explicit step, avoiding the "step must be monotonically
         # increasing" warning that occurs because this thread may run after further
         # training steps have been logged.
         wandb.log(images)
-    logging.info(f"Render thread finished: logged {len(images)} plots for step {step}")
-    del images, ep_frame_images, all_predictions, all_predictions_neg, all_predictions_random, all_attn_scores
+    logging.info(f"Render thread finished: {'saved' if output_dir else 'logged'} {len(images)} plots for step {step}")
+    del images, ep_frame_images, all_predictions, all_predictions_neg, all_predictions_random, all_predictions_counterfactual, all_attn_scores
 
 
 def generate_validation_plots_dlimp(
@@ -1609,12 +1683,13 @@ def generate_validation_plots_dlimp(
     action_conditioned: bool,
     data_config: _config.DataConfig,
     cache_dir: str,
+    output_dir: str | None = None,
 ) -> dict:
     """Generate validation plots for RoboCOIN.
 
     Loads pre-cached validation episodes from ``cache_dir`` (populated at
     init time via ``cache_val_episodes``), runs value-function inference,
-    and logs plots to W&B asynchronously.
+    and logs plots to W&B (async) or saves to ``output_dir`` on disk.
 
     Args:
         model: The value function model.
@@ -1623,9 +1698,10 @@ def generate_validation_plots_dlimp(
         action_conditioned: Whether the model is action-conditioned (Q vs V).
         data_config: Data configuration.
         cache_dir: Directory containing cached validation episodes.
+        output_dir: If set, save plots/videos to this directory instead of logging to wandb.
 
     Returns:
-        Empty dict (plots are logged asynchronously by a background thread).
+        Empty dict (plots are logged/saved asynchronously by a background thread).
     """
     traj_frames: dict[int, list[dict]] = {}
     logging.info(f"Loading cached validation episodes from {cache_dir}")
@@ -1718,7 +1794,7 @@ def generate_validation_plots_dlimp(
 
     logging.info(f"Processing {len(all_frames)} total frames across {len(ep_mc_returns)} episodes in batches of 64")
 
-    all_predictions, all_predictions_neg, all_predictions_random, all_attn_scores = predict_values(
+    all_predictions, all_predictions_neg, all_predictions_random, all_predictions_counterfactual, all_attn_scores = predict_values(
         model, all_frames, ep_mc_returns, action_conditioned
     )
     del all_frames, traj_frames
@@ -1733,10 +1809,15 @@ def generate_validation_plots_dlimp(
         _render_thread = threading.Thread(
             target = _render_and_log_plots,
             args = (
-                all_predictions, all_predictions_neg, all_predictions_random, all_attn_scores,
+                all_predictions, all_predictions_neg, all_predictions_random,
+                all_attn_scores,
                 ep_mc_returns, ep_frame_images, ep_fps, ep_include_masks,
                 ep_subtasks, ep_negative_subtasks,
                 traj_to_repo_ep, action_conditioned, step,
+            ),
+            kwargs = dict(
+                all_predictions_counterfactual = all_predictions_counterfactual,
+                output_dir = output_dir,
             ),
             daemon = True,
         )
