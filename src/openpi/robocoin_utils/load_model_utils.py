@@ -48,3 +48,29 @@ def restore_state_with_shardings(checkpoint_manager, state_shape, state_sharding
             ),
         )
     return _checkpoints._merge_params(restored["train_state"], restored["params"])
+
+
+def restore_params_with_shardings(checkpoint_manager, state_shape, state_sharding):
+    """Restore only inference params with explicit target shardings.
+
+    This avoids materializing optimizer state when loading a checkpoint for
+    evaluation, which substantially reduces memory pressure compared to
+    restoring the full training state.
+    """
+    with at.disable_typechecking():
+        _, params = _checkpoints._split_params(state_shape)
+        _, params_sharding = _checkpoints._split_params(state_sharding)
+
+        def _to_restore_args(sharding_tree):
+            return jax.tree.map(lambda s: ocp.ArrayRestoreArgs(sharding = s), sharding_tree)
+
+        restored = checkpoint_manager.restore(
+            step = None,
+            args = ocp.args.Composite(
+                params = ocp.args.PyTreeRestore(
+                    item = {"params": params},
+                    restore_args = {"params": _to_restore_args(params_sharding)},
+                ),
+            ),
+        )
+    return restored["params"]

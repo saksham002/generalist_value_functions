@@ -64,6 +64,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         latent_store_dir: str | None = None,
         latent_views: Sequence[rlds_dataset.latent_store.LatentViewConfig] = (),
         counterfactual_action_store_dir: str | None = None,
+        counterfactual_action_dim_offset: int = 0,
     ):
         if td_n is not None and td_n % 5 != 0:
             raise ValueError(f"td_n must be a multiple of 5, got {td_n}")
@@ -80,13 +81,15 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         self._use_chunk_wise_delta = use_chunk_wise_delta
         self._state_dim = state_dim
         self._state_dim_checked = False
+        self._counterfactual_action_dim_offset = counterfactual_action_dim_offset
         logging.info(
             f"RoboCoinRldsDataset: critic_mode={critic_mode}, discount={discount}, "
             f"reward_scale={reward_scale}, reward_bias={reward_bias}, use_eef={use_eef}, "
             f"td_n={td_n}, filter_n={filter_n}, mask_50fps={mask_50fps}, "
             f"mask_boundary_actions={mask_boundary_actions}, "
             f"use_chunk_wise_delta={use_chunk_wise_delta}, "
-            f"state_dim={state_dim}"
+            f"state_dim={state_dim}, "
+            f"counterfactual_action_dim_offset={counterfactual_action_dim_offset}"
         )
 
         super().__init__(
@@ -211,7 +214,16 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             if key.startswith(("latents/", "_latent")):
                 mapped_traj[key] = value
         if "counterfactual_actions" in raw_traj:
-            mapped_traj["counterfactual_actions"] = raw_traj["counterfactual_actions"]
+            counterfactual_actions = raw_traj["counterfactual_actions"]
+            if self._counterfactual_action_dim_offset > 0:
+                action_dim = mapped_traj["actions"].shape[-1]
+                if action_dim is None:
+                    raise ValueError("Expected static action dimension for RoboCOIN actions.")
+                counterfactual_actions = counterfactual_actions[
+                    ...,
+                    self._counterfactual_action_dim_offset : self._counterfactual_action_dim_offset + action_dim,
+                ]
+            mapped_traj["counterfactual_actions"] = counterfactual_actions
         for key in ("_ca_episode_index",):
             if key in raw_traj:
                 mapped_traj[key] = raw_traj[key]
@@ -339,9 +351,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             safe_upper = tf.maximum(first_null_index, 1)
             sampled_idx = tf.random.uniform([], minval = 0, maxval = safe_upper, dtype = tf.int32)
 
-        selected_steps = steps_all[sampled_idx]
-        selected_steps_f = tf.cast(selected_steps, tf.float32)
-
         subtask_texts = tf.stack(
             [
                 frame["subtask_1"],
@@ -364,22 +373,20 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         min_idx = tf.argmin(masked_steps, output_type = tf.int32)
 
         if self._critic_mode:
-            frame["prompt"] = subtask_texts[sampled_idx]
             # When counterfactual actions are cached, the policy generated them
             # using the min-length valid subtask's mask. Use the same index for
             # action_mask / next_action_mask so ReplaceMaskedActions and the
             # network's attention mask are consistent with the cached actions.
-            if self._counterfactual_action_store_dir is not None:
-                mask_idx = min_idx
-            else:
-                mask_idx = sampled_idx
+            if self._counterfactual_action_store_dir is not None and self._mask_boundary_actions:
+                sampled_idx = min_idx
+            frame["prompt"] = subtask_texts[sampled_idx]
         else:
             selected_texts = tf.boolean_mask(stripped_subtask_texts, include_subtasks)
             frame["prompt"] = tf.strings.reduce_join(selected_texts, separator = ", ")
             sampled_idx = min_idx
-            mask_idx = min_idx
-            selected_steps = steps_all[sampled_idx]
-            selected_steps_f = tf.cast(selected_steps, tf.float32)
+
+        selected_steps = steps_all[sampled_idx]
+        selected_steps_f = tf.cast(selected_steps, tf.float32)
 
         frame["include_subtask"] = include_subtasks[sampled_idx]
         frame["steps_to_subtask_end"] = selected_steps
@@ -390,8 +397,8 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             frame["action_mask"] = tf.ones([full_action_horizon], dtype = tf.bool)
             frame["next_action_mask"] = tf.ones([full_action_horizon], dtype = tf.bool)
         else:
-            frame["action_mask"] = frame["action_mask"][mask_idx]
-            frame["next_action_mask"] = frame["next_action_mask"][mask_idx]
+            frame["action_mask"] = frame["action_mask"][sampled_idx]
+            frame["next_action_mask"] = frame["next_action_mask"][sampled_idx]
 
         fps = tf.cast(frame["fps"], tf.int32)
         exponent_per_step = tf.cast(tf.where(tf.equal(fps, 30), 5, 3), tf.float32)

@@ -205,15 +205,14 @@ class ReplaceMaskedActions(DataTransformFn):
             if actions.ndim not in (2, 3):
                 raise ValueError(f"{actions_key} must have rank 2 or 3, got shape {actions.shape}")
 
-            last_valid_idx = int(action_mask.sum()) - 1
-            if last_valid_idx < 0:
-                raise ValueError(f"{mask_key} must contain at least one valid action.")
+            last_valid_idx = max(int(action_mask.sum()) - 1, 0)
 
             if actions.ndim == 3:
                 # [num_samples, action_horizon, action_dim] — broadcast mask across samples
+                # Use the same noise across all samples so replacement is consistent
                 last_valid_action = actions[:, last_valid_idx]
-                noise = (noise_scale * self.rng.standard_normal(actions.shape)).astype(actions.dtype)
-                replacement = last_valid_action[:, None, :] + noise
+                shared_noise = (noise_scale * self.rng.standard_normal(actions.shape[1:])).astype(actions.dtype)
+                replacement = last_valid_action[:, None, :] + shared_noise[None, :, :]
                 mask_broadcast = action_mask[None, :, None]
                 actions = np.where(mask_broadcast, actions, replacement)
             else:
@@ -223,12 +222,16 @@ class ReplaceMaskedActions(DataTransformFn):
                 actions[~action_mask] = replacement[~action_mask]
 
             data[actions_key] = actions
-            if actions_key in ("actions", "next_actions"):
-                action_mask[:] = True
-                if fps == 30:
-                    action_horizon = action_mask.shape[0]
-                    action_mask[3 * action_horizon // 5 :] = False
-                data[mask_key] = action_mask
+
+        for mask_key in ("action_mask", "next_action_mask"):
+            if mask_key not in data:
+                continue
+            action_mask = np.asarray(data[mask_key], dtype = np.bool_).copy()
+            action_mask[:] = True
+            if fps == 30:
+                action_horizon = action_mask.shape[0]
+                action_mask[3 * action_horizon // 5 :] = False
+            data[mask_key] = action_mask
 
         return data
 

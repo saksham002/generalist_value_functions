@@ -167,7 +167,7 @@ def get_obs_and_action(
         prefix: Key prefix (e.g., "", "negative_", "random_").
                 For prefix="", uses keys like "state", "image", "actions".
                 For prefix="negative_", only changes tokenized_prompt keys.
-                For prefix="random_", only changes the action key.
+                For prefix="random_" or prefix="counterfactual_", only changes the action key.
         action_conditioned: Whether to include actions and action_mask.
 
     Returns:
@@ -185,6 +185,13 @@ def get_obs_and_action(
         state_key = "state"
         image_key = "image"
         actions_key = "random_actions"
+        action_mask_key = "action_mask"
+        prompt_key = "tokenized_prompt"
+        prompt_mask_key = "tokenized_prompt_mask"
+    elif prefix == "counterfactual_":
+        state_key = "state"
+        image_key = "image"
+        actions_key = "counterfactual_actions"
         action_mask_key = "action_mask"
         prompt_key = "tokenized_prompt"
         prompt_mask_key = "tokenized_prompt_mask"
@@ -210,6 +217,8 @@ def get_obs_and_action(
     action_mask = None
     if action_conditioned:
         action = stack_frames(frame_dicts, actions_key)
+        if action is not None and action.ndim == 4:
+            action = action[:, 0]
         action_mask = stack_frames(frame_dicts, action_mask_key)
 
     obs = _model.Observation(
@@ -267,7 +276,7 @@ _CACHE_KEYS = {
     "state", "image", "image_mask", "actions", "action_mask",
     "tokenized_prompt", "tokenized_prompt_mask",
     "tokenized_negative_prompt", "tokenized_negative_prompt_mask",
-    "negative_subtask_1_text", "random_actions",
+    "negative_subtask_1_text", "random_actions", "counterfactual_actions",
     "mc_return", "include_subtask", "fps",
     "repo_id", "episode_index", "_frame_index",
 }
@@ -427,6 +436,7 @@ def predict_values(
     dict[str, list[float]],
     dict[str, list[float]],
     dict[str, list[float]],
+    dict[str, list[float]],
     dict[str, list[np.ndarray]],
 ]:
     """Run batched value function inference on collected validation frames.
@@ -449,6 +459,7 @@ def predict_values(
             all_predictions,
             all_predictions_neg,
             all_predictions_random,
+            all_predictions_counterfactual,
             all_attn_scores,
         ).
     """
@@ -456,6 +467,7 @@ def predict_values(
     all_predictions: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_predictions_neg: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_predictions_random: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
+    all_predictions_counterfactual: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_attn_scores: dict[str, list[np.ndarray]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
 
     for batch_start in range(0, len(all_frames), BATCH_SIZE):
@@ -486,6 +498,15 @@ def predict_values(
             obs_random, act_random = get_obs_and_action(frame_dicts, prefix="random_", action_conditioned=action_conditioned)
             pred_values_random_np, _ = jax.device_get(_jitted_compute_value(model, obs_random, act_random))
 
+        pred_values_counterfactual_np = None
+        if "counterfactual_actions" in frame_dicts[0]:
+            obs_counterfactual, act_counterfactual = get_obs_and_action(
+                frame_dicts, prefix = "counterfactual_", action_conditioned = action_conditioned
+            )
+            pred_values_counterfactual_np, _ = jax.device_get(
+                _jitted_compute_value(model, obs_counterfactual, act_counterfactual)
+            )
+
         for i, (ep_idx, _, _) in enumerate(batch_frames):
             all_predictions[ep_idx].append(float(pred_values_np[i]))
             all_attn_scores[ep_idx].append(attn_np[i])
@@ -493,11 +514,15 @@ def predict_values(
                 all_predictions_neg[ep_idx].append(float(pred_values_neg_np[i]))
             if pred_values_random_np is not None:
                 all_predictions_random[ep_idx].append(float(pred_values_random_np[i]))
+            if pred_values_counterfactual_np is not None:
+                all_predictions_counterfactual[ep_idx].append(float(pred_values_counterfactual_np[i]))
 
     total_predictions = sum(len(preds) for preds in all_predictions.values())
     logger.info(f"Computed {total_predictions} predictions")
 
-    return all_predictions, all_predictions_neg, all_predictions_random, all_attn_scores
+    return all_predictions, all_predictions_neg, all_predictions_random, all_predictions_counterfactual, all_attn_scores
+
+
 
 
 @nnx.jit

@@ -145,22 +145,26 @@ class BestOfNWrapper(_model.BaseModel):
                     "Ensure the data pipeline populates this field."
                 )
             actions = transition.counterfactual_next_actions
-            if actions.shape[1] < self.num_samples:
+        else:
+            if transition.counterfactual_actions is None:
                 raise ValueError(
-                    "Cached counterfactual actions provide fewer samples than BestOfN requires: "
-                    f"expected at least {self.num_samples}, got {actions.shape[1]} "
-                    f"for shape {actions.shape}."
+                    "compute_next_action=False but transition.counterfactual_actions is None. "
+                    "Ensure the data pipeline populates this field."
                 )
-            if actions.shape[1] > self.num_samples:
-                actions = actions[:, : self.num_samples]
-            # Slice to model's action_horizon if cached actions have longer horizon
-            if actions.shape[2] > self.action_horizon:
-                actions = actions[:, :, : self.action_horizon, :]
-            return actions
-        raise ValueError(
-            "BestOfNWrapper without base_model only supports compute_next_action=True "
-            "(cached actions are for next-action selection in TD backup)"
-        )
+            actions = transition.counterfactual_actions
+
+        if actions.shape[1] < self.num_samples:
+            raise ValueError(
+                "Cached counterfactual actions provide fewer samples than BestOfN requires: "
+                f"expected at least {self.num_samples}, got {actions.shape[1]} "
+                f"for shape {actions.shape}."
+            )
+        if actions.shape[1] > self.num_samples:
+            actions = actions[:, : self.num_samples]
+        # Slice to model's action_horizon if cached actions have longer horizon
+        if actions.shape[2] > self.action_horizon:
+            actions = actions[:, :, : self.action_horizon, :]
+        return actions
 
     @override
     def sample_actions(
@@ -222,19 +226,37 @@ class BestOfNWrapper(_model.BaseModel):
 
         expanded_obs = expand_observation(observation, n)
         flat_actions = all_actions.reshape(batch_size * n, action_horizon, action_dim_size)
+        prefix_cache = None
+        network = getattr(value_function, "q_network", getattr(value_function, "network", None))
+        if network is not None and hasattr(network, "compute_prefix_cache"):
+            raw_kv_cache, raw_prefix_mask = value_function.compute_prefix_cache(
+                observation, use_target = self.use_target_value
+            )
+            repeated_kv_cache = jax.tree.map(
+                lambda x: jnp.repeat(x, n, axis = 1), raw_kv_cache
+            )
+            repeated_prefix_mask = jnp.repeat(raw_prefix_mask, n, axis = 0)
+            prefix_cache = (repeated_kv_cache, repeated_prefix_mask)
+
+        value_kwargs = {
+            "take_min_over_ensemble": self.take_min_over_ensemble,
+        }
+        if prefix_cache is not None:
+            value_kwargs["prefix_cache"] = prefix_cache
 
         if self.use_target_value:
-            q_values = value_function.compute_target_value(
+            result = value_function.compute_target_value(
                 expanded_obs,
                 flat_actions,
-                take_min_over_ensemble=self.take_min_over_ensemble,
+                **value_kwargs,
             )
         else:
-            q_values = value_function.compute_value(
+            result = value_function.compute_value(
                 expanded_obs,
                 flat_actions,
-                take_min_over_ensemble=self.take_min_over_ensemble,
+                **value_kwargs,
             )
+        q_values = result[0] if isinstance(result, tuple) else result
         q_values = q_values.reshape(batch_size, n)
 
         if self.selection_mode == "argmax":
@@ -316,4 +338,5 @@ def expand_observation(observation: _model.Observation, num_samples: int) -> _mo
         tokenized_prompt_mask=_repeat(observation.tokenized_prompt_mask),
         token_ar_mask=_repeat(observation.token_ar_mask),
         token_loss_mask=_repeat(observation.token_loss_mask),
+        action_mask=_repeat(observation.action_mask),
     )

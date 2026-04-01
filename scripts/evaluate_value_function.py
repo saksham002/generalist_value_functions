@@ -1,335 +1,342 @@
-"""Evaluate a value function model on specific RoboCOIN episodes.
+"""Evaluate a value function checkpoint on RoboCOIN cached trajectories."""
 
-Caches episodes to disk (one pickle per trajectory), then loads the model,
-computes predicted values, and logs plots to wandb.
-
-Episodes are specified as (repo_index, episode_index) pairs. The script first
-iterates through the val split to find matching episodes; any remaining
-episodes are searched in the train split.
-
-Usage:
-    python scripts/evaluate_value_function.py \
-        --model robocoin_bimanual_paligemma_q_sarsa:gs://bucket/checkpoints/.../exp \
-        --episodes 3,270 0,15 \
-        --cache-dir /path/to/cache \
-        [--project-name robocoin_value_eval]
-"""
-
-import argparse
-import dataclasses as dc
+import dataclasses
 import logging
 import os
 import pickle
+import tempfile
 
 import flax.nnx as nnx
 import jax
 import numpy as np
-import optax
-import wandb
 
-from openpi.models.tokenizer import create_tokenizer
-from openpi.robocoin_utils.load_model_utils import load_train_module, restore_state_with_shardings
-import openpi.shared.nnx_utils as nnx_utils
+from openpi.models.best_of_n import BestOfNWrapper
+import openpi.models.model as _model
+from openpi.robocoin_utils.load_model_utils import load_train_module, restore_params_with_shardings
+from openpi.robocoin_utils.utils import cache_val_episodes, count_subtask_segments, get_obs_and_action
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
+import openpi.training.data_loader as _data_loader
 import openpi.training.sharding as sharding
-logger = logging.getLogger()
-logger.warning("evaluate_value_function.py: This script has not been ported to the RLDS pipeline and will not work.")
+import openpi.transforms as _transforms
+import openpi.value_functions.base_value_functions as _base_vf
+
+logger = logging.getLogger(__name__)
 
 
+@dataclasses.dataclass(frozen = True)
+class EvalConfig:
+    """Configuration for value function evaluation."""
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description = "Evaluate value function on specific RoboCOIN episodes.")
-    parser.add_argument(
-        "--model",
-        action = "append",
-        required = True,
-        metavar = "CONFIG_NAME:CHECKPOINT_PATH",
-        help = "Model specification as config_name:checkpoint_path. Can be repeated.",
-    )
-    parser.add_argument(
-        "--episodes",
-        nargs = "+",
-        required = True,
-        metavar = "REPO_IDX,EP_IDX",
-        help = "Episode specifications as repo_index,episode_index pairs.",
-    )
-    parser.add_argument("--cache-dir", required = True, help = "Directory for cached episode pickles.")
-    parser.add_argument("--project-name", default = "robocoin_value_eval", help = "Wandb project name.")
-    return parser.parse_args()
+    config_name: str
+    checkpoint_path: str
+    split: str = "val"
+    fine_tune: str | None = None
+    include_repos: tuple[str, ...] = ()
+    num_trajectories: int = 10
+    cache_dir: str | None = None
+    output_dir: str | None = None
+    project_name: str = "robocoin_value_eval"
+    counterfactual_best_of_n: bool = False
+    counterfactual_action_store_dir: str | None = None
 
 
-def parse_model_spec(spec: str) -> tuple[str, str]:
-    parts = spec.split(":", 1)
-    if len(parts) != 2:
-        raise ValueError(f"Model spec must be config_name:checkpoint_path, got: {spec}")
-    return parts[0], parts[1]
+def _resolve_eval_cache_dir(eval_config: EvalConfig) -> str:
+    if eval_config.cache_dir is not None:
+        return eval_config.cache_dir
+    if eval_config.checkpoint_path.startswith("gs://"):
+        return os.path.join(
+            tempfile.gettempdir(),
+            "openpi_eval_cache",
+            eval_config.config_name,
+            eval_config.split,
+        )
+    return os.path.join(eval_config.checkpoint_path, "eval_cache", eval_config.split)
 
 
-def parse_episode_spec(spec: str) -> tuple[int, int]:
-    parts = spec.split(",")
-    if len(parts) != 2:
-        raise ValueError(f"Episode spec must be repo_index,episode_index, got: {spec}")
-    return int(parts[0]), int(parts[1])
-
-
-def get_model_display_name(config_name: str, checkpoint_path: str) -> str:
-    tail = checkpoint_path.rstrip("/").rsplit("/", 1)[-1]
-    if tail.isdigit() or tail == config_name:
-        return config_name
-    return f"{config_name}/{tail}"
-
-
-def compute_param_norm(model: nnx.Module) -> float:
-    kernel_params = nnx.state(
-        model,
-        nnx.All(
-            nnx.Param,
-            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
-            nnx.Not(nnx_utils.PathRegex(".*target_(network|head)/.*")),
-            lambda _, x: x.value.ndim > 1,
-        ),
-    )
-    return float(jax.device_get(optax.global_norm(kernel_params)))
-
-
-def cache_episodes_by_identity(
-    robocoin_config,
-    backbone_variant: str,
-    action_horizon: int,
-    requested: list[tuple[int, int]],
-    cache_dir: str,
-):
-    """Cache specific episodes identified by (repo_index, episode_index).
-
-    First iterates the val split, then the train split for any remaining episodes.
-    """
-    os.makedirs(cache_dir, exist_ok = True)
-
-    # Check which episodes are already cached
-    already_cached: set[tuple[int, int]] = set()
+def _load_cached_trajectories(cache_dir: str) -> dict[int, list[dict]]:
+    traj_frames: dict[int, list[dict]] = {}
     for filename in os.listdir(cache_dir):
         if filename.startswith("traj_") and filename.endswith(".pkl"):
             traj_idx = int(filename.replace("traj_", "").replace(".pkl", ""))
-            cache_file = os.path.join(cache_dir, filename)
-            with open(cache_file, "rb") as f:
-                frames = pickle.load(f)
-            if frames:
-                repo_idx = int(frames[0]["_traj_index"])
-                ep_idx = int(frames[0]["episode_index"])
-                already_cached.add((repo_idx, ep_idx))
-
-    remaining = set(requested) - already_cached
-    if not remaining:
-        logger.info(f"All {len(requested)} episodes already cached in {cache_dir}")
-        return
-
-    logger.info(f"{len(already_cached)} episodes already cached, {len(remaining)} to collect")
-
-    for split in ("val", "train"):
-        if not remaining:
-            break
-
-        logger.info(f"Searching {split} split for {len(remaining)} episodes...")
-        num_images = robocoin_config.max_cameras if backbone_variant == "gemma3" else 0
-        tokenizer = create_tokenizer(backbone_variant, robocoin_config.max_token_len, num_images = num_images)
-
-        loader_config = dc.replace(
-            robocoin_config,
-            split = split,
-            batch_size = 64,
-            prefetch_buffer_size = 2,
-            shuffle = False,
-            repeat = False,
-            action_horizon = action_horizon,
-            state_norm_stats = robocoin_config.state_norm_stats,
-            use_quantile_norm = robocoin_config.use_quantile_norm,
-        )
-        dataloader = create_robocoin_data_loader(loader_config, tokenizer = tokenizer)
-
-        active_trajs: dict[int, tuple[int, int]] = {}
-        traj_frames: dict[int, list[dict]] = {}
-        found_count = 0
-
-        for batch in dataloader:
-            traj_indices = batch.get("_traj_index", None)
-            if traj_indices is None:
-                continue
-            if hasattr(traj_indices, "device"):
-                traj_indices = np.asarray(traj_indices)
-
-            unique_batch_trajs = set(int(t) for t in traj_indices)
-
-            completed = set(active_trajs.keys()) - unique_batch_trajs
-            for traj_idx in completed:
-                if traj_idx in traj_frames:
-                    frames = traj_frames[traj_idx]
-                    if frames:
-                        frames.sort(key = lambda f: f["_frame_index"])
-                    cache_file = os.path.join(cache_dir, f"traj_{traj_idx}.pkl")
-                    with open(cache_file, "wb") as f:
-                        pickle.dump(frames, f)
-                    repo_idx, ep_idx = active_trajs[traj_idx]
-                    logger.info(f"Saved traj {traj_idx} (repo {repo_idx}, episode {ep_idx}, {len(frames)} frames) to {cache_file}")
-                    remaining.discard((repo_idx, ep_idx))
-                    found_count += 1
-                    del traj_frames[traj_idx]
-                del active_trajs[traj_idx]
-
-            if not remaining and not active_trajs:
-                break
-
-            batch_size = traj_indices.shape[0]
-            for i in range(batch_size):
-                traj_idx = int(traj_indices[i])
-
-                if traj_idx not in traj_frames and traj_idx not in active_trajs:
-                    ep_idx = int(batch["episode_index"][i])
-                    repo_id = batch["repo_id"][i]
-                    if isinstance(repo_id, bytes):
-                        repo_id = repo_id.decode("utf-8")
-                    repo_idx = traj_idx
-
-                    if (repo_idx, ep_idx) not in remaining:
-                        continue
-
-                    traj_frames[traj_idx] = []
-                    active_trajs[traj_idx] = (repo_idx, ep_idx)
-
-                if traj_idx not in active_trajs:
-                    continue
-
-                frame = {}
-                for key, value in batch.items():
-                    if isinstance(value, dict):
-                        frame[key] = {sub_key: np.asarray(sub_value[i]) for sub_key, sub_value in value.items()}
-                    else:
-                        frame[key] = np.asarray(value[i])
-                traj_frames[traj_idx].append(frame)
-
-        for traj_idx in list(active_trajs.keys()):
-            if traj_idx in traj_frames:
-                frames = traj_frames[traj_idx]
-                if frames:
-                    frames.sort(key = lambda f: f["_frame_index"])
-                cache_file = os.path.join(cache_dir, f"traj_{traj_idx}.pkl")
-                with open(cache_file, "wb") as f:
-                    pickle.dump(frames, f)
-                repo_idx, ep_idx = active_trajs[traj_idx]
-                logger.info(f"Saved remaining traj {traj_idx} (repo {repo_idx}, episode {ep_idx}, {len(frames)} frames) to {cache_file}")
-                remaining.discard((repo_idx, ep_idx))
-                found_count += 1
-
-        del dataloader
-        logger.info(f"Found {found_count} episodes in {split} split, {len(remaining)} still remaining")
-
-    if remaining:
-        logger.warning(f"Could not find {len(remaining)} episodes: {remaining}")
+            with open(os.path.join(cache_dir, filename), "rb") as f:
+                traj_frames[traj_idx] = pickle.load(f)
+    return traj_frames
 
 
-def load_model(train_module, config_name: str, checkpoint_path: str):
-    """Load model, auto-detecting local device count for cross-device restore."""
-    config = _config.get_config(config_name)
+def _split_trajectory_frames(
+    traj_frames: dict[int, list[dict]],
+) -> tuple[dict[str, list[dict]], dict[str, tuple[str, int, str]], dict[str, list[str]]]:
+    max_subtask_segments = 16
+    split_traj_frames: dict[str, list[dict]] = {}
+    traj_to_repo_ep: dict[str, tuple[str, int, str]] = {}
+    ep_subtasks: dict[str, list[str]] = {}
 
-    local_devices = jax.local_device_count()
-    local_config = dc.replace(config, fsdp_devices = local_devices)
+    for traj_idx, frames in traj_frames.items():
+        if not frames:
+            continue
 
-    init_rng = jax.random.PRNGKey(86)
-    mesh = sharding.make_mesh(local_devices)
+        episode_index = int(frames[0]["episode_index"])
+        repo_id = frames[0]["repo_id"]
+        if isinstance(repo_id, np.ndarray):
+            repo_id = repo_id.item()
+        if isinstance(repo_id, bytes):
+            repo_id = repo_id.decode("utf-8")
 
-    train_state_shape, state_sharding = train_module.init_train_state(local_config, init_rng, mesh, resume = True)
+        num_segments, split_frame_idx, segments = count_subtask_segments(frames)
+        if num_segments > max_subtask_segments:
+            split_segment_idx = num_segments // 2
+            key_part0 = f"{traj_idx}_p0"
+            key_part1 = f"{traj_idx}_p1"
+            split_traj_frames[key_part0] = frames[:split_frame_idx]
+            split_traj_frames[key_part1] = frames[split_frame_idx:]
+            traj_to_repo_ep[key_part0] = (repo_id, episode_index, "_part0")
+            traj_to_repo_ep[key_part1] = (repo_id, episode_index, "_part1")
+            ep_subtasks[key_part0] = segments[:split_segment_idx]
+            ep_subtasks[key_part1] = segments[split_segment_idx:]
+        else:
+            key = str(traj_idx)
+            split_traj_frames[key] = frames
+            traj_to_repo_ep[key] = (repo_id, episode_index, "")
+            ep_subtasks[key] = segments
 
-    mngr, _ = _checkpoints.initialize_checkpoint_dir(
-        checkpoint_path, keep_period = None, overwrite = False, resume = True
-    )
-    train_state = restore_state_with_shardings(mngr, train_state_shape, state_sharding)
-
-    critic_state = train_state.critic
-    model = nnx.merge(critic_state.model_def, critic_state.params)
-
-    param_norm = compute_param_norm(model)
-    logger.info(f"param_norm for {config_name} ({checkpoint_path}): {param_norm:.4f}")
-
-    action_conditioned = model.network.action_conditioned
-
-    return model, action_conditioned, config
+    return split_traj_frames, traj_to_repo_ep, ep_subtasks
 
 
-def main():
+def main(eval_config: EvalConfig):
     logging.basicConfig(level = logging.INFO, format = "%(asctime)s %(levelname)s %(name)s: %(message)s", force = True)
+
+    if eval_config.split not in {"train", "val"}:
+        raise ValueError(f"--split must be 'train' or 'val', got {eval_config.split!r}.")
+    if eval_config.counterfactual_best_of_n and eval_config.counterfactual_action_store_dir is None:
+        raise ValueError("--counterfactual-action-store-dir is required with --counterfactual-best-of-n.")
 
     platform = os.environ.get("PLATFORM", "gpu")
     if platform == "tpu":
         jax.distributed.initialize()
         logger.info(f"Initialized JAX distributed: process {jax.process_index()} of {jax.process_count()}")
 
-    args = parse_args()
-    requested_episodes = [parse_episode_spec(s) for s in args.episodes]
-    logger.info(f"Requested episodes (repo_idx, ep_idx): {requested_episodes}")
+    jax.config.update("jax_compilation_cache_dir", os.path.expanduser("~/.cache/jax"))
 
-    model_specs = [parse_model_spec(s) for s in args.model]
-    logger.info(f"Models: {[s[0] for s in model_specs]}")
+    config = _config.get_config(eval_config.config_name)
+    if eval_config.fine_tune is not None:
+        ft_config = _config.get_fine_tune_config(eval_config.fine_tune)
+        config = ft_config.apply_overrides(config, pretrained_step = None)
+
+    if eval_config.include_repos:
+        config = dataclasses.replace(config, include_repos = eval_config.include_repos)
+    if eval_config.counterfactual_action_store_dir is not None:
+        config = dataclasses.replace(
+            config,
+            data = dataclasses.replace(config.data, counterfactual_action_store_dir = eval_config.counterfactual_action_store_dir),
+        )
+    config = dataclasses.replace(
+        config,
+        num_val_trajectories = eval_config.num_trajectories,
+        fsdp_devices = jax.local_device_count(),
+    )
 
     train_module = load_train_module()
+    rng = jax.random.PRNGKey(86)
+    mesh = sharding.make_mesh(config.fsdp_devices)
+    train_state_shape, state_sharding = train_module.init_train_state(config, rng, mesh, resume = True)
 
-    # Use the first model's config for dataloader setup
-    first_config = _config.get_config(model_specs[0][0])
-    data_config = first_config.data.create()
-    robocoin_config = data_config.robocoin_data_config
+    checkpoint_manager, _ = _checkpoints.initialize_checkpoint_dir(
+        eval_config.checkpoint_path,
+        keep_period = None,
+        overwrite = False,
+        resume = True,
+    )
+    restored_params = restore_params_with_shardings(checkpoint_manager, train_state_shape, state_sharding)
+    critic_state_shape = train_state_shape.critic
+    critic_params = restored_params["params"]["critic"]["params"]
+    model = nnx.merge(critic_state_shape.model_def, critic_params)
+    action_conditioned = model.network.action_conditioned
+    logger.info(f"Loaded model from {eval_config.checkpoint_path}, action_conditioned={action_conditioned}")
 
-    # Cache episodes (worker 0 only)
+    data_config = config.data.create(config.assets_dirs, config.model)
+    action_horizon = config.action_horizon or config.model.action_horizon
+    val_tokenizer = config.data._get_critic_tokenizer(config.model)
+    assert val_tokenizer is not None, "RoboCOIN evaluation requires a critic tokenizer."
+
+    val_input_transform = _transforms.compose([
+        *data_config.repack_transforms.inputs,
+        *data_config.data_transforms.inputs,
+        _transforms.Normalize(data_config.norm_stats, use_quantiles = data_config.use_quantile_norm),
+        *([_transforms.Clip(data_config.clip_normalized_bounds)] if data_config.clip_normalized_bounds is not None else []),
+        *data_config.model_transforms.inputs,
+        _config.AddRoboCoinValidationVariants(
+            val_tokenizer,
+            use_quantile_norm = data_config.use_quantile_norm,
+        ),
+    ])
+
+    cache_dir = _resolve_eval_cache_dir(eval_config)
+    split = data_config.val_split if eval_config.split == "val" else eval_config.split
+
     if jax.process_index() == 0:
-        cache_episodes_by_identity(
-            robocoin_config,
-            first_config.backbone_variant,
-            first_config.action_horizon or 5,
-            requested_episodes,
-            args.cache_dir,
+        val_trajectory_dataset = _data_loader.create_rlds_dataset(
+            data_config,
+            action_horizon,
+            config.batch_size,
+            split = split,
+            shuffle = False,
+            return_trajectories = True,
+        )
+        cache_val_episodes(
+            val_trajectory_dataset,
+            eval_config.num_trajectories,
+            cache_dir,
+            include_repos = config.include_repos,
+            save_only = True,
+            input_transform = val_input_transform,
+        )
+        del val_trajectory_dataset
+    if jax.process_count() > 1:
+        jax.experimental.multihost_utils.sync_global_devices("eval_cache_write")
+
+    if eval_config.output_dir is None and jax.process_index() == 0:
+        import wandb
+
+        wandb.init(
+            project = eval_config.project_name,
+            name = f"eval_{eval_config.config_name}",
+            config = dataclasses.asdict(eval_config),
         )
 
-    # Count cached episodes for val_episode_indices placeholder
-    num_cached = sum(
-        1 for f in os.listdir(args.cache_dir)
-        if f.startswith("traj_") and f.endswith(".pkl")
-    ) if os.path.isdir(args.cache_dir) else 0
+    train_module.generate_validation_plots_dlimp(
+        model = model,
+        val_episode_indices = list(range(eval_config.num_trajectories)),
+        step = 0,
+        action_conditioned = action_conditioned,
+        data_config = data_config,
+        cache_dir = cache_dir,
+        output_dir = eval_config.output_dir,
+    )
 
-    # Evaluate each model
-    for model_idx, (config_name, checkpoint_path) in enumerate(model_specs):
-        display_name = get_model_display_name(config_name, checkpoint_path)
-        logger.info(f"Loading model: {display_name}")
+    if eval_config.counterfactual_best_of_n and action_conditioned:
+        logger.info("Running BestOfN counterfactual evaluation...")
+        import jax.numpy as jnp
 
-        model, action_conditioned, config = load_model(train_module, config_name, checkpoint_path)
+        traj_frames = _load_cached_trajectories(cache_dir)
+        split_traj_frames, traj_to_repo_ep, ep_subtasks = _split_trajectory_frames(traj_frames)
 
-        if jax.process_index() == 0:
-            wandb.init(
-                project = args.project_name,
-                name = f"eval_{display_name}",
-                config = {"config_name": config_name, "checkpoint_path": checkpoint_path},
+        first_frames = next(iter(split_traj_frames.values()))
+        num_samples = first_frames[0]["counterfactual_actions"].shape[0]
+        network_config = config.model.network_config
+
+        bon_model = BestOfNWrapper(
+            action_dim = network_config.action_dim,
+            action_horizon = action_horizon,
+            max_token_len = network_config.max_token_len,
+            base_model = None,
+            num_samples = num_samples,
+            take_min_over_ensemble = True,
+            use_target_value = False,
+            selection_mode = "argmax",
+            softmax_temperature = 1.0,
+        )
+
+        @nnx.jit
+        def _jitted_bon_eval(bon, vf, rng, obs, cf_actions):
+            transition = _base_vf.Transition(
+                observation = obs,
+                counterfactual_actions = cf_actions,
             )
+            best_action = bon.sample_actions(rng, transition, compute_next_action = False, value_function = vf)
+            result = vf.compute_value(obs, best_action, take_min_over_ensemble = True)
+            q_value = result[0] if isinstance(result, tuple) else result
+            return q_value
 
-        train_module.generate_validation_plots_dlimp(
-            model = model,
-            val_episode_indices = list(range(num_cached)),
-            step = 0,
-            action_conditioned = action_conditioned,
-            data_config = data_config,
-            cache_dir = args.cache_dir,
-        )
+        BATCH_SIZE = 8
+        bon_rng = jax.random.PRNGKey(86)
+        ep_mc_returns = {}
+        ep_frame_images = {}
+        ep_fps = {}
+        ep_include_masks = {}
+        bon_predictions: dict[str, list[float]] = {}
 
-        # Wait for the background render thread to finish before closing wandb
-        if hasattr(train_module, "_render_thread") and train_module._render_thread is not None:
-            train_module._render_thread.join()
-            train_module._render_thread = None
+        for traj_idx, frames in split_traj_frames.items():
+            ep_mc_returns[traj_idx] = [f["mc_return"] for f in frames]
+            ep_frame_images[traj_idx] = [
+                np.stack([
+                    np.asarray(f["image"]["left_wrist_0_rgb"]),
+                    np.asarray(f["image"]["right_wrist_0_rgb"]),
+                    np.asarray(f["image"]["base_0_rgb"]),
+                ])
+                for f in frames
+            ]
+            ep_fps[traj_idx] = int(frames[0]["fps"])
+            ep_include_masks[traj_idx] = [bool(f.get("include_subtask", True)) for f in frames]
+            bon_predictions[traj_idx] = []
+
+            for batch_start in range(0, len(frames), BATCH_SIZE):
+                batch_frames = frames[batch_start : batch_start + BATCH_SIZE]
+                obs, _ = get_obs_and_action(batch_frames, prefix = "", action_conditioned = True)
+                cf_actions = jnp.asarray(np.stack([f["counterfactual_actions"] for f in batch_frames], axis = 0))
+                bon_rng, step_rng = jax.random.split(bon_rng)
+                q_values = jax.device_get(_jitted_bon_eval(bon_model, model, step_rng, obs, cf_actions))
+                bon_predictions[traj_idx].extend(q_values.tolist())
+
+        total = sum(len(preds) for preds in bon_predictions.values())
+        logger.info(f"Computed {total} BestOfN predictions")
 
         if jax.process_index() == 0:
-            wandb.finish()
+            best_of_n_images = {}
+            for traj_idx in ep_mc_returns:
+                repo_id, ep_idx, part_suffix = traj_to_repo_ep[traj_idx]
+                plot_key = f"val/{repo_id.removeprefix('RoboCOIN/')}_episode_{ep_idx}{part_suffix}_best_of_n"
+                mc_returns = ep_mc_returns[traj_idx]
+                include_masks = ep_include_masks[traj_idx]
+                predicted_values = bon_predictions[traj_idx]
 
-        del model
-        jax.clear_caches()
-        logger.info(f"Done with {display_name}")
+                if len(predicted_values) != len(mc_returns):
+                    raise ValueError(
+                        f"BestOfN prediction length mismatch for {traj_idx}: "
+                        f"{len(predicted_values)} predictions vs {len(mc_returns)} returns."
+                    )
 
-    logger.info("All evaluations complete")
+                filtered_mc = [mc for mc, include in zip(mc_returns, include_masks, strict = True) if include]
+                filtered_pred = [pred for pred, include in zip(predicted_values, include_masks, strict = True) if include]
+                filtered_images = [img for img, include in zip(ep_frame_images[traj_idx], include_masks, strict = True) if include]
+
+                if not filtered_mc:
+                    continue
+
+                best_of_n_images[plot_key] = train_module._create_value_plot(
+                    filtered_mc,
+                    filtered_pred,
+                    ep_idx,
+                    0,
+                    " (BestOfN Q)",
+                    oracle_values = None,
+                    subtask_texts = ep_subtasks[traj_idx],
+                    plot_video = True,
+                    frame_images = filtered_images,
+                    fps = ep_fps[traj_idx],
+                    output_dir = eval_config.output_dir,
+                    plot_key = plot_key,
+                )
+
+            if eval_config.output_dir is None and best_of_n_images:
+                import wandb
+
+                wandb.log(best_of_n_images)
+
+    if hasattr(train_module, "_render_thread") and train_module._render_thread is not None:
+        train_module._render_thread.join()
+        train_module._render_thread = None
+
+    if eval_config.output_dir is None and jax.process_index() == 0:
+        import wandb
+
+        wandb.finish()
+
+    logger.info("Evaluation complete")
 
 
 if __name__ == "__main__":
-    main()
+    import tyro
+
+    eval_config = tyro.cli(EvalConfig)
+    main(eval_config)
