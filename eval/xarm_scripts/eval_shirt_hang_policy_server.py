@@ -6,8 +6,6 @@ the returned action chunks on the robot.
 
 Usage:
     uv run eval/xarm_scripts/eval_shirt_hang_policy_server.py \
-        --config-name cosmos_robocoin_bc_flow \
-        --prompt "hang the shirt on the rack" \
         --policy-host babel-gpu-node \
         --robot-host robot-machine
 """
@@ -25,8 +23,6 @@ import numpy as np
 import requests
 import tyro
 
-import openpi.training.config as _config
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -38,13 +34,6 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class Args:
-    config_name: str
-    """TrainConfig name registered in config.py (e.g. 'cosmos_robocoin_bc_flow').
-    Used to resolve data preprocessing settings (use_eef, embodiment, etc.)."""
-
-    prompt: str
-    """Subtask prompt sent to the policy (e.g. 'hang the shirt on the rack')."""
-
     policy_host: str = "localhost"
     """Host running serve_policy.py."""
 
@@ -80,6 +69,163 @@ class Args:
 
     policy_timeout: float = 300.0
     """Timeout in seconds for policy server requests. Should be long enough to cover JIT compilation on first call."""
+
+
+# =============================================================================
+# Subtask tracker
+# =============================================================================
+
+_SUBTASK_PROMPTS = [
+    "Grasp the hanger",
+    "Lift the hanger off the rod",
+    "Pass hanger from right to left arm",
+    "Hook one side of the shirt onto the hanger",
+    "Hook the other side of the shirt onto the hanger",
+    "Place the hanger on the rod",
+]
+
+_GRIP_THRESH = 400
+_MIN_BOUNDARY_GAP = 75
+
+
+class SubtaskTracker:
+    """Real-time subtask detector mirroring the heuristics in solve_subtask_boundaries.py.
+
+    Maintains a state machine over the 6 shirt-hang subtasks and advances to the next
+    subtask when the corresponding sensor transition is detected from the live observation
+    stream. Call update() every env step; read prompt to get the current subtask string.
+
+    Signals used (all from obs["state"]):
+        left/gripper_pos, right/gripper_pos  — gripper open/close state
+        right/tcp_pose[2]                    — absolute right-arm TCP Z height (metres)
+    """
+
+    def __init__(self) -> None:
+        self._subtask = 0
+        self._steps_in_subtask = 0
+        self._step = 0
+
+        # T0→1: pending right-close event (gripper closed at high Z, waiting for descent)
+        self._t01_pending: bool = False
+        self._t01_steps_watching: int = 0
+
+        # T2→3: consecutive frames of stable left close
+        self._t23_left_close_streak: int = 0
+
+        # T4→5: track consecutive frames of left open (final release confirmation)
+        self._t45_open_streak: int = 0
+
+    @property
+    def subtask(self) -> int:
+        return self._subtask
+
+    @property
+    def prompt(self) -> str:
+        return _SUBTASK_PROMPTS[self._subtask]
+
+    def update(self, obs: dict[str, Any]) -> None:
+        state = obs["state"]
+
+        def _scalar(key: str) -> float:
+            val = state.get(key)
+            if val is None:
+                return 0.0
+            arr = np.asarray(val, dtype=np.float32)
+            # Take last frame if obs is stacked, then flatten to scalar.
+            return float(arr[-1].flat[0] if arr.ndim > 1 else arr.flat[0])
+
+        def _vec(key: str, dim: int = 3) -> np.ndarray:
+            val = state.get(key)
+            if val is None:
+                return np.zeros(dim, dtype=np.float32)
+            arr = np.asarray(val, dtype=np.float32)
+            return arr[-1] if arr.ndim > 1 else arr
+
+        lg = _scalar("left/gripper_pos")
+        rg = _scalar("right/gripper_pos")
+        if "right/tcp_pose" not in state and self._step == 0:
+            logger.warning(
+                "SubtaskTracker: 'right/tcp_pose' not found in obs['state']. "
+                "T0→1 and T1→2 transitions require absolute TCP Z and will not fire. "
+                "Available keys: %s", list(state.keys())
+            )
+        rz = float(_vec("right/tcp_pose", dim=7)[2])
+
+        if self._steps_in_subtask >= _MIN_BOUNDARY_GAP and self._subtask < len(_SUBTASK_PROMPTS) - 1:
+            self._check_transition(lg, rg, rz)
+
+        self._step += 1
+        self._steps_in_subtask += 1
+
+    def _advance(self) -> None:
+        logger.info(f"SubtaskTracker: subtask {self._subtask} → {self._subtask + 1} "
+                    f"({_SUBTASK_PROMPTS[self._subtask + 1]!r}) at step {self._step}")
+        self._subtask += 1
+        self._steps_in_subtask = 0
+        self._t01_pending = False
+        self._t01_steps_watching = 0
+        self._t23_left_close_streak = 0
+        self._t45_open_streak = 0
+
+    def _check_transition(self, lg: float, rg: float, rz: float) -> None:
+        if self._subtask == 0:
+            self._check_t01(rg, rz)
+        elif self._subtask == 1:
+            self._check_t12(rz)
+        elif self._subtask == 2:
+            self._check_t23(lg)
+        elif self._subtask == 3:
+            self._check_t34(rg, lg)
+        elif self._subtask == 4:
+            self._check_t45(lg)
+
+    def _check_t01(self, rg: float, rz: float) -> None:
+        # Right gripper closes while Z > 0.30, then descends to Z < 0.20 without reopening.
+        rg_open = rg > _GRIP_THRESH
+        if not self._t01_pending:
+            if not rg_open and rz > 0.30:
+                self._t01_pending = True
+                self._t01_steps_watching = 0
+        else:
+            self._t01_steps_watching += 1
+            if rg_open:
+                # Gripper reopened before descent confirmed — failed grasp attempt.
+                self._t01_pending = False
+                self._t01_steps_watching = 0
+            elif self._t01_steps_watching > 500:
+                # Arm stayed closed for 500+ steps but never descended — invalid grasp.
+                self._t01_pending = False
+                self._t01_steps_watching = 0
+            elif rz < 0.20:
+                self._advance()
+
+    def _check_t12(self, rz: float) -> None:
+        # Right TCP Z drops below handoff height. Guard against rz=0.0 (missing key).
+        if 0.0 < rz < 0.22:
+            self._advance()
+
+    def _check_t23(self, lg: float) -> None:
+        # Left gripper closes and stays closed for 40+ consecutive frames.
+        if lg <= _GRIP_THRESH:
+            self._t23_left_close_streak += 1
+            if self._t23_left_close_streak >= 40:
+                self._advance()
+        else:
+            self._t23_left_close_streak = 0
+
+    def _check_t34(self, rg: float, lg: float) -> None:
+        # Right firmly closed AND left open simultaneously.
+        if rg < 200 and lg > _GRIP_THRESH:
+            self._advance()
+
+    def _check_t45(self, lg: float) -> None:
+        # Left gripper opens and stays open for 30+ consecutive frames (final release).
+        if lg > _GRIP_THRESH:
+            self._t45_open_streak += 1
+            if self._t45_open_streak >= 30:
+                self._advance()
+        else:
+            self._t45_open_streak = 0
 
 
 # =============================================================================
@@ -212,20 +358,28 @@ def run_episode(
     logger.info(f"Starting episode {episode_idx}")
     obs, _ = env.reset(seed=episode_idx)
 
+    tracker = SubtaskTracker()
+
     action_plan: np.ndarray | None = None
     t = 0
     terminated = False
     truncated = False
 
     while not (terminated or truncated) and t < args.max_steps:
+        tracker.update(obs)
+
         if t % args.query_freq == 0:
+            prompt = tracker.prompt
             state = extract_state(obs)
             images_bgr = extract_images_bgr(obs, args.camera_names)
-            full_actions = policy_client.predict(state, images_bgr, args.prompt, embodiment)
+            full_actions = policy_client.predict(state, images_bgr, prompt, embodiment)
             action_plan = full_actions[
                 :, args.real_action_start : args.real_action_start + args.real_action_dim
             ]
-            logger.info(f"Episode {episode_idx} step {t}: replanned, action_plan shape={action_plan.shape}")
+            logger.info(
+                f"Episode {episode_idx} step {t}: prompt={prompt!r}, "
+                f"action_plan shape={action_plan.shape}"
+            )
 
         plan_idx = min(t % args.query_freq, action_plan.shape[0] - 1)
         action = action_plan[plan_idx]

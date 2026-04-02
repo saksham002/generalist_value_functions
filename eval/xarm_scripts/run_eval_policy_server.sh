@@ -11,15 +11,12 @@ set -e
 # Configuration — edit these before running
 # =============================================================================
 
-CONFIG_NAME="FILL IN HERE"
-
 POLICY_HOST="babel-gpu-node"    # hostname of machine running serve_policy.py
 POLICY_PORT=8080
 
 ROBOT_HOST="robot-machine"      # hostname of machine running robot_environment_server.py
 ROBOT_PORT=8081
 
-PROMPT="hang the shirt on the rack"
 EMBODIMENT="dual_xarms"
 
 NUM_EPISODES=1
@@ -47,8 +44,7 @@ echo -e "${GREEN}================================================${NC}"
 echo ""
 echo -e "  Policy server: ${YELLOW}${POLICY_HOST}:${POLICY_PORT}${NC}"
 echo -e "  Robot server:  ${YELLOW}${ROBOT_HOST}:${ROBOT_PORT}${NC}"
-echo -e "  Prompt:        ${YELLOW}${PROMPT}${NC}"
-echo -e "  Embodiment:    ${YELLOW}${EMBODIMENT}${NC}"
+echo -e "  Embodiment:    ${YELLOW}${EMBODIMENT}${NC} (prompt auto-detected from robot state)"
 echo -e "  Episodes:      ${YELLOW}${NUM_EPISODES}${NC}"
 echo ""
 
@@ -84,8 +80,6 @@ echo -e "${BLUE}Starting eval...${NC}"
 echo ""
 
 uv run eval/xarm_scripts/eval_shirt_hang_policy_server.py \
-    --config-name "${CONFIG_NAME}" \
-    --prompt "${PROMPT}" \
     --embodiment "${EMBODIMENT}" \
     --policy-host "${POLICY_HOST}" \
     --policy-port "${POLICY_PORT}" \
