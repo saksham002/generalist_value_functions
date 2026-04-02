@@ -69,6 +69,7 @@ class PolicyServer:
         self._load_policy(config_name, checkpoint_dir)
 
     def _load_policy(self, config_name: str, checkpoint_dir: str) -> None:
+        #Code here copied from line 257-338 of computer_counterfactual_actions.py
         from etils import epath
         from flax import nnx
         import orbax.checkpoint as ocp
@@ -150,6 +151,7 @@ class PolicyServer:
         Returns:
             actions: float32 array of shape [action_horizon, action_dim].
         """
+        raw_state = np.asarray(obs_dict["state"], dtype=np.float32)
         transformed = self._input_transform(obs_dict)
 
         batched = {
@@ -168,11 +170,12 @@ class PolicyServer:
         actions_out = jax.block_until_ready(actions_out)
 
         actions_np = np.asarray(actions_out[0])  # [action_horizon, action_dim]
-        state_np = np.asarray(transformed["state"])
         decoded = self._output_transform({
             "embodiment": obs_dict.get("embodiment", ""),
-            "state": state_np,
+            "state": raw_state,
             "actions": actions_np,
+            "next_state": raw_state,
+            "next_actions": actions_np,
         })
         return np.asarray(decoded["actions"], dtype=np.float32)
 
