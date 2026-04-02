@@ -2374,18 +2374,18 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
     FineTuneConfig(
         name = "real_hang_pi05_finetune",
         data_overrides = {
-            "data_dir": "gs://saksham-euw4/hdf5/real_hang_state/",
+            "data_dir": "gs://saksham-euw4/hdf5/real_hang/",
             "dataset_name": "real_hang:1.0.0",
             "assets": AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang_state",
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
                 asset_id = "norm_stats",
             ),
-            "state_dim": 16,
             "mask_boundary_actions": False,
         },
-        num_train_steps = 100_000,
-        save_interval = 20_000,
-        keep_period = 20_000,
+        model_overrides = {"discrete_state_input": False},
+        num_train_steps = 200_000,
+        save_interval = 25_000,
+        keep_period = 25_000,
         lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
     ),
     FineTuneConfig(
