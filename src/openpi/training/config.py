@@ -2393,7 +2393,10 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         data_overrides = {
             "data_dir": "gs://saksham-euw4/hdf5/",
             "dataset_name": "real_hang:1.0.0",
-            "norm_stats_path": "gs://saksham-euw4/hdf5/real_hang/norm_stats/norm_stats.json",
+            "assets": AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
+                asset_id = "norm_stats",
+            ),
         },
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang/",
         num_val_trajectories = 1,
@@ -2405,7 +2408,10 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         data_overrides = {
             "data_dir": "gs://saksham-euw4/hdf5/",
             "dataset_name": "real_hang:1.0.0",
-            "norm_stats_path": "gs://saksham-euw4/hdf5/real_hang/norm_stats/norm_stats.json",
+            "assets": AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
+                asset_id = "norm_stats",
+            ),
         },
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang/",
         num_val_trajectories = 1,
@@ -2421,7 +2427,10 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         data_overrides = {
             "data_dir": "gs://saksham-euw4/hdf5/",
             "dataset_name": "real_hang:1.0.0",
-            "norm_stats_path": "gs://saksham-euw4/hdf5/real_hang/norm_stats/norm_stats.json",
+            "assets": AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
+                asset_id = "norm_stats_75",
+            ),
         },
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang_75/",
         num_val_trajectories = 2,
