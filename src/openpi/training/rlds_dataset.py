@@ -166,6 +166,11 @@ class BaseRldsDataset:
             if for_trajectories:
                 # Use strided sampling for validation to get diverse trajectories across the dataset.
                 # TFDS doesn't support stride syntax, so we build a union of individual indices.
+                if max_trajectories is not None and self._counterfactual_action_store_dir is not None:
+                    raise ValueError(
+                        "max_trajectories with counterfactual_action_store_dir is not supported in trajectory mode: "
+                        "strided episode selection would misalign the zip between RLDS and CA store datasets."
+                    )
                 if max_trajectories is not None:
                     num_episodes = builder.info.splits[split].num_examples
                     stride = max(1, num_episodes // max_trajectories)
@@ -205,8 +210,8 @@ class BaseRldsDataset:
                     max(1, process_count),
                 )
 
-            # Join with counterfactual action store if configured
-            if self._counterfactual_action_store_dir is not None and not for_trajectories:
+            # Join with counterfactual action store if configured (train split only)
+            if self._counterfactual_action_store_dir is not None and split == "train":
                 dataset = self._join_counterfactual_action_store(
                     dataset,
                     dataset_cfg,

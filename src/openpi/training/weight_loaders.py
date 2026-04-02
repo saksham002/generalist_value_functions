@@ -71,10 +71,14 @@ class PaliGemmaWeightLoader(WeightLoader):
             flat_params = dict(np.load(f, allow_pickle=False))
         paligemma_params = flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]
 
-        # Value function models nest PaliGemma under network/ (and target_network/
-        # for SARSA/SAC). Detect this and nest the loaded params accordingly so
-        # keys align with the model state.
-        if "network" in params and "PaliGemma" not in params:
+        # Value function models nest PaliGemma under network/ or q_network/
+        # (and target variants for SARSA/CQL). Detect this and nest the loaded
+        # params accordingly so keys align with the model state.
+        if "q_network" in params and "PaliGemma" not in params:
+            loaded_params = {"q_network": {"PaliGemma": paligemma_params}}
+            if "target_q_network" in params:
+                loaded_params["target_q_network"] = {"PaliGemma": copy.deepcopy(paligemma_params)}
+        elif "network" in params and "PaliGemma" not in params:
             loaded_params = {"network": {"PaliGemma": paligemma_params}}
             if "target_network" in params:
                 loaded_params["target_network"] = {"PaliGemma": copy.deepcopy(paligemma_params)}

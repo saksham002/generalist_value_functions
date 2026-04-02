@@ -46,7 +46,6 @@ def _extract_observations_from_batch(batch: dict) -> tuple[_model.Observation, _
         tokenized_prompt = batch.get("tokenized_prompt"),
         tokenized_prompt_mask = batch.get("tokenized_prompt_mask"),
         action_mask = batch.get("action_mask"),
-        loss_mask = batch.get("loss_mask"),
     )
     next_observation = _model.Observation(
         images = next_images,
@@ -81,6 +80,9 @@ class Transition:
     termination: at.Bool[at.Array, "*b"] | None = None
     truncation: at.Bool[at.Array, "*b"] | None = None
     td_discount: at.Float[at.Array, "*b"] | None = None
+    # Pre-computed counterfactual actions for best-of-n evaluation at current state
+    # Shape: [batch, num_samples, action_horizon, action_dim]
+    counterfactual_actions: at.Float[at.Array, "*b k ah ad"] | None = None
     # Pre-computed counterfactual next actions for best-of-n TD backup
     # Shape: [batch, num_samples, action_horizon, action_dim]
     counterfactual_next_actions: at.Float[at.Array, "*b k ah ad"] | None = None

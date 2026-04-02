@@ -533,6 +533,7 @@ def _compute_q_values_for_samples(
     q_head: ValueHead,
     observation: _model.Observation,
     actions: at.Array,
+    rng: at.KeyArrayLike | None = None,
 ) -> at.Array:
     """Compute Q values for multiple actions per observation.
 
@@ -543,7 +544,8 @@ def _compute_q_values_for_samples(
     if state.ndim == 2:
         num_actions = actions.shape[1]
         obs_for_actions = _expand_observation_for_actions(observation, num_actions)
-        features = q_network.compute_features(obs_for_actions, actions)
+        out = q_network.compute_features(obs_for_actions, actions, rng = rng)
+        features = out[0] if isinstance(out, tuple) else out
         return q_head(features)
 
     if state.ndim == 3:
@@ -557,7 +559,8 @@ def _compute_q_values_for_samples(
         obs_repeated = jax.tree_map(
             lambda x: jnp.repeat(x, num_actions, axis=0) if x is not None else None, observation
         )
-        features = q_network.compute_features(obs_repeated, actions_reshaped)
+        out = q_network.compute_features(obs_repeated, actions_reshaped, rng = rng)
+        features = out[0] if isinstance(out, tuple) else out
         q_values = q_head(features)
 
         if isinstance(q_head, EnsembleHead):
@@ -631,7 +634,8 @@ def cql_objective(
     rng = jax.random.key(rng) if isinstance(rng, int) else rng
 
     # Q(s, a) prediction (may be ensemble)
-    q_features = q_network.compute_features(transition.observation, transition.action)
+    rng, q_rng = jax.random.split(rng)
+    q_features = q_network.compute_features(transition.observation, transition.action, rng = q_rng)
     q_pred = q_head(q_features)
     q_pred_for_logging = jnp.mean(q_pred, axis=0) if isinstance(q_head, EnsembleHead) else q_pred
 
@@ -661,7 +665,8 @@ def cql_objective(
             compute_next_action=True,
             value_function=value_function,
         )
-        target_features = target_q_network.compute_features(transition.next_observation, next_actions)
+        target_out = target_q_network.compute_features(transition.next_observation, next_actions)
+        target_features = target_out[0] if isinstance(target_out, tuple) else target_out
         target_q_values = (
             target_q_head.compute_min(target_features)
             if isinstance(target_q_head, EnsembleHead)
@@ -683,6 +688,8 @@ def cql_objective(
     q_loss = _compute_value_loss(q_head, q_features, target)
     td_error = q_pred_for_logging - target
 
+    q_pred_mc_diff = (q_pred_for_logging - transition.mc_return) if transition.mc_return is not None else None
+
     # Early return if CQL is disabled
     if cql_alpha == 0:
         cql_loss = jnp.zeros_like(q_loss)
@@ -693,8 +700,10 @@ def cql_objective(
             "target_std": jnp.std(target),
             "td_error_mean": jnp.mean(td_error),
             "td_error_std": jnp.std(td_error),
-            "avg_q_minus_mc": jnp.mean(q_pred_for_logging - transition.mc_return),
         }
+        if q_pred_mc_diff is not None:
+            info["mc_loss"] = jnp.mean(jnp.square(q_pred_mc_diff))
+            info["avg_q_minus_mc"] = jnp.mean(q_pred_mc_diff)
         return q_loss, cql_loss, info
 
     # CQL samples: random, next, (optional) current
@@ -748,7 +757,8 @@ def cql_objective(
     )
 
     # Q values for sampled actions
-    cql_q_samples = _compute_q_values_for_samples(q_network, q_head, transition.observation, all_sampled_actions)
+    rng, cql_q_rng = jax.random.split(rng)
+    cql_q_samples = _compute_q_values_for_samples(q_network, q_head, transition.observation, all_sampled_actions, rng = cql_q_rng)
     if transition.observation.state.ndim == 3:
         expected_shape = (batch_size, num_transitions, expected_actions)
         if isinstance(q_head, EnsembleHead):
@@ -839,7 +849,9 @@ def cql_objective(
             "cql_ood_values_mean": jnp.mean(cql_ood_values),
             "cql_q_diff_mean": jnp.mean(cql_q_diff),
             "cql_loss_mean": jnp.mean(cql_loss),
-            "avg_q_minus_mc": jnp.mean(q_pred_for_logging - transition.mc_return),
         }
     )
+    if q_pred_mc_diff is not None:
+        info["mc_loss"] = jnp.mean(jnp.square(q_pred_mc_diff))
+        info["avg_q_minus_mc"] = jnp.mean(q_pred_mc_diff)
     return q_loss, cql_loss, info

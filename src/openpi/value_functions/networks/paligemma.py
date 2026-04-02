@@ -370,11 +370,45 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
               - 0s are for images/text (bidirectional)
               - 1s are for state, actions, and CLS (causal: can attend to earlier, not later)
         """
+        tokens, input_mask, ar_mask = self._embed_prefix(observation)
         batch_size = observation.state.shape[0]
 
-        input_mask = []
-        ar_mask = []
-        tokens = []
+        # 4. Add action tokens if action_conditioned
+        if self._action_conditioned:
+            action_tokens = self.action_proj(action)  # [B, action_horizon, embed_dim]
+            tokens.append(action_tokens)
+            input_mask.append(action_mask)
+
+            ar_mask.append(True)
+            ar_mask += [False] * (self._action_horizon - 1)
+
+        # 5. CLS token (last in sequence)
+        cls_tokens = jnp.broadcast_to(self.cls_token.value, (batch_size, 1, self._embed_dim))
+        tokens.append(cls_tokens)
+        input_mask.append(jnp.ones((batch_size, 1), dtype = jnp.bool_))
+        # CLS uses ar_mask=True (causal - can attend to all previous but not be attended)
+        ar_mask.append(True)
+
+        tokens = jnp.concatenate(tokens, axis = 1)
+        input_mask = jnp.concatenate(input_mask, axis = 1)
+        ar_mask = jnp.array(ar_mask)
+
+        return tokens, input_mask, ar_mask
+
+    def _embed_prefix(
+        self,
+        observation: _model.Observation,
+    ) -> tuple[list[jax.Array], list[jax.Array], list[bool]]:
+        """Embed the shared observation prefix: images + text + state.
+
+        Returns all three outputs as plain Python lists (not concatenated) so callers
+        can keep appending before a single final concatenation / jnp.array conversion.
+        """
+        batch_size = observation.state.shape[0]
+
+        input_mask: list[jax.Array] = []
+        ar_mask: list[bool] = []
+        tokens: list[jax.Array] = []
 
         # 1. Embed images (following pi0.py pattern)
         for name in self._image_keys:
@@ -393,7 +427,7 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
 
         # 2. Add language (tokenized inputs)
         if observation.tokenized_prompt is not None:
-            tokenized_inputs = self.PaliGemma.llm(observation.tokenized_prompt, method="embed")
+            tokenized_inputs = self.PaliGemma.llm(observation.tokenized_prompt, method = "embed")
             tokens.append(tokenized_inputs)
             input_mask.append(observation.tokenized_prompt_mask)
             # Text tokens: bidirectional with images
@@ -403,30 +437,9 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         if not self._no_state:
             state_token = self.state_proj(observation.state)[:, None, :]  # [B, 1, embed_dim]
             tokens.append(state_token)
-            input_mask.append(jnp.ones((batch_size, 1), dtype=jnp.bool_))
+            input_mask.append(jnp.ones((batch_size, 1), dtype = jnp.bool_))
             # State uses ar_mask=True (causal - can attend to images/text but not be attended)
             ar_mask.append(True)
-
-        # 4. Add action tokens if action_conditioned
-        if self._action_conditioned:
-            action_tokens = self.action_proj(action)  # [B, action_horizon, embed_dim]
-            tokens.append(action_tokens)
-                
-            input_mask.append(action_mask)
-
-            ar_mask.append(True)
-            ar_mask += [False] * (self._action_horizon - 1)
-
-        # 5. CLS token (last in sequence)
-        cls_tokens = jnp.broadcast_to(self.cls_token.value, (batch_size, 1, self._embed_dim))
-        tokens.append(cls_tokens)
-        input_mask.append(jnp.ones((batch_size, 1), dtype=jnp.bool_))
-        # CLS uses ar_mask=True (causal - can attend to all previous but not be attended)
-        ar_mask.append(True)
-
-        tokens = jnp.concatenate(tokens, axis=1)
-        input_mask = jnp.concatenate(input_mask, axis=1)
-        ar_mask = jnp.array(ar_mask)
 
         return tokens, input_mask, ar_mask
 
@@ -524,6 +537,7 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         action: _model.Actions | None = None,
         *,
         rng: at.KeyArrayLike | None = None,
+        prefix_cache: tuple[at.Array, at.Array] | None = None,
     ) -> at.Float[at.Array, "*b feature_dim"] | tuple[at.Float[at.Array, "*b feature_dim"], at.Float[at.Array, "*b _n"]]:
         """Compute features from observation (and optionally action) for value prediction.
 
@@ -543,10 +557,14 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
                 [batch, n_modalities] = mean over Gemma layers of CLS attention, grouped
                 by modality (img1..imgN, text, state, [actions if Q]).
         """
+        if prefix_cache is not None and self._is_gemma3:
+            raise ValueError("prefix_cache is only supported for non-Gemma3 PaliGemma value networks.")
+
         # Preprocess observation (handles resizing, default masks, augmentation)
         # train=True enables augmentation when rng is provided
         train = rng is not None
-        observation = _model.preprocess_observation(rng, observation, train=train, image_resolution=self._image_size)
+        if prefix_cache is None:
+            observation = _model.preprocess_observation(rng, observation, train = train, image_resolution = self._image_size)
 
         # Extract action array and mask if action_conditioned
         action_array = None
@@ -555,6 +573,47 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             action_array = action  # [B, action_horizon, action_dim]
             assert action_array.shape[1] == self._action_horizon
             action_mask_array = observation.action_mask  # [B, action_horizon] or None
+
+        if prefix_cache is not None:
+            if train:
+                raise ValueError("prefix_cache is only supported for inference.")
+            if not self._action_conditioned:
+                raise ValueError("prefix_cache is only supported for action-conditioned networks.")
+
+            kv_cache, prefix_mask = prefix_cache
+
+            suffix_tokens = []
+            suffix_mask = []
+            suffix_ar_mask = []
+
+            action_tokens = self.action_proj(action_array)
+            suffix_tokens.append(action_tokens)
+            suffix_mask.append(action_mask_array)
+            suffix_ar_mask.append(True)
+            suffix_ar_mask += [False] * (self._action_horizon - 1)
+
+            cls_tokens = jnp.broadcast_to(self.cls_token.value, (action_array.shape[0], 1, self._embed_dim))
+            suffix_tokens.append(cls_tokens)
+            suffix_mask.append(jnp.ones((action_array.shape[0], 1), dtype = jnp.bool_))
+            suffix_ar_mask.append(True)
+
+            suffix_tokens = jnp.concatenate(suffix_tokens, axis = 1)
+            suffix_mask = jnp.concatenate(suffix_mask, axis = 1)
+            suffix_ar_mask = jnp.array(suffix_ar_mask)
+
+            suffix_to_suffix = make_attn_mask(suffix_mask, suffix_ar_mask)
+            suffix_to_prefix = einops.repeat(prefix_mask, "b p -> b s p", s = suffix_tokens.shape[1])
+            attn_mask = jnp.concatenate([suffix_to_prefix, suffix_to_suffix], axis = -1)
+            positions = jnp.sum(prefix_mask.astype(jnp.int32), axis = -1)[:, None] + jnp.cumsum(suffix_mask.astype(jnp.int32), axis = -1) - 1
+
+            (output,), _ = self.PaliGemma.llm(
+                [suffix_tokens],
+                mask = attn_mask,
+                positions = positions,
+                kv_cache = kv_cache,
+                adarms_cond = [None],
+            )
+            return output[:, -1, :]
 
         # Build embeddings and attention mask
         if self._is_gemma3:
@@ -585,10 +644,10 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         # Inference: also return per-modality CLS attention scores
         (output,), _, all_cls_attn = self.PaliGemma.llm(
             [tokens],
-            mask=attn_mask,
-            positions=positions,
-            adarms_cond=[None],
-            return_cls_attention_score_distribution=True,
+            mask = attn_mask,
+            positions = positions,
+            adarms_cond = [None],
+            return_cls_attention_score_distribution = True,
         )
         cls_features = output[:, -1, :]  # [B, embed_dim]
 
@@ -597,6 +656,23 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         attn_scores = self._group_attn_scores(cls_attn_mean)
 
         return cls_features, attn_scores
+
+    def compute_prefix_cache(
+        self, observation: _model.Observation
+    ) -> tuple[at.Array, at.Array]:
+        """Compute and return the prefix KV cache for the given observation."""
+        if self._is_gemma3:
+            raise ValueError("compute_prefix_cache is only supported for non-Gemma3 PaliGemma value networks.")
+
+        observation = _model.preprocess_observation(None, observation, train = False, image_resolution = self._image_size)
+        prefix_tokens_list, prefix_mask_list, prefix_ar_mask_list = self._embed_prefix(observation)
+        prefix_tokens = jnp.concatenate(prefix_tokens_list, axis = 1)
+        prefix_mask = jnp.concatenate(prefix_mask_list, axis = 1)
+        prefix_ar_mask = jnp.array(prefix_ar_mask_list)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask.astype(jnp.int32), axis = 1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens], mask = prefix_attn_mask, positions = positions)
+        return kv_cache, prefix_mask
 
     def _group_attn_scores(self, cls_attn_mean: jax.Array) -> jax.Array:
         """Group per-position CLS attention [B, S] into per-modality scores [B, n_modalities].

@@ -14,8 +14,10 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
+from openpi.shared.normalize import NormStats
 from openpi.value_functions import base_value_functions as _base_vf
 
 
@@ -41,6 +43,11 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
 
     use_target_value: bool = False
 
+    # Norm stats for renormalizing actions between policy and critic spaces.
+    # Both must be None (default, no renormalization) or both non-None.
+    policy_norm_stats: dict[str, NormStats] | None = None
+    critic_norm_stats: dict[str, NormStats] | None = None
+
     # "argmax": pick action with highest Q-value.
     # "softmax": sample action with probability proportional to exp(Q / temperature).
     selection_mode: Literal["argmax", "softmax"] = "argmax"
@@ -57,6 +64,8 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
         # Cached-only mode: action_dim and action_horizon must be provided
         elif self.action_dim == 0 or self.action_horizon == 0:
             raise ValueError("action_dim and action_horizon must be provided when base_model_config is None")
+        if (self.policy_norm_stats is None) != (self.critic_norm_stats is None):
+            raise ValueError("policy_norm_stats and critic_norm_stats must both be None or both be provided")
 
     @property
     @override
@@ -76,6 +85,8 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
             use_target_value=self.use_target_value,
             selection_mode=self.selection_mode,
             softmax_temperature=self.softmax_temperature,
+            policy_norm_stats=self.policy_norm_stats,
+            critic_norm_stats=self.critic_norm_stats,
         )
 
     @override
@@ -109,6 +120,8 @@ class BestOfNWrapper(_model.BaseModel):
     use_target_value: bool
     selection_mode: Literal["argmax", "softmax"]
     softmax_temperature: float
+    policy_norm_stats: dict[str, NormStats] | None
+    critic_norm_stats: dict[str, NormStats] | None
 
     def __init__(
         self,
@@ -122,6 +135,8 @@ class BestOfNWrapper(_model.BaseModel):
         use_target_value: bool,
         selection_mode: Literal["argmax", "softmax"],
         softmax_temperature: float,
+        policy_norm_stats: dict[str, NormStats] | None = None,
+        critic_norm_stats: dict[str, NormStats] | None = None,
     ):
         super().__init__(action_dim, action_horizon, max_token_len)
         self.base_model = base_model
@@ -130,6 +145,20 @@ class BestOfNWrapper(_model.BaseModel):
         self.use_target_value = use_target_value
         self.selection_mode = selection_mode
         self.softmax_temperature = softmax_temperature
+        self.policy_norm_stats = policy_norm_stats
+        self.critic_norm_stats = critic_norm_stats
+
+    def _renormalize_actions(self, actions: at.Array) -> at.Array:
+        """Unnormalize from policy action space, then normalize into critic action space."""
+        action_key = "actions"
+        data = {action_key: actions}
+        # Filter to just the "actions" key — Unnormalize uses strict=True and would
+        # fail if norm_stats contains keys (e.g. "state") not present in data.
+        policy_action_stats = {action_key: self.policy_norm_stats[action_key]}
+        critic_action_stats = {action_key: self.critic_norm_stats[action_key]}
+        data = _transforms.Unnormalize(policy_action_stats)(data)
+        data = _transforms.Normalize(critic_action_stats)(data)
+        return data[action_key]
 
     def _get_cached_actions(
         self,
@@ -145,22 +174,26 @@ class BestOfNWrapper(_model.BaseModel):
                     "Ensure the data pipeline populates this field."
                 )
             actions = transition.counterfactual_next_actions
-            if actions.shape[1] < self.num_samples:
+        else:
+            if transition.counterfactual_actions is None:
                 raise ValueError(
-                    "Cached counterfactual actions provide fewer samples than BestOfN requires: "
-                    f"expected at least {self.num_samples}, got {actions.shape[1]} "
-                    f"for shape {actions.shape}."
+                    "compute_next_action=False but transition.counterfactual_actions is None. "
+                    "Ensure the data pipeline populates this field."
                 )
-            if actions.shape[1] > self.num_samples:
-                actions = actions[:, : self.num_samples]
-            # Slice to model's action_horizon if cached actions have longer horizon
-            if actions.shape[2] > self.action_horizon:
-                actions = actions[:, :, : self.action_horizon, :]
-            return actions
-        raise ValueError(
-            "BestOfNWrapper without base_model only supports compute_next_action=True "
-            "(cached actions are for next-action selection in TD backup)"
-        )
+            actions = transition.counterfactual_actions
+
+        if actions.shape[1] < self.num_samples:
+            raise ValueError(
+                "Cached counterfactual actions provide fewer samples than BestOfN requires: "
+                f"expected at least {self.num_samples}, got {actions.shape[1]} "
+                f"for shape {actions.shape}."
+            )
+        if actions.shape[1] > self.num_samples:
+            actions = actions[:, : self.num_samples]
+        # Slice to model's action_horizon if cached actions have longer horizon
+        if actions.shape[2] > self.action_horizon:
+            actions = actions[:, :, : self.action_horizon, :]
+        return actions
 
     @override
     def sample_actions(
@@ -220,21 +253,42 @@ class BestOfNWrapper(_model.BaseModel):
         action_horizon = all_actions.shape[2]
         action_dim_size = all_actions.shape[3]
 
+        # Renormalize actions if policy and critic use different norm stats.
+        eval_actions = self._renormalize_actions(all_actions) if self.policy_norm_stats is not None else all_actions
+
         expanded_obs = expand_observation(observation, n)
-        flat_actions = all_actions.reshape(batch_size * n, action_horizon, action_dim_size)
+        flat_actions = eval_actions.reshape(batch_size * n, action_horizon, action_dim_size)
+        prefix_cache = None
+        network = getattr(value_function, "q_network", getattr(value_function, "network", None))
+        if network is not None and hasattr(network, "compute_prefix_cache"):
+            raw_kv_cache, raw_prefix_mask = value_function.compute_prefix_cache(
+                observation, use_target = self.use_target_value
+            )
+            repeated_kv_cache = jax.tree.map(
+                lambda x: jnp.repeat(x, n, axis = 1), raw_kv_cache
+            )
+            repeated_prefix_mask = jnp.repeat(raw_prefix_mask, n, axis = 0)
+            prefix_cache = (repeated_kv_cache, repeated_prefix_mask)
+
+        value_kwargs = {
+            "take_min_over_ensemble": self.take_min_over_ensemble,
+        }
+        if prefix_cache is not None:
+            value_kwargs["prefix_cache"] = prefix_cache
 
         if self.use_target_value:
-            q_values = value_function.compute_target_value(
+            result = value_function.compute_target_value(
                 expanded_obs,
                 flat_actions,
-                take_min_over_ensemble=self.take_min_over_ensemble,
+                **value_kwargs,
             )
         else:
-            q_values = value_function.compute_value(
+            result = value_function.compute_value(
                 expanded_obs,
                 flat_actions,
-                take_min_over_ensemble=self.take_min_over_ensemble,
+                **value_kwargs,
             )
+        q_values = result[0] if isinstance(result, tuple) else result
         q_values = q_values.reshape(batch_size, n)
 
         if self.selection_mode == "argmax":
@@ -316,4 +370,5 @@ def expand_observation(observation: _model.Observation, num_samples: int) -> _mo
         tokenized_prompt_mask=_repeat(observation.tokenized_prompt_mask),
         token_ar_mask=_repeat(observation.token_ar_mask),
         token_loss_mask=_repeat(observation.token_loss_mask),
+        action_mask=_repeat(observation.action_mask),
     )

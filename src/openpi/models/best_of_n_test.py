@@ -3,10 +3,10 @@ import dataclasses
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import pytest
 from typing_extensions import override
 
 from openpi.models import best_of_n
-from openpi.models import in_context_mmdit
 from openpi.models import model as _model
 from openpi.models import tanh_gaussian
 from openpi.shared import array_typing as at
@@ -50,6 +50,60 @@ class _MockValueFunction(_base_vf.BaseValueFunction):
     def compute_loss(self, transition, *, train=False, rng=None, policy=None):
         batch_size = transition.observation.state.shape[0]
         return jnp.zeros((batch_size,)), {}
+
+
+@dataclasses.dataclass
+class _MockPrefixCacheValueFunction(_base_vf.BaseValueFunction):
+    prefix_cache_calls: int = 0
+    last_prefix_cache: tuple[jax.Array, jax.Array] | None = None
+    last_use_target: bool | None = None
+
+    def compute_prefix_cache(
+        self,
+        observation: _model.Observation,
+        use_target: bool = False,
+    ) -> tuple[jax.Array, jax.Array]:
+        self.prefix_cache_calls += 1
+        self.last_use_target = use_target
+        batch_size = observation.state.shape[0]
+        kv_cache = {"k": jnp.arange(batch_size * 2, dtype = jnp.float32).reshape(1, batch_size, 2)}
+        prefix_mask = jnp.ones((batch_size, 3), dtype = jnp.bool_)
+        return kv_cache, prefix_mask
+
+    @override
+    def compute_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+        prefix_cache: tuple[jax.Array, jax.Array] | None = None,
+    ) -> tuple[at.Float[at.Array, "*b"], at.Float[at.Array, "*b _n"]]:
+        del observation, take_min_over_ensemble
+        assert action is not None
+        self.last_prefix_cache = prefix_cache
+        values = action.sum(axis = (-2, -1))
+        attn_scores = jnp.zeros((values.shape[0], 1), dtype = values.dtype)
+        return values, attn_scores
+
+    @override
+    def compute_target_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        *,
+        take_min_over_ensemble: bool = False,
+        prefix_cache: tuple[jax.Array, jax.Array] | None = None,
+    ) -> at.Float[at.Array, "*b"]:
+        del observation, take_min_over_ensemble
+        assert action is not None
+        self.last_prefix_cache = prefix_cache
+        return -action.sum(axis = (-2, -1))
+
+    @override
+    def compute_loss(self, transition, *, train=False, rng=None, policy=None):
+        del transition, train, rng, policy
+        return jnp.zeros((1,)), {}
 
 
 def _make_config(num_samples=5, **kwargs):
@@ -232,6 +286,8 @@ def test_best_of_n_with_in_context_mmdit():
     This tests the fix for the vmap issue where vmapping over equinox model
     parameters caused shape mismatches.
     """
+    in_context_mmdit = pytest.importorskip("openpi.models.in_context_mmdit")
+
     rng = jax.random.key(0)
     base_config = in_context_mmdit.InContextMMDiTConfig(
         state_dim=8,
@@ -336,3 +392,67 @@ def test_cached_best_of_n_requires_enough_counterfactual_actions():
 
     with pytest.raises(ValueError, match="expected at least 4, got 3"):
         model.sample_actions(rng, transition, compute_next_action=True, value_function=vf)
+
+
+def test_best_of_n_reuses_prefix_cache_for_value_evaluation():
+    rng = jax.random.key(0)
+    config = _make_config(num_samples = 4, selection_mode = "argmax")
+    model = config.create(rng)
+    vf = _MockPrefixCacheValueFunction()
+
+    obs = _make_obs(batch_size = 2)
+    transition = _make_transition(obs)
+
+    actions = model.sample_actions(rng, transition, value_function = vf)
+
+    assert actions.shape == (2, 1, 2)
+    assert vf.prefix_cache_calls == 1
+    assert vf.last_prefix_cache is not None
+    kv_cache, prefix_mask = vf.last_prefix_cache
+    assert kv_cache["k"].shape == (1, 8, 2)
+    assert prefix_mask.shape == (8, 3)
+
+
+def test_best_of_n_handles_tuple_return_from_compute_value():
+    rng = jax.random.key(0)
+    config = best_of_n.BestOfNWrapperConfig(
+        action_dim = 2,
+        action_horizon = 1,
+        num_samples = 3,
+        base_model_config = None,
+        selection_mode = "argmax",
+    )
+    model = config.create(rng)
+    vf = _MockPrefixCacheValueFunction()
+
+    obs = _make_obs(batch_size = 1)
+    transition = Transition(
+        observation = obs,
+        action = jnp.zeros((1, 1, 2)),
+        reward = jnp.zeros((1,)),
+        next_observation = obs,
+        next_action = jnp.zeros((1, 1, 2)),
+        mc_return = jnp.zeros((1,)),
+        termination = jnp.zeros((1,), dtype = bool),
+        truncation = jnp.zeros((1,), dtype = bool),
+        td_discount = None,
+        counterfactual_next_actions = jnp.array([[[[0.0, 0.0]], [[1.0, 1.0]], [[2.0, 2.0]]]]),
+    )
+
+    actions = model.sample_actions(rng, transition, compute_next_action = True, value_function = vf)
+
+    assert jnp.allclose(actions, jnp.array([[[2.0, 2.0]]]))
+
+
+def test_best_of_n_uses_target_prefix_cache_when_configured():
+    rng = jax.random.key(0)
+    config = _make_config(num_samples = 4, selection_mode = "argmax", use_target_value = True)
+    model = config.create(rng)
+    vf = _MockPrefixCacheValueFunction()
+
+    obs = _make_obs(batch_size = 2)
+    transition = _make_transition(obs)
+
+    model.sample_actions(rng, transition, value_function = vf)
+
+    assert vf.last_use_target is True

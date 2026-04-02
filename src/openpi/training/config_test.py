@@ -31,7 +31,6 @@ def test_robocoin_rlds_data_config_chunk_wise_create(monkeypatch):
         datasets = (rlds_dataset.RLDSDataset(name = "robocoin_bimanual", version = "1.0.0", weight = 1.0),),
         use_eef = True,
         td_n = 50,
-        dont_mask_actions = True,
         use_chunk_wise_delta = True,
         use_quantile_norm = True,
     )

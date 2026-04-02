@@ -147,6 +147,8 @@ class Normalize(DataTransformFn):
             raise ValueError("Embodiment-keyed normalization requires 'embodiment' in the sample.")
 
         embodiment = data["embodiment"]
+        if isinstance(embodiment, np.ndarray):
+            embodiment = embodiment.item()
         if isinstance(embodiment, bytes):
             embodiment = embodiment.decode("utf-8")
         if embodiment not in self.norm_stats:
@@ -157,14 +159,12 @@ class Normalize(DataTransformFn):
         return self.norm_stats[embodiment]
 
     def _normalize(self, x, stats: NormStats):
-        mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
-        return (x - mean) / (std + 1e-6)
+        return (x - stats.mean) / (stats.std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
-        q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
-        return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        return (x - stats.q01) / (stats.q99 - stats.q01 + 1e-6) * 2.0 - 1.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -191,25 +191,46 @@ class ReplaceMaskedActions(DataTransformFn):
         fps = int(np.asarray(data["fps"]).item())
         noise_scale = 0.002 if self.use_quantile_norm else 0.005
 
-        for actions_key, mask_key in (("actions", "action_mask"), ("next_actions", "next_action_mask")):
+        for actions_key, mask_key in (
+            ("actions", "action_mask"),
+            ("next_actions", "next_action_mask"),
+            ("counterfactual_actions", "action_mask"),
+            ("counterfactual_next_actions", "next_action_mask"),
+        ):
+            if actions_key not in data:
+                continue
+
             actions = np.asarray(data[actions_key]).copy()
             action_mask = np.asarray(data[mask_key], dtype = np.bool_).copy()
+            if actions.ndim not in (2, 3):
+                raise ValueError(f"{actions_key} must have rank 2 or 3, got shape {actions.shape}")
 
-            last_valid_idx = int(action_mask.sum()) - 1
-            if last_valid_idx < 0:
-                raise ValueError(f"{mask_key} must contain at least one valid action.")
+            last_valid_idx = max(int(action_mask.sum()) - 1, 0)
 
-            last_valid_action = actions[last_valid_idx]
-            noise = (noise_scale * self.rng.standard_normal(actions.shape)).astype(actions.dtype)
-            replacement = last_valid_action[None, :] + noise
+            if actions.ndim == 3:
+                # [num_samples, action_horizon, action_dim] — broadcast mask across samples
+                # Use the same noise across all samples so replacement is consistent
+                last_valid_action = actions[:, last_valid_idx]
+                shared_noise = (noise_scale * self.rng.standard_normal(actions.shape[1:])).astype(actions.dtype)
+                replacement = last_valid_action[:, None, :] + shared_noise[None, :, :]
+                mask_broadcast = action_mask[None, :, None]
+                actions = np.where(mask_broadcast, actions, replacement)
+            else:
+                last_valid_action = actions[last_valid_idx]
+                noise = (noise_scale * self.rng.standard_normal(actions.shape)).astype(actions.dtype)
+                replacement = last_valid_action[None, :] + noise
+                actions[~action_mask] = replacement[~action_mask]
 
-            actions[~action_mask] = replacement[~action_mask]
+            data[actions_key] = actions
+
+        for mask_key in ("action_mask", "next_action_mask"):
+            if mask_key not in data:
+                continue
+            action_mask = np.asarray(data[mask_key], dtype = np.bool_).copy()
             action_mask[:] = True
             if fps == 30:
                 action_horizon = action_mask.shape[0]
                 action_mask[3 * action_horizon // 5 :] = False
-
-            data[actions_key] = actions
             data[mask_key] = action_mask
 
         return data
@@ -250,6 +271,8 @@ class Unnormalize(DataTransformFn):
             raise ValueError("Embodiment-keyed unnormalization requires 'embodiment' in the sample.")
 
         embodiment = data["embodiment"]
+        if isinstance(embodiment, np.ndarray):
+            embodiment = embodiment.item()
         if isinstance(embodiment, bytes):
             embodiment = embodiment.decode("utf-8")
         if embodiment not in self.norm_stats:

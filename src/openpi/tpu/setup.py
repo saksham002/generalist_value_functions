@@ -18,6 +18,7 @@ def setup_tpu(tpu_name: str, config: TPUConfigWithType) -> None:
     logger.info("Setting up TPU %s", tpu_name)
     mount_nfs(tpu_name, config)
     fix_tpu_logs_permissions(tpu_name, config.zone, config.project)
+    fix_val_cache_permissions(tpu_name, config.zone, config.project, config.nfs_mount_path)
     logger.info("TPU %s setup complete", tpu_name)
 
 
@@ -80,6 +81,28 @@ def fix_tpu_logs_permissions(tpu_name: str, zone: str, project: str) -> None:
     )
 
 
+def fix_val_cache_permissions(tpu_name: str, zone: str, project: str, nfs_mount_path: str) -> None:
+    """Fix permissions on validation episode cache directories.
+
+    These directories may end up root-owned after sudo rm cleanup, preventing
+    the training script from writing new cache files.
+
+    Args:
+        tpu_name: TPU VM name
+        zone: GCP zone
+        project: GCP project ID
+        nfs_mount_path: NFS mount path (e.g. /nfs/aidm_nfs)
+    """
+    logger.info("Fixing val episode cache permissions on %s", tpu_name)
+    ssh_command(
+        tpu_name,
+        zone,
+        f"sudo chmod -R 777 {nfs_mount_path}/saksham3/robocoin/val_episodes_cache* 2>/dev/null || true",
+        project=project,
+        worker="all",
+    )
+
+
 def verify_setup(tpu_name: str, config: TPUConfigWithType) -> bool:
     """Verify that TPU setup is complete.
 
@@ -102,9 +125,9 @@ def verify_setup(tpu_name: str, config: TPUConfigWithType) -> bool:
             zone,
             (
                 f"mountpoint -q {mount_path} && "
-                "source /nfs/aidm_nfs/saksham3/uv/vla/bin/activate && "
-                'export PATH="/nfs/aidm_nfs/saksham3/uv/bin:$PATH" && '
-                'export UV_PROJECT_ENVIRONMENT="/nfs/aidm_nfs/saksham3/uv/vla" && '
+                f"source {mount_path}/saksham3/uv/vla/bin/activate && "
+                f'export PATH="{mount_path}/saksham3/uv/bin:$PATH" && '
+                f'export UV_PROJECT_ENVIRONMENT="{mount_path}/saksham3/uv/vla" && '
                 "uv --version"
             ),
             project=project,

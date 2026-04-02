@@ -743,11 +743,19 @@ class CQLValueFunction(BaseValueFunction):
         action: _model.Actions | None = None,
         *,
         take_min_over_ensemble: bool = False,
-    ) -> at.Float[at.Array, "*b"]:
-        features = self.q_network.compute_features(observation, action)
-        val = self.q_head(features)
+        prefix_cache: tuple[at.Array, at.Array] | None = None,
+    ) -> at.Float[at.Array, "*b"] | tuple[at.Float[at.Array, "*b"], at.Float[at.Array, "*b _n"]]:
+        feature_kwargs = {"prefix_cache": prefix_cache} if prefix_cache is not None else {}
+        out = self.q_network.compute_features(observation, action, **feature_kwargs)
+        if isinstance(out, tuple):
+            features, attn_scores = out[0], out[1]
+            val = self.q_head(features)
+            if take_min_over_ensemble and val.ndim > 1:
+                val = jnp.min(val, axis = 0)
+            return val, attn_scores
+        val = self.q_head(out)
         if take_min_over_ensemble and val.ndim > 1:
-            val = jnp.min(val, axis=0)
+            val = jnp.min(val, axis = 0)
         return val
 
     @override
@@ -757,13 +765,29 @@ class CQLValueFunction(BaseValueFunction):
         action: _model.Actions | None = None,
         *,
         take_min_over_ensemble: bool = False,
+        prefix_cache: tuple[at.Array, at.Array] | None = None,
     ) -> at.Float[at.Array, "*b"]:
         """Compute target Q-value using target network."""
-        features = self.target_q_network.compute_features(observation, action)
+        feature_kwargs = {"prefix_cache": prefix_cache} if prefix_cache is not None else {}
+        target_out = self.target_q_network.compute_features(observation, action, **feature_kwargs)
+        features = target_out[0] if isinstance(target_out, tuple) else target_out
         val = self.target_q_head(features)
         if take_min_over_ensemble and val.ndim > 1:
-            val = jnp.min(val, axis=0)
+            val = jnp.min(val, axis = 0)
         return val
+
+    def compute_prefix_cache(
+        self,
+        observation: _model.Observation,
+        use_target: bool = False,
+    ) -> tuple[at.Array, at.Array]:
+        network = self.target_q_network if use_target else self.q_network
+        if not hasattr(network, "compute_prefix_cache"):
+            raise AttributeError(
+                f"{type(network).__name__} does not support prefix caching. "
+                "Callers should check hasattr before invoking."
+            )
+        return network.compute_prefix_cache(observation)
 
     @override
     def compute_loss(

@@ -176,7 +176,7 @@ def run_job(config: TPUJobConfig) -> int:
                     tpu_config.project,
                 )
                 if config.install_deps:
-                    install_deps(tpu_name, tpu_config.zone, config.working_dir, tpu_config.project)
+                    install_deps(tpu_name, tpu_config.zone, config.working_dir, tpu_config.project, tpu_config.nfs_mount_path)
                 sync_wandb_credentials(tpu_name, tpu_config.zone, tpu_config.project)
             except Exception as e:
                 logger.error("Failed to sync code: %s", e)
@@ -190,7 +190,8 @@ def run_job(config: TPUJobConfig) -> int:
             tpu_config.project,
             config.working_dir,
             notifier,
-            num_workers=num_workers,
+            num_workers = num_workers,
+            nfs_mount_path = tpu_config.nfs_mount_path,
         )
 
         notifier.notify_started(tpu_name, config.tpu_type, config.command)
