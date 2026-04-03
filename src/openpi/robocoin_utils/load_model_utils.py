@@ -64,7 +64,7 @@ def restore_state_with_shardings(checkpoint_manager, state_shape, state_sharding
     return _checkpoints._merge_params(restored["train_state"], restored["params"])
 
 
-def restore_params_with_shardings(checkpoint_manager, state_shape, state_sharding):
+def restore_params_with_shardings(checkpoint_manager, state_shape, state_sharding, *, step: int | None = None):
     """Restore only inference params with explicit target shardings.
 
     This avoids materializing optimizer state when loading a checkpoint for
@@ -79,7 +79,7 @@ def restore_params_with_shardings(checkpoint_manager, state_shape, state_shardin
             return jax.tree.map(lambda s: ocp.ArrayRestoreArgs(sharding = s), sharding_tree)
 
         restored = checkpoint_manager.restore(
-            step = None,
+            step = step,
             args = ocp.args.Composite(
                 params = ocp.args.PyTreeRestore(
                     item = {"params": params},
@@ -102,6 +102,7 @@ class LoadPolicyConfig:
     config_name: str
     checkpoint_path: str
     fine_tune: str | None = None
+    step: int | None = None
 
 
 def load_policy(load_config: LoadPolicyConfig):
@@ -129,7 +130,7 @@ def load_policy(load_config: LoadPolicyConfig):
         overwrite = False,
         resume = True,
     )
-    restored_params = restore_params_with_shardings(checkpoint_manager, train_state_shape, state_sharding)
+    restored_params = restore_params_with_shardings(checkpoint_manager, train_state_shape, state_sharding, step = load_config.step)
     params = restored_params["params"]
     model = nnx.merge(train_state_shape.model_def, params)
     logger.info(f"Loaded policy from {load_config.checkpoint_path}")
