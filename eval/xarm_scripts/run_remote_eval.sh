@@ -46,10 +46,6 @@ echo -e "${YELLOW}(Optional) Test connection first:${NC}"
 echo -e "  ${BLUE}cd ~/kshitiz2/openpi/scripts && python3 test_robot_connection.py${NC}"
 echo ""
 
-# Activate conda environment
-echo -e "${BLUE}Activating conda environment: openpi_mj336${NC}"
-eval "$(conda shell.bash hook)"
-conda activate openpi_mj336
 echo ""
 
 # Set RAC_PATH and find dual_xarms_sim package

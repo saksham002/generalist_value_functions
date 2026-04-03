@@ -1,18 +1,18 @@
-"""Basic eval script for shirt-hang task using the serve_policy HTTP server.
+"""Eval script for shirt-hang task with local policy inference.
 
-Connects to a remote robot environment server and a remote policy server,
-then runs episodes by sending observations to the policy server and executing
-the returned action chunks on the robot.
+Loads a trained policy checkpoint, connects to a remote robot environment
+server, and runs episodes by querying the policy locally and sending actions
+to the robot.
 
 Usage:
-    uv run eval/xarm_scripts/eval_shirt_hang_policy_server.py \
-        --policy-host babel-gpu-node \
-        --robot-host robot-machine
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run eval/xarm_scripts/eval_shirt_hang.py \
+        --args.config-name robocoin_bimanual_pi05 \
+        --args.checkpoint-dir /path/to/checkpoint \
+        --args.robot-host robot-machine
 """
 
 from __future__ import annotations
 
-import base64
 import dataclasses
 import logging
 import os
@@ -20,11 +20,15 @@ import time
 from typing import Any
 
 import cv2
+import jax
+import jax.numpy as jnp
 import numpy as np
 import requests
 import tyro
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+import openpi.models.model as _model
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 logger = logging.getLogger(__name__)
 
 
@@ -35,17 +39,23 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class Args:
-    policy_host: str = "localhost"
-    """Host running serve_policy.py."""
+    config_name: str
+    """TrainConfig name registered in config.py."""
 
-    policy_port: int = 8080
-    """Port for the policy server."""
+    checkpoint_dir: str
+    """Path to the policy checkpoint directory."""
 
     robot_host: str = "localhost"
     """Host running robot_environment_server.py."""
 
     robot_port: int = 8081
     """Port for the robot environment server."""
+
+    fine_tune_config: str | None = None
+    """Optional FineTuneConfig name from config.py. If set, applies overrides to the base config."""
+
+    step: int | None = None
+    """Checkpoint step number. If None, loads the latest checkpoint."""
 
     num_episodes: int = 1
     """Number of episodes to run."""
@@ -68,14 +78,129 @@ class Args:
     embodiment: str = "dual_xarms"
     """Embodiment string passed to the policy. Must match what the model was trained on."""
 
-    policy_timeout: float = 300.0
-    """Timeout in seconds for policy server requests. Should be long enough to cover JIT compilation on first call."""
-
     debug: bool = False
-    """Debug mode: skip policy server, save camera images to disk and print state instead."""
+    """Debug mode: skip policy loading, save camera images to disk and print state instead."""
 
-    debug_output_dir: str = "/tmp/eval_debug"
-    """Directory to save debug images when --debug is set."""
+    debug_output_dir: str = ""
+    """Directory to save debug images when --debug is set. Defaults to eval/xarm_scripts/debug/."""
+
+
+# =============================================================================
+# Local policy
+# =============================================================================
+
+
+class LocalPolicy:
+    """Loads a policy checkpoint and runs inference locally."""
+
+    def __init__(self, config_name: str, checkpoint_dir: str, step: int | None = None, fine_tune_config: str | None = None) -> None:
+        import openpi.policies.policy as _policy_module
+        import openpi.shared.nnx_utils as nnx_utils
+        import openpi.transforms as _transforms
+        from openpi.robocoin_utils.load_model_utils import LoadPolicyConfig, load_policy
+        from openpi.training import checkpoints as _checkpoints
+
+        logger.info(f"Loading checkpoint from {checkpoint_dir} (step={step})...")
+        load_config = LoadPolicyConfig(
+            config_name=config_name,
+            checkpoint_path=checkpoint_dir,
+            fine_tune=fine_tune_config,
+            step=step,
+        )
+        model, config = load_policy(load_config)
+        logger.info("Checkpoint restored successfully.")
+
+        policy_model_config = config.policy if config.policy is not None else config.model
+
+        logger.info("Loading normalization statistics...")
+        data_config = config.data.create(config.assets_dirs, policy_model_config)
+        from etils import epath
+        norm_stats = _checkpoints.load_norm_stats(epath.Path(checkpoint_dir) / "assets", data_config.asset_id)
+        logger.info("Norm stats loaded. Building policy transforms...")
+
+        policy = _policy_module.Policy(
+            model,
+            transforms=[
+                _transforms.InjectDefaultPrompt(None),
+                *data_config.data_transforms.inputs,
+                _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+                *(
+                    [_transforms.Clip(data_config.clip_normalized_bounds)]
+                    if data_config.clip_normalized_bounds is not None
+                    else []
+                ),
+                *data_config.model_transforms.inputs,
+            ],
+            output_transforms=[
+                *data_config.model_transforms.outputs,
+                _transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+                *data_config.data_transforms.outputs,
+            ],
+            metadata=config.policy_metadata,
+        )
+
+        self._model = policy._model  # noqa: SLF001
+        self._input_transform = policy._input_transform  # noqa: SLF001
+        self._output_transform = policy._output_transform  # noqa: SLF001
+        self._sample_kwargs = dict(policy._sample_kwargs)  # noqa: SLF001
+        self._rng = policy._rng  # noqa: SLF001
+
+        if hasattr(self._model, "config") and hasattr(self._model.config, "guidance"):
+            object.__setattr__(self._model.config, "guidance", 0.0)
+            logger.info("Disabled classifier-free guidance (guidance=0.0).")
+
+        self._sample_actions_jit = nnx_utils.module_jit(self._model.sample_actions)
+        logger.info("Policy loaded and JIT-compiled successfully.")
+
+    def predict(self, obs_dict: dict[str, Any]) -> np.ndarray:
+        """Run policy inference on a single observation.
+
+        Args:
+            obs_dict: Raw observation with keys: image (dict of camera name -> RGB uint8 array),
+                state, prompt, embodiment.
+
+        Returns:
+            actions: float32 array of shape [action_horizon * 2, action_dim] (upsampled 30->60 Hz).
+        """
+        raw_state = np.asarray(obs_dict["state"], dtype=np.float32)
+        transformed = self._input_transform(obs_dict)
+
+        batched = {
+            k: jnp.asarray(v)[None, ...]
+            for k, v in transformed.items()
+            if not isinstance(v, str)
+        }
+
+        # Mask out the last 20 action positions so the model only attends to the first 30.
+        action_horizon = self._model.action_horizon
+        action_mask = jnp.concatenate([
+            jnp.ones(action_horizon - 20, dtype=jnp.bool_),
+            jnp.zeros(20, dtype=jnp.bool_),
+        ])[None, :]  # (1, action_horizon)
+        batched["action_mask"] = action_mask
+
+        observation = _model.Observation.from_dict(batched)
+        transition = _model.wrap_observation_as_transition(observation)
+
+        self._rng, sample_rng = jax.random.split(self._rng)
+
+        actions_out = self._sample_actions_jit(sample_rng, transition, **self._sample_kwargs)
+        actions_out = jax.block_until_ready(actions_out)
+
+        actions_np = np.asarray(actions_out[0])  # [action_horizon, action_dim]
+        actions_np = actions_np[:30]
+
+        decoded = self._output_transform({
+            "embodiment": obs_dict.get("embodiment", ""),
+            "state": raw_state,
+            "actions": actions_np,
+            "next_state": raw_state,
+            "next_actions": actions_np,
+        })
+        actions = np.asarray(decoded["actions"], dtype=np.float32)
+        # Policy outputs 30 Hz actions; robot runs at 60 Hz. Repeat each action twice.
+        actions = np.repeat(actions, 2, axis=0)
+        return actions
 
 
 # =============================================================================
@@ -112,14 +237,9 @@ class SubtaskTracker:
         self._steps_in_subtask = 0
         self._step = 0
 
-        # T0→1: pending right-close event (gripper closed at high Z, waiting for descent)
         self._t01_pending: bool = False
         self._t01_steps_watching: int = 0
-
-        # T2→3: consecutive frames of stable left close
         self._t23_left_close_streak: int = 0
-
-        # T4→5: track consecutive frames of left open (final release confirmation)
         self._t45_open_streak: int = 0
 
     @property
@@ -138,7 +258,6 @@ class SubtaskTracker:
             if val is None:
                 return 0.0
             arr = np.asarray(val, dtype=np.float32)
-            # Take last frame if obs is stacked, then flatten to scalar.
             return float(arr[-1].flat[0] if arr.ndim > 1 else arr.flat[0])
 
         def _vec(key: str, dim: int = 3) -> np.ndarray:
@@ -153,7 +272,7 @@ class SubtaskTracker:
         if "right/tcp_pose" not in state and self._step == 0:
             logger.warning(
                 "SubtaskTracker: 'right/tcp_pose' not found in obs['state']. "
-                "T0→1 and T1→2 transitions require absolute TCP Z and will not fire. "
+                "T0->1 and T1->2 transitions require absolute TCP Z and will not fire. "
                 "Available keys: %s", list(state.keys())
             )
         rz = float(_vec("right/tcp_pose", dim=7)[2])
@@ -165,7 +284,7 @@ class SubtaskTracker:
         self._steps_in_subtask += 1
 
     def _advance(self) -> None:
-        logger.info(f"SubtaskTracker: subtask {self._subtask} → {self._subtask + 1} "
+        logger.info(f"SubtaskTracker: subtask {self._subtask} -> {self._subtask + 1} "
                     f"({_SUBTASK_PROMPTS[self._subtask + 1]!r}) at step {self._step}")
         self._subtask += 1
         self._steps_in_subtask = 0
@@ -187,7 +306,6 @@ class SubtaskTracker:
             self._check_t45(lg)
 
     def _check_t01(self, rg: float, rz: float) -> None:
-        # Right gripper closes while Z > 0.30, then descends to Z < 0.20 without reopening.
         rg_open = rg > _GRIP_THRESH
         if not self._t01_pending:
             if not rg_open and rz > 0.30:
@@ -196,23 +314,19 @@ class SubtaskTracker:
         else:
             self._t01_steps_watching += 1
             if rg_open:
-                # Gripper reopened before descent confirmed — failed grasp attempt.
                 self._t01_pending = False
                 self._t01_steps_watching = 0
             elif self._t01_steps_watching > 500:
-                # Arm stayed closed for 500+ steps but never descended — invalid grasp.
                 self._t01_pending = False
                 self._t01_steps_watching = 0
             elif rz < 0.20:
                 self._advance()
 
     def _check_t12(self, rz: float) -> None:
-        # Right TCP Z drops below handoff height. Guard against rz=0.0 (missing key).
         if 0.0 < rz < 0.22:
             self._advance()
 
     def _check_t23(self, lg: float) -> None:
-        # Left gripper closes and stays closed for 40+ consecutive frames.
         if lg <= _GRIP_THRESH:
             self._t23_left_close_streak += 1
             if self._t23_left_close_streak >= 40:
@@ -221,12 +335,10 @@ class SubtaskTracker:
             self._t23_left_close_streak = 0
 
     def _check_t34(self, rg: float, lg: float) -> None:
-        # Right firmly closed AND left open simultaneously.
         if rg < 200 and lg > _GRIP_THRESH:
             self._advance()
 
     def _check_t45(self, lg: float) -> None:
-        # Left gripper opens and stays open for 30+ consecutive frames (final release).
         if lg > _GRIP_THRESH:
             self._t45_open_streak += 1
             if self._t45_open_streak >= 30:
@@ -236,77 +348,14 @@ class SubtaskTracker:
 
 
 # =============================================================================
-# Policy server client
+# Observation extraction
 # =============================================================================
 
-# Maps robot environment camera names to canonical policy names.
 _CAMERA_MAP = {
     "right/top": "base_0_rgb",
     "left/wrist": "left_wrist_0_rgb",
     "right/wrist": "right_wrist_0_rgb",
 }
-
-
-class PolicyServerClient:
-    """Sends observations to serve_policy.py and returns action chunks."""
-
-    def __init__(self, host: str, port: int, timeout: float = 60.0) -> None:
-        self._base_url = f"http://{host}:{port}/api"
-        self._timeout = timeout
-        self._wait_for_server()
-
-    def _wait_for_server(self, max_wait: float = 120.0) -> None:
-        start = time.time()
-        while time.time() - start < max_wait:
-            try:
-                r = requests.get(f"{self._base_url}/health", timeout=5.0)
-                if r.status_code == 200:
-                    logger.info("Policy server is ready.")
-                    return
-            except requests.RequestException:
-                pass
-            logger.info("Waiting for policy server...")
-            time.sleep(2.0)
-        raise RuntimeError(f"Policy server at {self._base_url} not responding after {max_wait}s")
-
-    def predict(
-        self,
-        state: np.ndarray,
-        images_bgr: dict[str, np.ndarray],
-        prompt: str,
-        embodiment: str,
-    ) -> np.ndarray:
-        """Send one observation to the policy server and return the action chunk.
-
-        Args:
-            state: Robot state vector, shape (state_dim,), float32.
-            images_bgr: Dict of camera name -> BGR uint8 image (H, W, 3).
-            prompt: Subtask text prompt.
-            embodiment: Embodiment string.
-
-        Returns:
-            actions: float32 array of shape (action_horizon, action_dim).
-        """
-        encoded_images = {}
-        for cam_name, img_bgr in images_bgr.items():
-            canonical = _CAMERA_MAP.get(cam_name, cam_name)
-            _, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            encoded_images[canonical] = base64.b64encode(buf.tobytes()).decode("utf-8")
-
-        payload = {
-            "state": state.tolist(),
-            "images": encoded_images,
-            "prompt": prompt,
-            "embodiment": embodiment,
-        }
-        response = requests.post(f"{self._base_url}/predict", json=payload, timeout=self._timeout)
-        response.raise_for_status()
-        return np.array(response.json()["actions"], dtype=np.float32)
-
-
-# =============================================================================
-# Observation extraction
-# =============================================================================
 
 
 def extract_state(obs: dict[str, Any]) -> np.ndarray:
@@ -336,15 +385,18 @@ def extract_state(obs: dict[str, Any]) -> np.ndarray:
     return state
 
 
-def extract_images_bgr(obs: dict[str, Any], camera_names: tuple[str, ...]) -> dict[str, np.ndarray]:
-    """Extract BGR images from observation, taking the last frame if stacked."""
+def extract_images_rgb(obs: dict[str, Any], camera_names: tuple[str, ...]) -> dict[str, np.ndarray]:
+    """Extract RGB images from observation, mapped to canonical policy names."""
     images = {}
     for cam_name in camera_names:
         frames = obs["images"].get(cam_name)
         if frames is None:
             logger.warning(f"Camera {cam_name!r} not found in observation, skipping.")
             continue
-        images[cam_name] = frames[-1] if frames.ndim == 4 else frames
+        frame = frames[-1] if frames.ndim == 4 else frames
+        canonical = _CAMERA_MAP.get(cam_name, cam_name)
+        # Robot server returns BGR; convert to RGB for the policy.
+        images[canonical] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     if not images:
         raise RuntimeError(f"No cameras found. Expected {camera_names}, got {list(obs['images'].keys())}.")
     return images
@@ -357,8 +409,7 @@ def extract_images_bgr(obs: dict[str, Any], camera_names: tuple[str, ...]) -> di
 
 def run_episode(
     env: Any,
-    policy_client: PolicyServerClient,
-    embodiment: str,
+    policy: LocalPolicy,
     args: Args,
     episode_idx: int,
 ) -> None:
@@ -378,14 +429,25 @@ def run_episode(
         if t % args.query_freq == 0:
             prompt = tracker.prompt
             state = extract_state(obs)
-            images_bgr = extract_images_bgr(obs, args.camera_names)
-            full_actions = policy_client.predict(state, images_bgr, prompt, embodiment)
+            images_rgb = extract_images_rgb(obs, args.camera_names)
+
+            obs_dict = {
+                "image": images_rgb,
+                "state": state,
+                "prompt": prompt,
+                "embodiment": args.embodiment,
+            }
+
+            t0 = time.perf_counter()
+            full_actions = policy.predict(obs_dict)
+            elapsed = time.perf_counter() - t0
+
             action_plan = full_actions[
                 :, args.real_action_start : args.real_action_start + args.real_action_dim
             ]
             logger.info(
                 f"Episode {episode_idx} step {t}: prompt={prompt!r}, "
-                f"action_plan shape={action_plan.shape}"
+                f"action_plan shape={action_plan.shape}, inference={elapsed:.3f}s"
             )
 
         plan_idx = min(t % args.query_freq, action_plan.shape[0] - 1)
@@ -395,6 +457,36 @@ def run_episode(
         t += 1
 
     logger.info(f"Episode {episode_idx} finished after {t} steps (terminated={terminated}, truncated={truncated})")
+
+
+# =============================================================================
+# Debug mode
+# =============================================================================
+
+
+def run_debug_episode(env: Any, args: Args) -> None:
+    """Reset the robot, save camera images, and print the state. No policy needed."""
+    debug_dir = args.debug_output_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
+    os.makedirs(debug_dir, exist_ok=True)
+
+    logger.info("Debug mode: resetting environment...")
+    obs, _ = env.reset(seed=0)
+
+    state = extract_state(obs)
+    print(f"State vector (dim={state.shape[0]}):\n{state}")
+
+    for cam_name in args.camera_names:
+        frames = obs["images"].get(cam_name)
+        if frames is None:
+            logger.warning(f"Camera {cam_name!r} not found in observation, skipping.")
+            continue
+        frame = frames[-1] if frames.ndim == 4 else frames
+        safe_name = cam_name.replace("/", "_")
+        path = os.path.join(debug_dir, f"{safe_name}.png")
+        cv2.imwrite(path, frame)
+        logger.info(f"Saved {cam_name} image ({frame.shape}) to {path}")
+
+    logger.info(f"Debug output saved to {debug_dir}")
 
 
 # =============================================================================
@@ -412,26 +504,6 @@ def _check_connection(url: str, name: str, timeout: float = 5.0) -> None:
         raise RuntimeError(f"{name} not reachable at {url}/health: {e}") from e
 
 
-def run_debug_episode(env: Any, args: Args) -> None:
-    """Reset the robot, save camera images, and print the state. No policy needed."""
-    os.makedirs(args.debug_output_dir, exist_ok=True)
-
-    logger.info("Debug mode: resetting environment...")
-    obs, _ = env.reset(seed=0)
-
-    state = extract_state(obs)
-    print(f"State vector (dim={state.shape[0]}):\n{state}")
-
-    images_bgr = extract_images_bgr(obs, args.camera_names)
-    for cam_name, img in images_bgr.items():
-        safe_name = cam_name.replace("/", "_")
-        path = os.path.join(args.debug_output_dir, f"{safe_name}.png")
-        cv2.imwrite(path, img)
-        logger.info(f"Saved {cam_name} image ({img.shape}) to {path}")
-
-    logger.info(f"Debug output saved to {args.debug_output_dir}")
-
-
 def main(args: Args) -> None:
     import sys
     from pathlib import Path
@@ -439,34 +511,28 @@ def main(args: Args) -> None:
     sys.path.insert(0, str(Path(__file__).parent))
     from remote_environment_adapter import RemoteEnvironmentAdapter
 
-    logger.info(f"embodiment={args.embodiment!r}")
-
-    if args.debug:
-        robot_url = f"http://{args.robot_host}:{args.robot_port}/api"
-        policy_url = f"http://{args.policy_host}:{args.policy_port}/api"
-        _check_connection(robot_url, "Robot server")
-        _check_connection(policy_url, "Policy server")
-
-        logger.info(f"Connecting to robot environment at {args.robot_host}:{args.robot_port}")
-        env = RemoteEnvironmentAdapter(host=args.robot_host, port=args.robot_port)
-        run_debug_episode(env, args)
-        env.close()
-        return
-
-    # Verify both servers are reachable before loading anything.
-    policy_url = f"http://{args.policy_host}:{args.policy_port}/api"
     robot_url = f"http://{args.robot_host}:{args.robot_port}/api"
-    _check_connection(policy_url, "Policy server")
     _check_connection(robot_url, "Robot server")
-
-    policy_client = PolicyServerClient(host=args.policy_host, port=args.policy_port, timeout=args.policy_timeout)
 
     logger.info(f"Connecting to robot environment at {args.robot_host}:{args.robot_port}")
     env = RemoteEnvironmentAdapter(host=args.robot_host, port=args.robot_port)
     logger.info("Connected to robot environment.")
 
+    if args.debug:
+        run_debug_episode(env, args)
+        env.close()
+        return
+
+    logger.info(f"Loading policy: config={args.config_name}, checkpoint={args.checkpoint_dir}, "
+                f"fine_tune={args.fine_tune_config}")
+    policy = LocalPolicy(
+        config_name=args.config_name,
+        checkpoint_dir=args.checkpoint_dir,
+        step=args.step,
+        fine_tune_config=args.fine_tune_config,
+    )
     for episode_idx in range(args.num_episodes):
-        run_episode(env, policy_client, args.embodiment, args, episode_idx)
+        run_episode(env, policy, args, episode_idx)
 
     env.close()
 
