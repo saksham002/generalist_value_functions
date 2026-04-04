@@ -9,9 +9,9 @@ set -e
 # =============================================================================
 
 CONFIG_NAME="robocoin_bimanual_pi05"
-CHECKPOINT_DIR="/data/user_data/jeffyu/checkpoints/robocoin/pi05_finetune/real_hang_pi05_finetune"
+CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_finetune"
 FINE_TUNE_CONFIG="real_hang_pi05_finetune"  # Optional: FineTuneConfig name from config.py. Leave empty to skip.
-STEP=275000
+STEP=429999
 
 ROBOT_HOST="xarmpc.pc.cs.cmu.edu"
 ROBOT_PORT=8080
@@ -67,6 +67,7 @@ echo ""
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run eval/xarm_scripts/eval_shirt_hang_remote.py \
     --args.config-name "${CONFIG_NAME}" \
     --args.checkpoint-dir "${CHECKPOINT_DIR}" \
+    --args.step "${STEP}" \
     --args.robot-host "${ROBOT_HOST}" \
     --args.robot-port "${ROBOT_PORT}" \
     --args.num-episodes "${NUM_EPISODES}" \

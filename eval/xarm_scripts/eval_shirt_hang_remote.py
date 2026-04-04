@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import requests
+from scipy.spatial.transform import Rotation
 import tyro
 
 import openpi.models.model as _model
@@ -75,8 +76,6 @@ class Args:
     camera_names: tuple[str, ...] = ("right/top", "left/wrist", "right/wrist")
     """Camera names as returned by the robot environment server."""
 
-    embodiment: str = "dual_xarms"
-    """Embodiment string passed to the policy. Must match what the model was trained on."""
 
     debug: bool = False
     """Debug mode: skip policy loading, save camera images to disk and print state instead."""
@@ -111,11 +110,27 @@ class LocalPolicy:
         logger.info("Checkpoint restored successfully.")
 
         policy_model_config = config.policy if config.policy is not None else config.model
+        logger.info(f"discrete_state_input: {getattr(policy_model_config, 'discrete_state_input', 'N/A')}")
 
-        logger.info("Loading normalization statistics...")
+        logger.info("Loading normalization statistics from checkpoint assets...")
         data_config = config.data.create(config.assets_dirs, policy_model_config)
-        from etils import epath
-        norm_stats = _checkpoints.load_norm_stats(epath.Path(checkpoint_dir) / "assets", data_config.asset_id)
+        asset_id = data_config.asset_id
+        if step is not None:
+            step_dir = str(step)
+        else:
+            # Find the latest step directory.
+            step_dirs = sorted(
+                (d for d in os.listdir(checkpoint_dir) if d.isdigit()),
+                key = int,
+            )
+            step_dir = step_dirs[-1]
+            logger.info(f"No step specified, using latest: {step_dir}")
+        norm_stats_dir = os.path.join(checkpoint_dir, step_dir, "assets", asset_id)
+        logger.info(f"Norm stats directory: {norm_stats_dir}")
+        from openpi.shared import normalize as _normalize
+        all_norm_stats = _normalize.load(norm_stats_dir)
+        _INFERENCE_KEYS = {"state", "actions", "next_state", "next_actions"}
+        norm_stats = {k: v for k, v in all_norm_stats.items() if k in _INFERENCE_KEYS}
         logger.info("Norm stats loaded. Building policy transforms...")
 
         policy = _policy_module.Policy(
@@ -152,24 +167,29 @@ class LocalPolicy:
         self._sample_actions_jit = nnx_utils.module_jit(self._model.sample_actions)
         logger.info("Policy loaded and JIT-compiled successfully.")
 
-    def predict(self, obs_dict: dict[str, Any]) -> np.ndarray:
+    def predict(self, obs_dict: dict[str, Any], initial_eef_pose: np.ndarray) -> np.ndarray:
         """Run policy inference on a single observation.
 
         Args:
             obs_dict: Raw observation with keys: image (dict of camera name -> RGB uint8 array),
                 state, prompt, embodiment.
+            initial_eef_pose: Current 14-D EEF pose in euler format from extract_eef_pose().
 
         Returns:
-            actions: float32 array of shape [action_horizon * 2, action_dim] (upsampled 30->60 Hz).
+            actions: float32 array of shape [60, 14] (upsampled 30->60 Hz).
         """
         raw_state = np.asarray(obs_dict["state"], dtype=np.float32)
+        # import pdb; pdb.set_trace()
         transformed = self._input_transform(obs_dict)
 
-        batched = {
-            k: jnp.asarray(v)[None, ...]
-            for k, v in transformed.items()
-            if not isinstance(v, str)
-        }
+        batched = {}
+        for k, v in transformed.items():
+            if isinstance(v, str):
+                continue
+            if isinstance(v, dict):
+                batched[k] = {dk: jnp.asarray(dv)[None, ...] for dk, dv in v.items()}
+            else:
+                batched[k] = jnp.asarray(v)[None, ...]
 
         # Mask out the last 20 action positions so the model only attends to the first 30.
         action_horizon = self._model.action_horizon
@@ -178,6 +198,7 @@ class LocalPolicy:
             jnp.zeros(20, dtype=jnp.bool_),
         ])[None, :]  # (1, action_horizon)
         batched["action_mask"] = action_mask
+        batched["image_mask"] = {k: jnp.array([True]) for k in batched.get("image", {})}
 
         observation = _model.Observation.from_dict(batched)
         transition = _model.wrap_observation_as_transition(observation)
@@ -187,20 +208,33 @@ class LocalPolicy:
         actions_out = self._sample_actions_jit(sample_rng, transition, **self._sample_kwargs)
         actions_out = jax.block_until_ready(actions_out)
 
-        actions_np = np.asarray(actions_out[0])  # [action_horizon, action_dim]
-        actions_np = actions_np[:30]
-
+        actions_np = np.asarray(actions_out[0, :, 14 : 28])  # [action_horizon, 32]
+        # import ipdb; ipdb.set_trace()
         decoded = self._output_transform({
-            "embodiment": obs_dict.get("embodiment", ""),
             "state": raw_state,
             "actions": actions_np,
             "next_state": raw_state,
             "next_actions": actions_np,
         })
-        actions = np.asarray(decoded["actions"], dtype=np.float32)
-        # Policy outputs 30 Hz actions; robot runs at 60 Hz. Repeat each action twice.
-        actions = np.repeat(actions, 2, axis=0)
-        return actions
+        
+
+        # Extract the 14-D EEF action subset, first 30 steps only.
+        actions = np.asarray(decoded["actions"], dtype=np.float32)[:30]
+        unnormalize_gripper(actions)
+
+
+        # Policy predicts EEF deltas; add initial pose to position + euler components.
+        actions += initial_eef_pose
+
+        actions = np.repeat(actions, 2, axis = 0)
+
+        # Compute step-wise deltas (relative transforms between consecutive actions).
+        deltas = _compute_stepwise_deltas(actions)
+
+        # Policy outputs 30 Hz actions; robot runs at 60 Hz. Repeat each delta twice.
+        # deltas = np.repeat(deltas, 2, axis=0)
+
+        return deltas
 
 
 # =============================================================================
@@ -357,9 +391,79 @@ _CAMERA_MAP = {
     "right/wrist": "right_wrist_0_rgb",
 }
 
+_GRIPPER_MIN = 70.0
+_GRIPPER_MAX = 850.0
+
+
+def _compute_stepwise_deltas(actions: np.ndarray) -> np.ndarray:
+    """Compute step-wise deltas from absolute action chunk.
+
+    For each consecutive pair (a_i, a_{i+1}), computes the relative transformation.
+    Position and gripper dims use direct subtraction. Euler angles use rotation
+    matrix relative transform: R_delta = R_{i+1} @ R_i^{-1}.
+
+    Args:
+        actions: float32 array of shape [T, 14] with layout per 7-D arm block:
+            [pos(3), euler(3), gripper(1)].
+
+    Returns:
+        deltas: float32 array of shape [T, 14]. First row is zeros (identity delta).
+    """
+    T = actions.shape[0]
+    deltas = np.zeros((T, 14), dtype = np.float32)
+
+    for arm_offset in (0, 7):
+        pos_curr = actions[:-1, arm_offset : arm_offset + 3]
+        pos_next = actions[1:, arm_offset : arm_offset + 3]
+        deltas[1:, arm_offset : arm_offset + 3] = pos_next - pos_curr
+
+        euler_curr = actions[:-1, arm_offset + 3 : arm_offset + 6]
+        euler_next = actions[1:, arm_offset + 3 : arm_offset + 6]
+        R_curr = Rotation.from_euler("xyz", euler_curr)
+        R_next = Rotation.from_euler("xyz", euler_next)
+        R_delta = R_next * R_curr.inv()
+        deltas[1:, arm_offset + 3 : arm_offset + 6] = R_delta.as_euler("xyz").astype(np.float32)
+
+        grip_curr = actions[:-1, arm_offset + 6]
+        grip_next = actions[1:, arm_offset + 6]
+        deltas[1:, arm_offset + 6] = grip_next - grip_curr
+
+    return deltas
+
+
+def _quat_to_euler(quat: np.ndarray) -> np.ndarray:
+    """Convert quaternion (x, y, z, w) to Euler angles (roll, pitch, yaw).
+
+    Matches the convention in dexterous_hang_config.py exactly.
+    """
+    x, y, z, w = quat[0], quat[1], quat[2], quat[3]
+
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+    sinp = np.clip(2.0 * (w * y - z * x), -1.0, 1.0)
+    pitch = np.arcsin(sinp)
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+    return np.array([roll, pitch, yaw], dtype = np.float32)
+
+
+def unnormalize_gripper(action: np.ndarray) -> None:
+    """In-place unnormalize gripper columns from [0, 1] to [GRIPPER_MIN, GRIPPER_MAX]."""
+    action[:, 6] = _GRIPPER_MIN + (action[:, 6] * (_GRIPPER_MAX - _GRIPPER_MIN))
+    action[:, 13] = _GRIPPER_MIN + (action[:, 13] * (_GRIPPER_MAX - _GRIPPER_MIN))
+
 
 def extract_state(obs: dict[str, Any]) -> np.ndarray:
-    """Extract the 40-d relative-frame state vector from a RMPDualXArmsEnv observation."""
+    """Extract 14-D EEF state in euler format matching the training norm stats.
+
+    Layout: [left_pos(3), left_euler(3), left_gripper(1),
+             right_pos(3), right_euler(3), right_gripper(1)]
+    """
     state_dict = obs["state"]
 
     def _last(arr: np.ndarray) -> np.ndarray:
@@ -369,14 +473,15 @@ def extract_state(obs: dict[str, Any]) -> np.ndarray:
         val = state_dict.get(key)
         return _last(val).astype(np.float32) if val is not None else np.zeros(dim, dtype=np.float32)
 
+    left_tcp = _get("left/tcp_pose", 7)
+    right_tcp = _get("right/tcp_pose", 7)
+
     parts = [
-        _get("left/relative2_tcp_pose", 7),
-        _get("left/relative2_tcp_vel", 6),
-        _get("left/wrist_tcp_vel", 6),
+        left_tcp[:3],
+        _quat_to_euler(left_tcp[3:7]),
         _get("left/gripper_pos", 1),
-        _get("right/relative2_tcp_pose", 7),
-        _get("right/relative2_tcp_vel", 6),
-        _get("right/wrist_tcp_vel", 6),
+        right_tcp[:3],
+        _quat_to_euler(right_tcp[3:7]),
         _get("right/gripper_pos", 1),
     ]
     state = np.concatenate(parts, axis=-1)
@@ -435,11 +540,10 @@ def run_episode(
                 "image": images_rgb,
                 "state": state,
                 "prompt": prompt,
-                "embodiment": args.embodiment,
             }
 
             t0 = time.perf_counter()
-            full_actions = policy.predict(obs_dict)
+            full_actions = policy.predict(obs_dict, state)
             elapsed = time.perf_counter() - t0
 
             action_plan = full_actions[
@@ -451,7 +555,9 @@ def run_episode(
             )
 
         plan_idx = min(t % args.query_freq, action_plan.shape[0] - 1)
+        import ipdb; ipdb.set_trace()
         action = action_plan[plan_idx]
+        # action = np.zeros_like(action)
 
         obs, reward, terminated, truncated, _ = env.step(action)
         t += 1
@@ -511,14 +617,10 @@ def main(args: Args) -> None:
     sys.path.insert(0, str(Path(__file__).parent))
     from remote_environment_adapter import RemoteEnvironmentAdapter
 
-    robot_url = f"http://{args.robot_host}:{args.robot_port}/api"
-    _check_connection(robot_url, "Robot server")
-
-    logger.info(f"Connecting to robot environment at {args.robot_host}:{args.robot_port}")
-    env = RemoteEnvironmentAdapter(host=args.robot_host, port=args.robot_port)
-    logger.info("Connected to robot environment.")
-
     if args.debug:
+        robot_url = f"http://{args.robot_host}:{args.robot_port}/api"
+        _check_connection(robot_url, "Robot server")
+        env = RemoteEnvironmentAdapter(host=args.robot_host, port=args.robot_port)
         run_debug_episode(env, args)
         env.close()
         return
@@ -531,6 +633,11 @@ def main(args: Args) -> None:
         step=args.step,
         fine_tune_config=args.fine_tune_config,
     )
+
+    logger.info(f"Connecting to robot environment at {args.robot_host}:{args.robot_port}")
+    env = RemoteEnvironmentAdapter(host=args.robot_host, port=args.robot_port)
+    logger.info("Connected to robot environment.")
+
     for episode_idx in range(args.num_episodes):
         run_episode(env, policy, args, episode_idx)
 
