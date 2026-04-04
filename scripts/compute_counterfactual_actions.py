@@ -448,7 +448,12 @@ def run_worker(args: WorkerArgs) -> None:
 
     # Get action dimensions from policy model config
     action_horizon = policy_model_config.action_horizon
-    action_dim = policy_model_config.action_dim
+    action_dim_mask = getattr(policy_model_config, "action_dim_mask", None)
+    if action_dim_mask is not None:
+        action_dim_mask = np.asarray(action_dim_mask, dtype = np.bool_)
+        action_dim = int(np.sum(action_dim_mask))
+    else:
+        action_dim = policy_model_config.action_dim
     max_subtasks = 5
 
     logger.info(f"Action horizon={action_horizon}, action_dim={action_dim}, num_samples={args.num_samples}")
@@ -855,26 +860,27 @@ def run_worker(args: WorkerArgs) -> None:
                             }
                         )
                     output_actions = transformed_outputs["actions"]
+                    if action_dim_mask is not None:
+                        output_actions = output_actions[..., action_dim_mask]
 
                     offset = 0
                     for request, n in batch_requests:
                         request_actions = actions_np[offset : offset + n]
+                        if action_dim_mask is not None:
+                            request_actions = request_actions[..., action_dim_mask]
                         if args.debug_metrics:
+                            gt_actions = request.gt_actions
+                            if action_dim_mask is not None:
+                                gt_actions = gt_actions[..., action_dim_mask]
                             gt_actions_broadcast = np.broadcast_to(
-                                request.gt_actions[None, ...],
+                                gt_actions[None, ...],
                                 request_actions.shape,
                             )
                             abs_diff = np.abs(request_actions - gt_actions_broadcast)
                             sq_diff = np.square(request_actions - gt_actions_broadcast)
 
-                            if getattr(model, "action_dim_mask", None) is not None:
-                                dim_mask = np.asarray(model.action_dim_mask, dtype = np.float32)[None, None, :]
-                                dim_mask_den = max(float(np.sum(dim_mask)), 1.0)
-                                l1_per_step = np.sum(abs_diff * dim_mask, axis = -1) / dim_mask_den
-                                mse_per_step = np.sum(sq_diff * dim_mask, axis = -1) / dim_mask_den
-                            else:
-                                l1_per_step = np.mean(abs_diff, axis = -1)
-                                mse_per_step = np.mean(sq_diff, axis = -1)
+                            l1_per_step = np.mean(abs_diff, axis = -1)
+                            mse_per_step = np.mean(sq_diff, axis = -1)
 
                             step_mask = request.action_mask.astype(np.float32)[None, :]
                             episode_sampling_l1_sum += float(np.sum(l1_per_step * step_mask))
