@@ -456,7 +456,13 @@ def run_worker(args: WorkerArgs) -> None:
         action_dim = policy_model_config.action_dim
     max_subtasks = 5
 
-    logger.info(f"Action horizon={action_horizon}, action_dim={action_dim}, num_samples={args.num_samples}")
+    logger.info(
+        f"Action horizon={action_horizon}, action_dim={action_dim}, num_samples={args.num_samples}, "
+        f"action_dim_mask={action_dim_mask}, "
+        f"mask_boundary_actions={data_config.rlds_kwargs.get('mask_boundary_actions')}, "
+        f"use_chunk_wise_delta={data_config.rlds_kwargs.get('use_chunk_wise_delta')}, "
+        f"rng_seed=0 (hardcoded in Policy)"
+    )
 
     # Create manifest
     manifest = ca_store.CounterfactualActionStoreManifest(
