@@ -679,6 +679,8 @@ def run_worker(args: WorkerArgs) -> None:
                     if hasattr(step_state, "numpy"):
                         step_state = step_state.numpy()
                     step_state = np.array(step_state, dtype=np.float32)
+                    if data_config.rlds_kwargs["state_dim"] == 16 and step_state.shape[-1] == 14:
+                        step_state = np.concatenate([step_state[:6], [0.0], step_state[6:13], [0.0], step_state[13:]], axis = 0).astype(np.float32)
 
                     # Decode images once per step (not per subtask)
                     decoded_images = {}
@@ -863,6 +865,8 @@ def run_worker(args: WorkerArgs) -> None:
                                 "actions": actions_np,
                                 "next_state": batch_states,
                                 "next_actions": actions_np,
+                                "counterfactual_actions": actions_np,
+                                "counterfactual_next_actions": actions_np,
                             }
                         )
                     output_actions = transformed_outputs["actions"]
