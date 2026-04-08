@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import logging
+import os
 import time
 from typing import Any
 
@@ -69,6 +70,12 @@ class Args:
 
     policy_timeout: float = 300.0
     """Timeout in seconds for policy server requests. Should be long enough to cover JIT compilation on first call."""
+
+    debug: bool = False
+    """Debug mode: skip policy server, save camera images to disk and print state instead."""
+
+    debug_output_dir: str = "/tmp/eval_debug"
+    """Directory to save debug images when --debug is set."""
 
 
 # =============================================================================
@@ -395,6 +402,36 @@ def run_episode(
 # =============================================================================
 
 
+def _check_connection(url: str, name: str, timeout: float = 5.0) -> None:
+    """Send a GET to the health endpoint and raise if it fails."""
+    try:
+        r = requests.get(f"{url}/health", timeout=timeout)
+        r.raise_for_status()
+        logger.info(f"{name} health check passed ({url}/health).")
+    except requests.RequestException as e:
+        raise RuntimeError(f"{name} not reachable at {url}/health: {e}") from e
+
+
+def run_debug_episode(env: Any, args: Args) -> None:
+    """Reset the robot, save camera images, and print the state. No policy needed."""
+    os.makedirs(args.debug_output_dir, exist_ok=True)
+
+    logger.info("Debug mode: resetting environment...")
+    obs, _ = env.reset(seed=0)
+
+    state = extract_state(obs)
+    print(f"State vector (dim={state.shape[0]}):\n{state}")
+
+    images_bgr = extract_images_bgr(obs, args.camera_names)
+    for cam_name, img in images_bgr.items():
+        safe_name = cam_name.replace("/", "_")
+        path = os.path.join(args.debug_output_dir, f"{safe_name}.png")
+        cv2.imwrite(path, img)
+        logger.info(f"Saved {cam_name} image ({img.shape}) to {path}")
+
+    logger.info(f"Debug output saved to {args.debug_output_dir}")
+
+
 def main(args: Args) -> None:
     import sys
     from pathlib import Path
@@ -403,6 +440,24 @@ def main(args: Args) -> None:
     from remote_environment_adapter import RemoteEnvironmentAdapter
 
     logger.info(f"embodiment={args.embodiment!r}")
+
+    if args.debug:
+        robot_url = f"http://{args.robot_host}:{args.robot_port}/api"
+        policy_url = f"http://{args.policy_host}:{args.policy_port}/api"
+        _check_connection(robot_url, "Robot server")
+        _check_connection(policy_url, "Policy server")
+
+        logger.info(f"Connecting to robot environment at {args.robot_host}:{args.robot_port}")
+        env = RemoteEnvironmentAdapter(host=args.robot_host, port=args.robot_port)
+        run_debug_episode(env, args)
+        env.close()
+        return
+
+    # Verify both servers are reachable before loading anything.
+    policy_url = f"http://{args.policy_host}:{args.policy_port}/api"
+    robot_url = f"http://{args.robot_host}:{args.robot_port}/api"
+    _check_connection(policy_url, "Policy server")
+    _check_connection(robot_url, "Robot server")
 
     policy_client = PolicyServerClient(host=args.policy_host, port=args.policy_port, timeout=args.policy_timeout)
 

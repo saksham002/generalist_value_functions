@@ -16,11 +16,11 @@ dependencies = [
     "gym-aloha>=0.1.1",
     "gymnasium",
     "imageio>=2.36.1",
-    "jax==0.5.3",
+    "jax[cuda12]==0.5.3; sys_platform == 'linux'",
     "jaxtyping==0.2.36",
     "lerobot",
     "ml_collections==1.0.0",
-    "numpy>=1.22.4",
+    "numpy>=1.22.4,<2.0.0",
     "numpydantic>=1.6.6",
     "opencv-python>=4.10.0.84",
     "minari[all,mujoco]>=0.5.2",
@@ -39,9 +39,8 @@ dependencies = [
     "transformers==4.53.2",
     "rich>=14.0.0",
     "polars>=1.30.0",
+    "umap-learn>=0.5.0",
     "distrax>=0.1.5",
-    "tensorflow-probability>=0.25.0",
-    "tf-keras>=2.16.0",
     "ipdb>=0.13.13",
     "mujoco==3.1.6",
     "gymnasium-robotics>=1.2.3",
@@ -55,16 +54,13 @@ tpu = [
     "jax[tpu]==0.5.3",
     "libtpu==0.0.11.4",
 ]
-mmdit = [
-    "mmdit-jax",
+eval = [
+    "flask>=3.0.0",
+    "flask-cors>=4.0.0",
+    "h5py>=3.10.0",
+    "requests>=2.31.0",
 ]
-cosmos = [
-    "cosmos-predict2",
-]
-cosmos-cuda = [
-    "cosmos-cuda",
-]
-# Legacy D4RL support - may conflict with gymnasium, use with caution.
+# Legacy D4RL support - may conflict with gymnasium, use with caution
 legacy_d4rl = [
     "cython<3",
     "gym==0.23.1",
@@ -87,19 +83,17 @@ dev = [
 ]
 rlds = [
     "dlimp",
-    "tensorflow-cpu==2.20.0",
+    "tensorflow-cpu==2.15.0",
     "tensorflow-datasets==4.9.9",
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.5.3", "tensorstore==0.1.74", "av<14", "tensorflow-cpu==2.20.0", "transformers==4.53.2"]
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "tensorflow-probability==0.23.0"]
 dependency-metadata = [
-    # dlimp pins tensorflow==2.15.0 in setup.py; remap to tensorflow-cpu for resolver compatibility.
-    { name = "dlimp", version = "0.0.1", requires-dist = ["tensorflow-cpu==2.20.0", "tensorflow-datasets>=4.9.2"] },
+    { name = "dlimp", version = "0.0.1", requires-dist = ["tensorflow-cpu==2.15.0", "tensorflow-datasets>=4.9.2"] },
 ]
 # Allow resolving for macOS (without CUDA) and Linux
 environments = [
-    "sys_platform == 'darwin'",
     "sys_platform == 'linux'",
 ]
 find-links = ["https://storage.googleapis.com/jax-releases/libtpu_releases.html"]
@@ -115,9 +109,6 @@ conflicts = [
 openpi-client = { workspace = true }
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
 dlimp = { git = "https://github.com/maxsobolmark/dlimp" }
-mmdit-jax = { path = "third_party/mmdit_jax", editable = true }
-cosmos-predict2 = { path = "third_party/cosmos_predict2.5", editable = true }
-cosmos-cuda = { path = "third_party/cosmos_predict2.5/packages/cosmos-cuda", editable = true }
 
 [tool.uv.workspace]
 members = ["packages/*"]

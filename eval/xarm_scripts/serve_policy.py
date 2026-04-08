@@ -55,6 +55,9 @@ class Args:
     host: str = "0.0.0.0"
     """Interface to bind to."""
 
+    fine_tune_config: str | None = None
+    """Optional FineTuneConfig name from config.py. If set, applies overrides to the base config."""
+
 
 # =============================================================================
 # Policy server
@@ -64,45 +67,50 @@ class Args:
 class PolicyServer:
     """Loads a π₀ policy checkpoint and serves single-observation inference requests."""
 
-    def __init__(self, config_name: str, checkpoint_dir: str) -> None:
+    def __init__(self, config_name: str, checkpoint_dir: str, fine_tune_config: str | None = None) -> None:
         self._rng_lock = threading.Lock()
-        self._load_policy(config_name, checkpoint_dir)
+        
+        #self._load_policy(config_name, checkpoint_dir, fine_tune_config)
 
-    def _load_policy(self, config_name: str, checkpoint_dir: str) -> None:
-        #Code here copied from line 257-338 of computer_counterfactual_actions.py
-        from etils import epath
+    def _load_policy(self, config_name: str, checkpoint_dir: str, fine_tune_config: str | None = None) -> None:
+        import dataclasses as dc
+
         from flax import nnx
-        import orbax.checkpoint as ocp
 
         import openpi.policies.policy as _policy_module
-        import openpi.shared.nnx_utils as _nnx_utils
+        import openpi.shared.nnx_utils as nnx_utils
         import openpi.transforms as _transforms
+        from openpi.robocoin_utils.load_model_utils import load_policy_train_module, restore_state_with_shardings
         from openpi.training import checkpoints as _checkpoints
+        import openpi.training.sharding as sharding
 
         config = _config.get_config(config_name)
+        if fine_tune_config is not None:
+            ft_config = _config.get_fine_tune_config(fine_tune_config)
+            config = ft_config.apply_overrides(config)
+            logger.info(f"Applied FineTuneConfig '{fine_tune_config}' overrides to base config.")
         policy_model_config = config.policy if config.policy is not None else config.model
 
         logger.info(f"Loading policy from {checkpoint_dir}")
-        checkpoint_dir_path = epath.Path(checkpoint_dir)
-        all_params = _model.restore_params(checkpoint_dir_path / "params", dtype=jnp.bfloat16)
 
-        # For actor-critic checkpoints, params are structured as {"policy": ..., "critic": ...}.
-        # Extract the policy subtree so we can load it into the BC policy model config.
-        if "policy" in all_params:
-            policy_params = all_params["policy"]
-            if "params" in policy_params and len(policy_params) == 1:
-                policy_params = policy_params["params"]
-            logger.info(f"Extracted policy params with keys: {list(policy_params.keys())[:10]}")
-        else:
-            policy_params = all_params
+        train_module = load_policy_train_module()
+        local_devices = jax.local_device_count()
+        local_config = dc.replace(config, fsdp_devices=local_devices)
+        init_rng = jax.random.PRNGKey(86)
+        mesh = sharding.make_mesh(local_devices)
 
-        model_instance = nnx.eval_shape(policy_model_config.create, jax.random.key(0))
-        graphdef, state = nnx.split(model_instance)
-        policy_params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), policy_params)
-        _nnx_utils.replace_state_from_pure_dict_numeric_key_compat(state, policy_params)
-        model = nnx.merge(graphdef, state)
+        train_state_shape, state_sharding = train_module.init_train_state(local_config, init_rng, mesh, resume=True)
+
+        mngr, _ = _checkpoints.initialize_checkpoint_dir(
+            checkpoint_dir, keep_period=None, overwrite=False, resume=True
+        )
+        train_state = restore_state_with_shardings(mngr, train_state_shape, state_sharding)
+
+        model = nnx.merge(train_state.model_def, train_state.params)
 
         data_config = config.data.create(config.assets_dirs, policy_model_config)
+        from etils import epath
+        checkpoint_dir_path = epath.Path(checkpoint_dir)
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir_path / "assets", data_config.asset_id)
 
         policy = _policy_module.Policy(
@@ -136,7 +144,6 @@ class PolicyServer:
             object.__setattr__(self._model.config, "guidance", 0.0)
             logger.info("Disabled classifier-free guidance (guidance=0.0).")
 
-        from openpi.shared import nnx_utils
         self._sample_actions_jit = nnx_utils.module_jit(self._model.sample_actions)
         logger.info("Policy loaded and JIT-compiled successfully.")
 
@@ -160,6 +167,14 @@ class PolicyServer:
             if not isinstance(v, str)
         }
 
+        # Mask out the last 20 action positions so the model only attends to the first 30.
+        action_horizon = self._model.action_horizon
+        action_mask = jnp.concatenate([
+            jnp.ones(action_horizon - 20, dtype=jnp.bool_),
+            jnp.zeros(20, dtype=jnp.bool_),
+        ])[None, :]  # (1, action_horizon)
+        batched["action_mask"] = action_mask
+
         observation = _model.Observation.from_dict(batched)
         transition = _model.wrap_observation_as_transition(observation)
 
@@ -170,6 +185,8 @@ class PolicyServer:
         actions_out = jax.block_until_ready(actions_out)
 
         actions_np = np.asarray(actions_out[0])  # [action_horizon, action_dim]
+        actions_np = actions_np[:30]
+
         decoded = self._output_transform({
             "embodiment": obs_dict.get("embodiment", ""),
             "state": raw_state,
@@ -177,7 +194,9 @@ class PolicyServer:
             "next_state": raw_state,
             "next_actions": actions_np,
         })
-        return np.asarray(decoded["actions"], dtype=np.float32)
+        actions = np.asarray(decoded["actions"], dtype=np.float32)
+        actions = np.repeat(actions, 2, axis=0)
+        return actions
 
 
 # =============================================================================
@@ -238,8 +257,8 @@ def predict():
 
 def main(args: Args) -> None:
     global _server
-    logger.info(f"Loading policy: config={args.config_name}, checkpoint={args.checkpoint_dir}")
-    _server = PolicyServer(args.config_name, args.checkpoint_dir)
+    logger.info(f"Loading policy: config={args.config_name}, checkpoint={args.checkpoint_dir}, fine_tune={args.fine_tune_config}")
+    _server = PolicyServer(args.config_name, args.checkpoint_dir, args.fine_tune_config)
     logger.info(f"Starting server on {args.host}:{args.port}")
     app.run(host=args.host, port=args.port, threaded=False)
 

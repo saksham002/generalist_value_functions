@@ -30,7 +30,7 @@ fi
 
 # Server configuration
 PORT=8080
-HOST="0.0.0.0"
+HOST="xarmpc.pc.cs.cmu.edu"
 CONTROL_FREQ=60
 TIME_LIMIT=1800  # 30 minutes (increased for manual intervention + policy eval)
 
