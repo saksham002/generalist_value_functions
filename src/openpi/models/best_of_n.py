@@ -43,8 +43,13 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
 
     use_target_value: bool = False
 
-    # Norm stats for renormalizing actions between policy and critic spaces.
-    # Both must be None (default, no renormalization) or both non-None.
+    # Norm stats for renormalizing actions before passing to the critic.
+    # Three valid modes:
+    #   - both None: no renormalization (actions are already in critic space)
+    #   - both provided: unnormalize from policy space, then normalize into critic space
+    #   - only critic_norm_stats: actions are already unnormalized (e.g. cached
+    #     counterfactual actions), so just normalize into critic space
+    # policy_norm_stats alone is not valid.
     policy_norm_stats: dict[str, NormStats] | None = None
     critic_norm_stats: dict[str, NormStats] | None = None
 
@@ -64,8 +69,12 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
         # Cached-only mode: action_dim and action_horizon must be provided
         elif self.action_dim == 0 or self.action_horizon == 0:
             raise ValueError("action_dim and action_horizon must be provided when base_model_config is None")
-        if (self.policy_norm_stats is None) != (self.critic_norm_stats is None):
-            raise ValueError("policy_norm_stats and critic_norm_stats must both be None or both be provided")
+        if self.policy_norm_stats is not None and self.critic_norm_stats is None:
+            raise ValueError(
+                "policy_norm_stats was provided without critic_norm_stats. "
+                "Either provide both (to renormalize between policy and critic spaces), "
+                "or only critic_norm_stats (when actions are already unnormalized)."
+            )
 
     @property
     @override
@@ -149,14 +158,20 @@ class BestOfNWrapper(_model.BaseModel):
         self.critic_norm_stats = critic_norm_stats
 
     def _renormalize_actions(self, actions: at.Array) -> at.Array:
-        """Unnormalize from policy action space, then normalize into critic action space."""
+        """Bring actions into the critic's normalized action space.
+
+        If policy_norm_stats is provided, unnormalize from policy action space first.
+        Otherwise, actions are assumed to already be unnormalized (e.g. cached
+        counterfactual actions) and are only normalized into the critic action space.
+        """
         action_key = "actions"
         data = {action_key: actions}
-        # Filter to just the "actions" key — Unnormalize uses strict=True and would
+        # Filter to just the "actions" key — Normalize/Unnormalize use strict=True and would
         # fail if norm_stats contains keys (e.g. "state") not present in data.
-        policy_action_stats = {action_key: self.policy_norm_stats[action_key]}
         critic_action_stats = {action_key: self.critic_norm_stats[action_key]}
-        data = _transforms.Unnormalize(policy_action_stats)(data)
+        if self.policy_norm_stats is not None:
+            policy_action_stats = {action_key: self.policy_norm_stats[action_key]}
+            data = _transforms.Unnormalize(policy_action_stats)(data)
         data = _transforms.Normalize(critic_action_stats)(data)
         return data[action_key]
 
@@ -253,8 +268,8 @@ class BestOfNWrapper(_model.BaseModel):
         action_horizon = all_actions.shape[2]
         action_dim_size = all_actions.shape[3]
 
-        # Renormalize actions if policy and critic use different norm stats.
-        eval_actions = self._renormalize_actions(all_actions) if self.policy_norm_stats is not None else all_actions
+        # Renormalize actions into critic space if critic norm stats were provided.
+        eval_actions = self._renormalize_actions(all_actions) if self.critic_norm_stats is not None else all_actions
 
         expanded_obs = expand_observation(observation, n)
         flat_actions = eval_actions.reshape(batch_size * n, action_horizon, action_dim_size)

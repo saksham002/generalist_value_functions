@@ -14,6 +14,7 @@ from openpi.models.best_of_n import BestOfNWrapper
 import openpi.models.model as _model
 from openpi.robocoin_utils.load_model_utils import load_train_module, restore_params_with_shardings
 from openpi.robocoin_utils.utils import cache_val_episodes, count_subtask_segments, get_obs_and_action
+import openpi.shared.normalize as _normalize
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
@@ -225,6 +226,14 @@ def main(eval_config: EvalConfig):
         num_samples = first_frames[0]["counterfactual_actions"].shape[0]
         network_config = config.model.network_config
 
+        # Cached counterfactual actions are stored unnormalized, so we only need
+        # the critic's norm stats to map them into the critic's normalized action space.
+        # Load these from the checkpoint's assets dir rather than the data config's
+        # assets dir, which may not point at the same place.
+        critic_norm_stats_dir = os.path.join(eval_config.checkpoint_path, "assets", data_config.asset_id)
+        critic_norm_stats = _normalize.load(critic_norm_stats_dir)
+        logger.info(f"Loaded critic norm stats from {critic_norm_stats_dir}")
+
         bon_model = BestOfNWrapper(
             action_dim = network_config.action_dim,
             action_horizon = action_horizon,
@@ -235,6 +244,7 @@ def main(eval_config: EvalConfig):
             use_target_value = False,
             selection_mode = "argmax",
             softmax_temperature = 1.0,
+            critic_norm_stats = critic_norm_stats,
         )
 
         @nnx.jit
