@@ -9,9 +9,9 @@ set -e
 # =============================================================================
 
 CONFIG_NAME="robocoin_bimanual_pi05"
-CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_finetune"
+CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/robocoin_bimanual_pi05_rlds/real_hang_state_pi05_finetune/"
 FINE_TUNE_CONFIG="real_hang_pi05_finetune"  # Optional: FineTuneConfig name from config.py. Leave empty to skip.
-STEP=429999
+STEP=329999
 
 ROBOT_HOST="xarmpc.pc.cs.cmu.edu"
 ROBOT_PORT=8080

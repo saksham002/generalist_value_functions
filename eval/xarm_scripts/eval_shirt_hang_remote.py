@@ -13,24 +13,42 @@ Usage:
 
 from __future__ import annotations
 
-import dataclasses
 import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
+logger = logging.getLogger(__name__)
+
+logger.info("Importing standard library modules...")
+import dataclasses
 import os
 import time
 from typing import Any
 
+logger.info("Importing cv2...")
 import cv2
+
+logger.info("Importing jax...")
 import jax
+
+logger.info("Importing jax.numpy...")
 import jax.numpy as jnp
+
+logger.info("Importing numpy...")
 import numpy as np
+
+logger.info("Importing requests...")
 import requests
+
+logger.info("Importing scipy...")
 from scipy.spatial.transform import Rotation
+
+logger.info("Importing tyro...")
 import tyro
 
+logger.info("Importing openpi.models.model...")
 import openpi.models.model as _model
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
-logger = logging.getLogger(__name__)
+logger.info("All imports complete.")
 
 
 # =============================================================================
@@ -220,21 +238,14 @@ class LocalPolicy:
 
         # Extract the 14-D EEF action subset, first 30 steps only.
         actions = np.asarray(decoded["actions"], dtype=np.float32)[:30]
-        unnormalize_gripper(actions)
 
-
-        # Policy predicts EEF deltas; add initial pose to position + euler components.
+        # Policy predicts global actions relative to current state; add current pose to get absolute base frame targets.
         actions += initial_eef_pose
 
-        actions = np.repeat(actions, 2, axis = 0)
+        # Policy outputs 30 Hz actions; robot runs at 60 Hz.
+        actions = np.repeat(actions, 2, axis=0)
 
-        # Compute step-wise deltas (relative transforms between consecutive actions).
-        deltas = _compute_stepwise_deltas(actions)
-
-        # Policy outputs 30 Hz actions; robot runs at 60 Hz. Repeat each delta twice.
-        # deltas = np.repeat(deltas, 2, axis=0)
-
-        return deltas
+        return actions
 
 
 # =============================================================================
@@ -394,43 +405,6 @@ _CAMERA_MAP = {
 _GRIPPER_MIN = 70.0
 _GRIPPER_MAX = 850.0
 
-
-def _compute_stepwise_deltas(actions: np.ndarray) -> np.ndarray:
-    """Compute step-wise deltas from absolute action chunk.
-
-    For each consecutive pair (a_i, a_{i+1}), computes the relative transformation.
-    Position and gripper dims use direct subtraction. Euler angles use rotation
-    matrix relative transform: R_delta = R_{i+1} @ R_i^{-1}.
-
-    Args:
-        actions: float32 array of shape [T, 14] with layout per 7-D arm block:
-            [pos(3), euler(3), gripper(1)].
-
-    Returns:
-        deltas: float32 array of shape [T, 14]. First row is zeros (identity delta).
-    """
-    T = actions.shape[0]
-    deltas = np.zeros((T, 14), dtype = np.float32)
-
-    for arm_offset in (0, 7):
-        pos_curr = actions[:-1, arm_offset : arm_offset + 3]
-        pos_next = actions[1:, arm_offset : arm_offset + 3]
-        deltas[1:, arm_offset : arm_offset + 3] = pos_next - pos_curr
-
-        euler_curr = actions[:-1, arm_offset + 3 : arm_offset + 6]
-        euler_next = actions[1:, arm_offset + 3 : arm_offset + 6]
-        R_curr = Rotation.from_euler("xyz", euler_curr)
-        R_next = Rotation.from_euler("xyz", euler_next)
-        R_delta = R_next * R_curr.inv()
-        deltas[1:, arm_offset + 3 : arm_offset + 6] = R_delta.as_euler("xyz").astype(np.float32)
-
-        grip_curr = actions[:-1, arm_offset + 6]
-        grip_next = actions[1:, arm_offset + 6]
-        deltas[1:, arm_offset + 6] = grip_next - grip_curr
-
-    return deltas
-
-
 def _quat_to_euler(quat: np.ndarray) -> np.ndarray:
     """Convert quaternion (x, y, z, w) to Euler angles (roll, pitch, yaw).
 
@@ -450,13 +424,6 @@ def _quat_to_euler(quat: np.ndarray) -> np.ndarray:
     yaw = np.arctan2(siny_cosp, cosy_cosp)
 
     return np.array([roll, pitch, yaw], dtype = np.float32)
-
-
-def unnormalize_gripper(action: np.ndarray) -> None:
-    """In-place unnormalize gripper columns from [0, 1] to [GRIPPER_MIN, GRIPPER_MAX]."""
-    action[:, 6] = _GRIPPER_MIN + (action[:, 6] * (_GRIPPER_MAX - _GRIPPER_MIN))
-    action[:, 13] = _GRIPPER_MIN + (action[:, 13] * (_GRIPPER_MAX - _GRIPPER_MIN))
-
 
 def extract_state(obs: dict[str, Any]) -> np.ndarray:
     """Extract 14-D EEF state in euler format matching the training norm stats.
@@ -555,7 +522,7 @@ def run_episode(
             )
 
         plan_idx = min(t % args.query_freq, action_plan.shape[0] - 1)
-        import ipdb; ipdb.set_trace()
+        #import ipdb; ipdb.set_trace()
         action = action_plan[plan_idx]
         # action = np.zeros_like(action)
 
