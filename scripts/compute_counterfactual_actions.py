@@ -56,6 +56,36 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 
+def _resolve_config_with_fine_tune(config_name: str, fine_tune: str | None):
+    """Resolve openpi config and optionally apply a FineTuneConfig's overrides.
+
+    Mirrors the fine-tune handling in `scripts/train_value_function.py` (with
+    `pretrained_step = None`, since we are not training): only data/model/interval
+    overrides are applied, no schedule offsetting.
+
+    Returns (config, data_config, dataset_cfg, model_config).
+    """
+    import openpi.training.config as _config
+
+    config = _config.get_config(config_name)
+    if fine_tune is not None:
+        ft_config = _config.get_fine_tune_config(fine_tune)
+        config = ft_config.apply_overrides(config)
+
+    data_config = config.data.create(config.assets_dirs, config.model)
+
+    if data_config.rlds_data_dir is None:
+        raise ValueError("Config must have rlds_data_dir set.")
+
+    datasets = data_config.datasets
+    if not datasets:
+        raise ValueError("Config must have datasets configured.")
+    if len(datasets) > 1:
+        logger.warning("Multiple datasets configured, only processing first one.")
+
+    return config, data_config, datasets[0], config.model
+
+
 # =============================================================================
 # Argument dataclasses
 # =============================================================================
@@ -67,6 +97,9 @@ class CommonArgs:
 
     config_name: str = "cosmos_robocoin_bc_flow"
     """Config name to resolve RLDS data source and policy."""
+
+    fine_tune: str | None = None
+    """Optional FineTuneConfig name to apply on top of the base config (data/model overrides)."""
 
     checkpoint_dir: str = ""
     """Path to the trained policy checkpoint (required)."""
@@ -88,6 +121,10 @@ class CommonArgs:
 
     debug_metrics: bool = False
     """If True, compute extra normalized-space diagnostics such as sampling loss."""
+
+    reverse: bool = False
+    """If True, reverse shard processing order and skip metadata writes. Intended for running
+    a second set of workers that converge from the opposite end."""
 
 
 @dataclasses.dataclass
@@ -214,7 +251,7 @@ def run_worker(args: WorkerArgs) -> None:
     if not args.checkpoint_dir:
         raise ValueError("--checkpoint-dir is required.")
 
-    config, data_config, dataset_cfg, _ = resolve_config(args.config_name)
+    config, data_config, dataset_cfg, _ = _resolve_config_with_fine_tune(args.config_name, args.fine_tune)
 
     # Create builder once and reuse for metadata queries and dataset loading
     source_builder = tfds.builder(dataset_cfg.name, data_dir=data_config.rlds_data_dir, version=dataset_cfg.version)
@@ -234,12 +271,17 @@ def run_worker(args: WorkerArgs) -> None:
         if args.only_shard < 0 or args.only_shard >= num_shards:
             raise ValueError(f"--only-shard={args.only_shard} out of range [0, {num_shards}).")
         my_shards = [args.only_shard]
+    if args.reverse:
+        my_shards = my_shards[::-1]
     my_episode_count = sum(shard_info[i][1] for i in my_shards)
 
     logger.info(
         f"Worker {worker_id}/{num_workers}: assigned {len(my_shards)} shards "
         f"({my_episode_count} episodes total)"
+        + (" [REVERSE order]" if args.reverse else "")
     )
+    if args.reverse:
+        logger.warning("--reverse mode: metadata files, manifest, and done marker will NOT be written.")
 
     output_dir = epath.Path(args.output_dir)
     worker_dir = output_dir / "_workers" / f"worker_{worker_id}"
@@ -427,7 +469,10 @@ def run_worker(args: WorkerArgs) -> None:
         masked_steps = np.where(include_subtasks, steps_all, np.iinfo(np.int32).max)
         sampled_idx = int(np.argmin(masked_steps))
         selected_steps = int(steps_all[sampled_idx])
-        action_mask = np.arange(action_horizon, dtype = np.int32) <= selected_steps
+        if data_config.rlds_kwargs["mask_boundary_actions"]:
+            action_mask = np.arange(action_horizon, dtype = np.int32) <= selected_steps
+        else:
+            action_mask = np.ones(action_horizon, dtype = np.bool_)
         if fps == 30:
             valid_30fps_actions = 3 * action_horizon // 5
             action_mask &= np.arange(action_horizon, dtype = np.int32) < valid_30fps_actions
@@ -436,10 +481,21 @@ def run_worker(args: WorkerArgs) -> None:
 
     # Get action dimensions from policy model config
     action_horizon = policy_model_config.action_horizon
-    action_dim = policy_model_config.action_dim
+    action_dim_mask = getattr(policy_model_config, "action_dim_mask", None)
+    if action_dim_mask is not None:
+        action_dim_mask = np.asarray(action_dim_mask, dtype = np.bool_)
+        action_dim = int(np.sum(action_dim_mask))
+    else:
+        action_dim = policy_model_config.action_dim
     max_subtasks = 5
 
-    logger.info(f"Action horizon={action_horizon}, action_dim={action_dim}, num_samples={args.num_samples}")
+    logger.info(
+        f"Action horizon={action_horizon}, action_dim={action_dim}, num_samples={args.num_samples}, "
+        f"action_dim_mask={action_dim_mask}, "
+        f"mask_boundary_actions={data_config.rlds_kwargs.get('mask_boundary_actions')}, "
+        f"use_chunk_wise_delta={data_config.rlds_kwargs.get('use_chunk_wise_delta')}, "
+        f"rng_seed=0 (hardcoded in Policy)"
+    )
 
     # Create manifest
     manifest = ca_store.CounterfactualActionStoreManifest(
@@ -471,7 +527,28 @@ def run_worker(args: WorkerArgs) -> None:
             parts.append(f"{key}={value:.2f}s ({100.0 * value / total_time:.1f}%)")
         return ", ".join(parts)
 
-    for shard_idx in my_shards:
+    for shard_list_pos, shard_idx in enumerate(my_shards):
+        # In reverse mode, stop early if the forward worker has caught up: if the 5th
+        # upcoming shard (in our reversed order) already exists, both ends have converged.
+        if args.reverse:
+            lookahead = 10
+            lookahead_pos = shard_list_pos + lookahead
+            if lookahead_pos < len(my_shards):
+                lookahead_shard_idx = my_shards[lookahead_pos]
+                lookahead_path = (
+                    worker_dir
+                    / ca_store.COUNTERFACTUAL_ACTION_STORE_DATASET_NAME
+                    / ca_store.VERSION
+                    / ca_store.get_shard_filename(args.split, lookahead_shard_idx)
+                )
+                if lookahead_path.exists():
+                    logger.info(
+                        "Worker %d: reverse lookahead shard %d (position +%d) already exists, "
+                        "forward worker has caught up. Stopping early.",
+                        worker_id, lookahead_shard_idx, lookahead,
+                    )
+                    break
+
         start_pos, num_episodes = shard_info[shard_idx]
 
         # Apply max_episodes limit
@@ -635,6 +712,8 @@ def run_worker(args: WorkerArgs) -> None:
                     if hasattr(step_state, "numpy"):
                         step_state = step_state.numpy()
                     step_state = np.array(step_state, dtype=np.float32)
+                    if data_config.rlds_kwargs["state_dim"] == 16 and step_state.shape[-1] == 14:
+                        step_state = np.concatenate([step_state[:6], [0.0], step_state[6:13], [0.0], step_state[13:]], axis = 0).astype(np.float32)
 
                     # Decode images once per step (not per subtask)
                     decoded_images = {}
@@ -819,29 +898,32 @@ def run_worker(args: WorkerArgs) -> None:
                                 "actions": actions_np,
                                 "next_state": batch_states,
                                 "next_actions": actions_np,
+                                "counterfactual_actions": actions_np,
+                                "counterfactual_next_actions": actions_np,
                             }
                         )
                     output_actions = transformed_outputs["actions"]
+                    if action_dim_mask is not None:
+                        output_actions = output_actions[..., action_dim_mask]
 
                     offset = 0
                     for request, n in batch_requests:
                         request_actions = actions_np[offset : offset + n]
+                        if action_dim_mask is not None:
+                            request_actions = request_actions[..., action_dim_mask]
                         if args.debug_metrics:
+                            gt_actions = request.gt_actions
+                            if action_dim_mask is not None:
+                                gt_actions = gt_actions[..., action_dim_mask]
                             gt_actions_broadcast = np.broadcast_to(
-                                request.gt_actions[None, ...],
+                                gt_actions[None, ...],
                                 request_actions.shape,
                             )
                             abs_diff = np.abs(request_actions - gt_actions_broadcast)
                             sq_diff = np.square(request_actions - gt_actions_broadcast)
 
-                            if getattr(model, "action_dim_mask", None) is not None:
-                                dim_mask = np.asarray(model.action_dim_mask, dtype = np.float32)[None, None, :]
-                                dim_mask_den = max(float(np.sum(dim_mask)), 1.0)
-                                l1_per_step = np.sum(abs_diff * dim_mask, axis = -1) / dim_mask_den
-                                mse_per_step = np.sum(sq_diff * dim_mask, axis = -1) / dim_mask_den
-                            else:
-                                l1_per_step = np.mean(abs_diff, axis = -1)
-                                mse_per_step = np.mean(sq_diff, axis = -1)
+                            l1_per_step = np.mean(abs_diff, axis = -1)
+                            mse_per_step = np.mean(sq_diff, axis = -1)
 
                             step_mask = request.action_mask.astype(np.float32)[None, :]
                             episode_sampling_l1_sum += float(np.sum(l1_per_step * step_mask))
@@ -902,16 +984,17 @@ def run_worker(args: WorkerArgs) -> None:
             "num_bytes": shard_writer.total_bytes,
         }
 
-    # Save manifest
-    ca_store.save_manifest(manifest, str(worker_dir))
+    if not args.reverse:
+        # Save manifest
+        ca_store.save_manifest(manifest, str(worker_dir))
 
-    # Save shard metadata
-    shard_metadata_path = worker_dir / "shard_metadata.json"
-    with shard_metadata_path.open("w") as f:
-        json.dump(shard_metadata, f, indent=2)
+        # Save shard metadata
+        shard_metadata_path = worker_dir / "shard_metadata.json"
+        with shard_metadata_path.open("w") as f:
+            json.dump(shard_metadata, f, indent=2)
 
-    done_marker.parent.mkdir(parents=True, exist_ok=True)
-    done_marker.write_text(f"completed at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        done_marker.parent.mkdir(parents=True, exist_ok=True)
+        done_marker.write_text(f"completed at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
     if timed_episode_count > 0:
         average_times = {key: value / timed_episode_count for key, value in worker_times.items()}
@@ -951,7 +1034,7 @@ def run_launch(args: LaunchArgs) -> None:
         import tensorflow as tf
 
         tf.config.set_visible_devices([], "GPU")
-        _, data_config, dataset_cfg, _ = resolve_config(args.config_name)
+        _, data_config, dataset_cfg, _ = _resolve_config_with_fine_tune(args.config_name, args.fine_tune)
         total_episodes = get_total_episodes(data_config.rlds_data_dir, dataset_cfg, args.split)
 
     logger.info(f"Total source episodes: {total_episodes}")
@@ -959,6 +1042,8 @@ def run_launch(args: LaunchArgs) -> None:
         logger.info(f"  Worker {worker_id} -> {worker_partitions[worker_id]}")
 
     log_dir = epath.Path(args.log_dir_base).expanduser() / args.config_name
+    if args.fine_tune is not None:
+        log_dir = log_dir / args.fine_tune
     if args.ssh_host:
         subprocess.run(["ssh", args.ssh_host, f"mkdir -p {shlex.quote(str(log_dir))}"], check=True)
     else:
@@ -997,6 +1082,10 @@ def run_launch(args: LaunchArgs) -> None:
         extra_worker_args += ["--max-episodes", str(args.max_episodes)]
     if args.debug_metrics:
         extra_worker_args += ["--debug-metrics"]
+    if args.reverse:
+        extra_worker_args += ["--reverse"]
+    if args.fine_tune is not None:
+        extra_worker_args += ["--fine-tune", args.fine_tune]
 
     extra_args_str = " ".join(extra_worker_args)
 
@@ -1015,7 +1104,8 @@ def run_launch(args: LaunchArgs) -> None:
             worker_cmd += f" {extra_args_str}"
 
         wrap_cmd = _make_wrap_cmd(worker_cmd)
-        log_pattern = str(log_dir / f"ca_store_worker_{worker_id}.log")
+        log_suffix = "_reverse" if args.reverse else ""
+        log_pattern = str(log_dir / f"ca_store_worker_{worker_id}{log_suffix}.log")
 
         sbatch_cmd = [
             "sbatch",
@@ -1067,6 +1157,8 @@ def run_launch(args: LaunchArgs) -> None:
             merge_partition,
             "--mem",
             "32GB",
+            "--gres",
+            args.gres,
             "--time",
             "04:00:00",
             "--output",

@@ -21,9 +21,18 @@ Key features:
 
 from collections.abc import Sequence
 import logging
-from typing import Any
+from typing import Any, Literal
 
 import openpi.training.rlds_dataset as rlds_dataset
+
+
+SubtaskPromptMode = Literal["subtask_only", "all_subtasks", "all_subtasks_predict_current_subtask"]
+
+ALL_SUBTASKS_HANG_PROMPT = (
+    "Grasp the hanger. Lift the hanger off the rod. Pass hanger from right to left arm. "
+    "Hook one side of the shirt onto the hanger. Hook the other side of the shirt onto the hanger. "
+    "Place the hanger on the rod."
+)
 
 
 class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
@@ -55,8 +64,10 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         filter_n: int | None = None,
         mask_50fps: bool = False,
         mask_boundary_actions: bool = True,
+        variable_horizon: bool = False,
         use_chunk_wise_delta: bool = False,
         state_dim: int = 14,
+        subtask_prompt_mode: SubtaskPromptMode = "subtask_only",
         include_images: bool = True,
         return_trajectories: bool = False,
         max_trajectories: int | None = None,
@@ -64,6 +75,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         latent_store_dir: str | None = None,
         latent_views: Sequence[rlds_dataset.latent_store.LatentViewConfig] = (),
         counterfactual_action_store_dir: str | None = None,
+        counterfactual_action_dim_offset: int = 0,
     ):
         if td_n is not None and td_n % 5 != 0:
             raise ValueError(f"td_n must be a multiple of 5, got {td_n}")
@@ -71,22 +83,36 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             raise ValueError(f"action_chunk_size must be a multiple of 5, got {action_chunk_size}")
         if filter_n is not None and filter_n % 5 != 0:
             raise ValueError(f"filter_n must be a multiple of 5, got {filter_n}")
+        if variable_horizon and mask_boundary_actions:
+            raise ValueError("variable_horizon=True requires mask_boundary_actions=False")
+        if variable_horizon and td_n != action_chunk_size:
+            raise ValueError(
+                "variable_horizon=True requires td_n == action_chunk_size, "
+                f"got td_n={td_n}, action_chunk_size={action_chunk_size}"
+            )
 
+        self._split = split
         self._use_eef = use_eef
         self._td_n = td_n
         self._filter_n = filter_n
         self._mask_50fps = mask_50fps
         self._mask_boundary_actions = mask_boundary_actions
+        self._variable_horizon = variable_horizon
         self._use_chunk_wise_delta = use_chunk_wise_delta
         self._state_dim = state_dim
         self._state_dim_checked = False
+        self._subtask_prompt_mode = subtask_prompt_mode
+        self._counterfactual_action_dim_offset = counterfactual_action_dim_offset
         logging.info(
             f"RoboCoinRldsDataset: critic_mode={critic_mode}, discount={discount}, "
             f"reward_scale={reward_scale}, reward_bias={reward_bias}, use_eef={use_eef}, "
             f"td_n={td_n}, filter_n={filter_n}, mask_50fps={mask_50fps}, "
             f"mask_boundary_actions={mask_boundary_actions}, "
+            f"variable_horizon={variable_horizon}, "
             f"use_chunk_wise_delta={use_chunk_wise_delta}, "
-            f"state_dim={state_dim}"
+            f"state_dim={state_dim}, "
+            f"subtask_prompt_mode={subtask_prompt_mode}, "
+            f"counterfactual_action_dim_offset={counterfactual_action_dim_offset}"
         )
 
         super().__init__(
@@ -116,7 +142,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
 
     def trajectory_transforms(self, traj: dict, dataset_cfg: rlds_dataset.RLDSDataset) -> dict:
         """Extract trajectory fields used by the frame-level transform."""
-        del dataset_cfg
         import tensorflow as tf
 
         if self._use_eef:
@@ -130,6 +155,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         traj_len = tf.shape(state)[0]
         fps = traj["traj_metadata"]["episode_metadata"]["fps"]
         repo_id = traj["traj_metadata"]["episode_metadata"]["repo_id"]
+        task_description = traj["traj_metadata"]["episode_metadata"]["task_description"]
         embodiment = tf.repeat(self._extract_embodiment(repo_id[0])[None], traj_len)
 
         observation = {"state": state}
@@ -150,9 +176,15 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             "first_null_index": traj["first_null_index"],
             "fps": fps,
             "repo_id": repo_id,
+            "task_description": task_description,
             "embodiment": embodiment,
         }
-        for key in ("index", "episode_index", "_frame_index", "_traj_index"):
+        metadata_keys = ("index", "episode_index", "_frame_index", "_traj_index")
+        if dataset_cfg.name != "robocoin":
+            metadata_keys = metadata_keys + ("repo_index",)
+        del dataset_cfg
+
+        for key in metadata_keys:
             if key in traj:
                 result[key] = traj[key]
 
@@ -211,7 +243,16 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             if key.startswith(("latents/", "_latent")):
                 mapped_traj[key] = value
         if "counterfactual_actions" in raw_traj:
-            mapped_traj["counterfactual_actions"] = raw_traj["counterfactual_actions"]
+            counterfactual_actions = raw_traj["counterfactual_actions"]
+            if self._counterfactual_action_dim_offset > 0:
+                action_dim = mapped_traj["actions"].shape[-1]
+                if action_dim is None:
+                    raise ValueError("Expected static action dimension for RoboCOIN actions.")
+                counterfactual_actions = counterfactual_actions[
+                    ...,
+                    self._counterfactual_action_dim_offset : self._counterfactual_action_dim_offset + action_dim,
+                ]
+            mapped_traj["counterfactual_actions"] = counterfactual_actions
         for key in ("_ca_episode_index",):
             if key in raw_traj:
                 mapped_traj[key] = raw_traj[key]
@@ -220,18 +261,53 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
 
         traj_len = tf.shape(mapped_traj["actions"])[0]
         fps = tf.cast(mapped_traj["fps"][0], tf.int32)
-        next_indices = self._compute_next_indices(traj_len, fps)
+
+        offsets = tf.range(self._action_chunk_size, dtype = tf.int32)
+        steps = tf.cast(mapped_traj["steps_to_subtask_end"], tf.int32)
+        base_action_mask = offsets[None, None, :] <= steps[:, :, None]
+        mapped_traj["action_mask"] = base_action_mask
+
+        if self._td_n is None:
+            next_indices = self._compute_next_indices(traj_len, fps)
+        elif self._variable_horizon:
+            sampled_k_cap = tf.where(
+                tf.equal(fps, 30),
+                tf.constant(3 * self._action_chunk_size // 5, dtype = tf.int32),
+                tf.constant(self._action_chunk_size, dtype = tf.int32),
+            )
+            if self._split == "train":
+                sampled_k_native = tf.random.uniform(
+                    tf.shape(steps),
+                    minval = 1,
+                    maxval = sampled_k_cap + 1,
+                    dtype = tf.int32,
+                )
+            else:
+                sampled_k_native = tf.broadcast_to(sampled_k_cap, tf.shape(steps))
+            k_native = tf.minimum(sampled_k_native, tf.reduce_sum(tf.cast(base_action_mask, tf.int32), axis = -1))
+            next_indices = tf.minimum(tf.range(traj_len, dtype = tf.int32)[:, None] + k_native, traj_len - 1)
+            mapped_traj["variable_k_native"] = k_native
+            mapped_traj["action_mask"] = offsets[None, None, :] < k_native[:, :, None]
+            mapped_traj["next_action_mask"] = mapped_traj["action_mask"] & (offsets[None, None, :] <= (steps - k_native)[:, :, None])
+        else:
+            next_indices = self._compute_next_indices(traj_len, fps)
+            td_n_native = tf.where(tf.equal(fps, 30), 3 * self._td_n // 5, self._td_n)
+            mapped_traj["next_action_mask"] = offsets[None, None, :] <= (steps - td_n_native)[:, :, None]
 
         mapped_traj["next_observation"] = {
             key: tf.gather(value, next_indices) for key, value in mapped_traj["observation"].items()
         }
-        mapped_traj["next_actions_raw"] = tf.gather(mapped_traj["actions"], next_indices)
 
-        offsets = tf.range(self._action_chunk_size, dtype = tf.int32)
-        steps = tf.cast(mapped_traj["steps_to_subtask_end"], tf.int32)
-        mapped_traj["action_mask"] = offsets[None, None, :] <= steps[:, :, None]
-        next_steps = tf.gather(steps, next_indices)
-        mapped_traj["next_action_mask"] = offsets[None, None, :] <= next_steps[:, :, None]
+        if self._variable_horizon:
+            next_action_indices = tf.minimum(
+                tf.range(traj_len, dtype = tf.int32)[:, None, None]
+                + mapped_traj["variable_k_native"][:, :, None]
+                + offsets[None, None, :],
+                traj_len - 1,
+            )
+        else:
+            next_action_indices = tf.minimum(next_indices[:, None] + offsets[None, :], traj_len - 1)
+        mapped_traj["next_actions"] = tf.gather(mapped_traj["actions"], next_action_indices)
 
         if "counterfactual_actions" in mapped_traj:
             mapped_traj["counterfactual_next_actions"] = tf.gather(mapped_traj["counterfactual_actions"], next_indices)
@@ -275,55 +351,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         """Decode images, select a subtask, and produce the final per-frame batch keys."""
         import tensorflow as tf
 
-        frame = super().frame_transforms(frame)
-
-        images, image_masks = self._restructure_images(frame)
-        next_images, next_image_masks = self._restructure_images(frame, prefix = "next_")
-
-        raw_state = tf.cast(frame["observation"]["state"], tf.float32)
-        raw_next_state = tf.cast(frame["next_observation"]["state"], tf.float32)
-
-        if self._state_dim == 14:
-            if not self._state_dim_checked:
-                tf.debugging.assert_equal(
-                    tf.shape(raw_state)[-1], 14,
-                    message = "state_dim=14 but raw state is not 14D",
-                )
-                self._state_dim_checked = True
-            frame["state"] = raw_state
-            frame["next_state"] = raw_next_state
-        elif self._state_dim == 16:
-            raw_dim = tf.shape(raw_state)[-1]
-            if not self._state_dim_checked:
-                tf.debugging.assert_rank(raw_state, 1)
-                self._state_dim_checked = True
-            frame["state"] = tf.cond(
-                tf.equal(raw_dim, 16),
-                lambda: raw_state,
-                lambda: tf.concat([raw_state[:6], [0.0], raw_state[6:13], [0.0], raw_state[13:]], axis = 0),
-            )
-            frame["next_state"] = tf.cond(
-                tf.equal(raw_dim, 16),
-                lambda: raw_next_state,
-                lambda: tf.concat([raw_next_state[:6], [0.0], raw_next_state[6:13], [0.0], raw_next_state[13:]], axis = 0),
-            )
-
-        del frame["observation"]
-        del frame["next_observation"]
-
-        frame["actions"] = tf.cast(frame["actions"], tf.float32)
-        frame["next_actions"] = tf.cast(frame["next_actions"], tf.float32)
-        if self._use_chunk_wise_delta:
-            frame["actions"] = frame["actions"] - frame["actions"][:1, :]
-            frame["next_actions"] = frame["next_actions"] - frame["next_actions"][:1, :]
-
-        if images:
-            frame["image"] = images
-            frame["image_mask"] = image_masks
-        if next_images:
-            frame["next_image"] = next_images
-            frame["next_image_mask"] = next_image_masks
-
         first_null_index = tf.cast(frame["first_null_index"], tf.int32)
         steps_all = tf.cast(frame["steps_to_subtask_end"], tf.int32)
 
@@ -332,12 +359,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         else:
             safe_upper = tf.maximum(first_null_index, 1)
             sampled_idx = tf.random.uniform([], minval = 0, maxval = safe_upper, dtype = tf.int32)
-
-        selected_steps = steps_all[sampled_idx]
-        selected_steps_f = tf.cast(selected_steps, tf.float32)
-        loss_mask = first_null_index > 0
-        if self._mask_50fps:
-            loss_mask = tf.logical_and(loss_mask, tf.equal(tf.cast(frame["fps"], tf.int32), 30))
 
         subtask_texts = tf.stack(
             [
@@ -357,38 +378,125 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             & tf.not_equal(lower_subtask_texts, b"abnormal")
         )
 
+        masked_steps = tf.where(include_subtasks, steps_all, tf.int32.max)
+        min_idx = tf.argmin(masked_steps, output_type = tf.int32)
+
         if self._critic_mode:
+            # When counterfactual actions are cached, the policy generated them
+            # using the min-length valid subtask's mask. Use the same index for
+            # action_mask / next_action_mask so ReplaceMaskedActions and the
+            # network's attention mask are consistent with the cached actions.
+            if self._counterfactual_action_store_dir is not None and self._mask_boundary_actions:
+                sampled_idx = min_idx
             frame["prompt"] = subtask_texts[sampled_idx]
         else:
             selected_texts = tf.boolean_mask(stripped_subtask_texts, include_subtasks)
             frame["prompt"] = tf.strings.reduce_join(selected_texts, separator = ", ")
-            masked_steps = tf.where(include_subtasks, steps_all, tf.int32.max)
-            sampled_idx = tf.argmin(masked_steps, output_type = tf.int32)
-            selected_steps = steps_all[sampled_idx]
-            selected_steps_f = tf.cast(selected_steps, tf.float32)
+            sampled_idx = min_idx
 
-        loss_mask = tf.logical_and(loss_mask, include_subtasks[sampled_idx])
-        frame["steps_to_subtask_end"] = selected_steps
+        if self._variable_horizon:
+            frame["next_observation"] = {
+                key: value[sampled_idx] for key, value in frame["next_observation"].items()
+            }
+            frame["next_actions"] = frame["next_actions"][sampled_idx]
+            if "counterfactual_next_actions" in frame:
+                frame["counterfactual_next_actions"] = frame["counterfactual_next_actions"][sampled_idx]
+            if self._use_chunk_wise_delta:
+                frame["next_actions"] = frame["next_actions"] - frame["next_actions"][:1, :]
+        else:
+            frame["next_actions"] = tf.cast(frame["next_actions"], tf.float32)
+            if self._use_chunk_wise_delta:
+                frame["next_actions"] = frame["next_actions"] - frame["next_actions"][:1, :]
+
+        frame = super().frame_transforms(frame)
+
+        images, image_masks = self._restructure_images(frame)
+        raw_state = tf.cast(frame["observation"]["state"], tf.float32)
+
+        if self._state_dim == 14:
+            if not self._state_dim_checked:
+                tf.debugging.assert_equal(
+                    tf.shape(raw_state)[-1], 14,
+                    message = "state_dim=14 but raw state is not 14D",
+                )
+                self._state_dim_checked = True
+            frame["state"] = raw_state
+        elif self._state_dim == 16:
+            raw_dim = tf.shape(raw_state)[-1]
+            if not self._state_dim_checked:
+                tf.debugging.assert_rank(raw_state, 1)
+                self._state_dim_checked = True
+            frame["state"] = tf.cond(
+                tf.equal(raw_dim, 16),
+                lambda: raw_state,
+                lambda: tf.concat([raw_state[:6], [0.0], raw_state[6:13], [0.0], raw_state[13:]], axis = 0),
+            )
+
+        del frame["observation"]
+
+        frame["actions"] = tf.cast(frame["actions"], tf.float32)
+        if self._use_chunk_wise_delta:
+            frame["actions"] = frame["actions"] - frame["actions"][:1, :]
+
+        if images:
+            frame["image"] = images
+            frame["image_mask"] = image_masks
+
+        raw_next_state = tf.cast(frame["next_observation"]["state"], tf.float32)
+        if self._state_dim == 14:
+            frame["next_state"] = raw_next_state
+        elif self._state_dim == 16:
+            raw_dim = tf.shape(raw_next_state)[-1]
+            frame["next_state"] = tf.cond(
+                tf.equal(raw_dim, 16),
+                lambda: raw_next_state,
+                lambda: tf.concat([raw_next_state[:6], [0.0], raw_next_state[6:13], [0.0], raw_next_state[13:]], axis = 0),
+            )
+
+        next_images, next_image_masks = self._restructure_images(frame, prefix = "next_")
+        if next_images:
+            frame["next_image"] = next_images
+            frame["next_image_mask"] = next_image_masks
+        del frame["next_observation"]
+
+        selected_steps = steps_all[sampled_idx]
+        frame["include_subtask"] = include_subtasks[sampled_idx]
         frame["sampled_index"] = sampled_idx
-        frame["loss_mask"] = loss_mask
 
         full_action_horizon = tf.shape(frame["action_mask"])[1]
-        if not self._mask_boundary_actions:
-            frame["action_mask"] = tf.ones([full_action_horizon], dtype = tf.bool)
-            frame["next_action_mask"] = tf.ones([full_action_horizon], dtype = tf.bool)
-        else:
+        if self._variable_horizon or self._mask_boundary_actions:
             frame["action_mask"] = frame["action_mask"][sampled_idx]
             frame["next_action_mask"] = frame["next_action_mask"][sampled_idx]
+        else:
+            frame["action_mask"] = tf.ones([full_action_horizon], dtype = tf.bool)
+            frame["next_action_mask"] = tf.ones([full_action_horizon], dtype = tf.bool)
+
+        if self._subtask_prompt_mode == "all_subtasks":
+            frame["prompt"] = tf.constant(ALL_SUBTASKS_HANG_PROMPT)
+            frame["subtask_text"] = tf.constant(b"")
+        elif self._subtask_prompt_mode == "all_subtasks_predict_current_subtask":
+            frame["prompt"] = tf.constant(ALL_SUBTASKS_HANG_PROMPT)
+            frame["subtask_text"] = subtask_texts[sampled_idx]
+
+        selected_steps_f = tf.cast(selected_steps, tf.float32)
+        frame["steps_to_subtask_end"] = selected_steps
 
         fps = tf.cast(frame["fps"], tf.int32)
         exponent_per_step = tf.cast(tf.where(tf.equal(fps, 30), 5, 3), tf.float32)
         frame["mc_return"] = tf.pow(self._discount, exponent_per_step * selected_steps_f)
 
         td_n = self._td_n if self._td_n is not None else 0
-        frame["td_discount"] = tf.pow(self._discount, 3.0 * tf.cast(td_n, tf.float32))
+        if self._variable_horizon:
+            k_native = tf.cast(frame["variable_k_native"][sampled_idx], tf.int32)
+            frame["td_discount"] = tf.pow(self._discount, exponent_per_step * tf.cast(k_native, tf.float32))
+        else:
+            frame["td_discount"] = tf.pow(self._discount, 3.0 * tf.cast(td_n, tf.float32))
 
         if self._td_n is not None:
-            td_n_native = tf.where(tf.equal(fps, 30), 3 * td_n // 5, td_n)
+            if self._variable_horizon:
+                td_n_native = tf.cast(frame["variable_k_native"][sampled_idx], tf.int32)
+            else:
+                td_n_native = tf.where(tf.equal(fps, 30), 3 * td_n // 5, td_n)
             termination = selected_steps < td_n_native
             td_reward = tf.pow(self._discount, exponent_per_step * selected_steps_f)
             frame["termination"] = termination
@@ -409,6 +517,8 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             tf.logical_and(frame["next_action_mask"], fps_mask_30),
             frame["next_action_mask"],
         )
+        if self._variable_horizon:
+            frame["variable_k_native"] = tf.cast(frame["variable_k_native"][sampled_idx], tf.int32)
 
         return frame
 
@@ -426,11 +536,17 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         return tf.nest.map_structure(lambda x: tf.boolean_mask(x, mask), traj)
 
     def frame_filter(self, frame: dict) -> bool:
-        """Filter frames by the selected subtask horizon when filter_n is configured."""
+        """Filter out frames with invalid subtasks or insufficient horizon."""
         import tensorflow as tf
 
-        if self._filter_n is None:
-            return tf.constant(value = True)
-        fps = tf.cast(frame["fps"], tf.int32)
-        filter_n_native = tf.where(tf.equal(fps, 30), 3 * self._filter_n // 5, self._filter_n)
-        return frame["steps_to_subtask_end"] >= filter_n_native
+        keep = tf.constant(True)
+        if self._mask_50fps:
+            keep = tf.logical_and(keep, tf.equal(tf.cast(frame["fps"], tf.int32), 30))
+        keep = tf.logical_and(keep, frame["include_subtask"])
+
+        if self._filter_n is not None:
+            fps = tf.cast(frame["fps"], tf.int32)
+            filter_n_native = tf.where(tf.equal(fps, 30), 3 * self._filter_n // 5, self._filter_n)
+            keep = tf.logical_and(keep, frame["steps_to_subtask_end"] >= filter_n_native)
+
+        return keep

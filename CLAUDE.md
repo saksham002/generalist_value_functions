@@ -12,6 +12,14 @@ openpi is Physical Intelligence's open-source repository for Vision-Language-Act
 
 The repository supports both JAX and PyTorch implementations, with JAX being the primary framework and PyTorch support validated on LIBERO benchmark.
 
+## Error Notifications
+
+When you encounter an unexpected failure, error, or bug (e.g., a command fails, a job crashes, a test produces wrong results), send exactly one Slack message with a brief description of the issue:
+```bash
+python ~/utils/slack.py "brief description of the error"
+```
+Do not send more than one message per distinct error. Do not ask for permission — this command is pre-approved.
+
 ## Development Commands
 
 ### Environment Setup
@@ -26,6 +34,8 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 # Update submodules (required for some examples)
 git submodule update --init --recursive
 ```
+
+**Note**: The virtualenv is already sourced in `~/.bashrc`, so `python` can be used directly instead of `uv run` for running scripts.
 
 ### Testing
 ```bash
@@ -339,6 +349,7 @@ def compute_value(
 **CRITICAL**: You must NEVER push changes to the remote repository without explicit user approval.
 - Always ask the user for permission to push, displaying the commit messages.
 - Wait for an explicit "yes" or "push" from the user before running any `git push` command.
+- **Always run `git fetch origin main` before checking what exists on the main branch.** The local copy of `origin/main` can be stale.
 
 ## Important Development Notes
 
@@ -423,16 +434,52 @@ When setting up a new TPU pod, refer to `TPU_GUIDE.md` for important setup steps
 
 **Design rule**: Keep the TPU launch pipeline generic. Do not hard-code script-specific behavior into `run_on_tpu.py`, `src/openpi/tpu/`, or similar shared TPU orchestration code. If a specific script needs TPU-only behavior (for example, avoiding `jax.distributed.initialize()` and using one-worker semantics), implement that in the launched script or its TPU wrapper, not in the shared TPU pipeline.
 
-#### Checking if a TPU pod is free
-To check whether any worker is actively using the TPU accelerator:
+#### Launching jobs via `scripts/run_on_tpu.py`
+
+When launching training via `run_on_tpu.py`, the `--command` must include additional args derived from `pod_config.py`. These are **not** automatically injected by `run_on_tpu.py`:
+
+**For policy training** (`scripts/train.py`):
 ```bash
-gcloud compute tpus tpu-vm ssh <pod-name> --zone=europe-west4-b --worker=all --command="sudo lsof -w /dev/accel0 2>/dev/null; echo exit_\$?"
+python scripts/run_on_tpu.py --tpu-type v5e-64 --tpu-name <pod-name> \
+  --command "python scripts/train.py <config_name> --resume \
+    --batch-size=256 \
+    --checkpoint-base-dir=gs://saksham-euw4/checkpoints/robocoin/pi05_finetune \
+    --project-name=robocoin_value_learning \
+    --log-interval=100 \
+    --wandb-group=Policies"
 ```
-If all workers print only `exit_0` with no other output, the pod is free.
+
+**For value function training** (`scripts/train_value_function.py`):
+```bash
+python scripts/run_on_tpu.py --tpu-type v5e-64 --tpu-name <pod-name> \
+  --command "python scripts/train_value_function.py <config_name> --resume \
+    --batch-size=256 \
+    --checkpoint-base-dir=gs://saksham-euw4/checkpoints/robocoin/value_functions/<Q|V> \
+    --project-name=robocoin_value_learning \
+    --log-interval=100 \
+    --wandb-group='Value Functions'"
+```
+
+#### TPU job logs
+Jobs launched via `run_on_tpu.py` write output to `~/tpu_job_output.log` on each worker. The exit code is written to `~/tpu_job_exit_code`. To check logs:
+```bash
+gcloud compute tpus tpu-vm ssh <pod-name> --zone=europe-west4-b --worker=0 --command="tail -100 ~/tpu_job_output.log"
+```
+
+#### Checking if a TPU pod is free
+```bash
+gcloud compute tpus tpu-vm ssh <pod-name> --zone=europe-west4-b --worker=all --command="sudo lsof /dev/vfio/0 2>/dev/null || echo 'free'"
+```
+If any worker shows a process holding `/dev/vfio/0`, the TPU is busy. Ask the user how to proceed before taking any action.
+
+#### Killing all processes on a TPU pod
+```bash
+gcloud compute tpus tpu-vm ssh <pod-name> --zone=europe-west4-b --worker=all --command="pkill -9 python"
+```
 
 #### Stale TPU lockfile
 JAX acquires `/tmp/libtpu_lockfile` on TPU init. If a job crashes without cleanup, the lockfile remains and blocks subsequent runs. To fix:
-1. Confirm the pod is truly free using the `lsof` command above.
+1. Confirm the pod is truly free using the check above.
 2. Delete the lockfile on all workers:
 ```bash
 gcloud compute tpus tpu-vm ssh <pod-name> --zone=europe-west4-b --worker=all --command="sudo rm -f /tmp/libtpu_lockfile"

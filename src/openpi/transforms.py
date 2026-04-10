@@ -147,6 +147,8 @@ class Normalize(DataTransformFn):
             raise ValueError("Embodiment-keyed normalization requires 'embodiment' in the sample.")
 
         embodiment = data["embodiment"]
+        if isinstance(embodiment, np.ndarray):
+            embodiment = embodiment.item()
         if isinstance(embodiment, bytes):
             embodiment = embodiment.decode("utf-8")
         if embodiment not in self.norm_stats:
@@ -157,14 +159,12 @@ class Normalize(DataTransformFn):
         return self.norm_stats[embodiment]
 
     def _normalize(self, x, stats: NormStats):
-        mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
-        return (x - mean) / (std + 1e-6)
+        return (x - stats.mean) / (stats.std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
-        q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
-        return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        return (x - stats.q01) / (stats.q99 - stats.q01 + 1e-6) * 2.0 - 1.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -191,25 +191,46 @@ class ReplaceMaskedActions(DataTransformFn):
         fps = int(np.asarray(data["fps"]).item())
         noise_scale = 0.002 if self.use_quantile_norm else 0.005
 
-        for actions_key, mask_key in (("actions", "action_mask"), ("next_actions", "next_action_mask")):
+        for actions_key, mask_key in (
+            ("actions", "action_mask"),
+            ("next_actions", "next_action_mask"),
+            ("counterfactual_actions", "action_mask"),
+            ("counterfactual_next_actions", "next_action_mask"),
+        ):
+            if actions_key not in data:
+                continue
+
             actions = np.asarray(data[actions_key]).copy()
             action_mask = np.asarray(data[mask_key], dtype = np.bool_).copy()
+            if actions.ndim not in (2, 3):
+                raise ValueError(f"{actions_key} must have rank 2 or 3, got shape {actions.shape}")
 
-            last_valid_idx = int(action_mask.sum()) - 1
-            if last_valid_idx < 0:
-                raise ValueError(f"{mask_key} must contain at least one valid action.")
+            last_valid_idx = max(int(action_mask.sum()) - 1, 0)
 
-            last_valid_action = actions[last_valid_idx]
-            noise = (noise_scale * self.rng.standard_normal(actions.shape)).astype(actions.dtype)
-            replacement = last_valid_action[None, :] + noise
+            if actions.ndim == 3:
+                # [num_samples, action_horizon, action_dim] — broadcast mask across samples
+                # Use the same noise across all samples so replacement is consistent
+                last_valid_action = actions[:, last_valid_idx]
+                shared_noise = (noise_scale * self.rng.standard_normal(actions.shape[1:])).astype(actions.dtype)
+                replacement = last_valid_action[:, None, :] + shared_noise[None, :, :]
+                mask_broadcast = action_mask[None, :, None]
+                actions = np.where(mask_broadcast, actions, replacement)
+            else:
+                last_valid_action = actions[last_valid_idx]
+                noise = (noise_scale * self.rng.standard_normal(actions.shape)).astype(actions.dtype)
+                replacement = last_valid_action[None, :] + noise
+                actions[~action_mask] = replacement[~action_mask]
 
-            actions[~action_mask] = replacement[~action_mask]
+            data[actions_key] = actions
+
+        for mask_key in ("action_mask", "next_action_mask"):
+            if mask_key not in data:
+                continue
+            action_mask = np.asarray(data[mask_key], dtype = np.bool_).copy()
             action_mask[:] = True
             if fps == 30:
                 action_horizon = action_mask.shape[0]
                 action_mask[3 * action_horizon // 5 :] = False
-
-            data[actions_key] = actions
             data[mask_key] = action_mask
 
         return data
@@ -250,6 +271,8 @@ class Unnormalize(DataTransformFn):
             raise ValueError("Embodiment-keyed unnormalization requires 'embodiment' in the sample.")
 
         embodiment = data["embodiment"]
+        if isinstance(embodiment, np.ndarray):
+            embodiment = embodiment.item()
         if isinstance(embodiment, bytes):
             embodiment = embodiment.decode("utf-8")
         if embodiment not in self.norm_stats:
@@ -342,7 +365,7 @@ class AbsoluteActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
-    tokenizer: _tokenizer.PaligemmaTokenizer
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer
     discrete_state_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
@@ -360,6 +383,47 @@ class TokenizePrompt(DataTransformFn):
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeRoboCoinSubtaskPrompt(DataTransformFn):
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer
+    prefix_text: str
+    discrete_state_input: bool = False
+
+    def __call__(self, data: DataDict) -> DataDict:
+        prefix = data.pop("prompt", None)
+        suffix = data.pop("subtask_text", None)
+        if prefix is None or suffix is None:
+            raise ValueError("Both prompt and subtask_text are required")
+
+        if not isinstance(prefix, str):
+            prefix = prefix.item()
+        if not isinstance(suffix, str):
+            suffix = suffix.item()
+
+        if prefix != self.prefix_text:
+            raise ValueError(f"Expected prefix {self.prefix_text!r}, got {prefix!r}")
+
+        if self.discrete_state_input:
+            if (state := data.get("state", None)) is None:
+                raise ValueError("State is required.")
+        else:
+            state = None
+
+        tokens, token_masks, subtask_start_index, subtask_end_index = _tokenize_robocoin_subtask_prompt(
+            self.tokenizer,
+            prefix,
+            suffix,
+            state = state,
+        )
+        return {
+            **data,
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": token_masks,
+            "subtask_start_index": np.int32(subtask_start_index),
+            "subtask_end_index": np.int32(subtask_end_index),
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -534,6 +598,54 @@ def _insert_at_offset(x: np.ndarray, target_dim: int, offset: int) -> np.ndarray
     out = np.zeros(out_shape, dtype = x.dtype)
     out[..., offset : offset + real_dim] = x
     return out
+
+
+def _clean_prompt_text(prompt: str) -> str:
+    return prompt.strip().replace("_", " ").replace("\n", " ")
+
+
+def _tokenize_robocoin_subtask_prompt(
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer,
+    prefix: str,
+    suffix: str,
+    *,
+    state: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    if state is not None:
+        raise NotImplementedError("TokenizeRoboCoinSubtaskPrompt does not support discrete state input.")
+
+    cleaned_prefix = _clean_prompt_text(prefix)
+    cleaned_suffix = _clean_prompt_text(suffix)
+
+    # Tokenize prefix and suffix separately so the split index is correct by construction.
+    # SentencePiece is non-compositional across boundaries — joining the strings before
+    # encoding can shift tokens at the boundary and invalidate len(prefix_tokens) as the split.
+    prefix_tokens = tokenizer._tokenizer.encode(cleaned_prefix, add_bos = True)
+    suffix_tokens = tokenizer._tokenizer.encode(cleaned_suffix, add_bos = False)
+    newline_tokens = tokenizer._tokenizer.encode("\n")
+    raw_tokens = prefix_tokens + suffix_tokens + newline_tokens
+    subtask_start_index = len(prefix_tokens)
+    subtask_end_index = subtask_start_index + len(suffix_tokens) - 1
+
+    if isinstance(tokenizer, _tokenizer.Gemma3Tokenizer) and tokenizer._num_images > 0:
+        soi_markers = [_tokenizer.Gemma3Tokenizer.START_OF_IMAGE_ID] * tokenizer._num_images
+        raw_tokens = [raw_tokens[0]] + soi_markers + raw_tokens[1:]
+        subtask_start_index += tokenizer._num_images
+        subtask_end_index += tokenizer._num_images
+
+    max_len = tokenizer._max_len + (tokenizer._num_images if isinstance(tokenizer, _tokenizer.Gemma3Tokenizer) else 0)
+    tokens_len = len(raw_tokens)
+    if tokens_len < max_len:
+        padding = [False] * (max_len - tokens_len)
+        token_mask = [True] * tokens_len + padding
+        raw_tokens = raw_tokens + padding
+    else:
+        raw_tokens = raw_tokens[:max_len]
+        token_mask = [True] * max_len
+        subtask_start_index = min(subtask_start_index, max_len)
+        subtask_end_index = min(subtask_end_index, max_len - 1)
+
+    return np.asarray(raw_tokens), np.asarray(token_mask), subtask_start_index, subtask_end_index
 
 
 def pad_to_dim(x: np.ndarray, target_dim: int, axis: int = -1, value: float = 0.0) -> np.ndarray:

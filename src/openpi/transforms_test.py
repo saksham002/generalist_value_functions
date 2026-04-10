@@ -85,6 +85,28 @@ def test_tokenize_no_prompt():
         transform({})
 
 
+def test_tokenize_robocoin_subtask_prompt():
+    tokenizer = _tokenizer.PaligemmaTokenizer(max_len = 48)
+    prefix = "Grasp the hanger. Lift the hanger off the rod."
+    suffix = "Hook one side of the shirt onto the hanger."
+    transform = _transforms.TokenizeRoboCoinSubtaskPrompt(tokenizer = tokenizer, prefix_text = prefix)
+
+    data = transform({"prompt": prefix, "subtask_text": suffix})
+
+    assert "subtask_start_index" in data
+    assert "subtask_end_index" in data
+    subtask_start_index = int(data["subtask_start_index"])
+    subtask_end_index = int(data["subtask_end_index"])
+    expected_prefix_ids = list(tokenizer._tokenizer.encode(prefix, add_bos = True))
+    actual_prefix_ids = [int(t) for t in data["tokenized_prompt"][: subtask_start_index]]
+    assert actual_prefix_ids == expected_prefix_ids
+    decoded_prefix = tokenizer.decode(data["tokenized_prompt"][: subtask_start_index])
+    decoded_suffix = tokenizer.decode(data["tokenized_prompt"][subtask_start_index : subtask_end_index + 1])
+    assert "Grasp the hanger." in decoded_prefix
+    assert "Lift the hanger off the rod." in decoded_prefix
+    assert "Hook one side of the shirt onto the hanger." in decoded_suffix
+
+
 def test_resize_images_resizes_next_image():
     transform = _transforms.ResizeImages(8, 8)
     image = np.zeros((4, 6, 3), dtype = np.uint8)

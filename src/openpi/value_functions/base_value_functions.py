@@ -38,6 +38,10 @@ def _extract_observations_from_batch(batch: dict) -> tuple[_model.Observation, _
     image_masks = {k: jnp.asarray(v) for k, v in batch.get("image_mask", {}).items()}
     next_images = _convert_images_to_float(batch.get("next_image", {}))
     next_image_masks = {k: jnp.asarray(v) for k, v in batch.get("next_image_mask", {}).items()}
+    subtask_start_index = batch.get("subtask_start_index")
+    next_subtask_start_index = batch.get("next_subtask_start_index", subtask_start_index)
+    subtask_end_index = batch.get("subtask_end_index")
+    next_subtask_end_index = batch.get("next_subtask_end_index", subtask_end_index)
 
     observation = _model.Observation(
         images = images,
@@ -46,7 +50,8 @@ def _extract_observations_from_batch(batch: dict) -> tuple[_model.Observation, _
         tokenized_prompt = batch.get("tokenized_prompt"),
         tokenized_prompt_mask = batch.get("tokenized_prompt_mask"),
         action_mask = batch.get("action_mask"),
-        loss_mask = batch.get("loss_mask"),
+        subtask_start_index = jnp.asarray(subtask_start_index) if subtask_start_index is not None else None,
+        subtask_end_index = jnp.asarray(subtask_end_index) if subtask_end_index is not None else None,
     )
     next_observation = _model.Observation(
         images = next_images,
@@ -55,6 +60,8 @@ def _extract_observations_from_batch(batch: dict) -> tuple[_model.Observation, _
         tokenized_prompt = batch.get("next_tokenized_prompt", batch.get("tokenized_prompt")),
         tokenized_prompt_mask = batch.get("next_tokenized_prompt_mask", batch.get("tokenized_prompt_mask")),
         action_mask = batch.get("next_action_mask"),
+        subtask_start_index = jnp.asarray(next_subtask_start_index) if next_subtask_start_index is not None else None,
+        subtask_end_index = jnp.asarray(next_subtask_end_index) if next_subtask_end_index is not None else None,
     )
     return observation, next_observation
 
@@ -81,6 +88,9 @@ class Transition:
     termination: at.Bool[at.Array, "*b"] | None = None
     truncation: at.Bool[at.Array, "*b"] | None = None
     td_discount: at.Float[at.Array, "*b"] | None = None
+    # Pre-computed counterfactual actions for best-of-n evaluation at current state
+    # Shape: [batch, num_samples, action_horizon, action_dim]
+    counterfactual_actions: at.Float[at.Array, "*b k ah ad"] | None = None
     # Pre-computed counterfactual next actions for best-of-n TD backup
     # Shape: [batch, num_samples, action_horizon, action_dim]
     counterfactual_next_actions: at.Float[at.Array, "*b k ah ad"] | None = None
