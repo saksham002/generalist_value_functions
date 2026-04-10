@@ -56,6 +56,36 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 
+def _resolve_config_with_fine_tune(config_name: str, fine_tune: str | None):
+    """Resolve openpi config and optionally apply a FineTuneConfig's overrides.
+
+    Mirrors the fine-tune handling in `scripts/train_value_function.py` (with
+    `pretrained_step = None`, since we are not training): only data/model/interval
+    overrides are applied, no schedule offsetting.
+
+    Returns (config, data_config, dataset_cfg, model_config).
+    """
+    import openpi.training.config as _config
+
+    config = _config.get_config(config_name)
+    if fine_tune is not None:
+        ft_config = _config.get_fine_tune_config(fine_tune)
+        config = ft_config.apply_overrides(config)
+
+    data_config = config.data.create(config.assets_dirs, config.model)
+
+    if data_config.rlds_data_dir is None:
+        raise ValueError("Config must have rlds_data_dir set.")
+
+    datasets = data_config.datasets
+    if not datasets:
+        raise ValueError("Config must have datasets configured.")
+    if len(datasets) > 1:
+        logger.warning("Multiple datasets configured, only processing first one.")
+
+    return config, data_config, datasets[0], config.model
+
+
 # =============================================================================
 # Argument dataclasses
 # =============================================================================
@@ -67,6 +97,9 @@ class CommonArgs:
 
     config_name: str = "cosmos_robocoin_bc_flow"
     """Config name to resolve RLDS data source and policy."""
+
+    fine_tune: str | None = None
+    """Optional FineTuneConfig name to apply on top of the base config (data/model overrides)."""
 
     checkpoint_dir: str = ""
     """Path to the trained policy checkpoint (required)."""
@@ -218,7 +251,7 @@ def run_worker(args: WorkerArgs) -> None:
     if not args.checkpoint_dir:
         raise ValueError("--checkpoint-dir is required.")
 
-    config, data_config, dataset_cfg, _ = resolve_config(args.config_name)
+    config, data_config, dataset_cfg, _ = _resolve_config_with_fine_tune(args.config_name, args.fine_tune)
 
     # Create builder once and reuse for metadata queries and dataset loading
     source_builder = tfds.builder(dataset_cfg.name, data_dir=data_config.rlds_data_dir, version=dataset_cfg.version)
@@ -1001,7 +1034,7 @@ def run_launch(args: LaunchArgs) -> None:
         import tensorflow as tf
 
         tf.config.set_visible_devices([], "GPU")
-        _, data_config, dataset_cfg, _ = resolve_config(args.config_name)
+        _, data_config, dataset_cfg, _ = _resolve_config_with_fine_tune(args.config_name, args.fine_tune)
         total_episodes = get_total_episodes(data_config.rlds_data_dir, dataset_cfg, args.split)
 
     logger.info(f"Total source episodes: {total_episodes}")
@@ -1009,6 +1042,8 @@ def run_launch(args: LaunchArgs) -> None:
         logger.info(f"  Worker {worker_id} -> {worker_partitions[worker_id]}")
 
     log_dir = epath.Path(args.log_dir_base).expanduser() / args.config_name
+    if args.fine_tune is not None:
+        log_dir = log_dir / args.fine_tune
     if args.ssh_host:
         subprocess.run(["ssh", args.ssh_host, f"mkdir -p {shlex.quote(str(log_dir))}"], check=True)
     else:
@@ -1049,6 +1084,8 @@ def run_launch(args: LaunchArgs) -> None:
         extra_worker_args += ["--debug-metrics"]
     if args.reverse:
         extra_worker_args += ["--reverse"]
+    if args.fine_tune is not None:
+        extra_worker_args += ["--fine-tune", args.fine_tune]
 
     extra_args_str = " ".join(extra_worker_args)
 
@@ -1120,6 +1157,8 @@ def run_launch(args: LaunchArgs) -> None:
             merge_partition,
             "--mem",
             "32GB",
+            "--gres",
+            args.gres,
             "--time",
             "04:00:00",
             "--output",
