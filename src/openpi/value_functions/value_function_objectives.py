@@ -11,6 +11,7 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 
 from openpi.models import model as _model
 from openpi.policy_extraction.temperature import Temperature
@@ -67,6 +68,21 @@ def _compute_value_loss(head: ValueHead, features: at.Array, target: at.Array) -
     return jnp.square(head(features) - target)
 
 
+def next_token_objective(
+    network: BaseValueNetwork,
+    next_token_embeddings: at.Array,
+    next_token_targets: at.Array,
+    next_token_mask: at.Array,
+) -> at.Array:
+    if not hasattr(network, "decode"):
+        raise AttributeError(f"{type(network).__name__} does not support next-token decoding.")
+    logits = network.decode(next_token_embeddings)
+    per_token_loss = optax.softmax_cross_entropy_with_integer_labels(logits, next_token_targets)
+    masked_loss = jnp.where(next_token_mask, per_token_loss, 0.0)
+    denom = jnp.maximum(jnp.sum(next_token_mask, axis = -1), 1)
+    return jnp.sum(masked_loss, axis = -1) / denom
+
+
 def mc_objective(
     network: BaseValueNetwork,
     head: ValueHead,
@@ -110,6 +126,7 @@ def sarsa_objective(
     target_head: ValueHead,
     *,
     discount: float = 0.99,
+    next_token_loss_weight: float = 0.0,
     rng: at.KeyArrayLike | None = None,
 ) -> tuple[at.Array, dict[str, at.Array]]:
     """SARSA: target = r + gamma * Q(s', a').
@@ -141,8 +158,22 @@ def sarsa_objective(
     target = jax.lax.stop_gradient(target)
 
     action = transition.action if network.action_conditioned else None
-    features = network.compute_features(transition.observation, action, rng=rng)
+    network_out = network.compute_features(transition.observation, action, rng=rng)
+    if isinstance(network_out, tuple) and len(network_out) == 2 and isinstance(network_out[1], dict):
+        features, aux = network_out
+    else:
+        features, aux = network_out, {}
     loss = _compute_value_loss(head, features, target)
+    next_token_embeddings = aux.get("next_token_embeddings")
+    next_token_loss = None
+    if next_token_embeddings is not None:
+        next_token_loss = next_token_objective(
+            network,
+            next_token_embeddings,
+            aux["next_token_targets"],
+            aux["next_token_mask"],
+        )
+        loss = loss + next_token_loss_weight * next_token_loss
 
     pred = head(features)
     td_error = pred - target
@@ -157,6 +188,8 @@ def sarsa_objective(
         "mc_loss": mc_loss,
         "effective_discount": jnp.mean(effective_discount),
     }
+    if next_token_loss is not None:
+        info["next_token_loss"] = next_token_loss
     return loss, info
 
 

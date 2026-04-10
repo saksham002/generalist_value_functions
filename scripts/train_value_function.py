@@ -662,6 +662,10 @@ def value_function_train_step(
         mc_loss_arr = value_info.pop("mc_loss")
         value_stats["mc_loss"] = jnp.mean(mc_loss_arr)
 
+    if "next_token_loss" in value_info:
+        next_token_loss_arr = value_info.pop("next_token_loss")
+        value_stats["next_token_loss"] = jnp.mean(next_token_loss_arr)
+
     grads_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), grads)
     kernel_params_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), kernel_params)
     target_params_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), target_params)

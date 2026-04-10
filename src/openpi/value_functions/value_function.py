@@ -118,6 +118,7 @@ class SARSAValueFunctionConfig(ValueFunctionConfig):
 
     discount: float = 0.99
     tau: float = 0.005
+    next_token_loss_weight: float = 0.0
 
     @override
     def create(self, rng: at.KeyArrayLike) -> SARSAValueFunction:
@@ -140,6 +141,7 @@ class SARSAValueFunctionConfig(ValueFunctionConfig):
             target_head=target_head,
             discount=self.discount,
             tau=self.tau,
+            next_token_loss_weight=self.next_token_loss_weight,
         )
 
 
@@ -312,6 +314,7 @@ class SARSAValueFunction(ValueFunction):
     target_head: ValueHead
     discount: float
     tau: float
+    next_token_loss_weight: float
 
     def __init__(
         self,
@@ -321,12 +324,14 @@ class SARSAValueFunction(ValueFunction):
         target_head: ValueHead,
         discount: float,
         tau: float,
+        next_token_loss_weight: float,
     ):
         super().__init__(network, head)
         self.target_network = target_network
         self.target_head = target_head
         self.discount = discount
         self.tau = tau
+        self.next_token_loss_weight = next_token_loss_weight
 
     @override
     def compute_target_value(
@@ -361,6 +366,7 @@ class SARSAValueFunction(ValueFunction):
             self.target_network,
             self.target_head,
             discount=self.discount,
+            next_token_loss_weight=self.next_token_loss_weight,
             rng=rng,
         )
 

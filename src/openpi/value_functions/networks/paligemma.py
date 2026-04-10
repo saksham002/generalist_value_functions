@@ -60,45 +60,49 @@ NUM_PATCHES_PER_IMAGE = 256
 
 # Gemma 3 image block: [\n\n, <SOI>, 256 patches, <EOI>, \n\n]
 GEMMA3_TOKENS_PER_IMAGE_BLOCK = NUM_PATCHES_PER_IMAGE + 4
+MAX_SUBTASK_TOKENS_FOR_LOSS = 12
 
 
 def make_attn_mask(
     input_mask: jax.Array,
     mask_ar: jax.Array,
+    *,
+    suffix_mask: jax.Array | None = None,
 ) -> jax.Array:
     """Create attention mask for value network with state and CLS tokens at the end.
 
-    Sequence structure: [images] [text] [state] [CLS]
+    Sequence structure: [images] [prefix_text] [suffix_text] [state] [CLS]
 
-    Desired attention pattern:
-    - Images/Text: bidirectional with each other
-    - State: can attend to images/text, cannot be attended by images/text
-    - CLS (last position): can attend to ALL, cannot be attended by others
+    The cumsum of mask_ar groups tokens: positions sharing the same cumsum value
+    attend bidirectionally; a position with higher cumsum can attend to lower but
+    not vice-versa.  Suffix text tokens have mask_ar=1 so they are causal among
+    themselves and invisible to prefix tokens (lower cumsum).
 
-    The ar_mask format [0, 0...0, 1, 1] naturally achieves this via causal masking:
-    - Positions with ar_mask=0: bidirectional (images/text)
-    - Positions with ar_mask=1: causal (state, CLS) - can attend to earlier but not later
+    When suffix_mask is provided, an additional constraint prevents non-suffix
+    queries (state, actions, CLS) from attending to suffix keys, keeping the
+    value-relevant outputs independent of the subtask text.
 
     Args:
         input_mask: bool[B, N] true if part of the input, false if padding.
-        mask_ar: bool[B, N] or bool[N]. Format: [0, 0...0, 1, 1] where 0=bidirectional
-            (images/text), 1=causal (state, CLS).
+        mask_ar: bool[B, N] or bool[N]. 0=bidirectional, 1=causal.
+        suffix_mask: Optional bool[B, N]. True for suffix (subtask) text positions.
+            Non-suffix queries are blocked from attending to suffix keys.
 
     Returns:
         Attention mask [B, N, N] where True means "can attend".
     """
     mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
 
-    # Standard causal/bidirectional mask construction
-    # cumsum groups tokens by their ar_mask value
-    # Tokens with same cumsum value can attend to each other (bidirectional)
-    # Tokens with higher cumsum can attend to lower (causal)
     cumsum = jnp.cumsum(mask_ar, axis=1)
     mask = cumsum[:, None, :] <= cumsum[:, :, None]  # [B, N, N]
 
-    # Apply valid positions mask (both positions must be valid)
     valid = input_mask[:, None, :] * input_mask[:, :, None]
     mask = jnp.logical_and(mask, valid)
+
+    if suffix_mask is not None:
+        suffix_mask = jnp.broadcast_to(suffix_mask, input_mask.shape)
+        non_suffix_seeing_suffix = (~suffix_mask[:, :, None]) & suffix_mask[:, None, :]
+        mask = mask & ~non_suffix_seeing_suffix
 
     return mask
 
@@ -354,7 +358,7 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         observation: _model.Observation,
         action: jax.Array | None = None,
         action_mask: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
         """Embed full sequence: images + text + state + [actions] + CLS.
 
         Args:
@@ -363,12 +367,12 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             action_mask: Optional mask [B, action_horizon] for valid actions in chunk.
 
         Returns:
-            Tuple of (tokens, input_mask, ar_mask)
+            Tuple of (tokens, input_mask, ar_mask, suffix_mask)
             - tokens: [B, seq_len, embed_dim]
             - input_mask: [B, seq_len] bool
-            - ar_mask: [seq_len] bool - format [0, 0...0, 1, 1] where:
-              - 0s are for images/text (bidirectional)
-              - 1s are for state, actions, and CLS (causal: can attend to earlier, not later)
+            - ar_mask: [seq_len] or [B, seq_len] bool where 0=bidirectional
+              (images, prefix text), 1=causal (subtask text, state, actions, CLS)
+            - suffix_mask: [B, seq_len] bool or None — True for subtask text positions
         """
         tokens, input_mask, ar_mask = self._embed_prefix(observation)
         batch_size = observation.state.shape[0]
@@ -386,14 +390,27 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         cls_tokens = jnp.broadcast_to(self.cls_token.value, (batch_size, 1, self._embed_dim))
         tokens.append(cls_tokens)
         input_mask.append(jnp.ones((batch_size, 1), dtype = jnp.bool_))
-        # CLS uses ar_mask=True (causal - can attend to all previous but not be attended)
         ar_mask.append(True)
 
         tokens = jnp.concatenate(tokens, axis = 1)
         input_mask = jnp.concatenate(input_mask, axis = 1)
         ar_mask = jnp.array(ar_mask)
 
-        return tokens, input_mask, ar_mask
+        # Mark subtask text tokens as causal in ar_mask. The cumsum logic in
+        # make_attn_mask then ensures suffix tokens are causal among themselves
+        # and invisible to prefix tokens.
+        suffix_mask = None
+        if observation.subtask_start_index is not None and observation.tokenized_prompt is not None:
+            text_start = self._num_cameras * NUM_PATCHES_PER_IMAGE
+            text_len = observation.tokenized_prompt.shape[1]
+            seq_positions = jnp.arange(ar_mask.shape[0])
+            global_subtask_start = text_start + observation.subtask_start_index  # [B]
+            suffix_mask = (seq_positions[None, :] >= global_subtask_start[:, None]) & (
+                seq_positions[None, :] < text_start + text_len
+            )
+            ar_mask = ar_mask[None, :] | suffix_mask  # [B, N]
+
+        return tokens, input_mask, ar_mask, suffix_mask
 
     def _embed_prefix(
         self,
@@ -430,7 +447,6 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             tokenized_inputs = self.PaliGemma.llm(observation.tokenized_prompt, method = "embed")
             tokens.append(tokenized_inputs)
             input_mask.append(observation.tokenized_prompt_mask)
-            # Text tokens: bidirectional with images
             ar_mask += [False] * tokenized_inputs.shape[1]
 
         # 3. Add state token (skip entirely when no_state is True)
@@ -530,6 +546,50 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
 
         return tokens, input_mask, attn_mask
 
+    def decode(self, x: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t v"]:
+        return self.PaliGemma.llm(x, method = "decode")
+
+    def _next_token_outputs(
+        self,
+        output: jax.Array,
+        observation: _model.Observation,
+    ) -> dict[str, jax.Array]:
+        if observation.subtask_start_index is None:
+            raise ValueError("subtask_start_index is required for next-token outputs.")
+        if observation.subtask_end_index is None:
+            raise ValueError("subtask_end_index is required for next-token outputs.")
+        if observation.tokenized_prompt is None or observation.tokenized_prompt_mask is None:
+            raise ValueError("tokenized_prompt and tokenized_prompt_mask are required for next-token outputs.")
+
+        text_start = self._num_cameras * NUM_PATCHES_PER_IMAGE
+        text_len = observation.tokenized_prompt.shape[1]
+        text_hidden = output[:, text_start : text_start + text_len, :]
+        prompt_tokens = observation.tokenized_prompt
+        prompt_mask = observation.tokenized_prompt_mask
+        subtask_start_index = observation.subtask_start_index
+        subtask_end_index = observation.subtask_end_index
+
+        candidate_embeddings = text_hidden[:, :-1, :]
+        candidate_targets = prompt_tokens[:, 1:]
+        candidate_mask = prompt_mask[:, :-1] & prompt_mask[:, 1:]
+
+        first_predict_pos = jnp.maximum(subtask_start_index - 1, 0)
+        last_predict_pos = subtask_end_index - 1
+        window_offsets = jnp.arange(MAX_SUBTASK_TOKENS_FOR_LOSS, dtype = first_predict_pos.dtype)[None, :]
+        predict_positions = first_predict_pos[:, None] + window_offsets
+        max_candidate_pos = candidate_targets.shape[1] - 1
+        gather_positions = jnp.clip(predict_positions, 0, max_candidate_pos)
+        valid_positions = (
+            (predict_positions <= last_predict_pos[:, None])
+            & (predict_positions <= max_candidate_pos)
+            & jnp.take_along_axis(candidate_mask, gather_positions, axis = 1)
+        )
+        return {
+            "next_token_embeddings": jnp.take_along_axis(candidate_embeddings, gather_positions[:, :, None], axis = 1),
+            "next_token_targets": jnp.take_along_axis(candidate_targets, gather_positions, axis = 1),
+            "next_token_mask": valid_positions,
+        }
+
     @override
     def compute_features(
         self,
@@ -538,7 +598,11 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         *,
         rng: at.KeyArrayLike | None = None,
         prefix_cache: tuple[at.Array, at.Array] | None = None,
-    ) -> at.Float[at.Array, "*b feature_dim"] | tuple[at.Float[at.Array, "*b feature_dim"], at.Float[at.Array, "*b _n"]]:
+    ) -> (
+        at.Float[at.Array, "*b feature_dim"]
+        | tuple[at.Float[at.Array, "*b feature_dim"], dict[str, at.Array]]
+        | tuple[at.Float[at.Array, "*b feature_dim"], at.Float[at.Array, "*b _n"]]
+    ):
         """Compute features from observation (and optionally action) for value prediction.
 
         Args:
@@ -621,10 +685,10 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
                 observation, action = action_array, action_mask = action_mask_array
             )
         else:
-            tokens, input_mask, ar_mask = self._embed_sequence(
+            tokens, input_mask, ar_mask, suffix_mask = self._embed_sequence(
                 observation, action = action_array, action_mask = action_mask_array
             )
-            attn_mask = make_attn_mask(input_mask, ar_mask)
+            attn_mask = make_attn_mask(input_mask, ar_mask, suffix_mask = suffix_mask)
 
         # Compute positions: cumsum of valid positions, starting from 0
         positions = jnp.cumsum(input_mask.astype(jnp.int32), axis = 1) - 1
@@ -639,6 +703,12 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             )
             # Extract CLS token output (last position) for value prediction
             cls_features = output[:, -1, :]  # [B, embed_dim]
+            if observation.subtask_start_index is not None:
+                if self._is_gemma3:
+                    raise ValueError(
+                        "subtask_start_index is not supported with the Gemma3 PaliGemma value network."
+                    )
+                return cls_features, self._next_token_outputs(output, observation)
             return cls_features
 
         # Inference: also return per-modality CLS attention scores
@@ -717,3 +787,109 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             attn_parts.append(cls_attn_mean[:, action_start : action_start + self._action_horizon].sum(axis = -1))
 
         return jnp.stack(attn_parts, axis = -1)
+
+
+# =============================================================================
+# Inline self-test: python src/openpi/value_functions/networks/paligemma.py
+# =============================================================================
+if __name__ == "__main__":
+
+    def _check(condition: bool, msg: str) -> None:
+        if not condition:
+            raise AssertionError(f"FAIL: {msg}")
+        print(f"  PASS: {msg}")
+
+    # Sequence layout used by both cases:
+    #   [img (3)] [text (4)] [state (1)] [CLS (1)]   total = 9
+    N_IMG, N_TEXT = 3, 4
+    SEQ_LEN = N_IMG + N_TEXT + 2  # +state +CLS
+    IMG = slice(0, N_IMG)
+    TEXT = slice(N_IMG, N_IMG + N_TEXT)
+    STATE = N_IMG + N_TEXT
+    CLS = SEQ_LEN - 1
+
+    # =========================================================================
+    # Case 1 — no subtask (subtask_start_index is None)
+    # =========================================================================
+    print("Case 1: No subtask text")
+
+    ar = jnp.array([False] * N_IMG + [False] * N_TEXT + [True, True])
+    inp = jnp.ones((1, SEQ_LEN), dtype=jnp.bool_)
+    m = make_attn_mask(inp, ar)[0]
+
+    _check(m[IMG, IMG].all().item(), "img <-> img bidirectional")
+    _check(m[IMG, TEXT].all().item(), "img -> text")
+    _check(m[TEXT, IMG].all().item(), "text -> img")
+    _check(m[TEXT, TEXT].all().item(), "text <-> text bidirectional")
+
+    _check(m[STATE, IMG].all().item(), "state -> img")
+    _check(m[STATE, TEXT].all().item(), "state -> text")
+    _check(not m[IMG, STATE].any().item(), "img -/-> state")
+    _check(not m[TEXT, STATE].any().item(), "text -/-> state")
+
+    _check(m[CLS, :CLS].all().item(), "CLS -> all prior")
+    _check(not m[:CLS, CLS].any().item(), "others -/-> CLS")
+
+    # =========================================================================
+    # Case 2 — with subtask text (batch=2, different subtask starts)
+    # =========================================================================
+    print("\nCase 2: With subtask text (batch=2, subtask starts at text offset 2 and 3)")
+
+    N_PREFIX_A, N_SUFFIX_A = 2, 2  # batch element 0
+    N_PREFIX_B, N_SUFFIX_B = 3, 1  # batch element 1
+
+    inp2 = jnp.ones((2, SEQ_LEN), dtype=jnp.bool_)
+
+    # Build per-element ar_mask [B, N]: suffix text positions + state + CLS are True.
+    base_ar = jnp.array([False] * N_IMG + [False] * N_TEXT + [True, True])  # [N]
+    subtask_start_index = jnp.array([N_PREFIX_A, N_PREFIX_B])  # within text region
+    text_start = N_IMG
+    seq_positions = jnp.arange(SEQ_LEN)
+    global_subtask_start = text_start + subtask_start_index
+    suffix = (seq_positions[None, :] >= global_subtask_start[:, None]) & (
+        seq_positions[None, :] < text_start + N_TEXT
+    )
+    ar2 = base_ar[None, :] | suffix  # [2, N]
+
+    m2 = make_attn_mask(inp2, ar2, suffix_mask=suffix)
+
+    for b, (n_pre, n_suf) in enumerate([(N_PREFIX_A, N_SUFFIX_A), (N_PREFIX_B, N_SUFFIX_B)]):
+        tag = f"[b={b}, prefix={n_pre}, suffix={n_suf}]"
+        mb = m2[b]
+
+        prefix_text = slice(N_IMG, N_IMG + n_pre)
+        suffix_text = slice(N_IMG + n_pre, N_IMG + n_pre + n_suf)
+
+        _check(mb[IMG, IMG].all().item(), f"{tag} img <-> img bidirectional")
+        _check(mb[IMG, prefix_text].all().item(), f"{tag} img -> prefix_text")
+        _check(mb[prefix_text, IMG].all().item(), f"{tag} prefix_text -> img")
+        _check(mb[prefix_text, prefix_text].all().item(), f"{tag} prefix_text <-> prefix_text bidirectional")
+
+        _check(not mb[prefix_text, suffix_text].any().item(), f"{tag} prefix_text -/-> suffix_text")
+        _check(not mb[IMG, suffix_text].any().item(), f"{tag} img -/-> suffix_text")
+
+        _check(mb[suffix_text, prefix_text].all().item(), f"{tag} suffix_text -> prefix_text")
+        _check(mb[suffix_text, IMG].all().item(), f"{tag} suffix_text -> img")
+
+        # Suffix tokens are causal among themselves.
+        for qi in range(n_suf):
+            for ki in range(n_suf):
+                q_abs = N_IMG + n_pre + qi
+                k_abs = N_IMG + n_pre + ki
+                if ki <= qi:
+                    _check(mb[q_abs, k_abs].item(), f"{tag} suffix[{qi}] -> suffix[{ki}] (causal ok)")
+                else:
+                    _check(not mb[q_abs, k_abs].item(), f"{tag} suffix[{qi}] -/-> suffix[{ki}] (causal block)")
+
+        _check(mb[STATE, IMG].all().item(), f"{tag} state -> img")
+        _check(mb[STATE, prefix_text].all().item(), f"{tag} state -> prefix_text")
+        _check(not mb[STATE, suffix_text].any().item(), f"{tag} state -/-> suffix_text")
+
+        _check(mb[CLS, IMG].all().item(), f"{tag} CLS -> img")
+        _check(mb[CLS, prefix_text].all().item(), f"{tag} CLS -> prefix_text")
+        _check(mb[CLS, STATE].item(), f"{tag} CLS -> state")
+        _check(not mb[CLS, suffix_text].any().item(), f"{tag} CLS -/-> suffix_text")
+
+        _check(not mb[:CLS, CLS].any().item(), f"{tag} others -/-> CLS")
+
+    print("\nAll tests passed!")

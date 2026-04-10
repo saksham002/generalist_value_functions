@@ -365,7 +365,7 @@ class AbsoluteActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
-    tokenizer: _tokenizer.PaligemmaTokenizer
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer
     discrete_state_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
@@ -383,6 +383,47 @@ class TokenizePrompt(DataTransformFn):
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeRoboCoinSubtaskPrompt(DataTransformFn):
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer
+    prefix_text: str
+    discrete_state_input: bool = False
+
+    def __call__(self, data: DataDict) -> DataDict:
+        prefix = data.pop("prompt", None)
+        suffix = data.pop("subtask_text", None)
+        if prefix is None or suffix is None:
+            raise ValueError("Both prompt and subtask_text are required")
+
+        if not isinstance(prefix, str):
+            prefix = prefix.item()
+        if not isinstance(suffix, str):
+            suffix = suffix.item()
+
+        if prefix != self.prefix_text:
+            raise ValueError(f"Expected prefix {self.prefix_text!r}, got {prefix!r}")
+
+        if self.discrete_state_input:
+            if (state := data.get("state", None)) is None:
+                raise ValueError("State is required.")
+        else:
+            state = None
+
+        tokens, token_masks, subtask_start_index, subtask_end_index = _tokenize_robocoin_subtask_prompt(
+            self.tokenizer,
+            prefix,
+            suffix,
+            state = state,
+        )
+        return {
+            **data,
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": token_masks,
+            "subtask_start_index": np.int32(subtask_start_index),
+            "subtask_end_index": np.int32(subtask_end_index),
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -557,6 +598,54 @@ def _insert_at_offset(x: np.ndarray, target_dim: int, offset: int) -> np.ndarray
     out = np.zeros(out_shape, dtype = x.dtype)
     out[..., offset : offset + real_dim] = x
     return out
+
+
+def _clean_prompt_text(prompt: str) -> str:
+    return prompt.strip().replace("_", " ").replace("\n", " ")
+
+
+def _tokenize_robocoin_subtask_prompt(
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer,
+    prefix: str,
+    suffix: str,
+    *,
+    state: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    if state is not None:
+        raise NotImplementedError("TokenizeRoboCoinSubtaskPrompt does not support discrete state input.")
+
+    cleaned_prefix = _clean_prompt_text(prefix)
+    cleaned_suffix = _clean_prompt_text(suffix)
+
+    # Tokenize prefix and suffix separately so the split index is correct by construction.
+    # SentencePiece is non-compositional across boundaries — joining the strings before
+    # encoding can shift tokens at the boundary and invalidate len(prefix_tokens) as the split.
+    prefix_tokens = tokenizer._tokenizer.encode(cleaned_prefix, add_bos = True)
+    suffix_tokens = tokenizer._tokenizer.encode(cleaned_suffix, add_bos = False)
+    newline_tokens = tokenizer._tokenizer.encode("\n")
+    raw_tokens = prefix_tokens + suffix_tokens + newline_tokens
+    subtask_start_index = len(prefix_tokens)
+    subtask_end_index = subtask_start_index + len(suffix_tokens) - 1
+
+    if isinstance(tokenizer, _tokenizer.Gemma3Tokenizer) and tokenizer._num_images > 0:
+        soi_markers = [_tokenizer.Gemma3Tokenizer.START_OF_IMAGE_ID] * tokenizer._num_images
+        raw_tokens = [raw_tokens[0]] + soi_markers + raw_tokens[1:]
+        subtask_start_index += tokenizer._num_images
+        subtask_end_index += tokenizer._num_images
+
+    max_len = tokenizer._max_len + (tokenizer._num_images if isinstance(tokenizer, _tokenizer.Gemma3Tokenizer) else 0)
+    tokens_len = len(raw_tokens)
+    if tokens_len < max_len:
+        padding = [False] * (max_len - tokens_len)
+        token_mask = [True] * tokens_len + padding
+        raw_tokens = raw_tokens + padding
+    else:
+        raw_tokens = raw_tokens[:max_len]
+        token_mask = [True] * max_len
+        subtask_start_index = min(subtask_start_index, max_len)
+        subtask_end_index = min(subtask_end_index, max_len - 1)
+
+    return np.asarray(raw_tokens), np.asarray(token_mask), subtask_start_index, subtask_end_index
 
 
 def pad_to_dim(x: np.ndarray, target_dim: int, axis: int = -1, value: float = 0.0) -> np.ndarray:

@@ -47,6 +47,12 @@ class PaligemmaTokenizer:
 
         return np.asarray(tokens), np.asarray(mask)
 
+    def decode(self, tokens: np.ndarray | list[int]) -> str:
+        if isinstance(tokens, np.ndarray):
+            tokens = tokens.tolist()
+        valid_tokens = [int(token) for token in tokens if int(token) != 0]
+        return self._tokenizer.decode(valid_tokens)
+
 
 class Gemma3Tokenizer:
     # Gemma 3 special token IDs
@@ -96,6 +102,12 @@ class Gemma3Tokenizer:
             mask = [True] * total_len
 
         return np.asarray(tokens), np.asarray(mask)
+
+    def decode(self, tokens: np.ndarray | list[int]) -> str:
+        if isinstance(tokens, np.ndarray):
+            tokens = tokens.tolist()
+        valid_tokens = [int(token) for token in tokens if int(token) != 0 and int(token) != self.START_OF_IMAGE_ID]
+        return self._tokenizer.decode(valid_tokens)
 
 
 def create_tokenizer(

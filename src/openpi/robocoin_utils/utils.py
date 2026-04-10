@@ -364,19 +364,20 @@ def cache_val_episodes(
         assert trajectory_iter is not None, "No cache found and no trajectory iterator provided."
         assert input_transform is not None, "input_transform is required when collecting trajectories."
 
-        seen_repo_ids: set[str] = set()
+        seen_repo_keys: set[int | str] = set()
         seen_required_repo_ids: set[str] = set()
         num_non_required_slots = num_val_trajectories - len(include_repos)
         collected_count = 0
-        logger.info(f"Collecting validation trajectories for {num_val_trajectories} unique repo_ids")
+        logger.info(f"Collecting validation trajectories for {num_val_trajectories} unique repos")
 
         if cache_dir:
             os.makedirs(cache_dir, exist_ok = True)
 
         for traj in trajectory_iter:
             repo_id = _decode_repo_id(traj["repo_id"][0])
+            repo_key: int | str = int(traj["repo_index"][0]) if "repo_index" in traj else repo_id
 
-            if repo_id in seen_repo_ids:
+            if repo_key in seen_repo_keys:
                 continue
 
             is_required = repo_id in include_repos and repo_id not in seen_required_repo_ids
@@ -409,7 +410,7 @@ def cache_val_episodes(
             if not save_only:
                 traj_frames[collected_count] = frames
 
-            seen_repo_ids.add(repo_id)
+            seen_repo_keys.add(repo_key)
             if is_required:
                 seen_required_repo_ids.add(repo_id)
             else:
@@ -419,7 +420,7 @@ def cache_val_episodes(
             if collected_count >= num_val_trajectories:
                 break
 
-        logger.info(f"Collected {collected_count} trajectories, unique repo_ids: {len(seen_repo_ids)}")
+        logger.info(f"Collected {collected_count} trajectories, unique repos: {len(seen_repo_keys)}")
 
     if save_only:
         return {}

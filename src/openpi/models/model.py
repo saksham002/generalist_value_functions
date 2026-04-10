@@ -117,6 +117,11 @@ class Observation(Generic[ArrayT]):
     # Action mask for Q(s,a) models - indicates valid actions in action chunk.
     action_mask: at.Bool[ArrayT, "*b ah"] | None = None
 
+    # Index of the first current-subtask token within tokenized_prompt.
+    subtask_start_index: at.Int[ArrayT, "*b"] | None = None
+    # Index of the last current-subtask token within tokenized_prompt.
+    subtask_end_index: at.Int[ArrayT, "*b"] | None = None
+
     # Per-sample loss mask — False to exclude a sample from the training loss.
     loss_mask: at.Bool[ArrayT, "*b"] | None = None
 
@@ -149,6 +154,8 @@ class Observation(Generic[ArrayT]):
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
             action_mask=data.get("action_mask"),
+            subtask_start_index=data.get("subtask_start_index"),
+            subtask_end_index=data.get("subtask_end_index"),
             loss_mask=data.get("loss_mask"),
         )
 
@@ -230,6 +237,8 @@ def preprocess_observation(
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
         action_mask=observation.action_mask,
+        subtask_start_index=observation.subtask_start_index,
+        subtask_end_index=observation.subtask_end_index,
     )
 
 
