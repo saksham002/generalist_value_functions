@@ -1,3 +1,9 @@
+# Scratch / one-off scripts
+random/
+
+# Separate repo
+eval/
+
 # Data directories.
 assets/
 checkpoints/

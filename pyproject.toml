@@ -55,6 +55,12 @@ tpu = [
     "jax[tpu]==0.5.3",
     "libtpu==0.0.11.4",
 ]
+eval = [
+    "flask>=3.0.0",
+    "flask-cors>=4.0.0",
+    "h5py>=3.10.0",
+    "requests>=2.31.0",
+]
 # Legacy D4RL support - may conflict with gymnasium, use with caution
 legacy_d4rl = [
     "cython<3",

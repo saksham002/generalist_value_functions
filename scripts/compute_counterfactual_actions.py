@@ -746,9 +746,9 @@ def run_worker(args: WorkerArgs) -> None:
                             step_idx + np.arange(action_horizon, dtype = np.int32),
                             num_steps - 1,
                         )
+                        # Pass absolute actions; the input_transform's DeltaActions step will
+                        # convert to state-relative delta when use_chunk_wise_delta is enabled.
                         gt_actions = episode_actions[gt_action_indices].copy()
-                        if data_config.rlds_kwargs["use_chunk_wise_delta"]:
-                            gt_actions = gt_actions - gt_actions[:1, :]
                         transform_with_actions["actions"] = gt_actions
 
                     with episode_timer.context("input_transform"):

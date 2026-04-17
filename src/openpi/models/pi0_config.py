@@ -35,6 +35,8 @@ class Pi0Config(_model.BaseModelConfig):
     action_dim_offset: int = 0
     # Static mask over action dims — True at dims carrying real values, False at padding.
     action_dim_mask: tuple[bool, ...] | None = None
+    # If False, only actions are padded to action_dim in the model transforms.
+    pad_state_to_action_dim: bool = True
 
     def __post_init__(self):
         if self.max_token_len is None:

@@ -641,6 +641,9 @@ def value_function_train_step(
         batch_stats["batch/counterfactual_next_actions_std"] = jnp.std(transition.counterfactual_next_actions)
         batch_stats["batch/counterfactual_next_actions_min"] = jnp.min(transition.counterfactual_next_actions)
         batch_stats["batch/counterfactual_next_actions_max"] = jnp.max(transition.counterfactual_next_actions)
+        batch_stats["batch/counterfactual_next_actions_out_of_range_frac"] = jnp.mean(
+            (jnp.abs(transition.counterfactual_next_actions) >= 1.0).astype(jnp.float32)
+        )
 
     batch_size = transition.reward.shape[0]
 
@@ -1688,6 +1691,7 @@ def generate_validation_plots_dlimp(
     data_config: _config.DataConfig,
     cache_dir: str,
     output_dir: str | None = None,
+    batch_size: int = 64,
 ) -> dict:
     """Generate validation plots for RoboCOIN.
 
@@ -1796,10 +1800,10 @@ def generate_validation_plots_dlimp(
         logging.warning("No valid frames found across all episodes")
         return {}
 
-    logging.info(f"Processing {len(all_frames)} total frames across {len(ep_mc_returns)} episodes in batches of 64")
+    logging.info(f"Processing {len(all_frames)} total frames across {len(ep_mc_returns)} episodes in batches of {batch_size}")
 
     all_predictions, all_predictions_neg, all_predictions_random, all_predictions_counterfactual, all_attn_scores = predict_values(
-        model, all_frames, ep_mc_returns, action_conditioned
+        model, all_frames, ep_mc_returns, action_conditioned, batch_size = batch_size
     )
     del all_frames, traj_frames
 

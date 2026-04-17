@@ -7,6 +7,7 @@ import flax.traverse_util as traverse_util
 import jax
 import numpy as np
 from openpi_client import image_tools
+from scipy.spatial.transform import Rotation
 
 from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
@@ -321,50 +322,119 @@ class SubsampleActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class DeltaActions(DataTransformFn):
-    """Repacks absolute actions into delta action space."""
+    """Repacks absolute actions into delta action space.
+
+    Position dims (mask=True) become `action - state`. Orientation blocks
+    starting at each index in `rpy_index_start` (treated as three extrinsic
+    xyz euler angles) become the euler angles of `R_action @ R_state.inv()`.
+    Dims outside both the mask and the rpy blocks stay absolute.
+    """
 
     # Boolean mask for the action dimensions to be repacked into delta action space. Length
     # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
     # See `make_bool_mask` for more details.
     mask: Sequence[bool] | None
+    # Starting indices of 3-wide extrinsic-xyz euler blocks to be composed as relative rotations.
+    rpy_index_start: Sequence[int] | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "actions" not in data or self.mask is None:
+        if self.mask is None and self.rpy_index_start is None:
             return data
 
-        state, actions = data["state"], data["actions"]
-        mask = np.asarray(self.mask)
-        dims = mask.shape[-1]
-        actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
-        data["actions"] = actions
+        if self.mask is not None:
+            mask = np.asarray(self.mask).copy()
+            # Zero the mask over rpy slots so they are not double-processed by the subtraction below.
+            if self.rpy_index_start is not None:
+                for s in self.rpy_index_start:
+                    mask[s : s + 3] = False
+            dims = mask.shape[-1]
+        else:
+            mask = None
+            dims = 0
+
+        for state_key, action_key in (("state", "actions"), ("next_state", "next_actions")):
+            if action_key not in data or state_key not in data:
+                continue
+            state = data[state_key]
+            # Force a copy so in-place updates below do not mutate the caller's array.
+            actions = np.array(data[action_key])
+            if mask is not None:
+                actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis = -2)
+            if self.rpy_index_start is not None:
+                _apply_rpy_delta(state, actions, self.rpy_index_start)
+            data[action_key] = actions
 
         return data
 
 
 @dataclasses.dataclass(frozen=True)
 class AbsoluteActions(DataTransformFn):
-    """Repacks delta actions into absolute action space."""
+    """Repacks delta actions into absolute action space.
+
+    Inverse of `DeltaActions`: position dims (mask=True) add state back,
+    and rpy blocks are recomposed via `R_delta @ R_state` before being
+    written back as extrinsic xyz euler angles.
+    """
 
     # Boolean mask for the action dimensions to be repacked into absolute action space. Length
     # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
     # See `make_bool_mask` for more details.
     mask: Sequence[bool] | None
+    # Starting indices of 3-wide extrinsic-xyz euler blocks that were composed as relative rotations.
+    rpy_index_start: Sequence[int] | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "actions" not in data or self.mask is None:
+        if "actions" not in data or (self.mask is None and self.rpy_index_start is None):
             return data
 
-        state, actions = data["state"], data["actions"]
-        mask = np.asarray(self.mask)
-        dims = mask.shape[-1]
-        actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+        # Force a copy so in-place updates below do not mutate the caller's array.
+        state, actions = data["state"], np.array(data["actions"])
+        if self.mask is not None:
+            mask = np.asarray(self.mask).copy()
+            if self.rpy_index_start is not None:
+                for s in self.rpy_index_start:
+                    mask[s : s + 3] = False
+            dims = mask.shape[-1]
+            actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis = -2)
+        if self.rpy_index_start is not None:
+            _apply_rpy_absolute(state, actions, self.rpy_index_start)
         data["actions"] = actions
 
         return data
 
 
+def _apply_rpy_delta(state, actions, rpy_index_start: Sequence[int]) -> None:
+    """In-place: write extrinsic-xyz euler angles of R_action @ R_state.inv() into each rpy block."""
+    state = np.asarray(state)
+    for s in rpy_index_start:
+        state_rpy = state[..., s : s + 3]
+        action_rpy = actions[..., s : s + 3]
+        # Broadcast state over the chunk axis so each action in the chunk composes with the same state.
+        state_rpy_b = np.broadcast_to(state_rpy[..., None, :], action_rpy.shape)
+        leading = action_rpy.shape[:-1]
+        r_state = Rotation.from_euler("xyz", state_rpy_b.reshape(-1, 3))
+        r_action = Rotation.from_euler("xyz", action_rpy.reshape(-1, 3))
+        r_delta = r_action * r_state.inv()
+        actions[..., s : s + 3] = r_delta.as_euler("xyz").reshape(*leading, 3)
+
+
+def _apply_rpy_absolute(state, actions, rpy_index_start: Sequence[int]) -> None:
+    """In-place: write extrinsic-xyz euler angles of R_delta @ R_state into each rpy block."""
+    state = np.asarray(state)
+    for s in rpy_index_start:
+        state_rpy = state[..., s : s + 3]
+        action_rpy = actions[..., s : s + 3]
+        state_rpy_b = np.broadcast_to(state_rpy[..., None, :], action_rpy.shape)
+        leading = action_rpy.shape[:-1]
+        r_state = Rotation.from_euler("xyz", state_rpy_b.reshape(-1, 3))
+        r_delta = Rotation.from_euler("xyz", action_rpy.reshape(-1, 3))
+        r_abs = r_delta * r_state
+        actions[..., s : s + 3] = r_abs.as_euler("xyz").reshape(*leading, 3)
+
+
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
+    # tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer
     tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer
     discrete_state_input: bool = False
 
@@ -387,8 +457,9 @@ class TokenizePrompt(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class TokenizeRoboCoinSubtaskPrompt(DataTransformFn):
+    # tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer
     tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer
-    prefix_text: str
+    prefix_text: str | None = None
     discrete_state_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
@@ -402,7 +473,7 @@ class TokenizeRoboCoinSubtaskPrompt(DataTransformFn):
         if not isinstance(suffix, str):
             suffix = suffix.item()
 
-        if prefix != self.prefix_text:
+        if self.prefix_text is not None and prefix != self.prefix_text:
             raise ValueError(f"Expected prefix {self.prefix_text!r}, got {prefix!r}")
 
         if self.discrete_state_input:
@@ -494,14 +565,17 @@ class PadStatesAndActions(DataTransformFn):
 
     model_action_dim: int
     action_dim_offset: int = 0
+    pad_state: bool = True
 
     def __call__(self, data: DataDict) -> DataDict:
         if self.action_dim_offset > 0:
-            data["state"] = _insert_at_offset(data["state"], self.model_action_dim, self.action_dim_offset)
+            if self.pad_state:
+                data["state"] = _insert_at_offset(data["state"], self.model_action_dim, self.action_dim_offset)
             if "actions" in data:
                 data["actions"] = _insert_at_offset(data["actions"], self.model_action_dim, self.action_dim_offset)
         else:
-            data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis = -1)
+            if self.pad_state:
+                data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis = -1)
             if "actions" in data:
                 data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis = -1)
         return data
@@ -605,6 +679,7 @@ def _clean_prompt_text(prompt: str) -> str:
 
 
 def _tokenize_robocoin_subtask_prompt(
+    # tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer,
     tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer,
     prefix: str,
     suffix: str,
@@ -627,13 +702,15 @@ def _tokenize_robocoin_subtask_prompt(
     subtask_start_index = len(prefix_tokens)
     subtask_end_index = subtask_start_index + len(suffix_tokens) - 1
 
-    if isinstance(tokenizer, _tokenizer.Gemma3Tokenizer) and tokenizer._num_images > 0:
-        soi_markers = [_tokenizer.Gemma3Tokenizer.START_OF_IMAGE_ID] * tokenizer._num_images
+    # image_tokenizer = isinstance(tokenizer, (_tokenizer.Gemma3Tokenizer, _tokenizer.Gemma4Tokenizer))
+    image_tokenizer = isinstance(tokenizer, _tokenizer.Gemma3Tokenizer)
+    if image_tokenizer and tokenizer._num_images > 0:
+        soi_markers = [tokenizer.START_OF_IMAGE_ID] * tokenizer._num_images
         raw_tokens = [raw_tokens[0]] + soi_markers + raw_tokens[1:]
         subtask_start_index += tokenizer._num_images
         subtask_end_index += tokenizer._num_images
 
-    max_len = tokenizer._max_len + (tokenizer._num_images if isinstance(tokenizer, _tokenizer.Gemma3Tokenizer) else 0)
+    max_len = tokenizer._max_len + (tokenizer._num_images if image_tokenizer else 0)
     tokens_len = len(raw_tokens)
     if tokens_len < max_len:
         padding = [False] * (max_len - tokens_len)
