@@ -8,10 +8,17 @@ set -e
 # Configuration — edit these before running
 # =============================================================================
 
-CONFIG_NAME="robocoin_bimanual_pi05"
+CONFIG_NAME="robocoin_bimanual_pi05_rlds"
 CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/robocoin_bimanual_pi05_rlds/real_hang_state_pi05_finetune/"
-FINE_TUNE_CONFIG="real_hang_pi05_finetune"  # Optional: FineTuneConfig name from config.py. Leave empty to skip.
+FINE_TUNE_CONFIG="real_hang_state_pi05_finetune"  # Optional: FineTuneConfig name from config.py. Leave empty to skip.
 STEP=329999
+
+# Optional: enable BestOfN value-guided action selection by uncommenting these.
+# CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa"
+# CRITIC_CHECKPOINT="/data/group_data/rl/saksham3/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_q_sarsa/real_hang_finetune_75_tcp"
+# CRITIC_FINE_TUNE_CONFIG="real_hang_finetune_75_tcp"
+# CRITIC_STEP=232000
+# NUM_SAMPLES=8
 
 ROBOT_HOST="xarmpc.pc.cs.cmu.edu"
 ROBOT_PORT=8080
@@ -37,6 +44,13 @@ echo -e "  Checkpoint: ${YELLOW}${CHECKPOINT_DIR}${NC}"
 if [ -n "${FINE_TUNE_CONFIG}" ]; then
     echo -e "  Fine-tune:  ${YELLOW}${FINE_TUNE_CONFIG}${NC}"
 fi
+if [ -n "${CRITIC_CONFIG}" ]; then
+    echo -e "  Critic:     ${YELLOW}${CRITIC_CONFIG}${NC}"
+    echo -e "  Critic ckpt:${YELLOW}${CRITIC_CHECKPOINT}${NC}"
+    echo -e "  Critic ft:  ${YELLOW}${CRITIC_FINE_TUNE_CONFIG}${NC}"
+    echo -e "  Critic step:${YELLOW}${CRITIC_STEP}${NC}"
+    echo -e "  Num samples:${YELLOW}${NUM_SAMPLES}${NC}"
+fi
 echo -e "  Robot:      ${YELLOW}${ROBOT_HOST}:${ROBOT_PORT}${NC}"
 echo -e "  Episodes:   ${YELLOW}${NUM_EPISODES}${NC}"
 echo -e "  Debug:      ${YELLOW}${DEBUG}${NC}"
@@ -56,6 +70,17 @@ if [ -n "${FINE_TUNE_CONFIG}" ]; then
     FINE_TUNE_ARGS="--args.fine-tune-config ${FINE_TUNE_CONFIG}"
 fi
 
+CRITIC_ARGS=""
+if [ -n "${CRITIC_CONFIG}" ]; then
+    CRITIC_ARGS="--args.critic-config ${CRITIC_CONFIG} --args.critic-checkpoint ${CRITIC_CHECKPOINT} --args.num-samples ${NUM_SAMPLES}"
+    if [ -n "${CRITIC_FINE_TUNE_CONFIG}" ]; then
+        CRITIC_ARGS="${CRITIC_ARGS} --args.critic-fine-tune-config ${CRITIC_FINE_TUNE_CONFIG}"
+    fi
+    if [ -n "${CRITIC_STEP}" ]; then
+        CRITIC_ARGS="${CRITIC_ARGS} --args.critic-step ${CRITIC_STEP}"
+    fi
+fi
+
 DEBUG_ARGS=""
 if [ "${DEBUG}" = true ]; then
     DEBUG_ARGS="--args.debug"
@@ -72,4 +97,5 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run eval/xarm_scripts/eval_shirt_hang_remo
     --args.robot-port "${ROBOT_PORT}" \
     --args.num-episodes "${NUM_EPISODES}" \
     ${FINE_TUNE_ARGS} \
+    ${CRITIC_ARGS} \
     ${DEBUG_ARGS}

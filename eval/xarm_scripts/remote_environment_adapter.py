@@ -35,6 +35,7 @@ class RemoteEnvironmentAdapter:
         timeout: float = 30.0,
         retry_attempts: int = 3,
         retry_delay: float = 1.0,
+        control_freq: int = 30,
     ):
         """
         Initialize remote environment adapter.
@@ -45,11 +46,15 @@ class RemoteEnvironmentAdapter:
             timeout: Request timeout in seconds
             retry_attempts: Number of retry attempts for failed requests
             retry_delay: Delay between retry attempts in seconds
+            control_freq: Frequency (Hz) at which the robot server should expect
+                actions. Used to assert against the server's reported metadata so
+                the client and server agree on the control rate.
         """
         self.base_url = f"http://{host}:{port}/api"
         self.timeout = timeout
         self.retry_attempts = retry_attempts
         self.retry_delay = retry_delay
+        self.control_freq = control_freq
 
         self.metadata = None
         self.episode_active = False
@@ -62,6 +67,14 @@ class RemoteEnvironmentAdapter:
         # Get metadata
         self.metadata = self._get_metadata()
         logger.info(f"Connected to robot server. Metadata: {self.metadata}")
+
+        server_control_freq = self.metadata.get("control_freq")
+        if server_control_freq is not None and int(server_control_freq) != int(control_freq):
+            raise RuntimeError(
+                f"Control frequency mismatch: client expects {control_freq} Hz but "
+                f"robot server is configured for {server_control_freq} Hz. Restart the "
+                f"server with --control_freq {control_freq}."
+            )
 
     def _wait_for_server(self, max_wait: float = 60.0):
         """Wait for server to be ready."""
