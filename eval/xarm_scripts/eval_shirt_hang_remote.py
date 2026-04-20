@@ -328,9 +328,9 @@ class LocalPolicy:
             actions_out[0, :, start : start + self._eef_action_dim]
         )  # [action_horizon, eef_action_dim]
         decoded = self._output_transform({
-            "state": raw_state,
+            "state": observation.state[0],
             "actions": actions_np,
-            "next_state": raw_state,
+            "next_state": observation.state[0],
             "next_actions": actions_np,
         })
         
@@ -338,9 +338,9 @@ class LocalPolicy:
         actions = np.asarray(decoded["actions"], dtype=np.float32)[:30]
 
         # Policy predicts global actions relative to current state; add current pose to get absolute base frame targets.
-        actions += initial_eef_pose
+        # actions += initial_eef_pose
 
-        # ipdb.set_trace()
+        #ipdb.set_trace()
 
         return actions
 
@@ -378,20 +378,11 @@ class SubtaskTracker:
         self._subtask = 0
         self._steps_in_subtask = 0
         self._step = 0
-        self._last_boundary_step = -_MIN_BOUNDARY_GAP - 1
 
-        self._prev_lg_open: bool | None = None
-        self._prev_rg_open: bool | None = None
-
-        self._t01_step: int | None = None
-        self._t12_step: int | None = None
-        self._t23_pending_step: int | None = None
+        self._t01_pending: bool = False
+        self._t01_steps_watching: int = 0
         self._t23_left_close_streak: int = 0
-        self._t23_step: int | None = None
-        self._t34_step: int | None = None
-        self._t45_candidate_step: int | None = None
-        self._t45_steps_since_candidate: int = 0
-        self._t45_step: int | None = None
+        self._t45_open_streak: int = 0
 
     @property
     def subtask(self) -> int:
@@ -428,95 +419,74 @@ class SubtaskTracker:
             )
         rz = float(_vec("right/tcp_pose", dim=7)[2])
 
-        lg_open = lg > _GRIP_THRESH
-        rg_open = rg > _GRIP_THRESH
-
-        if self._subtask < len(_SUBTASK_PROMPTS) - 1:
-            self._check_transition(lg, rg, rz, lg_open, rg_open)
-
-        self._prev_lg_open = lg_open
-        self._prev_rg_open = rg_open
+        if self._steps_in_subtask >= _MIN_BOUNDARY_GAP and self._subtask < len(_SUBTASK_PROMPTS) - 1:
+            self._check_transition(lg, rg, rz)
 
         self._step += 1
         self._steps_in_subtask += 1
 
-    def _can_accept_boundary(self, boundary_step: int) -> bool:
-        return boundary_step - self._last_boundary_step > _MIN_BOUNDARY_GAP
-
-    def _advance(self, boundary_step: int) -> None:
+    def _advance(self) -> None:
         logger.info(f"SubtaskTracker: subtask {self._subtask} -> {self._subtask + 1} "
-                    f"({_SUBTASK_PROMPTS[self._subtask + 1]!r}) at step {self._step} "
-                    f"(boundary_step={boundary_step})")
+                    f"({_SUBTASK_PROMPTS[self._subtask + 1]!r}) at step {self._step}")
         self._subtask += 1
         self._steps_in_subtask = 0
-        self._last_boundary_step = boundary_step
-        self._t23_pending_step = None
+        self._t01_pending = False
+        self._t01_steps_watching = 0
         self._t23_left_close_streak = 0
-        self._t45_candidate_step = None
-        self._t45_steps_since_candidate = 0
+        self._t45_open_streak = 0
 
-    def _check_transition(self, lg: float, rg: float, rz: float, lg_open: bool, rg_open: bool) -> None:
+    def _check_transition(self, lg: float, rg: float, rz: float) -> None:
         if self._subtask == 0:
-            self._check_t01(rz, rg_open)
+            self._check_t01(rg, rz)
         elif self._subtask == 1:
             self._check_t12(rz)
         elif self._subtask == 2:
-            self._check_t23(lg_open)
+            self._check_t23(lg)
         elif self._subtask == 3:
             self._check_t34(rg, lg)
         elif self._subtask == 4:
-            self._check_t45(lg_open)
+            self._check_t45(lg)
 
-    def _check_t01(self, rz: float, rg_open: bool) -> None:
-        right_close_edge = self._prev_rg_open is True and not rg_open
-        if right_close_edge and rz > 0.30 and self._can_accept_boundary(self._step):
-            self._t01_step = self._step
-            self._advance(self._step)
+    def _check_t01(self, rg: float, rz: float) -> None:
+        rg_open = rg > _GRIP_THRESH
+        if not self._t01_pending:
+            if not rg_open and rz > 0.30:
+                self._t01_pending = True
+                self._t01_steps_watching = 0
+        else:
+            self._t01_steps_watching += 1
+            if rg_open:
+                self._t01_pending = False
+                self._t01_steps_watching = 0
+            elif self._t01_steps_watching > 500:
+                self._t01_pending = False
+                self._t01_steps_watching = 0
+            elif rz < 0.20:
+                self._advance()
 
     def _check_t12(self, rz: float) -> None:
-        if rz < 0.22 and self._can_accept_boundary(self._step):
-            self._t12_step = self._step
-            self._advance(self._step)
+        if 0.0 < rz < 0.22:
+            self._advance()
 
-    def _check_t23(self, lg_open: bool) -> None:
-        left_close_edge = self._prev_lg_open is True and not lg_open
-        assert self._t01_step is not None
-
-        if self._t23_pending_step is None:
-            if left_close_edge and self._step > self._t01_step + 50:
-                self._t23_pending_step = self._step
-                self._t23_left_close_streak = 1
-        elif not lg_open:
+    def _check_t23(self, lg: float) -> None:
+        if lg <= _GRIP_THRESH:
             self._t23_left_close_streak += 1
             if self._t23_left_close_streak >= 40:
-                if self._can_accept_boundary(self._t23_pending_step):
-                    self._t23_step = self._t23_pending_step
-                    self._advance(self._t23_pending_step)
+                self._advance()
         else:
-            self._t23_pending_step = None
             self._t23_left_close_streak = 0
 
     def _check_t34(self, rg: float, lg: float) -> None:
-        if rg < 200 and lg > _GRIP_THRESH and self._can_accept_boundary(self._step):
-            self._t34_step = self._step
-            self._advance(self._step)
+        if rg < 200 and lg > _GRIP_THRESH:
+            self._advance()
 
-    def _check_t45(self, lg_open: bool) -> None:
-        left_open_edge = self._prev_lg_open is False and lg_open
-
-        if left_open_edge:
-            self._t45_candidate_step = self._step
-            self._t45_steps_since_candidate = 1
-        elif self._t45_candidate_step is not None and lg_open:
-            self._t45_steps_since_candidate += 1
+    def _check_t45(self, lg: float) -> None:
+        if lg > _GRIP_THRESH:
+            self._t45_open_streak += 1
+            if self._t45_open_streak >= 30:
+                self._advance()
         else:
-            self._t45_candidate_step = None
-            self._t45_steps_since_candidate = 0
-
-        if self._t45_candidate_step is not None and self._t45_steps_since_candidate >= 30:
-            if self._can_accept_boundary(self._t45_candidate_step):
-                self._t45_step = self._t45_candidate_step
-                self._advance(self._t45_candidate_step)
+            self._t45_open_streak = 0
 
 
 # =============================================================================
@@ -636,8 +606,8 @@ def extract_state(obs: dict[str, Any]) -> np.ndarray:
     if eef_state.ndim > 1:
         eef_state = eef_state.flatten()
 
-    state = np.concatenate([_get("left/joint_qpos", 7), _get("left/gripper_pos", 1), _get("right/joint_qpos", 7), _get("right/gripper_pos", 1)], axis = -1)
-    return state, eef_state
+    #state = np.concatenate([_get("left/joint_qpos", 7), _get("left/gripper_pos", 1), _get("right/joint_qpos", 7), _get("right/gripper_pos", 1)], axis = -1)
+    return eef_state, eef_state
 
 
 def extract_images_rgb(obs: dict[str, Any], camera_names: tuple[str, ...]) -> dict[str, np.ndarray]:
@@ -703,7 +673,7 @@ def run_episode(
                 f"Episode {episode_idx} step {t}: prompt={prompt!r}, "
                 f"action_plan shape={action_plan.shape}, inference={elapsed:.3f}s"
             )
-            ipdb.set_trace()
+            #ipdb.set_trace()
             
 
         plan_idx = min(t % args.query_freq, action_plan.shape[0] - 1)

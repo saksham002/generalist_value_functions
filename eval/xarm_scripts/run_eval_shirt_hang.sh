@@ -8,10 +8,10 @@ set -e
 # Configuration — edit these before running
 # =============================================================================
 
-CONFIG_NAME="robocoin_bimanual_pi05_rlds"
-CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/robocoin_bimanual_pi05_rlds/real_hang_state_pi05_finetune/"
-FINE_TUNE_CONFIG="real_hang_state_pi05_finetune"  # Optional: FineTuneConfig name from config.py. Leave empty to skip.
-STEP=329999
+CONFIG_NAME="real_hang_pi05_filter_intervention"
+CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention/"
+FINE_TUNE_CONFIG=""  # Optional: FineTuneConfig name from config.py. Leave empty to skip.
+STEP=99999
 
 # Optional: enable BestOfN value-guided action selection by uncommenting these.
 # CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa"
@@ -89,7 +89,7 @@ fi
 echo -e "${BLUE}Starting eval...${NC}"
 echo ""
 
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run eval/xarm_scripts/eval_shirt_hang_remote.py \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run eval/xarm_scripts/eval_shirt_hang_remote.py \
     --args.config-name "${CONFIG_NAME}" \
     --args.checkpoint-dir "${CHECKPOINT_DIR}" \
     --args.step "${STEP}" \

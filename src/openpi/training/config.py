@@ -3903,7 +3903,7 @@ _CONFIGS = [
             rlds_data_dir="gs://saksham-euw4/hdf5/",
             datasets=(rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
             assets=AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
+                assets_dir = "/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention/",
                 asset_id = "norm_stats",
             ),
             discount=0.999,
