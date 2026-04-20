@@ -110,13 +110,73 @@ class Gemma3Tokenizer:
         return self._tokenizer.decode(valid_tokens)
 
 
+class Gemma4Tokenizer:
+    # Gemma 4 special token IDs (from fork's _Gemma4SpecialTokens).
+    BOS_ID = 2
+    START_OF_IMAGE_ID = 255999
+    END_OF_IMAGE_ID = 258882
+    IMAGE_PLACEHOLDER_ID = 258880
+    NEWLINE_NEWLINE_ID = 108
+
+    def __init__(self, max_len: int = 48, num_images: int = 0):
+        self._max_len = max_len
+        self._num_images = num_images
+
+        path = download.maybe_download("gs://gemma-data/tokenizers/tokenizer_gemma4.model")
+        with path.open("rb") as f:
+            self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto = f.read())
+
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+        if state is not None:
+            discretized_state = np.digitize(state, bins = np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            state_str = " ".join(map(str, discretized_state))
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            tokens = self._tokenizer.encode(full_prompt, add_bos = True)
+        else:
+            tokens = self._tokenizer.encode(cleaned_text, add_bos = True) + self._tokenizer.encode("\n")
+
+        # Insert <start_of_image> markers after BOS. `_embed_sequence_gemma4` splices
+        # the full [\n\n, SOI, <soft tokens>, EOI, \n\n] block in place of each marker.
+        if self._num_images > 0:
+            soi_markers = [self.START_OF_IMAGE_ID] * self._num_images
+            tokens = [tokens[0]] + soi_markers + tokens[1:]
+
+        total_len = self._max_len + self._num_images
+        tokens_len = len(tokens)
+        if tokens_len < total_len:
+            padding = [False] * (total_len - tokens_len)
+            mask = [True] * tokens_len + padding
+            tokens = tokens + padding
+        else:
+            if tokens_len > total_len:
+                logging.warning(
+                    f"Token length ({tokens_len}) exceeds max length ({total_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: total_len]
+            mask = [True] * total_len
+
+        return np.asarray(tokens), np.asarray(mask)
+
+    def decode(self, tokens: np.ndarray | list[int]) -> str:
+        if isinstance(tokens, np.ndarray):
+            tokens = tokens.tolist()
+        valid_tokens = [int(token) for token in tokens if int(token) != 0 and int(token) != self.START_OF_IMAGE_ID]
+        return self._tokenizer.decode(valid_tokens)
+
+
 def create_tokenizer(
     backbone_variant: str | None, max_len: int, num_images: int = 0
+# ) -> PaligemmaTokenizer | Gemma3Tokenizer | Gemma4Tokenizer:
 ) -> PaligemmaTokenizer | Gemma3Tokenizer:
     """Factory function that returns the appropriate tokenizer for the given backbone variant."""
     if backbone_variant == "gemma3":
         logging.info(f"Creating Gemma3Tokenizer: max_len={max_len}, num_images={num_images}")
         return Gemma3Tokenizer(max_len = max_len, num_images = num_images)
+    # if backbone_variant == "gemma4":
+    #     logging.info(f"Creating Gemma4Tokenizer: max_len={max_len}, num_images={num_images}")
+    #     return Gemma4Tokenizer(max_len = max_len, num_images = num_images)
     logging.info(f"Creating PaligemmaTokenizer: max_len={max_len}")
     return PaligemmaTokenizer(max_len = max_len)
 

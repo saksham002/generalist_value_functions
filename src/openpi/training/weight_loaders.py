@@ -301,6 +301,147 @@ class Gemma3WeightLoader(WeightLoader):
         return result
 
 
+@dataclasses.dataclass(frozen = True)
+class Gemma4WeightLoader(WeightLoader):
+    """Loads transformer + vision encoder weights from a Gemma 4 checkpoint.
+
+    Unlike `Gemma3WeightLoader`, this loader does NOT stack per-layer params
+    along axis 0 (our Gemma 4 Module uses an explicit per-layer loop rather
+    than `nn.scan`, so each layer has its own named subtree `layer_{i}/...`).
+
+    The checkpoint is expected to have the same Flax param names as the fork's
+    Transformer module, which we reuse for Block/Embedder. The only remapping
+    needed is splitting between the LLM subtree (goes under `PaliGemma/llm`)
+    and the vision encoder subtree (goes under `PaliGemma/img/encoder`).
+    """
+
+    checkpoint_path: str = "gs://gemma-data/checkpoints/gemma4-e2b-pt"
+    local_dir: str = "~/.cache/openpi/gemma4_checkpoints"
+
+    def load(self, params: at.Params) -> at.Params:
+        import os
+        import subprocess
+
+        local_dir = os.path.expanduser(self.local_dir)
+        local_checkpoint = os.path.join(local_dir, os.path.basename(self.checkpoint_path))
+
+        if not os.path.exists(local_checkpoint):
+            logger.info(f"Downloading Gemma 4 checkpoint to {local_checkpoint}...")
+            os.makedirs(local_dir, exist_ok = True)
+            subprocess.run(
+                ["gsutil", "-m", "cp", "-r", self.checkpoint_path, local_dir],
+                check = True,
+            )
+
+        logger.info(f"Loading Gemma 4 checkpoint from {local_checkpoint}...")
+        import orbax.checkpoint as ocp
+
+        checkpointer = ocp.StandardCheckpointer()
+        raw_params = checkpointer.restore(local_checkpoint)
+        if "transformer" not in raw_params and any("/" in key for key in raw_params):
+            raw_params = flax.traverse_util.unflatten_dict(raw_params, sep = "/")
+
+        logger.info(f"Gemma 4 checkpoint top-level keys: {sorted(raw_params.keys())}")
+
+        remapped_llm = self._remap_checkpoint_params(raw_params)
+        remapped_vision = self._remap_vision_params(raw_params)
+
+        if "network" in params and "PaliGemma" not in params:
+            paligemma_ref = params["network"]["PaliGemma"]
+        else:
+            paligemma_ref = params.get("PaliGemma", {})
+        use_module_prefix = "module" in paligemma_ref.get("llm", {})
+        if use_module_prefix:
+            llm_entry = {"module": remapped_llm}
+            img_entry = {"module": remapped_vision}
+        else:
+            llm_entry = remapped_llm
+            img_entry = remapped_vision
+
+        paligemma_loaded = {"PaliGemma": {"llm": llm_entry, "img": img_entry}}
+
+        if "network" in params and "PaliGemma" not in params:
+            loaded_params = {"network": paligemma_loaded}
+            if "target_network" in params:
+                loaded_params["target_network"] = copy.deepcopy(paligemma_loaded)
+        else:
+            loaded_params = paligemma_loaded
+
+        return _merge_params(loaded_params, params, missing_regex = ".*")
+
+    def _remap_checkpoint_params(self, raw_params: dict) -> dict:
+        """Remap Gemma 4 LLM params to match our Module's param structure.
+
+        Our `Module` uses per-layer named blocks (`layer_{i}`), which matches
+        the fork's Transformer naming convention, so no stacking is needed.
+        The only caveat: if the fork saves a top-level `transformer/` wrapper,
+        we strip it.
+        """
+        transformer = raw_params.get("transformer", raw_params)
+
+        result = {}
+
+        # Embedder: pass through all params (input_embedding, mm_*, per_layer_*).
+        # Our module reuses the fork's Embedder, so param names already match.
+        embedder = transformer["embedder"]
+        result["embedder"] = {k: np.array(v) if not isinstance(v, dict) else {
+            kk: np.array(vv) for kk, vv in v.items()
+        } for k, v in embedder.items()}
+
+        # Per-layer blocks: unwrap the `mlp/<name>/{w: tensor}` nesting that the
+        # checkpoint stores into bare tensors at `mlp/<name>`. The fork's
+        # FeedForward wires its sub-Einsums via `nn.share_scope` with custom
+        # `weight_name` ("gating_einsum", "linear"), so the live model expects
+        # bare tensors at those paths. Mirrors upstream
+        # `gemma/gm/ckpts/_compat.py::param_remapper`.
+        layer_indices = sorted(
+            int(k.split("_")[1]) for k in transformer if k.startswith("layer_")
+        )
+        logger.info(f"Found {len(layer_indices)} LLM layers in checkpoint")
+        for idx in layer_indices:
+            layer_key = f"layer_{idx}"
+            layer_params = _deep_convert_to_numpy(transformer[layer_key])
+            mlp = layer_params.get("mlp")
+            if isinstance(mlp, dict):
+                for sub_name, sub_val in list(mlp.items()):
+                    if isinstance(sub_val, dict) and "w" in sub_val:
+                        mlp[sub_name] = sub_val["w"]
+            result[layer_key] = layer_params
+
+        # Final norm
+        result["final_norm"] = {"scale": np.array(transformer["final_norm"]["scale"])}
+        return result
+
+    def _remap_vision_params(self, raw_params: dict) -> dict:
+        """Remap Gemma 4 vision encoder params to our `Module.encoder/...` structure.
+
+        The fork's VisionEncoder has submodules `entry`, `transformer`, `exit`
+        (and optionally `standardize`). Our wrapper names the entire
+        VisionEncoder as `encoder`, so we wrap the fork's subtree accordingly.
+        """
+        # Gemma 4's vision encoder is a submodule of the top-level Transformer,
+        # so it typically lives at `transformer/vision_encoder/` in the ckpt.
+        transformer = raw_params.get("transformer", raw_params)
+        if "vision_encoder" in transformer:
+            vision = transformer["vision_encoder"]
+        elif "vision_encoder" in raw_params:
+            vision = raw_params["vision_encoder"]
+        else:
+            raise KeyError(
+                f"No vision_encoder found in checkpoint. Top-level keys: {sorted(raw_params.keys())}. "
+                f"transformer keys: {sorted(transformer.keys())}"
+            )
+        logger.info(f"Vision encoder subtree keys: {sorted(vision.keys())}")
+        return {"encoder": _deep_convert_to_numpy(vision)}
+
+
+def _deep_convert_to_numpy(obj):
+    """Recursively convert all leaf arrays in a nested dict to numpy arrays."""
+    if isinstance(obj, dict):
+        return {k: _deep_convert_to_numpy(v) for k, v in obj.items()}
+    return np.array(obj)
+
+
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 

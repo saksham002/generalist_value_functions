@@ -119,6 +119,10 @@ class SARSAValueFunctionConfig(ValueFunctionConfig):
     discount: float = 0.99
     tau: float = 0.005
     next_token_loss_weight: float = 0.0
+    # Read by init_critic in train_value_function.py to cast params after init. 
+    # Polyak updates cast the
+    # aggregated target back to target_dtype so the dtype is preserved.
+    target_dtype: str = "float32"
 
     @override
     def create(self, rng: at.KeyArrayLike) -> SARSAValueFunction:
@@ -1206,11 +1210,17 @@ class MultiIQLValueFunction(BaseMultiValueFunction):
 
 
 def _polyak_update(target_module: nnx.Module, online_module: nnx.Module, tau: float) -> None:
-    """Polyak averaging: target = tau * online + (1 - tau) * target."""
+    """Polyak averaging: target = tau * online + (1 - tau) * target.
+
+    JAX type-promotes the aggregate to the wider of the two operand dtypes, so a
+    bf16 target mixed with an fp32 online would silently drift to fp32 after one
+    update. Cast the final aggregate back to the target's original dtype to keep
+    the target stack's dtype stable across steps.
+    """
     target_state = nnx.state(target_module)
     online_state = nnx.state(online_module)
     new_target_state = jax.tree.map(
-        lambda t, o: tau * o + (1.0 - tau) * t,
+        lambda t, o: (tau * o + (1.0 - tau) * t).astype(t.dtype),
         target_state,
         online_state,
     )

@@ -1189,6 +1189,7 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
         norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
 
         data_transforms_inputs: list[_transforms.DataTransformFn] = []
+        data_transforms_outputs: list[_transforms.DataTransformFn] = []
         if self.use_chunk_wise_delta:
             action_dim = self._get_action_dim(model_config)
             assert self.state_dim == action_dim, (
@@ -1203,13 +1204,16 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
             data_transforms_inputs.append(
                 _transforms.DeltaActions(mask = delta_mask, rpy_index_start = (3, 10))
             )
+            data_transforms_outputs.append(
+                _transforms.AbsoluteActions(mask = delta_mask, rpy_index_start = (3, 10))
+            )
 
         return DataConfig(
             repo_id = self.repo_id,
             asset_id = asset_id,
             norm_stats = norm_stats,
             repack_transforms = _transforms.Group(inputs = []),
-            data_transforms = _transforms.Group(inputs = data_transforms_inputs, outputs = []),
+            data_transforms = _transforms.Group(inputs = data_transforms_inputs, outputs = data_transforms_outputs),
             model_transforms = self._create_model_transforms(model_config),
             use_quantile_norm = self.use_quantile_norm,
             critic_mode = self.critic_mode,
@@ -1513,6 +1517,11 @@ class TrainConfig:
     wandb_enabled: bool = True
     # Optional wandb group name for organizing runs within a project.
     wandb_group: str | None = None
+    # If true, on --resume start a brand-new wandb run (and overwrite
+    # wandb_id.txt) instead of continuing the existing run. Useful when logs
+    # have advanced past the checkpoint step and would collide with wandb's
+    # monotonic step requirement.
+    wandb_new: bool = False
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -3077,8 +3086,8 @@ _CONFIGS = [
         data=RoboCoinRldsDataConfig(
             rlds_data_dir="/data/group_data/rl/datasets/",
             assets=AssetsConfig(
-                assets_dir="gs://saksham-euw4/robocoin_bimanual/norm_stats",
-                asset_id="robocoin_1.0.0",
+                assets_dir="gs://saksham-euw4/robocoin_bimanual/",
+                asset_id="norm_stats",
             ),
             datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
             discount=0.999,
@@ -3110,6 +3119,110 @@ _CONFIGS = [
         num_val_trajectories=10,
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
+    ),
+    TrainConfig(
+        name="robocoin_bimanual_paligemma_q_sarsa_online_bf16",
+        model=_value_function.SARSAValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(224, 224),
+                max_token_len=48,
+                action_dim=14,
+                dtype="bfloat16",
+                no_state=True,
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+            target_dtype="float32",
+        ),
+        data=RoboCoinRldsDataConfig(
+            rlds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            assets=AssetsConfig(
+                assets_dir="gs://saksham-euw4/robocoin_bimanual/",
+                asset_id="norm_stats",
+            ),
+            datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            use_quantile_norm=False,
+            shuffle_buffer_size=50_000,
+            mask_boundary_actions=False,
+            replace_boundary_actions=True,
+            use_chunk_wise_delta=False,
+            state_dim=14,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=5_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=50_000,
+        save_interval=50_000,
+        fsdp_devices=16,
+        action_horizon=50,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_task_description/",
+    ),
+    TrainConfig(
+        name="robocoin_bimanual_paligemma_q_sarsa_target_bf16",
+        model=_value_function.SARSAValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(224, 224),
+                max_token_len=48,
+                action_dim=14,
+                dtype="float32",
+                no_state=True,
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+            target_dtype="bfloat16",
+        ),
+        data=RoboCoinRldsDataConfig(
+            rlds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            assets=AssetsConfig(
+                assets_dir="gs://saksham-euw4/robocoin_bimanual/",
+                asset_id="norm_stats",
+            ),
+            datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            use_quantile_norm=False,
+            shuffle_buffer_size=50_000,
+            mask_boundary_actions=False,
+            replace_boundary_actions=True,
+            use_chunk_wise_delta=False,
+            state_dim=14,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=5_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=50_000,
+        save_interval=50_000,
+        fsdp_devices=16,
+        action_horizon=50,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_task_description/",
     ),
     TrainConfig(
         name="robocoin_bimanual_paligemma_q_sarsa_task_description",
@@ -3772,7 +3885,7 @@ _CONFIGS = [
     ),
     # Same as robocoin_bimanual_pi05_rlds, but trained on the real_hang_state dataset/norm-stats.
     TrainConfig(
-        name="real_hang_pi05",
+        name="real_hang_pi05_filter_intervention",
         model=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b",
             action_expert_variant="gemma_300m",
@@ -3800,6 +3913,7 @@ _CONFIGS = [
             use_chunk_wise_delta=True,
             use_quantile_norm=True,
             filter_n=5,
+            filter_intervention=True,
             shuffle_buffer_size=50_000,
             mask_boundary_actions=False,
             state_dim=14,
