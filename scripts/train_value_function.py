@@ -366,6 +366,7 @@ def init_wandb(
     log_code: bool = False,
     enabled: bool = True,
     ft_config: _config.FineTuneConfig | None = None,
+    start_new: bool = False,
 ):
     # Only worker 0 should initialize wandb to avoid file conflicts and duplicate runs
     if not enabled or jax.process_index() != 0:
@@ -375,7 +376,7 @@ def init_wandb(
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
+    if resuming and not start_new:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
         wandb.init(id=run_id, resume="must", project=config.project_name)
     else:
@@ -438,6 +439,7 @@ def init_train_state(
             lambda p: p.replace(p.value.astype(jnp.bfloat16)),
         )
         weight_dtype = jnp.dtype(model_config.weight_dtype) if hasattr(model_config, "weight_dtype") else jnp.float32
+        target_dtype = jnp.dtype(model_config.target_dtype) if hasattr(model_config, "target_dtype") else jnp.float32
         params = nnx_utils.state_map(
             params,
             config.trainable_filter,
@@ -446,7 +448,7 @@ def init_train_state(
         params = nnx_utils.state_map(
             params,
             nnx_utils.PathRegex(".*target_(q_)?(network|head)/.*"),
-            lambda p: p.replace(p.value.astype(jnp.bfloat16)),
+            lambda p: p.replace(p.value.astype(target_dtype)),
         )
 
         return training_utils.TrainState(
@@ -641,6 +643,9 @@ def value_function_train_step(
         batch_stats["batch/counterfactual_next_actions_std"] = jnp.std(transition.counterfactual_next_actions)
         batch_stats["batch/counterfactual_next_actions_min"] = jnp.min(transition.counterfactual_next_actions)
         batch_stats["batch/counterfactual_next_actions_max"] = jnp.max(transition.counterfactual_next_actions)
+        batch_stats["batch/counterfactual_next_actions_out_of_range_frac"] = jnp.mean(
+            (jnp.abs(transition.counterfactual_next_actions) >= 1.0).astype(jnp.float32)
+        )
 
     batch_size = transition.reward.shape[0]
 
@@ -1688,6 +1693,7 @@ def generate_validation_plots_dlimp(
     data_config: _config.DataConfig,
     cache_dir: str,
     output_dir: str | None = None,
+    batch_size: int = 64,
 ) -> dict:
     """Generate validation plots for RoboCOIN.
 
@@ -1796,10 +1802,10 @@ def generate_validation_plots_dlimp(
         logging.warning("No valid frames found across all episodes")
         return {}
 
-    logging.info(f"Processing {len(all_frames)} total frames across {len(ep_mc_returns)} episodes in batches of 64")
+    logging.info(f"Processing {len(all_frames)} total frames across {len(ep_mc_returns)} episodes in batches of {batch_size}")
 
     all_predictions, all_predictions_neg, all_predictions_random, all_predictions_counterfactual, all_attn_scores = predict_values(
-        model, all_frames, ep_mc_returns, action_conditioned
+        model, all_frames, ep_mc_returns, action_conditioned, batch_size = batch_size
     )
     del all_frames, traj_frames
 
@@ -1832,15 +1838,18 @@ def generate_validation_plots_dlimp(
 
 def main(config: _config.TrainConfig):
     """Train a value function."""
+    init_logging()
+    logger = logging.getLogger(__name__)
+
     # Initialize distributed training for TPU pods
     # Set PLATFORM=tpu environment variable to enable
     platform = os.environ.get("PLATFORM", "gpu")
     if platform == "tpu":
+        logger.info("Calling jax.distributed.initialize()")
         jax.distributed.initialize()
-        logging.info(f"Initialized JAX distributed: process {jax.process_index()} of {jax.process_count()}")
-    
-    init_logging()
-    logging.info(f"Running on: {_platform.node()}, platform: {platform}")
+        logger.info(f"Initialized JAX distributed: process {jax.process_index()} of {jax.process_count()}")
+
+    logger.info(f"Running on: {_platform.node()}, platform: {platform}")
 
     if not isinstance(config.model, _value_fn.BaseValueFunctionConfig):
         raise TypeError(
@@ -1895,7 +1904,13 @@ def main(config: _config.TrainConfig):
         resume=config.resume,
     )
     wandb_resuming = resuming and ft_config is None
-    init_wandb(config, resuming=wandb_resuming, enabled=config.wandb_enabled, ft_config=ft_config)
+    init_wandb(
+        config,
+        resuming = wandb_resuming,
+        enabled = config.wandb_enabled,
+        ft_config = ft_config,
+        start_new = config.wandb_new,
+    )
     logging.info(f"Initialized checkpoint manager with resuming={resuming}, config.resume={config.resume}")
 
     data_loader = _data_loader.create_data_loader(
@@ -2127,9 +2142,10 @@ def main(config: _config.TrainConfig):
         )
 
     start_step = int(critic_state.step)
+    if start_step > 0:
+        logging.info(f"Resuming with data-loader fast-forward through step {start_step}")
     pbar = tqdm.tqdm(
-        range(start_step, config.num_train_steps),
-        initial=start_step,
+        range(config.num_train_steps),
         total=config.num_train_steps,
         dynamic_ncols=True,
     )
@@ -2142,6 +2158,18 @@ def main(config: _config.TrainConfig):
     for step in pbar:
         # Split rng for this step
         rng, step_rng = jax.random.split(rng)
+        if step < start_step:
+            with timer.context("data_fetch"):
+                raw_batch = next(data_iter)
+
+            with timer.context("data_postprocess"):
+                if isinstance(raw_batch, tuple):
+                    obs, _ = raw_batch
+                    batch = {"state": obs.state}
+                else:
+                    batch = raw_batch
+            continue
+
         with timer.context("train_step_compute"), sharding.set_mesh(mesh):
             critic_state, info = ptrain_step(critic_state, policy_state, batch, step_rng)
 

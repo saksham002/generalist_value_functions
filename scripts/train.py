@@ -216,10 +216,12 @@ def train_step(
         "batch/obs_std": jnp.std(observation.state),
         "batch/obs_min": jnp.min(observation.state),
         "batch/obs_max": jnp.max(observation.state),
+        "batch/obs_out_of_range_frac": jnp.mean((jnp.abs(observation.state) >= 1.0).astype(jnp.float32)),
         "batch/action_mean": jnp.mean(actions),
         "batch/action_std": jnp.std(actions),
         "batch/action_min": jnp.min(actions),
         "batch/action_max": jnp.max(actions),
+        "batch/action_out_of_range_frac": jnp.mean((jnp.abs(actions) >= 1.0).astype(jnp.float32)),
     }
 
     grads_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), grads)

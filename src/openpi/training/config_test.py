@@ -75,3 +75,21 @@ def test_robocoin_rlds_data_config_chunk_wise_create(monkeypatch):
     assert isinstance(data_config.model_transforms.inputs[1], _config._transforms.ResizeImages)
     assert isinstance(data_config.model_transforms.inputs[2], _config.DecodeRoboCoinPromptBytes)
     assert isinstance(data_config.model_transforms.inputs[3], _config._transforms.TokenizePrompt)
+
+
+def test_real_hang_pi05_filter_intervention_only_pads_actions(monkeypatch):
+    monkeypatch.setattr(_config.RoboCoinRldsDataConfig, "_load_norm_stats", lambda self, *_: _make_norm_stats())
+
+    cfg = _config.get_config("real_hang_pi05_filter_intervention")
+
+    assert cfg.model.pad_state_to_action_dim is False
+
+    _, action_spec = cfg.model.inputs_spec()
+    assert action_spec.shape == (1, 50, 32)
+
+    data_config = cfg.data.create(pathlib.Path("."), cfg.model)
+    pad_transform = data_config.model_transforms.inputs[-1]
+    assert isinstance(pad_transform, _config._transforms.PadStatesAndActions)
+    assert pad_transform.model_action_dim == 32
+    assert pad_transform.action_dim_offset == 14
+    assert pad_transform.pad_state is False

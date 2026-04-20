@@ -26,13 +26,20 @@ from typing import Any, Literal
 import openpi.training.rlds_dataset as rlds_dataset
 
 
-SubtaskPromptMode = Literal["subtask_only", "all_subtasks", "all_subtasks_predict_current_subtask"]
+SubtaskPromptMode = Literal[
+    "subtask_only",
+    "all_subtasks",
+    "all_subtasks_predict_current_subtask",
+    "task_description_predict_current_subtask",
+]
 
 ALL_SUBTASKS_HANG_PROMPT = (
     "Grasp the hanger. Lift the hanger off the rod. Pass hanger from right to left arm. "
     "Hook one side of the shirt onto the hanger. Hook the other side of the shirt onto the hanger. "
     "Place the hanger on the rod."
 )
+
+TASK_DESCRIPTION_HANG_PROMPT = "Place the shirt on the hanger and hang it from the rod."
 
 
 class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
@@ -50,7 +57,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         *,
         split: str = "train",
         shuffle: bool = True,
-        shuffle_seed: int = 42,
+        shuffle_seed: int = 86,
         action_chunk_size: int = 25,
         shuffle_buffer_size: int = 250_000,
         num_parallel_reads: int = -1,
@@ -62,6 +69,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         use_eef: bool = False,
         td_n: int | None = None,
         filter_n: int | None = None,
+        filter_intervention: bool = False,
         mask_50fps: bool = False,
         mask_boundary_actions: bool = True,
         variable_horizon: bool = False,
@@ -95,10 +103,10 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         self._use_eef = use_eef
         self._td_n = td_n
         self._filter_n = filter_n
+        self._filter_intervention = filter_intervention
         self._mask_50fps = mask_50fps
         self._mask_boundary_actions = mask_boundary_actions
         self._variable_horizon = variable_horizon
-        self._use_chunk_wise_delta = use_chunk_wise_delta
         self._state_dim = state_dim
         self._state_dim_checked = False
         self._subtask_prompt_mode = subtask_prompt_mode
@@ -106,10 +114,9 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         logging.info(
             f"RoboCoinRldsDataset: critic_mode={critic_mode}, discount={discount}, "
             f"reward_scale={reward_scale}, reward_bias={reward_bias}, use_eef={use_eef}, "
-            f"td_n={td_n}, filter_n={filter_n}, mask_50fps={mask_50fps}, "
+            f"td_n={td_n}, filter_n={filter_n}, filter_intervention={filter_intervention}, mask_50fps={mask_50fps}, "
             f"mask_boundary_actions={mask_boundary_actions}, "
             f"variable_horizon={variable_horizon}, "
-            f"use_chunk_wise_delta={use_chunk_wise_delta}, "
             f"state_dim={state_dim}, "
             f"subtask_prompt_mode={subtask_prompt_mode}, "
             f"counterfactual_action_dim_offset={counterfactual_action_dim_offset}"
@@ -145,13 +152,36 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         import tensorflow as tf
 
         if self._use_eef:
-            actions = self._construct_eef_repr(
-                tf.cast(traj["action"], tf.float32),
-                tf.cast(traj["eef_sim_pose_action"], tf.float32),
+            eef_action = tf.cast(traj["eef_sim_pose_action"], tf.float32)
+            eef_state = tf.cast(traj["eef_sim_pose_state"], tf.float32)
+            raw_action = tf.cast(traj["action"], tf.float32)
+            raw_state = tf.cast(traj["observation/state"], tf.float32)
+            # 14D EEF construction assumes 12D EEF pose (6 xyz+rpy per arm) and raw joint dim 14 or 16.
+            tf.debugging.assert_equal(
+                tf.shape(eef_state)[-1], 12,
+                message = "use_eef=True requires 12D eef_sim_pose_state",
             )
+            tf.debugging.assert_equal(
+                tf.shape(eef_action)[-1], 12,
+                message = "use_eef=True requires 12D eef_sim_pose_action",
+            )
+            raw_state_dim = tf.shape(raw_state)[-1]
+            raw_action_dim = tf.shape(raw_action)[-1]
+            tf.debugging.assert_equal(
+                tf.logical_or(tf.equal(raw_state_dim, 14), tf.equal(raw_state_dim, 16)),
+                True,
+                message = "use_eef=True requires raw observation/state of dim 14 or 16",
+            )
+            tf.debugging.assert_equal(
+                tf.logical_or(tf.equal(raw_action_dim, 14), tf.equal(raw_action_dim, 16)),
+                True,
+                message = "use_eef=True requires raw action of dim 14 or 16",
+            )
+            actions = self._construct_eef_repr(raw_action, eef_action)
+            state = self._construct_eef_state(raw_state, eef_state)
         else:
             actions = tf.cast(traj["action"], tf.float32)
-        state = tf.cast(traj["observation/state"], tf.float32)
+            state = tf.cast(traj["observation/state"], tf.float32)
         traj_len = tf.shape(state)[0]
         fps = traj["traj_metadata"]["episode_metadata"]["fps"]
         repo_id = traj["traj_metadata"]["episode_metadata"]["repo_id"]
@@ -179,6 +209,8 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             "task_description": task_description,
             "embodiment": embodiment,
         }
+        if self._filter_intervention:
+            result["is_intervention"] = traj["is_intervention"]
         metadata_keys = ("index", "episode_index", "_frame_index", "_traj_index")
         if dataset_cfg.name != "robocoin":
             metadata_keys = metadata_keys + ("repo_index",)
@@ -197,15 +229,29 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
 
     @staticmethod
     def _construct_eef_repr(data, eef_data):
-        """Construct 14D EEF representation from EEF pose and gripper values."""
+        """Construct 14D EEF representation from 12D EEF pose and two gripper slots of `data`.
+
+        EEF pose is always laid out as [left_xyz(3), left_rpy(3), right_xyz(3), right_rpy(3)].
+        Gripper positions within `data` depend on its dim: left at dim//2 - 1, right at dim - 1,
+        matching the 14D (6, 13) and 16D (7, 15) raw-state layouts.
+        """
         import tensorflow as tf
+
+        total_dim = tf.shape(data)[-1]
+        left_gripper_index = total_dim // 2 - 1
+        right_gripper_index = total_dim - 1
+
+        tf.debugging.assert_equal(
+            tf.shape(eef_data)[-1], 12,
+            message = "_construct_eef_repr expects 12D EEF data (6 xyz+rpy dims per arm)",
+        )
 
         return tf.concat(
             [
-                eef_data[..., :6],
-                data[..., 6:7],
-                eef_data[..., 6:12],
-                data[..., 13:14],
+                tf.gather(eef_data, tf.range(6), axis = -1),
+                tf.gather(data, [left_gripper_index], axis = -1),
+                tf.gather(eef_data, tf.range(6, 12), axis = -1),
+                tf.gather(data, [right_gripper_index], axis = -1),
             ],
             axis = -1,
         )
@@ -401,19 +447,23 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             frame["next_actions"] = frame["next_actions"][sampled_idx]
             if "counterfactual_next_actions" in frame:
                 frame["counterfactual_next_actions"] = frame["counterfactual_next_actions"][sampled_idx]
-            if self._use_chunk_wise_delta:
-                frame["next_actions"] = frame["next_actions"] - frame["next_actions"][:1, :]
         else:
             frame["next_actions"] = tf.cast(frame["next_actions"], tf.float32)
-            if self._use_chunk_wise_delta:
-                frame["next_actions"] = frame["next_actions"] - frame["next_actions"][:1, :]
 
         frame = super().frame_transforms(frame)
 
         images, image_masks = self._restructure_images(frame)
         raw_state = tf.cast(frame["observation"]["state"], tf.float32)
 
-        if self._state_dim == 14:
+        if self._use_eef:
+            if not self._state_dim_checked:
+                tf.debugging.assert_equal(
+                    tf.shape(raw_state)[-1], 14,
+                    message = "use_eef=True requires 14D state inside RoboCoinRldsDataset",
+                )
+                self._state_dim_checked = True
+            frame["state"] = raw_state
+        elif self._state_dim == 14:
             if not self._state_dim_checked:
                 tf.debugging.assert_equal(
                     tf.shape(raw_state)[-1], 14,
@@ -435,15 +485,19 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         del frame["observation"]
 
         frame["actions"] = tf.cast(frame["actions"], tf.float32)
-        if self._use_chunk_wise_delta:
-            frame["actions"] = frame["actions"] - frame["actions"][:1, :]
 
         if images:
             frame["image"] = images
             frame["image_mask"] = image_masks
 
         raw_next_state = tf.cast(frame["next_observation"]["state"], tf.float32)
-        if self._state_dim == 14:
+        if self._use_eef:
+            tf.debugging.assert_equal(
+                tf.shape(raw_next_state)[-1], 14,
+                message = "use_eef=True requires 14D next_state inside RoboCoinRldsDataset",
+            )
+            frame["next_state"] = raw_next_state
+        elif self._state_dim == 14:
             frame["next_state"] = raw_next_state
         elif self._state_dim == 16:
             raw_dim = tf.shape(raw_next_state)[-1]
@@ -476,6 +530,9 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             frame["subtask_text"] = tf.constant(b"")
         elif self._subtask_prompt_mode == "all_subtasks_predict_current_subtask":
             frame["prompt"] = tf.constant(ALL_SUBTASKS_HANG_PROMPT)
+            frame["subtask_text"] = subtask_texts[sampled_idx]
+        elif self._subtask_prompt_mode == "task_description_predict_current_subtask":
+            frame["prompt"] = frame["task_description"]
             frame["subtask_text"] = subtask_texts[sampled_idx]
 
         selected_steps_f = tf.cast(selected_steps, tf.float32)
@@ -527,12 +584,18 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         import tensorflow as tf
 
         traj = super()._apply_frame_transforms_to_trajectory(traj)
-        if self._filter_n is None:
-            return traj
 
-        fps = tf.cast(traj["fps"], tf.int32)
-        filter_n_native = tf.where(tf.equal(fps, 30), 3 * self._filter_n // 5, self._filter_n)
-        mask = traj["steps_to_subtask_end"] >= filter_n_native
+        # Mirror the per-frame predicates in `frame_filter` so trajectory mode applies the
+        # same filtering as flat-frame mode (include_subtask, mask_50fps, filter_n, filter_intervention).
+        mask = tf.cast(traj["include_subtask"], tf.bool)
+        if self._mask_50fps:
+            mask = tf.logical_and(mask, tf.equal(tf.cast(traj["fps"], tf.int32), 30))
+        if self._filter_n is not None:
+            fps = tf.cast(traj["fps"], tf.int32)
+            filter_n_native = tf.where(tf.equal(fps, 30), 3 * self._filter_n // 5, self._filter_n)
+            mask = tf.logical_and(mask, traj["steps_to_subtask_end"] >= filter_n_native)
+        if self._filter_intervention:
+            mask = tf.logical_and(mask, tf.cast(traj["is_intervention"], tf.bool))
         return tf.nest.map_structure(lambda x: tf.boolean_mask(x, mask), traj)
 
     def frame_filter(self, frame: dict) -> bool:
@@ -548,5 +611,8 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             fps = tf.cast(frame["fps"], tf.int32)
             filter_n_native = tf.where(tf.equal(fps, 30), 3 * self._filter_n // 5, self._filter_n)
             keep = tf.logical_and(keep, frame["steps_to_subtask_end"] >= filter_n_native)
+
+        if self._filter_intervention:
+            keep = tf.logical_and(keep, tf.cast(frame["is_intervention"], tf.bool))
 
         return keep

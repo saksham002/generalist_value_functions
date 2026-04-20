@@ -433,6 +433,7 @@ def predict_values(
     all_frames: list[tuple],
     ep_mc_returns: dict,
     action_conditioned: bool,
+    batch_size: int = 64,
 ) -> tuple[
     dict[str, list[float]],
     dict[str, list[float]],
@@ -464,15 +465,14 @@ def predict_values(
             all_attn_scores,
         ).
     """
-    BATCH_SIZE = 64
     all_predictions: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_predictions_neg: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_predictions_random: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_predictions_counterfactual: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_attn_scores: dict[str, list[np.ndarray]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
 
-    for batch_start in range(0, len(all_frames), BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, len(all_frames))
+    for batch_start in range(0, len(all_frames), batch_size):
+        batch_end = min(batch_start + batch_size, len(all_frames))
         batch_frames = all_frames[batch_start:batch_end]
 
         frame_dicts = [f[2] for f in batch_frames]

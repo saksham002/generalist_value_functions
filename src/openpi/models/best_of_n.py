@@ -44,14 +44,25 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
     use_target_value: bool = False
 
     # Norm stats for renormalizing actions before passing to the critic.
-    # Three valid modes:
+    # Two valid modes:
     #   - both None: no renormalization (actions are already in critic space)
     #   - both provided: unnormalize from policy space, then normalize into critic space
-    #   - only critic_norm_stats: actions are already unnormalized (e.g. cached
-    #     counterfactual actions), so just normalize into critic space
-    # policy_norm_stats alone is not valid.
+    # Providing one without the other is not valid.
     policy_norm_stats: dict[str, NormStats] | None = None
     critic_norm_stats: dict[str, NormStats] | None = None
+
+    # When True, converts cached counterfactual actions from chunk-wise-delta
+    # format (delta[i] = global[i] - global[0]) to global by adding initial_pose
+    # before normalizing into critic space.
+    convert_to_global: bool = False
+
+    # When the policy and critic have different action dimensions, slice the policy
+    # action down to the critic's action dim before applying critic norm stats. The
+    # slice covers indices [critic_action_dim_offset : critic_action_dim_offset + critic_action_dim],
+    # where critic_action_dim is read from critic_norm_stats. Used e.g. when the
+    # policy outputs a 32-d padded action and the critic only consumes the 14-d
+    # EEF subset at offset 14. Must be set explicitly when dims differ.
+    critic_action_dim_offset: int | None = None
 
     # "argmax": pick action with highest Q-value.
     # "softmax": sample action with probability proportional to exp(Q / temperature).
@@ -69,11 +80,11 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
         # Cached-only mode: action_dim and action_horizon must be provided
         elif self.action_dim == 0 or self.action_horizon == 0:
             raise ValueError("action_dim and action_horizon must be provided when base_model_config is None")
-        if self.policy_norm_stats is not None and self.critic_norm_stats is None:
+        if (self.policy_norm_stats is None) != (self.critic_norm_stats is None):
             raise ValueError(
-                "policy_norm_stats was provided without critic_norm_stats. "
-                "Either provide both (to renormalize between policy and critic spaces), "
-                "or only critic_norm_stats (when actions are already unnormalized)."
+                "policy_norm_stats and critic_norm_stats must both be provided or both be None. "
+                f"Got policy_norm_stats={'set' if self.policy_norm_stats is not None else 'None'}, "
+                f"critic_norm_stats={'set' if self.critic_norm_stats is not None else 'None'}."
             )
 
     @property
@@ -92,10 +103,12 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
             num_samples=self.num_samples,
             take_min_over_ensemble=self.take_min_over_ensemble,
             use_target_value=self.use_target_value,
+            convert_to_global=self.convert_to_global,
             selection_mode=self.selection_mode,
             softmax_temperature=self.softmax_temperature,
             policy_norm_stats=self.policy_norm_stats,
             critic_norm_stats=self.critic_norm_stats,
+            critic_action_dim_offset=self.critic_action_dim_offset,
         )
 
     @override
@@ -127,10 +140,12 @@ class BestOfNWrapper(_model.BaseModel):
     num_samples: int
     take_min_over_ensemble: bool
     use_target_value: bool
+    convert_to_global: bool
     selection_mode: Literal["argmax", "softmax"]
     softmax_temperature: float
     policy_norm_stats: dict[str, NormStats] | None
     critic_norm_stats: dict[str, NormStats] | None
+    critic_action_dim_offset: int | None
 
     def __init__(
         self,
@@ -142,36 +157,63 @@ class BestOfNWrapper(_model.BaseModel):
         num_samples: int,
         take_min_over_ensemble: bool,
         use_target_value: bool,
+        convert_to_global: bool = False,
         selection_mode: Literal["argmax", "softmax"],
         softmax_temperature: float,
         policy_norm_stats: dict[str, NormStats] | None = None,
         critic_norm_stats: dict[str, NormStats] | None = None,
+        critic_action_dim_offset: int | None = None,
     ):
         super().__init__(action_dim, action_horizon, max_token_len)
         self.base_model = base_model
         self.num_samples = num_samples
         self.take_min_over_ensemble = take_min_over_ensemble
         self.use_target_value = use_target_value
+        self.convert_to_global = convert_to_global
         self.selection_mode = selection_mode
         self.softmax_temperature = softmax_temperature
         self.policy_norm_stats = policy_norm_stats
         self.critic_norm_stats = critic_norm_stats
+        self.critic_action_dim_offset = critic_action_dim_offset
 
-    def _renormalize_actions(self, actions: at.Array) -> at.Array:
-        """Bring actions into the critic's normalized action space.
+    def _renormalize_actions(self, actions: at.Array, initial_pose: at.Array | None = None) -> at.Array:
+        """Bring actions from policy normalized space into the critic's normalized action space.
 
-        If policy_norm_stats is provided, unnormalize from policy action space first.
-        Otherwise, actions are assumed to already be unnormalized (e.g. cached
-        counterfactual actions) and are only normalized into the critic action space.
+        Steps:
+        1. Optionally slice action dim to match critic (e.g. 32-d padded → 14-d EEF).
+        2. Unnormalize from policy action space.
+        3. Optionally convert delta actions to global using initial_pose.
+        4. Normalize into critic action space.
+
+        Both policy_norm_stats and critic_norm_stats must be set (enforced by config validation).
         """
         action_key = "actions"
         data = {action_key: actions}
         # Filter to just the "actions" key — Normalize/Unnormalize use strict=True and would
         # fail if norm_stats contains keys (e.g. "state") not present in data.
+        policy_action_stats = {action_key: self.policy_norm_stats[action_key]}
         critic_action_stats = {action_key: self.critic_norm_stats[action_key]}
-        if self.policy_norm_stats is not None:
-            policy_action_stats = {action_key: self.policy_norm_stats[action_key]}
-            data = _transforms.Unnormalize(policy_action_stats)(data)
+        # When the policy and critic have different action dims (e.g. 32-d padded
+        # policy action vs 14-d EEF critic action), slice down to the critic's
+        # action dim before applying any norm stats. policy_norm_stats for "actions"
+        # are stored at the *unpadded* (critic) dim, so this slice must happen
+        # before Unnormalize.
+        critic_action_dim = critic_action_stats[action_key].mean.shape[-1]
+        if data[action_key].shape[-1] != critic_action_dim:
+            if self.critic_action_dim_offset is None:
+                raise ValueError(
+                    f"Action dim mismatch: input has {data[action_key].shape[-1]} but critic expects {critic_action_dim}. "
+                    f"Set critic_action_dim_offset to specify which slice of the input to use."
+                )
+            start = self.critic_action_dim_offset
+            data[action_key] = data[action_key][..., start : start + critic_action_dim]
+        data = _transforms.Unnormalize(policy_action_stats)(data)
+        if self.convert_to_global:
+            assert initial_pose is not None, (
+                "initial_pose is required when convert_to_global=True. Pass transition.action[:, :1, :] as initial_pose."
+            )
+            # initial_pose: [B, 1, ad] -> broadcast over [B, N, ah, ad]
+            data[action_key] = data[action_key] + initial_pose[:, None, :, :]
         data = _transforms.Normalize(critic_action_stats)(data)
         return data[action_key]
 
@@ -266,13 +308,18 @@ class BestOfNWrapper(_model.BaseModel):
 
         n = all_actions.shape[1]
         action_horizon = all_actions.shape[2]
-        action_dim_size = all_actions.shape[3]
 
         # Renormalize actions into critic space if critic norm stats were provided.
-        eval_actions = self._renormalize_actions(all_actions) if self.critic_norm_stats is not None else all_actions
+        if self.critic_norm_stats is not None:
+            initial_pose = transition.action[:, :1, :] if self.convert_to_global else None
+            eval_actions = self._renormalize_actions(all_actions, initial_pose=initial_pose)
+        else:
+            eval_actions = all_actions
 
         expanded_obs = expand_observation(observation, n)
-        flat_actions = eval_actions.reshape(batch_size * n, action_horizon, action_dim_size)
+        # eval_actions may have a different last dim than all_actions when the
+        # critic consumes a sliced subset of the policy's action vector.
+        flat_actions = eval_actions.reshape(batch_size * n, action_horizon, eval_actions.shape[-1])
         prefix_cache = None
         network = getattr(value_function, "q_network", getattr(value_function, "network", None))
         if network is not None and hasattr(network, "compute_prefix_cache"):

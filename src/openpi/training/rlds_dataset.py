@@ -52,7 +52,7 @@ class BaseRldsDataset:
         *,
         split: str = "train",
         shuffle: bool = True,
-        shuffle_seed: int = 42,
+        shuffle_seed: int = 86,
         action_chunk_size: int = 16,
         shuffle_buffer_size: int = 250_000,
         num_parallel_reads: int = -1,

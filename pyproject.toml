@@ -17,6 +17,7 @@ dependencies = [
     "gymnasium",
     "imageio>=2.36.1",
     "jax[cuda12]==0.5.3; sys_platform == 'linux'",
+    "jax==0.5.3; sys_platform == 'darwin'",
     "jaxtyping==0.2.36",
     "lerobot",
     "ml_collections==1.0.0",
@@ -94,6 +95,7 @@ dependency-metadata = [
 ]
 # Allow resolving for macOS (without CUDA) and Linux
 environments = [
+    "sys_platform == 'darwin'",
     "sys_platform == 'linux'",
 ]
 find-links = ["https://storage.googleapis.com/jax-releases/libtpu_releases.html"]
