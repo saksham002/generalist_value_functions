@@ -1,6 +1,9 @@
 # Scratch / one-off scripts
 random/
 
+# Per-user project status snapshots (see CLAUDE.md "Project Status / Session Context")
+project_status/
+
 # Separate repo
 eval/
 
@@ -62,6 +65,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+test/
 
 # Translations
 *.mo

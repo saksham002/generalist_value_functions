@@ -315,6 +315,46 @@ def _decode_repo_id(raw) -> str:
     return str(raw)
 
 
+def _decode_and_resize_image_bytes(
+    image_bytes: bytes | np.ndarray, target_size: tuple[int, int]
+) -> np.ndarray:
+    """Decode a single JPEG/PNG image to uint8 and resize to target_size.
+
+    Used at prediction time so that cache_val_episodes can store the raw
+    compressed bytes (≈10–30x smaller than decoded uint8) and we only
+    materialize the decoded array for one episode at a time.
+    """
+    import tensorflow as tf
+
+    if isinstance(image_bytes, np.ndarray):
+        image_bytes = image_bytes.item() if image_bytes.shape == () else bytes(image_bytes)
+    image = tf.io.decode_image(image_bytes, expand_animations = False, dtype = tf.uint8)
+    image = tf.image.resize(
+        image, target_size, method = tf.image.ResizeMethod.BILINEAR, antialias = True
+    )
+    image = tf.cast(tf.clip_by_value(tf.round(image), 0.0, 255.0), tf.uint8)
+    return image.numpy()
+
+
+def decode_episode_images(frames: list[dict], target_size: tuple[int, int]) -> None:
+    """In-place decode + resize of all `image` entries in a list of cached frames.
+
+    Frames cached via cache_val_episodes (with the upstream dataset configured
+    with decode_images=False) hold raw compressed bytes per camera. This
+    converts them to uint8 (target_size, 3) arrays so downstream stack_images /
+    plotting can consume them. Only operates on frames whose `image[cam]` is
+    bytes / scalar object array; already-decoded frames are passed through.
+    """
+    for frame in frames:
+        if "image" not in frame:
+            continue
+        image_dict = frame["image"]
+        for cam_key, value in list(image_dict.items()):
+            if isinstance(value, np.ndarray) and value.dtype == np.uint8 and value.ndim == 3:
+                continue  # already decoded
+            image_dict[cam_key] = _decode_and_resize_image_bytes(value, target_size)
+
+
 def cache_val_episodes(
     trajectory_iter,
     num_val_trajectories: int,
@@ -374,6 +414,12 @@ def cache_val_episodes(
             os.makedirs(cache_dir, exist_ok = True)
 
         for traj in trajectory_iter:
+            # Some shards/transforms can yield zero-frame trajectories (all
+            # frames filtered out by include_subtask / mask_50fps / etc.). Skip
+            # rather than crash on traj["repo_id"][0].
+            if len(traj["repo_id"]) == 0:
+                continue
+
             repo_id = _decode_repo_id(traj["repo_id"][0])
             repo_key: int | str = int(traj["repo_index"][0]) if "repo_index" in traj else repo_id
 
