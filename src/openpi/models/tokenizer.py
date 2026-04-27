@@ -118,9 +118,10 @@ class Gemma4Tokenizer:
     IMAGE_PLACEHOLDER_ID = 258880
     NEWLINE_NEWLINE_ID = 108
 
-    def __init__(self, max_len: int = 48, num_images: int = 0):
+    def __init__(self, max_len: int = 48, num_images: int = 0, use_bos: bool = True):
         self._max_len = max_len
         self._num_images = num_images
+        self._use_bos = use_bos
 
         path = download.maybe_download("gs://gemma-data/tokenizers/tokenizer_gemma4.model")
         with path.open("rb") as f:
@@ -132,15 +133,16 @@ class Gemma4Tokenizer:
             discretized_state = np.digitize(state, bins = np.linspace(-1, 1, 256 + 1)[:-1]) - 1
             state_str = " ".join(map(str, discretized_state))
             full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
-            tokens = self._tokenizer.encode(full_prompt, add_bos = True)
+            tokens = self._tokenizer.encode(full_prompt, add_bos = self._use_bos)
         else:
-            tokens = self._tokenizer.encode(cleaned_text, add_bos = True) + self._tokenizer.encode("\n")
+            tokens = self._tokenizer.encode(cleaned_text, add_bos = self._use_bos) + self._tokenizer.encode("\n")
 
-        # Insert <start_of_image> markers after BOS. `_embed_sequence_gemma4` splices
-        # the full [\n\n, SOI, <soft tokens>, EOI, \n\n] block in place of each marker.
         if self._num_images > 0:
             soi_markers = [self.START_OF_IMAGE_ID] * self._num_images
-            tokens = [tokens[0]] + soi_markers + tokens[1:]
+            if self._use_bos:
+                tokens = [tokens[0]] + soi_markers + tokens[1:]
+            else:
+                tokens = soi_markers + tokens
 
         total_len = self._max_len + self._num_images
         tokens_len = len(tokens)
@@ -168,15 +170,14 @@ class Gemma4Tokenizer:
 
 def create_tokenizer(
     backbone_variant: str | None, max_len: int, num_images: int = 0
-# ) -> PaligemmaTokenizer | Gemma3Tokenizer | Gemma4Tokenizer:
-) -> PaligemmaTokenizer | Gemma3Tokenizer:
+) -> PaligemmaTokenizer | Gemma3Tokenizer | Gemma4Tokenizer:
     """Factory function that returns the appropriate tokenizer for the given backbone variant."""
     if backbone_variant == "gemma3":
         logging.info(f"Creating Gemma3Tokenizer: max_len={max_len}, num_images={num_images}")
         return Gemma3Tokenizer(max_len = max_len, num_images = num_images)
-    # if backbone_variant == "gemma4":
-    #     logging.info(f"Creating Gemma4Tokenizer: max_len={max_len}, num_images={num_images}")
-    #     return Gemma4Tokenizer(max_len = max_len, num_images = num_images)
+    if backbone_variant == "gemma4":
+        logging.info(f"Creating Gemma4Tokenizer: max_len={max_len}, num_images={num_images}")
+        return Gemma4Tokenizer(max_len = max_len, num_images = num_images)
     logging.info(f"Creating PaligemmaTokenizer: max_len={max_len}")
     return PaligemmaTokenizer(max_len = max_len)
 
