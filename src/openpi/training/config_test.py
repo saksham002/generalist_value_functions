@@ -75,6 +75,7 @@ def test_robocoin_rlds_data_config_chunk_wise_create(monkeypatch):
         "image_size": (224, 224),
         "state_dim": 14,
         "subtask_prompt_mode": "subtask_only",
+        "subsample": False,
     }
     assert data_config.data_transforms.inputs == []
     assert isinstance(data_config.model_transforms.inputs[0], _config._transforms.ReplaceMaskedActions)

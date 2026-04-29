@@ -86,6 +86,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         latent_views: Sequence[rlds_dataset.latent_store.LatentViewConfig] = (),
         counterfactual_action_store_dir: str | None = None,
         counterfactual_action_dim_offset: int = 0,
+        subsample: bool = False,
     ):
         if td_n is not None and td_n % 5 != 0:
             raise ValueError(f"td_n must be a multiple of 5, got {td_n}")
@@ -113,6 +114,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         self._state_dim_checked = False
         self._subtask_prompt_mode = subtask_prompt_mode
         self._counterfactual_action_dim_offset = counterfactual_action_dim_offset
+        self._subsample = subsample
         logging.info(
             f"RoboCoinRldsDataset: critic_mode={critic_mode}, discount={discount}, "
             f"reward_scale={reward_scale}, reward_bias={reward_bias}, use_eef={use_eef}, "
@@ -121,7 +123,8 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             f"variable_horizon={variable_horizon}, "
             f"state_dim={state_dim}, "
             f"subtask_prompt_mode={subtask_prompt_mode}, "
-            f"counterfactual_action_dim_offset={counterfactual_action_dim_offset}"
+            f"counterfactual_action_dim_offset={counterfactual_action_dim_offset}, "
+            f"subsample={subsample}"
         )
 
         super().__init__(
@@ -188,6 +191,12 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             state = tf.cast(traj["observation/state"], tf.float32)
         traj_len = tf.shape(state)[0]
         fps = traj["traj_metadata"]["episode_metadata"]["fps"]
+        if self._subsample:
+            tf.debugging.assert_equal(
+                tf.cast(fps, tf.int32), tf.constant(60, dtype = tf.int32),
+                message = "subsample=True requires the underlying dataset to be 60 Hz.",
+            )
+            fps = tf.fill(tf.shape(fps), tf.cast(30, fps.dtype))
         repo_id = traj["traj_metadata"]["episode_metadata"]["repo_id"]
         task_description = traj["traj_metadata"]["episode_metadata"]["task_description"]
         embodiment = tf.repeat(self._extract_embodiment(repo_id[0])[None], traj_len)
@@ -383,7 +392,20 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
                         if key in mapped_traj:
                             mapped_traj[f"next_{key}"] = tf.gather(mapped_traj[key], next_indices)
 
+        if self._subsample:
+            # Drop every other action across the chunk axis (keep indices 1, 3, 5, ...).
+            mapped_traj["action_mask"] = mapped_traj["action_mask"][..., 1::2]
+            if "next_action_mask" in mapped_traj:
+                mapped_traj["next_action_mask"] = mapped_traj["next_action_mask"][..., 1::2]
+            mapped_traj["next_actions"] = mapped_traj["next_actions"][:, 1::2, :]
+
         return mapped_traj
+
+    def _chunk_actions(self, traj: dict, action_chunk_size: int) -> dict:
+        traj = super()._chunk_actions(traj, action_chunk_size)
+        if self._subsample:
+            traj["actions"] = traj["actions"][:, 1::2, :]
+        return traj
 
     def _restructure_images(self, frame: dict[str, Any], prefix: str = "") -> tuple[dict[str, Any], dict[str, Any]]:
         """Move camera images from observation dicts into the standard image/image_mask format."""

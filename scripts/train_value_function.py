@@ -198,6 +198,40 @@ def get_memory_stats() -> dict[str, float]:
                 logging.info(f"[MemoryDebug] backend has no 'memory_stats' attr. Platform={backend.platform}")
         except Exception as e:
             logging.info(f"[MemoryDebug] TPU backend memory_stats error: {e}")
+        # Modern JAX exposes HBM stats per-device. Sum across local devices for
+        # an aggregate, plus log per-device peak (useful when devices diverge).
+        try:
+            local_devs = jax.local_devices()
+            used_total = 0
+            limit_total = 0
+            peak_total = 0
+            for di, dev in enumerate(local_devs):
+                if not hasattr(dev, "memory_stats"):
+                    continue
+                ms = dev.memory_stats()
+                if not ms:
+                    continue
+                used = ms.get("bytes_in_use", 0)
+                peak = ms.get("peak_bytes_in_use", 0)
+                limit = ms.get("bytes_limit", 0) or ms.get("bytes_reservable_limit", 0)
+                used_total += used
+                peak_total += peak
+                limit_total += limit
+                stats[f"hbm_dev{di}_used_gb"] = used / 1e9
+                stats[f"hbm_dev{di}_peak_gb"] = peak / 1e9
+                stats[f"hbm_dev{di}_limit_gb"] = limit / 1e9
+            if limit_total > 0:
+                stats["hbm_used_gb_total"] = used_total / 1e9
+                stats["hbm_peak_gb_total"] = peak_total / 1e9
+                stats["hbm_limit_gb_total"] = limit_total / 1e9
+                logging.info(
+                    f"[MemoryDebug] HBM (sum over {len(local_devs)} local devs): "
+                    f"used={used_total / 1e9:.2f} GB, "
+                    f"peak={peak_total / 1e9:.2f} GB, "
+                    f"limit={limit_total / 1e9:.2f} GB"
+                )
+        except Exception as e:
+            logging.info(f"[MemoryDebug] device.memory_stats error: {e}")
     except Exception as e:
         logging.info(f"[MemoryDebug] TF device listing error: {e}")
     
@@ -507,58 +541,13 @@ def init_train_state(
         return train_state_shape, state_sharding
 
     partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.critic.params.to_pure_dict())
-    logging.info(f"[init_train_state pidx={jax.process_index()}] returned from _load_weights_and_validate")
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # Pre-shard partial_params to match the FSDP output sharding so each chip
     # only receives its shard (~x/N GB) instead of the full replicated copy
     # (~x GB). This avoids OOM during init on memory-constrained devices.
     params_sharding = sharding.fsdp_sharding(partial_params, mesh)
-    # Concise diagnostic — one line per host. Counts replicated vs sharded
-    # bytes/leaves and detects array aliasing in `partial_params` (where
-    # multiple paths reference the same numpy array). RSS sample helps
-    # correlate with memmon. Read-only — does not change behaviour, so
-    # paligemma path is unaffected.
-    try:
-        import numpy as _np
-        _empty_spec = jax.sharding.PartitionSpec()
-        _leaves_p = jax.tree_util.tree_leaves(partial_params)
-        _leaves_s = jax.tree_util.tree_leaves(params_sharding)
-        _total_b = _repl_b = _shard_b = 0
-        _n_total = _n_repl = _n_shard = 0
-        _ids = set()
-        _small_repl_b = 0  # bytes replicated *because* leaf < 4MiB threshold
-        for _arr, _sh in zip(_leaves_p, _leaves_s):
-            if not hasattr(_arr, "shape") or not hasattr(_arr, "dtype"):
-                continue
-            _sz = int(_np.prod(_arr.shape)) * _np.dtype(_arr.dtype).itemsize
-            _total_b += _sz; _n_total += 1
-            _ids.add(id(_arr))
-            if hasattr(_sh, "spec") and _sh.spec == _empty_spec:
-                _repl_b += _sz; _n_repl += 1
-                if _sz < 4 * 2**20:
-                    _small_repl_b += _sz
-            else:
-                _shard_b += _sz; _n_shard += 1
-        # current RSS
-        try:
-            with open("/proc/self/status") as _f:
-                _rss_kib = next(int(l.split()[1]) for l in _f if l.startswith("VmRSS:"))
-        except Exception:
-            _rss_kib = -1
-        logging.info(
-            f"[fsdp-stats pidx={jax.process_index()}] leaves={_n_total} "
-            f"(sharded={_n_shard} replicated={_n_repl}) "
-            f"bytes={_total_b/2**30:.2f}GiB "
-            f"(sharded={_shard_b/2**30:.2f}GiB replicated={_repl_b/2**30:.3f}GiB "
-            f"small_repl<4MiB={_small_repl_b/2**30:.3f}GiB) "
-            f"unique_arrays={len(_ids)}/{_n_total} "
-            f"RSS={_rss_kib/2**20:.2f}GiB"
-        )
-    except Exception as _e:
-        logging.warning(f"[fsdp-stats pidx={jax.process_index()}] diagnostic failed: {_e}")
 
-    logging.info(f"[init_train_state pidx={jax.process_index()}] computed params_sharding, calling jax.device_put")
     # `jax.device_put(tree, sharding)` calls `multihost_utils.assert_equal`
     # under the hood, which `broadcast_one_to_all`s each leaf with
     # `out_shardings=PartitionSpec()` (REPLICATED). For very large param trees
@@ -579,7 +568,6 @@ def init_train_state(
             return np.asarray(arr[idx])
         return jax.make_array_from_callback(shape, sharding, _cb)
     partial_params = jax.tree.map(_make_sharded_array, partial_params, params_sharding)
-    logging.info(f"[init_train_state pidx={jax.process_index()}] jax.device_put returned, entering init JIT")
 
     train_state = jax.jit(
         init_actor_critic,
@@ -587,7 +575,6 @@ def init_train_state(
         in_shardings = (replicated_sharding, params_sharding),
         out_shardings = state_sharding,
     )(init_rng, partial_params)
-    logging.info(f"[init_train_state pidx={jax.process_index()}] init JIT returned, returning train_state")
 
     return train_state, state_sharding
 
@@ -2004,26 +1991,14 @@ def main(config: _config.TrainConfig):
     )
     logging.info(f"Initialized checkpoint manager with resuming={resuming}, config.resume={config.resume}")
 
-    def _rss_g():
-        try:
-            with open("/proc/self/status") as _f:
-                for _l in _f:
-                    if _l.startswith("VmRSS:"):
-                        return int(_l.split()[1]) / 2**20
-        except Exception:
-            return -1.0
-    logging.info(f"[main pidx={jax.process_index()}] before create_data_loader RSS={_rss_g():.2f}GiB")
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
         shuffle=True,
     )
-    logging.info(f"[main pidx={jax.process_index()}] after create_data_loader RSS={_rss_g():.2f}GiB")
     data_iter = iter(data_loader)
-    logging.info(f"[main pidx={jax.process_index()}] after iter(data_loader) RSS={_rss_g():.2f}GiB")
 
     raw_batch = next(data_iter)
-    logging.info(f"[main pidx={jax.process_index()}] after first next(data_iter) RSS={_rss_g():.2f}GiB")
     if isinstance(raw_batch, tuple):
         obs, _ = raw_batch
         batch = {"state": obs.state}
@@ -2113,7 +2088,6 @@ def main(config: _config.TrainConfig):
         # we spin up the Gemma4 weight load — orbax restore stages the full
         # 26.9 GB checkpoint through host RAM and we can't afford the val side
         # holding tf.data threadpools / shuffle buffers.
-        logging.info(f"[main pidx={jax.process_index()}] after val cache (before cleanup) RSS={_rss_g():.2f}GiB")
         del val_trajectory_dataset, val_input_transform, _val_data_config, _val_rlds_kwargs
         gc.collect()
         try:
@@ -2121,7 +2095,6 @@ def main(config: _config.TrainConfig):
             _ctypes.CDLL("libc.so.6").malloc_trim(0)
         except OSError:
             pass
-        logging.info(f"[main pidx={jax.process_index()}] after val cache cleanup RSS={_rss_g():.2f}GiB")
     else:
         # Non-RoboCOIN: use LeRobot dataset
         from lerobot.common.datasets import lerobot_dataset
@@ -2174,9 +2147,7 @@ def main(config: _config.TrainConfig):
             f"({num_eval_envs} parallel envs)"
         )
 
-    logging.info(f"[main pidx={jax.process_index()}] calling init_train_state")
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
-    logging.info(f"[main pidx={jax.process_index()}] init_train_state returned")
 
     if resuming:
         logging.info("Resuming training from checkpoint")
@@ -2194,9 +2165,7 @@ def main(config: _config.TrainConfig):
     if policy_state:
         logging.info(f"Policy: {training_utils.array_tree_to_info(policy_state.params)}")
 
-    logging.info(f"[main pidx={jax.process_index()}] entering jax.block_until_ready(critic_state)")
     jax.block_until_ready(critic_state)
-    logging.info(f"[main pidx={jax.process_index()}] block_until_ready done")
 
     # === val_only mode: run one validation pass and exit ===
     if ft_config is not None and ft_config.val_only:
@@ -2289,7 +2258,6 @@ def main(config: _config.TrainConfig):
 
     # Log initial timing info
     logging.info(f"Starting training with batch_size={config.batch_size}, num_workers={config.num_workers}")
-    logging.info(f"[main pidx={jax.process_index()}] entering training loop")
 
     for step in pbar:
         # Split rng for this step
@@ -2306,12 +2274,8 @@ def main(config: _config.TrainConfig):
                     batch = raw_batch
             continue
 
-        if step == start_step:
-            logging.info(f"[train_loop pidx={jax.process_index()}] about to call ptrain_step (step={step})")
         with timer.context("train_step_compute"), sharding.set_mesh(mesh):
             critic_state, info = ptrain_step(critic_state, policy_state, batch, step_rng)
-        if step == start_step:
-            logging.info(f"[train_loop pidx={jax.process_index()}] ptrain_step returned (step={step})")
 
         with timer.context("train_step_sync"):
             jax.block_until_ready(critic_state)

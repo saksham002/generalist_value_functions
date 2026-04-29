@@ -905,6 +905,10 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
     use_chunk_wise_delta: bool = False
     state_dim: int = 14
     subtask_prompt_mode: robocoin_rlds_dataset.SubtaskPromptMode = "subtask_only"
+    # Subsample 60 Hz raw actions to an effective 30 Hz: drop every other action in each chunk
+    # (keep indices 1, 3, 5, ...). Halves both the action-chunk axis and the chunk-aware
+    # norm-stat axis, and overrides the per-trajectory fps from 60 to 30.
+    subsample: bool = False
 
     def __post_init__(self) -> None:
         if self.mask_boundary_actions and self.replace_boundary_actions:
@@ -1036,6 +1040,10 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
                         ],
                         axis = ax,
                     )
+                    # Mirror the action-chunk subsampling: keep indices 1, 3, 5, ... along
+                    # the chunk axis. Only chunk-wise stats have a leading chunk dim.
+                    if self.subsample and combined[stat_key].ndim >= 2:
+                        combined[stat_key] = combined[stat_key][1::2]
                 norm_stats["actions"] = _transforms.NormStats(**combined)
             else:
                 action_stats = data["action"]
@@ -1251,6 +1259,7 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
                 "image_size": self.image_size,
                 "state_dim": self.state_dim,
                 "subtask_prompt_mode": self.subtask_prompt_mode,
+                "subsample": self.subsample,
             },
         )
 
@@ -1540,8 +1549,8 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
-    # Backbone variant for tokenizer selection: "gemma3" uses Gemma3Tokenizer, "gemma4" uses
-    # Gemma4Tokenizer, None uses PaligemmaTokenizer.
+    # Backbone variant for tokenizer selection: "gemma<i>" uses Gemma<i>Tokenizer,
+    # None uses PaligemmaTokenizer.
     backbone_variant: str | None = None
     # Number of actions in the action chunk. None means V(s), not Q(s,a).
     action_horizon: int | None = None
@@ -3612,7 +3621,7 @@ _CONFIGS = [
             network_config=_paligemma_network.PaliGemmaNetworkConfig(
                 state_dim=14,
                 num_cameras=3,
-                image_size=(240, 240),
+                image_size=(432, 672),
                 max_token_len=96,                          # to account for task + subtask concatenation
                 action_dim=14,
                 dtype="bfloat16",
@@ -3634,7 +3643,7 @@ _CONFIGS = [
             td_n=50,
             use_eef=True,
             use_quantile_norm=False,
-            image_size=(240, 240),
+            image_size=(432, 672),
             shuffle_buffer_size=7_500,
             num_parallel_reads=4,
             num_parallel_calls=4,
@@ -3650,7 +3659,7 @@ _CONFIGS = [
         num_train_steps=230_000,
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
+            warmup_steps=5000,
             peak_lr=1e-5,
             decay_steps=230_000,
             decay_lr=1e-6,
@@ -3904,7 +3913,8 @@ _CONFIGS = [
             paligemma_variant="gemma_2b",
             action_expert_variant="gemma_300m",
             action_dim=32,
-            action_horizon=50,
+            # The dataset chunks 60 raw 60Hz actions and the data pipeline subsamples to 30.
+            action_horizon=30,
             max_token_len=96,
             pi05=True,
             discrete_state_input=True,
@@ -3914,10 +3924,11 @@ _CONFIGS = [
             dtype="float32",
         ),
         data=RoboCoinRldsDataConfig(
-            rlds_data_dir="gs://saksham-euw4/hdf5/",
+            rlds_data_dir="gs://saksham-euw4/hdf5/real_hang_60_Hz/",
+            # rlds_data_dir="/data/group_data/rl/saksham3/hdf5/real_hang_60_Hz/",
             datasets=(rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
             assets=AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang_60_Hz",
                 asset_id = "norm_stats",
             ),
             discount=0.999,
@@ -3931,16 +3942,16 @@ _CONFIGS = [
             shuffle_buffer_size=50_000,
             mask_boundary_actions=False,
             state_dim=14,
+            subsample=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=200_000,
         batch_size=256,
-        # Linear warmup to 5e-5, then constant (cosine-decay with peak == end == constant).
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
-            peak_lr=5e-5,
+            peak_lr=1e-4,
             decay_steps=200_000,
-            decay_lr=5e-5,
+            decay_lr=1e-5,
         ),
         optimizer=_optimizer.AdamW(),
         num_workers=0,
@@ -3948,9 +3959,11 @@ _CONFIGS = [
         save_interval=25_000,
         keep_period=25_000,
         fsdp_devices=16,
-        action_horizon=50,
+        # Top-level action_horizon controls dataset chunking (60 raw 60Hz frames per chunk);
+        # data.subsample=True then halves it to 30 to match model.action_horizon.
+        action_horizon=60,
     ),
-    # Same as real_hang_pi05_filter_intervention, but on the 60 Hz variant of the dataset.
+    # Same as real_hang_pi05_filter_intervention, but with action_horizon=60.
     TrainConfig(
         name="real_hang_pi05_filter_intervention_60_Hz",
         model=pi0_config.Pi0Config(
@@ -4002,109 +4015,6 @@ _CONFIGS = [
         keep_period=25_000,
         fsdp_devices=16,
         action_horizon=60,
-    ),
-    TrainConfig(
-        name="real_hang_pi05_filter_intervention_lr_1",
-        model=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b",
-            action_expert_variant="gemma_300m",
-            action_dim=32,
-            action_horizon=50,
-            max_token_len=96,
-            pi05=True,
-            discrete_state_input=True,
-            action_dim_offset=14,
-            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
-            pad_state_to_action_dim=False,
-            dtype="float32",
-        ),
-        data=RoboCoinRldsDataConfig(
-            rlds_data_dir="gs://saksham-euw4/hdf5/",
-            datasets=(rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
-            assets=AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
-                asset_id = "norm_stats",
-            ),
-            discount=0.999,
-            td_n=50,
-            use_eef=True,
-            critic_mode=False,
-            use_chunk_wise_delta=True,
-            use_quantile_norm=True,
-            filter_n=5,
-            filter_intervention=True,
-            shuffle_buffer_size=50_000,
-            mask_boundary_actions=False,
-            state_dim=14,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=200_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-4,
-            decay_steps=200_000,
-            decay_lr=1e-5,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        save_interval=25_000,
-        keep_period=25_000,
-        fsdp_devices=16,
-        action_horizon=50,
-    ),
-    # Same as real_hang_pi05_filter_intervention_lr_1 but with peak lr 3e-4.
-    TrainConfig(
-        name="real_hang_pi05_filter_intervention_lr_2",
-        model=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b",
-            action_expert_variant="gemma_300m",
-            action_dim=32,
-            action_horizon=50,
-            max_token_len=96,
-            pi05=True,
-            discrete_state_input=True,
-            action_dim_offset=14,
-            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
-            pad_state_to_action_dim=False,
-            dtype="float32",
-        ),
-        data=RoboCoinRldsDataConfig(
-            rlds_data_dir="gs://saksham-euw4/hdf5/",
-            datasets=(rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
-            assets=AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
-                asset_id = "norm_stats",
-            ),
-            discount=0.999,
-            td_n=50,
-            use_eef=True,
-            critic_mode=False,
-            use_chunk_wise_delta=True,
-            use_quantile_norm=True,
-            filter_n=5,
-            filter_intervention=True,
-            shuffle_buffer_size=50_000,
-            mask_boundary_actions=False,
-            state_dim=14,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=200_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=3e-4,
-            decay_steps=200_000,
-            decay_lr=1e-5,
-        ),
-        optimizer=_optimizer.AdamW(weight_decay=1e-6),
-        num_workers=0,
-        log_interval=100,
-        save_interval=25_000,
-        keep_period=25_000,
-        fsdp_devices=16,
-        action_horizon=50,
     ),
     # Same as robocoin_bimanual_pi05_no_mask but with state_dim=16 and discrete_state_input=True
     TrainConfig(

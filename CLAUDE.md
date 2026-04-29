@@ -50,15 +50,18 @@ git submodule update --init --recursive
 **Note**: The virtualenv is already sourced in `~/.bashrc`, so `python` can be used directly instead of `uv run` for running scripts.
 
 ### Testing
+
+**Always source the project virtualenv before running tests** — the Bash tool's shell does not always pick up `~/.bashrc`, so the venv may not be active by default. Run `source /data/user_data/saksham3/vla/bin/activate` (or chain it with `&&` in the test command) before any `pytest` / `python` invocation.
+
 ```bash
 # Run all non-manual tests
-uv run pytest --strict-markers -m "not manual"
+source /data/user_data/saksham3/vla/bin/activate && pytest --strict-markers -m "not manual"
 
 # Run specific test file
-uv run pytest src/openpi/models/model_test.py
+source /data/user_data/saksham3/vla/bin/activate && pytest src/openpi/models/model_test.py
 
 # Run single test
-uv run pytest src/openpi/models/model_test.py::test_name
+source /data/user_data/saksham3/vla/bin/activate && pytest src/openpi/models/model_test.py::test_name
 ```
 
 ### Code Quality
