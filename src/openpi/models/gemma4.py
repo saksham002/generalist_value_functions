@@ -7,13 +7,14 @@ Imports `Embedder`, `Block`, `RMSNorm`, `AttentionType` from the fork and
 exposes the same API surface as `openpi.models.gemma3.Module` so the existing
 `PaliGemmaValueNetwork` can call it via the NNX bridge.
 
-Unlike the Gemma 3 module (which uses `nn.scan` over identical layers) this
-module uses an explicit per-layer loop because Gemma 4 layers are not uniform:
-- local vs global attention (different RoPE proportion, key size, KV heads)
-- `k_eq_v_global` differs per attention type
+Two execution paths:
 
-Each layer block is wrapped with `nn.remat` individually for activation
-checkpointing.
+- Default (per-layer for-loop): each Block is individually `nn.remat`'d.
+  Original behavior; supports KV-cache inference.
+- ``stacked_layer_params=True``: per-layer params are stacked into one tensor
+  per (FFW-group x attn-type); a single Block template is shared via
+  `Module.apply` with sliced params in a manual layer for-loop. Cuts FSDP
+  all-gathers from N to 4. Layer execution order preserved.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import dataclasses
 from typing import Literal
 
 import flax.linen as nn
+import flax.traverse_util as _traverse_util
 import jax
 import jax.numpy as jnp
 
@@ -165,6 +167,38 @@ def get_config(variant: Variant) -> Config:
     raise ValueError(f"Unknown variant: {variant!r}")
 
 
+def _build_block_kwargs(config: Config, attn_type, hidden_dim_override: int | None = None):
+    """Common kwargs for instantiating a fork ``Block`` from our ``Config``."""
+    is_global = attn_type == _fork_mod.AttentionType.GLOBAL
+    rope_base_frequency = (
+        config.global_rope_base_freq if is_global else config.local_rope_base_freq
+    )
+    rope_scale_factor = (
+        config.global_rope_scale_factor if is_global else config.local_rope_scale_factor
+    )
+    return dict(
+        num_heads = config.num_heads,
+        num_kv_heads = config.num_kv_heads,
+        embed_dim = config.embed_dim,
+        head_dim = config.head_dim,
+        hidden_dim = hidden_dim_override if hidden_dim_override is not None else config.hidden_dim,
+        use_post_attn_norm = True,
+        use_post_ffw_norm = True,
+        attn_type = attn_type,
+        rope_base_frequency = rope_base_frequency,
+        rope_scale_factor = rope_scale_factor,
+        sliding_window_size = config.sliding_window_size,
+        qk_norm_with_scale = config.qk_norm_with_scale,
+        num_global_kv_heads = config.num_global_kv_heads,
+        global_key_size = config.global_key_size,
+        k_eq_v_global = config.k_eq_v_global,
+        global_rope_proportion = config.global_rope_proportion,
+        local_rope_proportion = config.local_rope_proportion,
+        per_layer_input_dim = config.per_layer_input_dim,
+    )
+
+
+
 class Module(nn.Module):
     """Gemma 4 transformer module. Interface matches `gemma3.Module` for drop-in use."""
 
@@ -173,6 +207,11 @@ class Module(nn.Module):
 
     # Unused, kept for API parity with gemma3.Module.
     adarms: bool = False
+
+    # Stack per-layer params per (FFW-group × attn-type) into single tensors;
+    # index into the stacked tensor at each layer step. 4 FSDP all-gathers
+    # (one per group) instead of one per layer.
+    stacked_layer_params: bool = False
 
     def setup(self):
         config = self.configs[0]
@@ -204,54 +243,132 @@ class Module(nn.Module):
             attention_types,
         )
 
-        block_cls = nn.remat(
-            _fork_mod.Block,
-            prevent_cse = False,
-            policy = jax.checkpoint_policies.nothing_saveable,
-        )
+        if config.kv_cache_sharing_frac_shared_layers > 0.0:
+            num_unshared = config.num_layers - int(
+                config.kv_cache_sharing_frac_shared_layers * config.num_layers
+            )
+        else:
+            num_unshared = config.num_layers
+        self._num_unshared = num_unshared
 
-        blocks = []
-        for layer_idx, attn_type in enumerate(attention_types):
-            is_global = attn_type == _fork_mod.AttentionType.GLOBAL
-            rope_base_frequency = (
-                config.global_rope_base_freq if is_global else config.local_rope_base_freq
+        if self.stacked_layer_params:
+            # Declare stacked params per (FFW-group × attn-type), apply the
+            # Block forward via Module.apply with a sliced params dict in a
+            # manual layer for-loop (preserves original layer order).
+            self._setup_stacked_layer_params(config, attention_types, attn_pattern = pattern, num_unshared = num_unshared)
+        else:
+            block_cls = nn.remat(
+                _fork_mod.Block,
+                prevent_cse = False,
+                policy = jax.checkpoint_policies.nothing_saveable,
             )
-            rope_scale_factor = (
-                config.global_rope_scale_factor if is_global else config.local_rope_scale_factor
-            )
-            if (
-                self._kv_sharing_enabled(layer_number = layer_idx)
-                and config.override_kv_shared_ffw_hidden is not None
-            ):
-                hidden_dim = config.override_kv_shared_ffw_hidden
-            else:
-                hidden_dim = config.hidden_dim
-            blocks.append(
-                block_cls(
-                    num_heads = config.num_heads,
-                    num_kv_heads = config.num_kv_heads,
-                    embed_dim = config.embed_dim,
-                    head_dim = config.head_dim,
-                    hidden_dim = hidden_dim,
-                    use_post_attn_norm = True,
-                    use_post_ffw_norm = True,
-                    attn_type = attn_type,
-                    rope_base_frequency = rope_base_frequency,
-                    rope_scale_factor = rope_scale_factor,
-                    sliding_window_size = config.sliding_window_size,
-                    qk_norm_with_scale = config.qk_norm_with_scale,
-                    num_global_kv_heads = config.num_global_kv_heads,
-                    global_key_size = config.global_key_size,
-                    k_eq_v_global = config.k_eq_v_global,
-                    global_rope_proportion = config.global_rope_proportion,
-                    local_rope_proportion = config.local_rope_proportion,
-                    per_layer_input_dim = config.per_layer_input_dim,
-                    name = f"layer_{layer_idx}",
-                )
-            )
-        self.blocks = blocks
+
+            blocks = []
+            for layer_idx, attn_type in enumerate(attention_types):
+                if (
+                    self._kv_sharing_enabled(layer_number = layer_idx)
+                    and config.override_kv_shared_ffw_hidden is not None
+                ):
+                    hidden_dim_override = config.override_kv_shared_ffw_hidden
+                else:
+                    hidden_dim_override = None
+                kwargs = _build_block_kwargs(config, attn_type, hidden_dim_override)
+                kwargs["name"] = f"layer_{layer_idx}"
+                blocks.append(block_cls(**kwargs))
+            self.blocks = blocks
 
         self.final_norm = _fork_layers.RMSNorm(name = "final_norm")
+
+    # ---- stacked-per-group layer params ----
+
+    def _setup_stacked_layer_params(self, config, attention_types, *, attn_pattern, num_unshared):
+        """Discover Block param shapes per (FFW-group × attn-type) and declare
+        a stacked self.param with leading axis = group size for each leaf.
+
+        Group indexing: 0 = unshared LOCAL, 1 = unshared GLOBAL,
+        2 = shared LOCAL, 3 = shared GLOBAL.
+        """
+        # Layer → (group_idx, within_idx). Build into local lists first; Flax
+        # freezes attributes set during setup, so direct .append on a self.
+        # attribute fails after the initial assignment.
+        layer_to_group: list[tuple[int, int]] = []
+        group_layers: list[list[int]] = [[], [], [], []]
+        for i in range(config.num_layers):
+            is_shared = i >= num_unshared
+            attn_flag = int(attn_pattern[i])  # 0 LOCAL / 1 GLOBAL
+            group_idx = (2 if is_shared else 0) + attn_flag
+            within_idx = len(group_layers[group_idx])
+            group_layers[group_idx].append(i)
+            layer_to_group.append((group_idx, within_idx))
+        self._layer_to_group = tuple(layer_to_group)
+        self._group_layers = tuple(tuple(g) for g in group_layers)
+
+        # Per-group Block templates (Python objects, NOT registered as
+        # submodules — we don't want their unstacked params auto-created).
+        templates: list[_fork_mod.Block | None] = []
+        for group_idx in range(4):
+            if not group_layers[group_idx]:
+                templates.append(None)
+                continue
+            is_shared = group_idx >= 2
+            attn_flag = group_idx % 2
+            attn_type = _ATTN_TYPE_MAP[attn_flag]
+            hidden_dim_override = (
+                config.override_kv_shared_ffw_hidden if is_shared else None
+            )
+            kwargs = _build_block_kwargs(config, attn_type, hidden_dim_override)
+            templates.append(_fork_mod.Block(**kwargs))
+        self._block_templates = tuple(templates)
+
+        # Discover Block param tree shape via jax.eval_shape on init.
+        # Use small dummy shapes (B=1, T=2) — only shapes matter.
+        rng = jax.random.PRNGKey(0)
+        b, t = 1, 2
+        dummy_x = jnp.zeros((b, t, config.embed_dim), dtype = jnp.float32)
+        dummy_pos = jnp.zeros((b, t), dtype = jnp.int32)
+        dummy_mask = jnp.ones((b, t, t), dtype = jnp.bool_)
+        dummy_pli = (
+            jnp.zeros((b, t, config.per_layer_input_dim), dtype = jnp.float32)
+            if config.per_layer_input_dim > 0
+            else None
+        )
+
+        # Maps (group_idx, leaf_path_tuple) -> stacked array.
+        stacked_dict: dict[tuple[int, tuple[str, ...]], jax.Array] = {}
+        for group_idx, template in enumerate(self._block_templates):
+            if template is None:
+                continue
+            n_group = len(self._group_layers[group_idx])
+            param_tree = jax.eval_shape(
+                template.init,
+                rng,
+                dummy_x,
+                dummy_pos,
+                None,         # cache
+                dummy_mask,
+                dummy_pli,
+                None,         # kv_shared_cache
+            )["params"]
+            flat_specs = _traverse_util.flatten_dict(param_tree)
+            for path_tuple, leaf_spec in flat_specs.items():
+                # Flat name uses '__' separator (Flax param names disallow '/').
+                name = f"g{group_idx}__" + "__".join(path_tuple)
+                stacked = self.param(
+                    name,
+                    nn.initializers.zeros,
+                    (n_group, *leaf_spec.shape),
+                    leaf_spec.dtype,
+                )
+                stacked_dict[(group_idx, path_tuple)] = stacked
+        self._stacked_params = stacked_dict
+
+    def _get_stacked_layer_params(self, group_idx: int, within_idx: int) -> dict:
+        """Slice the stacked params at within_idx, return a nested dict matching the Block's param tree."""
+        flat: dict[tuple[str, ...], jax.Array] = {}
+        for (g, path), stacked in self._stacked_params.items():
+            if g == group_idx:
+                flat[path] = stacked[within_idx]
+        return _traverse_util.unflatten_dict(flat)
 
     # ---- Public embedding helpers ----
 
@@ -318,6 +435,7 @@ class Module(nn.Module):
         if x is None:
             raise ValueError("Gemma 4 expects a non-None embedded input at index 0.")
         x = x.astype(self.embed_dtype)
+        assert x.dtype == jnp.dtype(self.embed_dtype)
 
         if config.per_layer_input_dim > 0 and per_layer_input is None:
             raise ValueError(
@@ -325,38 +443,71 @@ class Module(nn.Module):
             )
 
         new_cache: KVCache = {}
-        cls_attn_layers: list[jax.Array] = []
 
-        for layer_idx, block in enumerate(self.blocks):
-            layer_key = f"layer_{layer_idx}"
-            layer_cache_in = kv_cache[layer_key] if kv_cache is not None else None
-            if self._kv_sharing_enabled(layer_number = layer_idx):
-                shared_layer_key = f"layer_{self.kv_cache_sharing_patterns[layer_idx]}"
-                kv_shared_cache = new_cache.get(shared_layer_key)
-            else:
-                kv_shared_cache = None
+        if self.stacked_layer_params:
+            # walk layers in original order, slicing into per-group
+            # stacked params and applying the Block forward via Module.apply.
+            cls_attn_layers: list[jax.Array] = []
+            for layer_idx in range(config.num_layers):
+                group_idx, within_idx = self._layer_to_group[layer_idx]
+                template = self._block_templates[group_idx]
+                layer_key = f"layer_{layer_idx}"
+                layer_cache_in = kv_cache[layer_key] if kv_cache is not None else None
+                if self._kv_sharing_enabled(layer_number = layer_idx):
+                    shared_layer_key = f"layer_{self.kv_cache_sharing_patterns[layer_idx]}"
+                    kv_shared_cache = new_cache.get(shared_layer_key)
+                else:
+                    kv_shared_cache = None
+                if config.per_layer_input_dim > 0:
+                    per_layer_input_slice = per_layer_input[:, :, layer_idx, :]
+                else:
+                    per_layer_input_slice = None
 
-            if config.per_layer_input_dim > 0:
-                per_layer_input_slice = per_layer_input[:, :, layer_idx, :]
-            else:
-                per_layer_input_slice = None
+                sliced_params = self._get_stacked_layer_params(group_idx, within_idx)
+                layer_cache_out, x, cls_attn_row = template.apply(
+                    {"params": sliced_params},
+                    x,
+                    positions,
+                    layer_cache_in,
+                    mask,
+                    per_layer_input_slice,
+                    kv_shared_cache,
+                )
+                new_cache[layer_key] = layer_cache_out
+                cls_attn_layers.append(cls_attn_row)
+            stacked = jnp.stack(cls_attn_layers, axis = 0)
+        else:
+            cls_attn_layers: list[jax.Array] = []
+            for layer_idx, block in enumerate(self.blocks):
+                layer_key = f"layer_{layer_idx}"
+                layer_cache_in = kv_cache[layer_key] if kv_cache is not None else None
+                if self._kv_sharing_enabled(layer_number = layer_idx):
+                    shared_layer_key = f"layer_{self.kv_cache_sharing_patterns[layer_idx]}"
+                    kv_shared_cache = new_cache.get(shared_layer_key)
+                else:
+                    kv_shared_cache = None
 
-            layer_cache_out, x, cls_attn_row = block(
-                x,
-                positions,
-                layer_cache_in,
-                mask,
-                per_layer_input_slice,
-                kv_shared_cache,
-            )
-            new_cache[layer_key] = layer_cache_out
-            cls_attn_layers.append(cls_attn_row)
+                if config.per_layer_input_dim > 0:
+                    per_layer_input_slice = per_layer_input[:, :, layer_idx, :]
+                else:
+                    per_layer_input_slice = None
+
+                layer_cache_out, x, cls_attn_row = block(
+                    x,
+                    positions,
+                    layer_cache_in,
+                    mask,
+                    per_layer_input_slice,
+                    kv_shared_cache,
+                )
+                new_cache[layer_key] = layer_cache_out
+                cls_attn_layers.append(cls_attn_row)
+            stacked = jnp.stack(cls_attn_layers, axis = 0)
 
         output = self.final_norm(x)
 
         if return_cls_attention_score_distribution:
             # [num_layers, B, S] -> [B, num_layers, S]
-            stacked = jnp.stack(cls_attn_layers, axis = 0)
             stacked = jnp.transpose(stacked, (1, 0, 2))
             return [output], new_cache, stacked
         return [output], new_cache

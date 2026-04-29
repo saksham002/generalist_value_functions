@@ -347,14 +347,18 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             paligemma_config.per_layer_input_dim if self._is_gemma4 else 0
         )
 
-        # Initialize Gemma LLM (single config, no action expert)
-        llm = nnx_bridge.ToNNX(
-            gemma_module_cls(
-                configs = [paligemma_config],
-                embed_dtype = config.dtype,
-                adarms = False,
-            )
+        # Initialize Gemma LLM (single config, no action expert). For Gemma 4,
+        # use ``stacked_layer_params=True`` which cuts FSDP all-gathers from N
+        # to 4 (one per FFW-group × attn-type) at the cost of a manual layer
+        # for-loop in place of nn.scan.
+        gemma_kwargs = dict(
+            configs = [paligemma_config],
+            embed_dtype = config.dtype,
+            adarms = False,
         )
+        if self._is_gemma4:
+            gemma_kwargs["stacked_layer_params"] = True
+        llm = nnx_bridge.ToNNX(gemma_module_cls(**gemma_kwargs))
         llm.lazy_init(rngs = rngs, method = "init", use_adarms = [False])
 
         # Initialize image encoder.
