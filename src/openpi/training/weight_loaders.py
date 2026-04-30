@@ -5,6 +5,7 @@ import copy
 from typing import Protocol, runtime_checkable
 
 import flax.traverse_util
+import jax
 import numpy as np
 
 import openpi.models.model as _model
@@ -320,18 +321,31 @@ class Gemma4WeightLoader(WeightLoader):
 
     def load(self, params: at.Params) -> at.Params:
         import os
+        import shutil
         import subprocess
 
         local_dir = os.path.expanduser(self.local_dir)
         local_checkpoint = os.path.join(local_dir, os.path.basename(self.checkpoint_path))
+        # Sentinel: written iff gsutil cp succeeded. Absent = partial cache, redownload.
+        download_complete_marker = os.path.join(local_checkpoint, ".openpi_download_complete")
 
-        if not os.path.exists(local_checkpoint):
+        cache_complete = os.path.exists(local_checkpoint) and os.path.exists(download_complete_marker)
+        if os.path.exists(local_checkpoint) and not os.path.exists(download_complete_marker):
+            logger.warning(
+                f"Gemma 4 checkpoint cache at {local_checkpoint} is missing "
+                f"completion marker — treating as partial and re-downloading."
+            )
+            shutil.rmtree(local_checkpoint)
+
+        if not cache_complete:
             logger.info(f"Downloading Gemma 4 checkpoint to {local_checkpoint}...")
             os.makedirs(local_dir, exist_ok = True)
             subprocess.run(
                 ["gsutil", "-m", "cp", "-r", self.checkpoint_path, local_dir],
                 check = True,
             )
+            with open(download_complete_marker, "w") as f:
+                f.write("ok\n")
 
         logger.info(f"Loading Gemma 4 checkpoint from {local_checkpoint}...")
         import orbax.checkpoint as ocp
@@ -343,7 +357,26 @@ class Gemma4WeightLoader(WeightLoader):
 
         logger.info(f"Gemma 4 checkpoint top-level keys: {sorted(raw_params.keys())}")
 
-        remapped_llm = self._remap_checkpoint_params(raw_params)
+        # Detect target param format. Two layouts are supported:
+        # - per-layer (default): ``layer_{i}`` keys.
+        # - stacked_layer_params=True: flat ``g{i}__*`` keys with leading axis
+        #   = group size.
+        if "network" in params and "PaliGemma" not in params:
+            llm_ref = params["network"]["PaliGemma"].get("llm", {})
+        else:
+            llm_ref = params.get("PaliGemma", {}).get("llm", {})
+        llm_ref_inner = llm_ref.get("module", llm_ref)
+
+        stacked_layout = any(
+            k.startswith(("g0__", "g1__", "g2__", "g3__"))
+            for k in llm_ref_inner.keys()
+        )
+        if stacked_layout:
+            logger.info("Detected stacked-layer-params layout")
+            remapped_llm = self._remap_checkpoint_params(raw_params, scan_groups = None)
+            remapped_llm = self._stacked_layer_params_stack(remapped_llm, llm_ref_inner)
+        else:
+            remapped_llm = self._remap_checkpoint_params(raw_params, scan_groups = None)
         remapped_vision = self._remap_vision_params(raw_params)
 
         if "network" in params and "PaliGemma" not in params:
@@ -369,35 +402,44 @@ class Gemma4WeightLoader(WeightLoader):
 
         return _merge_params(loaded_params, params, missing_regex = ".*")
 
-    def _remap_checkpoint_params(self, raw_params: dict) -> dict:
+    def _remap_checkpoint_params(
+        self,
+        raw_params: dict,
+        *,
+        scan_groups: tuple[tuple[str, int, int], ...] | None = None,
+    ) -> dict:
         """Remap Gemma 4 LLM params to match our Module's param structure.
 
-        Our `Module` uses per-layer named blocks (`layer_{i}`), which matches
-        the fork's Transformer naming convention, so no stacking is needed.
-        The only caveat: if the fork saves a top-level `transformer/` wrapper,
-        we strip it.
+        Two output formats are supported:
+
+        - ``scan_groups=None`` (default): per-layer ``layer_{i}`` keys,
+          matching the fork's original layout. Used when ``Module(use_scan=False)``.
+        - ``scan_groups=((name, start_layer, num_super), ...)``: scan layout.
+          For each group ``(name, start, num_super)`` the layers
+          ``start..start + num_super * K - 1`` are stacked along axis 0 in
+          groups of pattern-unit size ``K``, producing keys
+          ``{name}/sub_{j}`` for ``j`` in ``0..K-1``. ``K`` is inferred from
+          the total layer count divided by the sum of ``num_super`` across
+          groups.
         """
         transformer = raw_params.get("transformer", raw_params)
 
         result = {}
 
         # Embedder: pass through all params (input_embedding, mm_*, per_layer_*).
-        # Our module reuses the fork's Embedder, so param names already match.
         embedder = transformer["embedder"]
         result["embedder"] = {k: np.array(v) if not isinstance(v, dict) else {
             kk: np.array(vv) for kk, vv in v.items()
         } for k, v in embedder.items()}
 
-        # Per-layer blocks: unwrap the `mlp/<name>/{w: tensor}` nesting that the
-        # checkpoint stores into bare tensors at `mlp/<name>`. The fork's
-        # FeedForward wires its sub-Einsums via `nn.share_scope` with custom
-        # `weight_name` ("gating_einsum", "linear"), so the live model expects
-        # bare tensors at those paths. Mirrors upstream
-        # `gemma/gm/ckpts/_compat.py::param_remapper`.
+        # Per-layer blocks: unwrap the `mlp/<name>/{w: tensor}` nesting and
+        # collect into a per-layer dict so we can either pass through directly
+        # or stack into super-block format.
         layer_indices = sorted(
             int(k.split("_")[1]) for k in transformer if k.startswith("layer_")
         )
         logger.info(f"Found {len(layer_indices)} LLM layers in checkpoint")
+        per_layer_params: dict[int, dict] = {}
         for idx in layer_indices:
             layer_key = f"layer_{idx}"
             layer_params = _deep_convert_to_numpy(transformer[layer_key])
@@ -406,10 +448,108 @@ class Gemma4WeightLoader(WeightLoader):
                 for sub_name, sub_val in list(mlp.items()):
                     if isinstance(sub_val, dict) and "w" in sub_val:
                         mlp[sub_name] = sub_val["w"]
-            result[layer_key] = layer_params
+            per_layer_params[idx] = layer_params
+
+        if scan_groups is None:
+            for idx, lp in per_layer_params.items():
+                result[f"layer_{idx}"] = lp
+        else:
+            num_layers = len(layer_indices)
+            total_super = sum(num_super for _, _, num_super in scan_groups)
+            assert total_super > 0 and num_layers % total_super == 0, (
+                f"num_layers={num_layers} not divisible by total super-blocks={total_super}"
+            )
+            pattern_unit_size = num_layers // total_super
+            for group_name, start_layer, num_super in scan_groups:
+                group_dict: dict[str, dict] = {}
+                for sub_idx in range(pattern_unit_size):
+                    sub_layer_params = [
+                        per_layer_params[start_layer + super_idx * pattern_unit_size + sub_idx]
+                        for super_idx in range(num_super)
+                    ]
+                    group_dict[f"sub_{sub_idx}"] = jax.tree.map(
+                        lambda *xs: np.stack(xs, axis = 0), *sub_layer_params
+                    )
+                result[group_name] = group_dict
 
         # Final norm
         result["final_norm"] = {"scale": np.array(transformer["final_norm"]["scale"])}
+        return result
+
+    def _stacked_layer_params_stack(self, per_layer_remapped: dict, llm_ref_inner: dict) -> dict:
+        """Stack per-layer params (``layer_X``) into the flat-named per-group layout.
+
+        The stacked layer params layout uses with names ``g{group_idx}__<path>__<...>``,
+        where group_idx ∈ {0=unshared LOCAL, 1=unshared GLOBAL, 2=shared LOCAL,
+        3=shared GLOBAL}. The leading axis = number of layers in the group.
+
+        LOCAL vs GLOBAL is inferred from ``attn.q_einsum.w`` last dim (head_dim
+        vs global_key_size). Unshared vs shared is determined by reading the
+        leading axes of the reference ``g{i}__*`` params: num_unshared = N0+N1
+        where N{i} is the layer count expected for group i. This is robust to
+        variants like E4B where unshared and shared FFW dims are identical.
+        """
+        layer_keys = sorted(
+            (k for k in per_layer_remapped if k.startswith("layer_")),
+            key = lambda k: int(k.split("_")[1]),
+        )
+        per_layer = {int(k.split("_")[1]): per_layer_remapped[k] for k in layer_keys}
+
+        # LOCAL vs GLOBAL discrimination by Q einsum's last dim.
+        q_disc = {idx: lp["attn"]["q_einsum"]["w"].shape[-1] for idx, lp in per_layer.items()}
+        q_dims = sorted(set(q_disc.values()))
+
+        # Read num_unshared from the reference param tree's g0/g1 leading axes.
+        # Each group's params share a leading-axis = group size; pick any leaf
+        # under each group key to read the size.
+        def _group_size(group_idx: int) -> int:
+            prefix = f"g{group_idx}__"
+            for k, v in llm_ref_inner.items():
+                if k.startswith(prefix) and hasattr(v, "shape"):
+                    return int(v.shape[0])
+            return 0
+        n_g0 = _group_size(0)  # unshared LOCAL
+        n_g1 = _group_size(1)  # unshared GLOBAL
+        num_unshared = n_g0 + n_g1
+        logger.info(
+            f"_stacked_layer_params_stack: num_unshared={num_unshared} "
+            f"(g0={n_g0} unshared LOCAL, g1={n_g1} unshared GLOBAL); "
+            f"shared layers = layer_{num_unshared}..end"
+        )
+
+        def get_group(idx):
+            is_global = q_disc[idx] == max(q_dims) if len(q_dims) > 1 else False
+            is_shared = idx >= num_unshared
+            return (2 if is_shared else 0) + (1 if is_global else 0)
+
+        group_layers: list[list[int]] = [[], [], [], []]
+        for idx in sorted(per_layer.keys()):
+            group_layers[get_group(idx)].append(idx)
+
+        result: dict = {}
+        for k, v in per_layer_remapped.items():
+            if not k.startswith("layer_"):
+                result[k] = v
+
+        for group_idx in range(4):
+            members = group_layers[group_idx]
+            if not members:
+                continue
+            flats = [flax.traverse_util.flatten_dict(per_layer[i]) for i in members]
+            for path in flats[0].keys():
+                shapes = [f[path].shape for f in flats]
+                if len(set(shapes)) > 1:
+                    logger.error(
+                        f"Stacked layer g{group_idx} path {path} has shape mismatch across "
+                        f"layers {members}: {shapes}"
+                    )
+                stacked = np.stack([f[path] for f in flats], axis = 0)
+                name = f"g{group_idx}__" + "__".join(path)
+                result[name] = stacked
+            logger.info(
+                f"Stacked layer group g{group_idx}: {len(members)} layers stacked, "
+                f"layer indices = {members}"
+            )
         return result
 
     def _remap_vision_params(self, raw_params: dict) -> dict:

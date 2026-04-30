@@ -8,6 +8,7 @@ Supports:
 
 import dataclasses
 import functools
+import gc
 import logging
 import platform as _platform
 import os
@@ -47,6 +48,7 @@ import openpi.value_functions.value_function as _value_fn_impl
 from openpi.robocoin_utils.utils import (
     cache_val_episodes,
     count_subtask_segments,
+    decode_episode_images,
     get_obs_and_action,
     predict_values,
     stack_frames,
@@ -196,6 +198,40 @@ def get_memory_stats() -> dict[str, float]:
                 logging.info(f"[MemoryDebug] backend has no 'memory_stats' attr. Platform={backend.platform}")
         except Exception as e:
             logging.info(f"[MemoryDebug] TPU backend memory_stats error: {e}")
+        # Modern JAX exposes HBM stats per-device. Sum across local devices for
+        # an aggregate, plus log per-device peak (useful when devices diverge).
+        try:
+            local_devs = jax.local_devices()
+            used_total = 0
+            limit_total = 0
+            peak_total = 0
+            for di, dev in enumerate(local_devs):
+                if not hasattr(dev, "memory_stats"):
+                    continue
+                ms = dev.memory_stats()
+                if not ms:
+                    continue
+                used = ms.get("bytes_in_use", 0)
+                peak = ms.get("peak_bytes_in_use", 0)
+                limit = ms.get("bytes_limit", 0) or ms.get("bytes_reservable_limit", 0)
+                used_total += used
+                peak_total += peak
+                limit_total += limit
+                stats[f"hbm_dev{di}_used_gb"] = used / 1e9
+                stats[f"hbm_dev{di}_peak_gb"] = peak / 1e9
+                stats[f"hbm_dev{di}_limit_gb"] = limit / 1e9
+            if limit_total > 0:
+                stats["hbm_used_gb_total"] = used_total / 1e9
+                stats["hbm_peak_gb_total"] = peak_total / 1e9
+                stats["hbm_limit_gb_total"] = limit_total / 1e9
+                logging.info(
+                    f"[MemoryDebug] HBM (sum over {len(local_devs)} local devs): "
+                    f"used={used_total / 1e9:.2f} GB, "
+                    f"peak={peak_total / 1e9:.2f} GB, "
+                    f"limit={limit_total / 1e9:.2f} GB"
+                )
+        except Exception as e:
+            logging.info(f"[MemoryDebug] device.memory_stats error: {e}")
     except Exception as e:
         logging.info(f"[MemoryDebug] TF device listing error: {e}")
     
@@ -511,7 +547,27 @@ def init_train_state(
     # only receives its shard (~x/N GB) instead of the full replicated copy
     # (~x GB). This avoids OOM during init on memory-constrained devices.
     params_sharding = sharding.fsdp_sharding(partial_params, mesh)
-    partial_params = jax.device_put(partial_params, params_sharding)
+
+    # `jax.device_put(tree, sharding)` calls `multihost_utils.assert_equal`
+    # under the hood, which `broadcast_one_to_all`s each leaf with
+    # `out_shardings=PartitionSpec()` (REPLICATED). For very large param trees
+    # like Gemma 4 e2b (~27 GB total, largest leaf ~9 GB), this replicated
+    # output overflows TPU HBM (16 GiB per chip on v5litepod) — the chip can't
+    # hold a full unsharded copy of the largest leaf. PaliGemma (224x224)
+    # works because its largest leaf is small.
+    #
+    # Workaround: each host already loaded the *same* deterministic .npz, so
+    # the assert_equal step is redundant. Construct each leaf's sharded
+    # `jax.Array` directly from local numpy via `make_array_from_callback` —
+    # each chip materialises only its own shard, no global broadcast.
+    def _make_sharded_array(arr, sharding):
+        if not hasattr(arr, "shape") or not hasattr(arr, "dtype"):
+            return arr
+        shape = arr.shape
+        def _cb(idx):
+            return np.asarray(arr[idx])
+        return jax.make_array_from_callback(shape, sharding, _cb)
+    partial_params = jax.tree.map(_make_sharded_array, partial_params, params_sharding)
 
     train_state = jax.jit(
         init_actor_critic,
@@ -1713,101 +1769,123 @@ def generate_validation_plots_dlimp(
     Returns:
         Empty dict (plots are logged/saved asynchronously by a background thread).
     """
-    traj_frames: dict[int, list[dict]] = {}
-    logging.info(f"Loading cached validation episodes from {cache_dir}")
+    # Per-episode load → decode + resize → predict → free pipeline so peak host
+    # RAM is bounded to one episode's decoded frames, not the entire val cache.
+    # Cached pkl files store raw image bytes (decode_images=False at the dataset
+    # level); decoding happens here, lazily.
+    image_size = data_config.rlds_kwargs.get("image_size")
+    assert image_size is not None, (
+        "image_size missing from data_config.rlds_kwargs — required to decode/resize "
+        "compressed val cache images at predict time."
+    )
+
+    cache_files: list[tuple[int, str]] = []
     for filename in os.listdir(cache_dir):
         if filename.startswith("traj_") and filename.endswith(".pkl"):
             traj_idx = int(filename.replace("traj_", "").replace(".pkl", ""))
-            cache_file = os.path.join(cache_dir, filename)
-            with open(cache_file, "rb") as f:
-                traj_frames[traj_idx] = pickle.load(f)
-    logging.info(f"Loaded {len(traj_frames)} trajectories from cache")
-
-    # Build traj_idx -> (repo_id, episode_index) mapping for plot names
-    traj_to_repo_ep: dict[int, tuple[str, int]] = {}
-    for traj_idx, frames in traj_frames.items():
-        ep_idx = int(frames[0]["episode_index"])
-        repo_id = frames[0]["repo_id"]
-        if isinstance(repo_id, np.ndarray):
-            repo_id = repo_id.item()
-        if isinstance(repo_id, bytes):
-            repo_id = repo_id.decode("utf-8")
-        traj_to_repo_ep[traj_idx] = (repo_id, ep_idx)
+            cache_files.append((traj_idx, os.path.join(cache_dir, filename)))
+    cache_files.sort()
+    logging.info(f"Found {len(cache_files)} cached validation episodes in {cache_dir}")
 
     MAX_SUBTASK_SEGMENTS = 16
-    split_traj_frames = {}
-    split_traj_to_repo_ep: dict[str, tuple[str, int, str]] = {}
+
+    # Accumulators populated one episode at a time. Heavy per-episode arrays
+    # (decoded images, frame dicts) are dropped after predict; we keep only
+    # what the renderer needs.
+    traj_to_repo_ep: dict[str, tuple[str, int, str]] = {}
     ep_subtasks: dict[str, list[str]] = {}
-    for traj_idx, frames in traj_frames.items():
-        repo_id, ep_idx = traj_to_repo_ep[traj_idx]
+    ep_mc_returns: dict[str, list] = {}
+    ep_frame_images: dict[str, list[np.ndarray]] = {}
+    ep_fps: dict[str, int] = {}
+    ep_include_masks: dict[str, list[bool]] = {}
+    ep_negative_subtasks: dict[str, list[str]] = {}
+    all_predictions: dict[str, list[float]] = {}
+    all_predictions_neg: dict[str, list[float]] = {}
+    all_predictions_random: dict[str, list[float]] = {}
+    all_predictions_counterfactual: dict[str, list[float]] = {}
+    all_attn_scores: dict[str, list[np.ndarray]] = {}
+
+    for traj_idx, cache_file in cache_files:
+        with open(cache_file, "rb") as f:
+            frames = pickle.load(f)
+        if not frames:
+            logging.warning(f"Traj {traj_idx} cache empty, skipping")
+            continue
+
+        decode_episode_images(frames, image_size)
+
+        repo_id_raw = frames[0]["repo_id"]
+        if isinstance(repo_id_raw, np.ndarray):
+            repo_id_raw = repo_id_raw.item()
+        if isinstance(repo_id_raw, bytes):
+            repo_id_raw = repo_id_raw.decode("utf-8")
+        ep_idx = int(frames[0]["episode_index"])
+
         n_segments, split_frame_idx, segments = count_subtask_segments(frames)
         if n_segments > MAX_SUBTASK_SEGMENTS:
             split_seg_idx = n_segments // 2
-            key_p0 = f"{traj_idx}_p0"
-            key_p1 = f"{traj_idx}_p1"
-            split_traj_frames[key_p0] = frames[:split_frame_idx]
-            split_traj_frames[key_p1] = frames[split_frame_idx:]
-            split_traj_to_repo_ep[key_p0] = (repo_id, ep_idx, "_part0")
-            split_traj_to_repo_ep[key_p1] = (repo_id, ep_idx, "_part1")
-            ep_subtasks[key_p0] = segments[:split_seg_idx]
-            ep_subtasks[key_p1] = segments[split_seg_idx:]
-            logging.info(f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}): {n_segments} subtask segments > {MAX_SUBTASK_SEGMENTS}, splitting at segment {split_seg_idx}, frame {split_frame_idx} ({split_frame_idx} + {len(frames) - split_frame_idx} frames)")
+            segment_specs = [
+                (f"{traj_idx}_p0", "_part0", frames[:split_frame_idx], segments[:split_seg_idx]),
+                (f"{traj_idx}_p1", "_part1", frames[split_frame_idx:], segments[split_seg_idx:]),
+            ]
+            logging.info(
+                f"Traj {traj_idx} (repo {repo_id_raw}, episode {ep_idx}): "
+                f"{n_segments} subtask segments > {MAX_SUBTASK_SEGMENTS}, splitting at "
+                f"segment {split_seg_idx}, frame {split_frame_idx} "
+                f"({split_frame_idx} + {len(frames) - split_frame_idx} frames)"
+            )
         else:
-            key = str(traj_idx)
-            split_traj_frames[key] = frames
-            split_traj_to_repo_ep[key] = (repo_id, ep_idx, "")
-            ep_subtasks[key] = segments
-    traj_frames = split_traj_frames
-    traj_to_repo_ep = split_traj_to_repo_ep
-    del split_traj_frames, split_traj_to_repo_ep
+            segment_specs = [(str(traj_idx), "", frames, segments)]
 
-    for traj_key, frames in traj_frames.items():
-        frame_keys = list(frames[0].keys()) if frames else []
-        repo_id, ep_idx, part = traj_to_repo_ep[traj_key]
-        logging.info(f"  Traj {traj_key} (repo {repo_id}, episode {ep_idx}{part}): {len(frames)} frames, keys: {frame_keys}")
-    total_frames = sum(len(frames) for frames in traj_frames.values())
-    logging.info(f"Processing {len(traj_frames)} trajectory segments, total_frames={total_frames}")
+        for seg_key, part_suffix, seg_frames, seg_subtasks in segment_specs:
+            if len(seg_frames) == 0:
+                continue
 
-    all_frames = []
-    ep_mc_returns = {}
-    ep_frame_images = {}
-    ep_fps = {}
-    ep_include_masks = {}
-    ep_negative_subtasks = {}
+            traj_to_repo_ep[seg_key] = (repo_id_raw, ep_idx, part_suffix)
+            ep_subtasks[seg_key] = seg_subtasks
+            ep_mc_returns[seg_key] = [f["mc_return"] for f in seg_frames]
+            ep_frame_images[seg_key] = [
+                np.stack([
+                    np.asarray(f["image"]["left_wrist_0_rgb"]),
+                    np.asarray(f["image"]["right_wrist_0_rgb"]),
+                    np.asarray(f["image"]["base_0_rgb"]),
+                ])
+                for f in seg_frames
+            ]
+            ep_fps[seg_key] = int(seg_frames[0]["fps"])
+            ep_include_masks[seg_key] = [bool(f.get("include_subtask", True)) for f in seg_frames]
+            _, _, negative_segments = count_subtask_segments(seg_frames, prefix = "negative_")
+            ep_negative_subtasks[seg_key] = negative_segments
 
-    for ep_idx, frames in traj_frames.items():
-        if len(frames) == 0:
-            continue
+            seg_all_frames = [(seg_key, idx, frame) for idx, frame in enumerate(seg_frames)]
+            seg_ep_mc_returns = {seg_key: ep_mc_returns[seg_key]}
+            logging.info(
+                f"Traj {seg_key} (repo {repo_id_raw}, episode {ep_idx}{part_suffix}): "
+                f"running predictions on {len(seg_all_frames)} frames"
+            )
+            preds, preds_neg, preds_random, preds_cf, attn = predict_values(
+                model, seg_all_frames, seg_ep_mc_returns, action_conditioned,
+                batch_size = batch_size,
+            )
+            all_predictions[seg_key] = preds[seg_key]
+            all_predictions_neg[seg_key] = preds_neg[seg_key]
+            all_predictions_random[seg_key] = preds_random[seg_key]
+            all_predictions_counterfactual[seg_key] = preds_cf[seg_key]
+            all_attn_scores[seg_key] = attn[seg_key]
 
-        ep_mc_returns[ep_idx] = [f["mc_return"] for f in frames]
+            del seg_all_frames
 
-        ep_frame_images[ep_idx] = [
-            np.stack([
-                np.asarray(f["image"]["left_wrist_0_rgb"]),
-                np.asarray(f["image"]["right_wrist_0_rgb"]),
-                np.asarray(f["image"]["base_0_rgb"]),
-            ])
-            for f in frames
-        ]
-        ep_fps[ep_idx] = int(frames[0]["fps"])
-        ep_include_masks[ep_idx] = [bool(f.get("include_subtask", True)) for f in frames]
+        # Drop the decoded frames for this trajectory before loading the next.
+        del frames
+        gc.collect()
 
-        _, _, negative_segments = count_subtask_segments(frames, prefix="negative_")
-        ep_negative_subtasks[ep_idx] = negative_segments
-
-        for frame_idx, frame in enumerate(frames):
-            all_frames.append((ep_idx, frame_idx, frame))
-
-    if len(all_frames) == 0:
+    if not all_predictions:
         logging.warning("No valid frames found across all episodes")
         return {}
 
-    logging.info(f"Processing {len(all_frames)} total frames across {len(ep_mc_returns)} episodes in batches of {batch_size}")
-
-    all_predictions, all_predictions_neg, all_predictions_random, all_predictions_counterfactual, all_attn_scores = predict_values(
-        model, all_frames, ep_mc_returns, action_conditioned, batch_size = batch_size
+    logging.info(
+        f"Computed predictions for {len(all_predictions)} trajectory segments"
     )
-    del all_frames, traj_frames
 
     if jax.process_index() == 0:
         global _render_thread
@@ -1958,8 +2036,24 @@ def main(config: _config.TrainConfig):
         action_horizon = config.action_horizon or config.model.action_horizon
         val_tokenizer = config.data._get_critic_tokenizer(config.model)
         assert val_tokenizer is not None, "RoboCOIN validation variants require a critic tokenizer."
-        val_trajectory_dataset = _data_loader.create_rlds_dataset(
+        # Build a val-only data_config that (a) optionally points at val_dataset_dir
+        # (a smaller variant of the same dataset) and (b) leaves images compressed.
+        # `decode_images=False` keeps cam_X as the raw JPEG/PNG bytes coming out
+        # of the TFRecord rather than decoded uint8 arrays, so the trajectory
+        # iterator does not blow up host RAM during caching. The downstream
+        # consumer (utils.cache_val_episodes → utils.load_episode_for_predict)
+        # decodes + resizes lazily, one episode at a time, at prediction time.
+        # These overrides only affect val trajectory caching — the training
+        # data_config and loader are untouched.
+        import dataclasses as _dc
+        _val_rlds_kwargs = {**data_config.rlds_kwargs, "decode_images": False}
+        _val_data_config = _dc.replace(
             data_config,
+            rlds_data_dir = data_config.val_dataset_dir or data_config.rlds_data_dir,
+            rlds_kwargs = _val_rlds_kwargs,
+        )
+        val_trajectory_dataset = _data_loader.create_rlds_dataset(
+            _val_data_config,
             action_horizon,
             config.batch_size,
             split = data_config.val_split,
@@ -1990,7 +2084,17 @@ def main(config: _config.TrainConfig):
             )
         if jax.process_count() > 1:
             jax.experimental.multihost_utils.sync_global_devices("val_cache_write")
-        del val_trajectory_dataset, val_input_transform
+        # Aggressively free anything held by the val trajectory pipeline before
+        # we spin up the Gemma4 weight load — orbax restore stages the full
+        # 26.9 GB checkpoint through host RAM and we can't afford the val side
+        # holding tf.data threadpools / shuffle buffers.
+        del val_trajectory_dataset, val_input_transform, _val_data_config, _val_rlds_kwargs
+        gc.collect()
+        try:
+            import ctypes as _ctypes
+            _ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except OSError:
+            pass
     else:
         # Non-RoboCOIN: use LeRobot dataset
         from lerobot.common.datasets import lerobot_dataset

@@ -42,6 +42,7 @@ def _make_robocoin_dataset_for_unit_tests(
     dataset._state_dim = state_dim  # noqa: SLF001
     dataset._state_dim_checked = False  # noqa: SLF001
     dataset._image_obs_keys = ("cam_0", "cam_1", "cam_2")  # noqa: SLF001
+    dataset._image_size = None  # noqa: SLF001
     dataset._action_chunk_size = 10  # noqa: SLF001
     dataset._return_trajectories = False  # noqa: SLF001
     dataset._include_images = True  # noqa: SLF001

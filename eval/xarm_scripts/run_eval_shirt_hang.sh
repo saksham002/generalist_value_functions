@@ -8,10 +8,10 @@ set -e
 # Configuration — edit these before running
 # =============================================================================
 
-CONFIG_NAME="real_hang_pi05_filter_intervention_60_Hz"
-CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention_60_Hz/"
+CONFIG_NAME="real_hang_pi05_filter_intervention"
+CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention/"
 FINE_TUNE_CONFIG=""  # Optional: FineTuneConfig name from config.py. Leave empty to skip.
-STEP=199999
+STEP=100000
 
 # Optional: enable BestOfN value-guided action selection by uncommenting these.
 # CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa"

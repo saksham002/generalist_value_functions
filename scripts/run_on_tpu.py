@@ -28,6 +28,7 @@ Example usage:
 import dataclasses
 import logging
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -81,6 +82,14 @@ class TPUJobConfig:
     local_code_dir: str = dataclasses.field(default_factory = lambda: str(Path(__file__).resolve().parents[1]))
     """Local code directory to sync from."""
 
+    local_gemma_dir: str = dataclasses.field(
+        default_factory = lambda: str(Path.home() / "projects/AIRe/robocoin/helper/gemma")
+    )
+    """Local Gemma helper checkout to sync from."""
+
+    remote_gemma_dir: str = "/nfs/aidm_nfs/saksham3/helper/gemma"
+    """Remote Gemma helper checkout path on NFS."""
+
     retry_on_preemption: bool = False
     """Whether to retry the job if the TPU is preempted."""
 
@@ -101,6 +110,67 @@ class TPUJobConfig:
 
     local_tmux: bool = True
     """Create a local tmux session with one window per worker for viewing outputs."""
+
+
+def sync_gemma_helper(config: TPUJobConfig, tpu_name: str, tpu_config) -> None:
+    """Sync the local Gemma helper checkout to the TPU NFS path."""
+    local_gemma_dir = Path(config.local_gemma_dir)
+    if not local_gemma_dir.exists():
+        raise FileNotFoundError(f"Local Gemma helper directory does not exist: {local_gemma_dir}")
+
+    remote_parent = str(Path(config.remote_gemma_dir).parent)
+    ssh_command(
+        tpu_name,
+        tpu_config.zone,
+        f"mkdir -p {remote_parent}",
+        project = tpu_config.project,
+        worker = "0",
+    )
+
+    ssh_cmd = (
+        f"gcloud compute tpus tpu-vm ssh {tpu_name} "
+        f"--zone={tpu_config.zone} --project={tpu_config.project} --worker=0 --"
+    )
+    rsync_args = [
+        "rsync",
+        "-rltvz",
+        "--progress",
+        "--omit-dir-times",
+        "--exclude=.git",
+        "--exclude=.venv",
+        "--exclude=__pycache__",
+        "--exclude=*.pyc",
+        "-e",
+        ssh_cmd,
+        f"{local_gemma_dir}/",
+        f":{config.remote_gemma_dir}",
+    ]
+
+    logger.info("Syncing Gemma helper from %s to %s:%s", local_gemma_dir, tpu_name, config.remote_gemma_dir)
+    subprocess.run(rsync_args, check = True)
+
+
+def install_gemma_helper(config: TPUJobConfig, tpu_name: str, tpu_config) -> None:
+    """Install the synced Gemma helper into the shared uv environment."""
+    nfs = tpu_config.nfs_mount_path
+    uv_bin = f"{nfs}/saksham3/uv/bin/uv"
+    vla_env = f"{nfs}/saksham3/uv/vla"
+    ssh_command(
+        tpu_name,
+        tpu_config.zone,
+        (
+            f"source {vla_env}/bin/activate && "
+            f'export UV_PROJECT_ENVIRONMENT="{vla_env}" && '
+            f'SITE_PACKAGES="$({vla_env}/bin/python -c \'import site; print(site.getsitepackages()[0])\')" && '
+            f"sudo chmod -R 777 {config.remote_gemma_dir} && "
+            'sudo chmod 777 "$SITE_PACKAGES" && '
+            f"cd {config.remote_gemma_dir} && "
+            f"{uv_bin} pip install --python {vla_env}/bin/python -e . --no-deps && "
+            'sudo chmod -R 777 "$SITE_PACKAGES"/gemma.pth "$SITE_PACKAGES"/gemma-*.dist-info'
+        ),
+        project = tpu_config.project,
+        worker = "0",
+    )
 
 
 def find_or_create_tpu(config: TPUJobConfig) -> str:
@@ -175,9 +245,19 @@ def run_job(config: TPUJobConfig) -> int:
                     config.working_dir,
                     tpu_config.project,
                 )
+                sync_gemma_helper(config, tpu_name, tpu_config)
+                install_gemma_helper(config, tpu_name, tpu_config)
                 if config.install_deps:
                     install_deps(tpu_name, tpu_config.zone, config.working_dir, tpu_config.project, tpu_config.nfs_mount_path)
                 sync_wandb_credentials(tpu_name, tpu_config.zone, tpu_config.project)
+            except subprocess.CalledProcessError as e:
+                logger.error("Failed to sync code: %s", e)
+                if e.stdout:
+                    logger.error("Command stdout:\n%s", e.stdout)
+                if e.stderr:
+                    logger.error("Command stderr:\n%s", e.stderr)
+                notifier.notify_error(tpu_name, f"Code sync failed: {e}", config.command)
+                return 1
             except Exception as e:
                 logger.error("Failed to sync code: %s", e)
                 notifier.notify_error(tpu_name, f"Code sync failed: {e}", config.command)

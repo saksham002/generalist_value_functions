@@ -67,11 +67,11 @@ class Args:
     num_episodes: int = 1
     """Number of episodes to run."""
 
-    control_freq: int = 60
+    control_freq: int = 30
     """Frequency (Hz) at which the robot server expects actions. Passed to the
     RemoteEnvironmentAdapter so the server initializes its control loop accordingly."""
 
-    query_freq: int = 30
+    query_freq: int = 15
     """How many env steps between policy replans."""
 
     max_steps: int = 3600
@@ -335,7 +335,7 @@ class LocalPolicy:
         })
         
         # Extract the 14-D EEF action subset, first 30 steps only.
-        actions = np.asarray(decoded["actions"], dtype=np.float32)[:60]
+        actions = np.asarray(decoded["actions"], dtype=np.float32)[ : 30]
 
         # Policy predicts global actions relative to current state; add current pose to get absolute base frame targets.
         # actions += initial_eef_pose

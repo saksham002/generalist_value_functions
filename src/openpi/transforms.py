@@ -434,8 +434,7 @@ def _apply_rpy_absolute(state, actions, rpy_index_start: Sequence[int]) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
-    # tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer
-    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer
     discrete_state_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
@@ -457,8 +456,7 @@ class TokenizePrompt(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class TokenizeRoboCoinSubtaskPrompt(DataTransformFn):
-    # tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer
-    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer
     prefix_text: str | None = None
     discrete_state_input: bool = False
 
@@ -679,8 +677,7 @@ def _clean_prompt_text(prompt: str) -> str:
 
 
 def _tokenize_robocoin_subtask_prompt(
-    # tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer,
-    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer,
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer,
     prefix: str,
     suffix: str,
     *,
@@ -691,19 +688,20 @@ def _tokenize_robocoin_subtask_prompt(
 
     cleaned_prefix = _clean_prompt_text(prefix)
     cleaned_suffix = _clean_prompt_text(suffix)
+    prefix_with_separator = f"{cleaned_prefix} " if cleaned_prefix else cleaned_prefix
 
     # Tokenize prefix and suffix separately so the split index is correct by construction.
     # SentencePiece is non-compositional across boundaries — joining the strings before
     # encoding can shift tokens at the boundary and invalidate len(prefix_tokens) as the split.
-    prefix_tokens = tokenizer._tokenizer.encode(cleaned_prefix, add_bos = True)
+    add_bos = getattr(tokenizer, "_use_bos", True)
+    prefix_tokens = tokenizer._tokenizer.encode(prefix_with_separator, add_bos = add_bos)
     suffix_tokens = tokenizer._tokenizer.encode(cleaned_suffix, add_bos = False)
     newline_tokens = tokenizer._tokenizer.encode("\n")
     raw_tokens = prefix_tokens + suffix_tokens + newline_tokens
     subtask_start_index = len(prefix_tokens)
     subtask_end_index = subtask_start_index + len(suffix_tokens) - 1
 
-    # image_tokenizer = isinstance(tokenizer, (_tokenizer.Gemma3Tokenizer, _tokenizer.Gemma4Tokenizer))
-    image_tokenizer = isinstance(tokenizer, _tokenizer.Gemma3Tokenizer)
+    image_tokenizer = isinstance(tokenizer, (_tokenizer.Gemma3Tokenizer, _tokenizer.Gemma4Tokenizer))
     if image_tokenizer and tokenizer._num_images > 0:
         soi_markers = [tokenizer.START_OF_IMAGE_ID] * tokenizer._num_images
         raw_tokens = [raw_tokens[0]] + soi_markers + raw_tokens[1:]
