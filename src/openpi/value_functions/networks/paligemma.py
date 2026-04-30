@@ -264,6 +264,12 @@ class PaliGemmaNetworkConfig:
     # Fix order in which to iterate through keys
     image_keys: tuple[str, str, str] = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
+    # Apply ``flax.nnx.LayerNorm`` (with learnable scale + bias) to CLS features
+    # before the value head. Keeps the head's ``lecun_normal`` init stable
+    # across LLM backbones with different final-norm scale magnitudes (gemma-4
+    # ckpt scales have RMS≈14 vs gemma-3 ≈1).
+    use_layernorm: bool = False
+
     def get_tokenizer(self, max_len: int | None = None):
         """Return the appropriate text tokenizer for this variant."""
         from openpi.models.tokenizer import Gemma3Tokenizer, Gemma4Tokenizer, PaligemmaTokenizer
@@ -418,6 +424,9 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         # Feature dimension is the Gemma embedding dimension
         self._feature_dim = embed_dim
         self._embed_dim = embed_dim
+
+        self._use_layernorm = config.use_layernorm
+        self.cls_layer_norm = nnx.LayerNorm(embed_dim, rngs = rngs) if config.use_layernorm else None
 
     def _get_special_embeddings(self) -> jax.Array:
         """Return [BOS, \\n\\n, <SOI>, <EOI>] embeddings [1, 4, D]."""
@@ -955,7 +964,8 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             )
             # Extract CLS token output (last position) for value prediction
             cls_features = output[:, -1, :]  # [B, embed_dim]
-            cls_features = self._normalize_cls_features(cls_features)
+            if self._use_layernorm:
+                cls_features = self.cls_layer_norm(cls_features)
             if observation.subtask_start_index is not None:
                 if self._is_gemma3:
                     raise ValueError(
@@ -974,27 +984,14 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             **llm_extra_kwargs,
         )
         cls_features = output[:, -1, :]  # [B, embed_dim]
-        cls_features = self._normalize_cls_features(cls_features)
+        if self._use_layernorm:
+            cls_features = self.cls_layer_norm(cls_features)
 
         # all_cls_attn: [B, L, S]; mean over L -> [B, S] -> group by modality -> [B, n_modalities]
         cls_attn_mean = all_cls_attn.mean(axis = 1)
         attn_scores = self._group_attn_scores(cls_attn_mean, input_mask)
 
         return cls_features, attn_scores
-
-    def _normalize_cls_features(self, cls_features: jax.Array) -> jax.Array:
-        """RMS-normalize CLS features so the value head's lecun_normal init is
-        stable across LLM backbones with different final-norm scale magnitudes.
-
-        Gemma-3 final_norm uses ``(1 + scale)`` with stored ``scale``≈0
-        (effective multiplier ≈1, per-element magnitude ≈1), while the
-        gemma-4 fork uses raw ``scale`` with ckpt values RMS≈14. Without
-        normalization, gemma-4 produces features ~14× larger than gemma-3,
-        inflating ``Var(Q)`` by ~200× and the initial SARSA loss by ~10×.
-        Normalizing to unit RMS decouples the head's init from the backbone.
-        """
-        rms = jnp.sqrt(jnp.mean(jnp.square(cls_features), axis = -1, keepdims = True) + 1e-6)
-        return cls_features / rms
 
     def compute_prefix_cache(
         self, observation: _model.Observation
@@ -1017,9 +1014,11 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         """Group per-position CLS attention [B, S] into per-modality scores [B, n_modalities].
 
         Modality order: [img1, img2, ..., imgN, text, (state if not no_state), (actions if Q)]
-        Gemma 4 uses a masked mean per group and excludes image demarcation tokens.
-        Other variants preserve the historical summed grouping.
-        The CLS self-attention at the last sequence position is excluded from all groups.
+        Gemma 4 uses a masked sum per group (skips padding) and excludes image
+        demarcation tokens. Other variants preserve the historical summed
+        grouping. The CLS self-attention at the last sequence position is
+        excluded from all groups, so the per-modality scores sum to ~1 across
+        groups (the small remainder is the CLS-self-attention probability).
         """
         attn_parts = []
 
@@ -1027,11 +1026,10 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             if input_mask is None:
                 raise ValueError("input_mask is required for Gemma 4 attention-score grouping.")
 
-            def _masked_mean(start: int, end: int) -> jax.Array:
+            def _masked_sum(start: int, end: int) -> jax.Array:
                 group_mask = input_mask[:, start : end]
                 group_scores = cls_attn_mean[:, start : end]
-                denom = jnp.maximum(jnp.sum(group_mask, axis = -1), 1)
-                return jnp.sum(jnp.where(group_mask, group_scores, 0.0), axis = -1) / denom
+                return jnp.sum(jnp.where(group_mask, group_scores, 0.0), axis = -1)
 
             num_soft = self._num_soft_tokens_per_image
             tokens_per_block = num_soft + 4
@@ -1039,18 +1037,18 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
                 block_start = 1 + i * tokens_per_block
                 patch_start = block_start + 2
                 patch_end = patch_start + num_soft
-                attn_parts.append(_masked_mean(patch_start, patch_end))
+                attn_parts.append(_masked_sum(patch_start, patch_end))
 
             text_start = 1 + self._num_cameras * tokens_per_block
             text_end = text_start + self._max_token_len - 1
-            attn_parts.append(_masked_mean(text_start, text_end))
+            attn_parts.append(_masked_sum(text_start, text_end))
             if not self._no_state:
-                attn_parts.append(_masked_mean(text_end, text_end + 1))
+                attn_parts.append(_masked_sum(text_end, text_end + 1))
                 action_start = text_end + 1
             else:
                 action_start = text_end
             if self._action_conditioned:
-                attn_parts.append(_masked_mean(action_start, action_start + self._action_horizon))
+                attn_parts.append(_masked_sum(action_start, action_start + self._action_horizon))
 
             return jnp.stack(attn_parts, axis = -1)
 
