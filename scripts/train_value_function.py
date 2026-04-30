@@ -639,11 +639,14 @@ def value_function_train_step(
             ),
         )
 
+    # The trailing-name regex uses `[/_]` so it also matches the stacked-layer-params
+    # layout, where per-layer scales/biases live under names like
+    # `g0__pre_attention_norm__scale` (separator `__` instead of `/`).
     kernel_params = nnx.state(
         model,
         nnx.All(
             nnx.Param,
-            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            nnx.Not(nnx_utils.PathRegex(".*[/_](bias|scale|pos_embedding|input_embedding)")),
             nnx.Not(nnx_utils.PathRegex(".*target_(q_)?(network|head)/.*")),
             lambda _, x: x.value.ndim > 1,
         ),
@@ -653,7 +656,7 @@ def value_function_train_step(
         nnx.All(
             nnx.Param,
             nnx_utils.PathRegex(".*target_(q_)?(network|head)/.*"),
-            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            nnx.Not(nnx_utils.PathRegex(".*[/_](bias|scale|pos_embedding|input_embedding)")),
             lambda _, x: x.value.ndim > 1,
         ),
     )
@@ -1779,12 +1782,11 @@ def generate_validation_plots_dlimp(
         "compressed val cache images at predict time."
     )
 
-    cache_files: list[tuple[int, str]] = []
-    for filename in os.listdir(cache_dir):
-        if filename.startswith("traj_") and filename.endswith(".pkl"):
-            traj_idx = int(filename.replace("traj_", "").replace(".pkl", ""))
+    cache_files: list[tuple[str, str]] = []
+    for filename in sorted(os.listdir(cache_dir)):
+        if filename.endswith(".pkl"):
+            traj_idx = filename[: -len(".pkl")]
             cache_files.append((traj_idx, os.path.join(cache_dir, filename)))
-    cache_files.sort()
     logging.info(f"Found {len(cache_files)} cached validation episodes in {cache_dir}")
 
     MAX_SUBTASK_SEGMENTS = 16
@@ -2075,26 +2077,18 @@ def main(config: _config.TrainConfig):
         val_episodes_cache_dir = config.validation_cache_dir
         val_dataset = None
 
-        # Only process 0 writes the cache to avoid multi-worker NFS corruption.
-        if jax.process_index() == 0:
-            cache_val_episodes(
-                val_trajectory_dataset, config.num_val_trajectories, val_episodes_cache_dir,
-                include_repos = config.include_repos, save_only = True,
-                input_transform = val_input_transform,
-            )
+        # All workers participate in caching: worker 0 covers all repos up to
+        # num_val_trajectories; non-zero workers only cache include_repos. Each
+        # worker checks file existence before claiming/writing, so concurrent
+        # writes to NFS are safe.
+        cache_val_episodes(
+            val_trajectory_dataset, config.num_val_trajectories, val_episodes_cache_dir,
+            include_repos = config.include_repos, save_only = True,
+            input_transform = val_input_transform,
+        )
         if jax.process_count() > 1:
             jax.experimental.multihost_utils.sync_global_devices("val_cache_write")
-        # Aggressively free anything held by the val trajectory pipeline before
-        # we spin up the Gemma4 weight load — orbax restore stages the full
-        # 26.9 GB checkpoint through host RAM and we can't afford the val side
-        # holding tf.data threadpools / shuffle buffers.
         del val_trajectory_dataset, val_input_transform, _val_data_config, _val_rlds_kwargs
-        gc.collect()
-        try:
-            import ctypes as _ctypes
-            _ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except OSError:
-            pass
     else:
         # Non-RoboCOIN: use LeRobot dataset
         from lerobot.common.datasets import lerobot_dataset
@@ -2181,6 +2175,7 @@ def main(config: _config.TrainConfig):
                 action_conditioned = action_conditioned,
                 data_config = data_config,
                 cache_dir = val_episodes_cache_dir,
+                batch_size = 32,
             )
         else:
             plot_images = generate_validation_plots(
@@ -2330,7 +2325,13 @@ def main(config: _config.TrainConfig):
                 _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step + 1)
 
         # Generate validation plots (all workers participate for FSDP, only worker 0 creates plots/logs)
-        if (step + 1) % config.plot_interval == 0 or step + 1 == config.num_train_steps:
+        # The third disjunct fires once at the resumed step so we can inspect the
+        # restored model state before further training shifts it.
+        if (
+            (step + 1) % config.plot_interval == 0
+            or step + 1 == config.num_train_steps
+            or (step % config.plot_interval == 0 and step == start_step and start_step > 0)
+        ):
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
@@ -2342,6 +2343,7 @@ def main(config: _config.TrainConfig):
                         action_conditioned = action_conditioned,
                         data_config = data_config,
                         cache_dir = val_episodes_cache_dir,
+                        batch_size = 16,
                     )
                 else:
                     plot_images = generate_validation_plots(
@@ -2358,7 +2360,8 @@ def main(config: _config.TrainConfig):
                             wandb.log(plot_images, step=step)
                         else:
                             logging.warning(f"No validation plots generated at step {step}")
-            
+                del model
+
         # Policy evaluation (only on worker 0)
         if eval_enabled and ((step + 1) % config.eval_interval == 0 or step + 1 == config.num_train_steps):
             with timer.context("policy_eval"):

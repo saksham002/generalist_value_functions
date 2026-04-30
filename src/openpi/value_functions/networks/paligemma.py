@@ -160,39 +160,30 @@ def make_gemma3_attn_mask(
 
 def make_gemma4_attn_mask(
     input_mask: jax.Array,
-    num_cameras: int,
-    tokens_per_image_block: int,
-    num_soft_tokens_per_image: int,
     *,
-    first_image_offset: int = 1,
     suffix_mask: jax.Array | None = None,
+    action_start: int | None = None,
+    action_length: int | None = None,
 ) -> jax.Array:
     """Create attention mask for Gemma 4 value network.
 
-    Sequence layout (value-network default, `first_image_offset=1` for BOS):
+    Sequence layout (value-network default):
         [BOS] [img_block_1] ... [img_block_N] [text] [state] [(actions)] [CLS]
 
-    For VLM-style prompts where image blocks are not placed immediately after BOS
-    (e.g. `[BOS, <start_of_turn>, user, \\n, img_block, text, <end_of_turn>, ...]`),
-    pass `first_image_offset` equal to the absolute column of the first image block's
-    opening `\\n\\n` token.
-
-    Each image block has `tokens_per_image_block` positions laid out as:
-        [\\n\\n, <SOI>, num_soft_tokens_per_image soft tokens, <EOI>, \\n\\n]
-
     Attention is causal throughout the visual/text/state/action stream,
-    including image soft tokens.
+    including image soft tokens. When ``action_start`` and ``action_length`` are
+    provided, the action block is made bidirectional within itself: each action
+    token can attend to every other action token (in both directions), while
+    tokens outside the block remain governed by the causal rule.
 
     Args:
         input_mask: bool[B, S] — True for valid positions, False for padding.
-        num_cameras: number of image blocks in the sequence.
-        tokens_per_image_block: total positions per image block (num_soft_tokens + 4).
-        num_soft_tokens_per_image: number of soft tokens produced by the vision
-            encoder per image (e.g. 49 for 336x336 with pool=3).
-        first_image_offset: absolute column index where the first image block starts.
-            Defaults to 1 to match the value-network layout (BOS at index 0).
         suffix_mask: Optional bool[B, S]. True for subtask target text positions.
             Non-suffix queries are blocked from attending to suffix keys.
+        action_start: absolute column index of the first action token, or None
+            if no action block is present.
+        action_length: number of action tokens in the action block, or None if
+            no action block is present.
 
     Returns:
         Attention mask [B, S, S] where True means "can attend".
@@ -202,9 +193,15 @@ def make_gemma4_attn_mask(
     causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype = jnp.bool_))
     causal = jnp.broadcast_to(causal[None], (batch_size, seq_len, seq_len))
 
-    del num_cameras, tokens_per_image_block, num_soft_tokens_per_image, first_image_offset
-
     mask = causal
+
+    if action_start is not None and action_length is not None and action_length > 0:
+        # Bidirectional attention within the action block: every action token
+        # can attend to every other action token (both directions).
+        positions = jnp.arange(seq_len)
+        in_action = (positions >= action_start) & (positions < action_start + action_length)
+        action_block = in_action[None, :] & in_action[:, None]  # [S, S]
+        mask = mask | action_block[None]
 
     valid = input_mask[:, None, :] & input_mask[:, :, None]
     mask = mask & valid
@@ -769,12 +766,18 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
                 seq_positions[None, :] < text_end
             )
 
+        if self._action_conditioned:
+            action_block_start = text_end + (0 if self._no_state else 1)
+            action_block_length = self._action_horizon
+        else:
+            action_block_start = None
+            action_block_length = None
+
         attn_mask = make_gemma4_attn_mask(
             input_mask,
-            num_cameras = num_cameras,
-            tokens_per_image_block = tokens_per_block,
-            num_soft_tokens_per_image = num_soft,
             suffix_mask = suffix_mask,
+            action_start = action_block_start,
+            action_length = action_block_length,
         )
 
         return tokens, input_mask, attn_mask, token_ids
