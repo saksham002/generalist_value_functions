@@ -8,10 +8,10 @@ set -e
 # Configuration — edit these before running
 # =============================================================================
 
-CONFIG_NAME="real_hang_pi05_filter_intervention"
-CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention/"
+CONFIG_NAME="real_hang_pi05_filter_intervention_60_Hz"
+CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention_60_Hz/"
 FINE_TUNE_CONFIG=""  # Optional: FineTuneConfig name from config.py. Leave empty to skip.
-STEP=100000
+STEP=199999
 
 # Optional: enable BestOfN value-guided action selection by uncommenting these.
 # CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa"
@@ -23,8 +23,9 @@ STEP=100000
 ROBOT_HOST="xarmpc.pc.cs.cmu.edu"
 ROBOT_PORT=8080
 
-NUM_EPISODES=1
+NUM_EPISODES=30
 DEBUG=false  # Set to true to skip policy loading and just save images / print state
+MANUAL=false  # Set to true to advance subtasks manually by pressing Enter (auto heuristic disabled)
 
 # =============================================================================
 
@@ -54,6 +55,7 @@ fi
 echo -e "  Robot:      ${YELLOW}${ROBOT_HOST}:${ROBOT_PORT}${NC}"
 echo -e "  Episodes:   ${YELLOW}${NUM_EPISODES}${NC}"
 echo -e "  Debug:      ${YELLOW}${DEBUG}${NC}"
+echo -e "  Manual:     ${YELLOW}${MANUAL}${NC}"
 echo ""
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -86,6 +88,11 @@ if [ "${DEBUG}" = true ]; then
     DEBUG_ARGS="--args.debug"
 fi
 
+MANUAL=true
+if [ "${MANUAL}" = true ]; then
+    MANUAL_ARGS="--args.manual"
+fi
+
 echo -e "${BLUE}Starting eval...${NC}"
 echo ""
 
@@ -98,4 +105,5 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run eval/xarm_scripts/eval_shirt_hang_rem
     --args.num-episodes "${NUM_EPISODES}" \
     ${FINE_TUNE_ARGS} \
     ${CRITIC_ARGS} \
-    ${DEBUG_ARGS}
+    ${DEBUG_ARGS} \
+    ${MANUAL_ARGS}

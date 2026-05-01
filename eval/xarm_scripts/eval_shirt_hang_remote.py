@@ -16,6 +16,8 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import queue
+import threading
 import time
 from typing import Any
 
@@ -37,6 +39,23 @@ import ipdb
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 logger = logging.getLogger(__name__)
+
+
+# Queue of Enter-key events used by --manual mode to advance subtasks.
+_advance_q: "queue.Queue[None]" = queue.Queue()
+
+
+def _start_key_listener() -> None:
+    """Start a daemon thread that pushes one event per Enter key press onto _advance_q."""
+    def _listen() -> None:
+        while True:
+            try:
+                input()
+            except EOFError:
+                return
+            _advance_q.put(None)
+
+    threading.Thread(target = _listen, daemon = True).start()
 
 
 # =============================================================================
@@ -67,14 +86,14 @@ class Args:
     num_episodes: int = 1
     """Number of episodes to run."""
 
-    control_freq: int = 30
+    control_freq: int = 60
     """Frequency (Hz) at which the robot server expects actions. Passed to the
     RemoteEnvironmentAdapter so the server initializes its control loop accordingly."""
 
-    query_freq: int = 15
+    query_freq: int = 30
     """How many env steps between policy replans."""
 
-    max_steps: int = 3600
+    max_steps: int = 7200
     """Maximum env steps per episode."""
 
     real_action_start: int = 0
@@ -107,6 +126,9 @@ class Args:
 
     num_samples: int = 8
     """Number of action candidates sampled per replan step when using BestOfN."""
+
+    manual: bool = False
+    """If set, advance subtasks manually by pressing Enter (auto heuristic is disabled)."""
 
 
 # =============================================================================
@@ -234,7 +256,7 @@ class LocalPolicy:
         self._action_dim_offset = policy_model_config.action_dim_offset
         self._eef_action_dim = norm_stats["actions"].mean.shape[-1]
 
-        # TODO: Store the VF inside BestOfN and set self._model = BestOfN when a critic
+        # TODO: Store the VF inside BestOfN and set model = BestOfN when a critic
         # is supplied, eliminating the branch in predict() and the @nnx.jit wrapper.
         # Both modules are frozen during eval so module_jit works uniformly.
         # Plan: ~/.claude-personal/plans/starry-dazzling-meteor.md
@@ -298,10 +320,11 @@ class LocalPolicy:
 
         # Mask out the last 20 action positions so the model only attends to the first 30.
         action_horizon = self._model.action_horizon
-        action_mask = jnp.concatenate([
-            jnp.ones(action_horizon - 20, dtype=jnp.bool_),
-            jnp.zeros(20, dtype=jnp.bool_),
-        ])[None, :]  # (1, action_horizon)
+        # action_mask = jnp.concatenate([
+        #     jnp.ones(action_horizon - 20, dtype=jnp.bool_),
+        #     jnp.zeros(20, dtype=jnp.bool_),
+        # ])[None, :]  # (1, action_horizon)
+        action_mask = jnp.ones(action_horizon, dtype=jnp.bool_)[None, :]
         batched["action_mask"] = action_mask
         batched["image_mask"] = {k: jnp.array([True]) for k in batched.get("image", {})}
 
@@ -335,7 +358,7 @@ class LocalPolicy:
         })
         
         # Extract the 14-D EEF action subset, first 30 steps only.
-        actions = np.asarray(decoded["actions"], dtype=np.float32)[ : 30]
+        actions = np.asarray(decoded["actions"], dtype=np.float32)[ : 60]
 
         # Policy predicts global actions relative to current state; add current pose to get absolute base frame targets.
         # actions += initial_eef_pose
@@ -374,11 +397,12 @@ class SubtaskTracker:
         right/tcp_pose[2]                    — absolute right-arm TCP Z height (metres)
     """
 
-    def __init__(self) -> None:
+    def __init__(self, manual: bool = False) -> None:
         self._subtask = 0
         self._steps_in_subtask = 0
         self._step = 0
         self._last_boundary_step = -_MIN_BOUNDARY_GAP - 1
+        self._manual = manual
 
         self._prev_lg_open: bool | None = None
         self._prev_rg_open: bool | None = None
@@ -431,7 +455,7 @@ class SubtaskTracker:
         lg_open = lg > _GRIP_THRESH
         rg_open = rg > _GRIP_THRESH
 
-        if self._subtask < len(_SUBTASK_PROMPTS) - 1:
+        if not self._manual and self._subtask < len(_SUBTASK_PROMPTS) - 1:
             self._check_transition(lg, rg, rz, lg_open, rg_open)
 
         self._prev_lg_open = lg_open
@@ -439,6 +463,11 @@ class SubtaskTracker:
 
         self._step += 1
         self._steps_in_subtask += 1
+
+    def force_advance(self) -> None:
+        """Manually move to the next subtask (used by --manual mode)."""
+        if self._subtask < len(_SUBTASK_PROMPTS) - 1:
+            self._advance(self._step)
 
     def _can_accept_boundary(self, boundary_step: int) -> bool:
         return boundary_step - self._last_boundary_step > _MIN_BOUNDARY_GAP
@@ -671,7 +700,12 @@ def run_episode(
     logger.info(f"Starting episode {episode_idx}")
     obs, _ = env.reset(seed=episode_idx)
 
-    tracker = SubtaskTracker()
+    tracker = SubtaskTracker(manual = args.manual)
+    if args.manual:
+        # Drain any Enter presses queued before this episode started.
+        while not _advance_q.empty():
+            _advance_q.get_nowait()
+        logger.info("Manual subtask switching enabled — press Enter to advance subtask.")
 
     action_plan: np.ndarray | None = None
     t = 0
@@ -680,6 +714,11 @@ def run_episode(
 
     while not (terminated or truncated) and t < args.max_steps:
         tracker.update(obs)
+        if args.manual:
+            while not _advance_q.empty():
+                _advance_q.get_nowait()
+                tracker.force_advance()
+                logger.info(f"Manual advance → subtask {tracker.subtask} ({tracker.prompt!r})")
 
         if t % args.query_freq == 0:
             prompt = tracker.prompt
@@ -769,6 +808,9 @@ def main(args: Args) -> None:
     sys.path.insert(0, str(Path(__file__).parent))
     from remote_environment_adapter import RemoteEnvironmentAdapter
 
+    if args.manual:
+        _start_key_listener()
+
     if args.debug:
         robot_url = f"http://{args.robot_host}:{args.robot_port}/api"
         _check_connection(robot_url, "Robot server")
@@ -809,7 +851,11 @@ def main(args: Args) -> None:
     logger.info("Connected to robot environment.")
 
     for episode_idx in range(args.num_episodes):
-        run_episode(env, policy, args, episode_idx)
+        try:
+            run_episode(env, policy, args, episode_idx)
+        except KeyboardInterrupt:
+            logger.info(f"Episode {episode_idx} interrupted by Ctrl+C — dropping into ipdb")
+        ipdb.set_trace()
 
     env.close()
 
