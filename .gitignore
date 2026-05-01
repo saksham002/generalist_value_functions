@@ -4,9 +4,6 @@ random/
 # Per-user project status snapshots (see CLAUDE.md "Project Status / Session Context")
 project_status/
 
-# Separate repo
-eval/
-
 # Data directories.
 assets/
 checkpoints/
