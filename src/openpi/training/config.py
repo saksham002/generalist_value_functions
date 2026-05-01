@@ -1331,6 +1331,8 @@ class FineTuneConfig:
     keep_period: int | None = None
     log_interval: int | None = None
 
+    action_horizon: int | None = None
+
     # Model config overrides (applied via dataclasses.replace on config.model)
     model_overrides: dict[str, Any] = dataclasses.field(default_factory = dict)
 
@@ -1343,6 +1345,7 @@ class FineTuneConfig:
     _TRAIN_CONFIG_FIELDS: ClassVar[tuple[str, ...]] = (
         "save_interval", "plot_interval", "keep_period", "log_interval",
         "include_repos", "validation_cache_dir", "num_val_trajectories",
+        "action_horizon",
     )
 
     def apply_overrides(self, config: "TrainConfig", pretrained_step: int | None = None) -> "TrainConfig":
@@ -2558,16 +2561,16 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
     FineTuneConfig(
         name = "real_hang_finetune_q_sarsa",
         data_overrides = {
-            "data_dir": "gs://saksham-euw4/hdf5/real_hang",
+            "data_dir": "gs://saksham-euw4/hdf5/real_hang_60_Hz",
             "dataset_name": "real_hang:1.0.0",
             "assets": AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang_60_Hz",
                 asset_id = "norm_stats",
             ),
-            # state_dim=16 only to avoid errors during data loading/normalization;
-            # does not affect the model since no_state=True.
-            "state_dim": 16,
+            "state_dim": 14,
+            "subsample": True,
         },
+        action_horizon = 30,
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang_q_sarsa/",
         num_val_trajectories = 5,
         include_repos = (),
@@ -3101,7 +3104,7 @@ _CONFIGS = [
             head_config=_heads.RegressionHeadConfig(),
         ),
         data=RoboCoinRldsDataConfig(
-            rlds_data_dir="/data/group_data/rl/datasets/",
+            rlds_data_dir="gs://saksham-euw4/robocoin_bimanual/",
             assets=AssetsConfig(
                 assets_dir="gs://saksham-euw4/robocoin_bimanual/",
                 asset_id="norm_stats",
@@ -3961,7 +3964,7 @@ _CONFIGS = [
         fsdp_devices=16,
         # Top-level action_horizon controls dataset chunking (60 raw 60Hz frames per chunk);
         # data.subsample=True then halves it to 30 to match model.action_horizon.
-        action_horizon=60,
+        action_horizon=30,
     ),
     # Same as real_hang_pi05_filter_intervention, but with action_horizon=60.
     TrainConfig(

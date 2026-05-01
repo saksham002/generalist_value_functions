@@ -391,7 +391,7 @@ def log_memory_debug(step: int, data_loader=None, force_gc: bool = False, log_to
             wandb.log(wandb_stats, step=step)
         except Exception:
             pass
-    
+
     return stats
 
 
@@ -465,7 +465,7 @@ def init_train_state(
 
         if partial_params is not None:
             graphdef, state = nnx.split(model)
-            state.replace_by_pure_dict(partial_params)
+            nnx_utils.replace_state_from_pure_dict_numeric_key_compat(state, partial_params)
             model = nnx.merge(graphdef, state)
 
         params = nnx.state(model)
@@ -502,10 +502,18 @@ def init_train_state(
         policy_schedule = config.policy_lr_schedule if config.policy_lr_schedule is not None else config.lr_schedule
         policy_tx = _optimizer.create_optimizer(config.optimizer, policy_schedule, weight_decay_mask=None)
 
-    def init_policy(rng: at.KeyArrayLike) -> training_utils.TrainState:
+    def init_policy(
+        rng: at.KeyArrayLike, partial_params: at.Params | None = None
+    ) -> training_utils.TrainState:
         if config.policy is None or policy_tx is None:
             raise ValueError("Config does not specify a policy")
         policy_model = config.policy.create(rng)
+
+        if partial_params is not None:
+            graphdef, state = nnx.split(policy_model)
+            nnx_utils.replace_state_from_pure_dict_numeric_key_compat(state, partial_params)
+            policy_model = nnx.merge(graphdef, state)
+
         policy_params = nnx.state(policy_model)
         policy_params = nnx_utils.state_map(
             policy_params,
@@ -523,14 +531,16 @@ def init_train_state(
         )
 
     def init_actor_critic(
-        rng: at.KeyArrayLike, partial_params: at.Params | None = None
+        rng: at.KeyArrayLike,
+        critic_partial_params: at.Params | None = None,
+        policy_partial_params: at.Params | None = None,
     ) -> training_utils.ActorCriticTrainState:
         rng, critic_rng, policy_rng = jax.random.split(rng, 3)
-        critic_state = init_critic(critic_rng, partial_params)
+        critic_state = init_critic(critic_rng, critic_partial_params)
 
         policy_state = None
         if config.policy is not None:
-            policy_state = init_policy(policy_rng)
+            policy_state = init_policy(policy_rng, policy_partial_params)
 
         return training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
 
@@ -540,13 +550,17 @@ def init_train_state(
     if resume:
         return train_state_shape, state_sharding
 
-    partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.critic.params.to_pure_dict())
+    critic_partial_params = _load_weights_and_validate(
+        config.weight_loader, train_state_shape.critic.params.to_pure_dict()
+    )
+    policy_partial_params = None
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # Pre-shard partial_params to match the FSDP output sharding so each chip
     # only receives its shard (~x/N GB) instead of the full replicated copy
     # (~x GB). This avoids OOM during init on memory-constrained devices.
-    params_sharding = sharding.fsdp_sharding(partial_params, mesh)
+    critic_params_sharding = sharding.fsdp_sharding(critic_partial_params, mesh)
+    policy_params_sharding = None
 
     # `jax.device_put(tree, sharding)` calls `multihost_utils.assert_equal`
     # under the hood, which `broadcast_one_to_all`s each leaf with
@@ -567,14 +581,21 @@ def init_train_state(
         def _cb(idx):
             return np.asarray(arr[idx])
         return jax.make_array_from_callback(shape, sharding, _cb)
-    partial_params = jax.tree.map(_make_sharded_array, partial_params, params_sharding)
+    critic_partial_params = jax.tree.map(_make_sharded_array, critic_partial_params, critic_params_sharding)
+
+    donate_argnums = (1,) if policy_partial_params is None else (1, 2)
+    in_shardings = (
+        replicated_sharding,
+        critic_params_sharding,
+        policy_params_sharding,
+    )
 
     train_state = jax.jit(
         init_actor_critic,
-        donate_argnums = (1,),
-        in_shardings = (replicated_sharding, params_sharding),
+        donate_argnums = donate_argnums,
+        in_shardings = in_shardings,
         out_shardings = state_sharding,
-    )(init_rng, partial_params)
+    )(init_rng, critic_partial_params, policy_partial_params)
 
     return train_state, state_sharding
 
@@ -2241,11 +2262,21 @@ def main(config: _config.TrainConfig):
         )
 
     start_step = int(critic_state.step)
-    if start_step > 0:
+    # Fine-tune mode loads pretrained weights from a different dataset, so
+    # advancing the new data iterator by ``start_step`` batches has no resume
+    # semantics — skip the fast-forward and iterate only the fine-tune range.
+    skip_fast_forward = config.fine_tune is not None
+    if start_step > 0 and not skip_fast_forward:
         logging.info(f"Resuming with data-loader fast-forward through step {start_step}")
+    loop_range = (
+        range(start_step, config.num_train_steps)
+        if skip_fast_forward
+        else range(config.num_train_steps)
+    )
     pbar = tqdm.tqdm(
-        range(config.num_train_steps),
+        loop_range,
         total=config.num_train_steps,
+        initial=start_step if skip_fast_forward else 0,
         dynamic_ncols=True,
     )
 

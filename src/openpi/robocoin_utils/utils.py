@@ -367,13 +367,16 @@ def cache_val_episodes(
 
     Iterates an RLDS trajectory dataset (return_trajectories=True), applies
     input_transform to each frame, and caches the transformed frames as
-    per-trajectory pickle files keyed by repo_id (sanitized: ``/`` → ``__``).
+    per-trajectory pickle files keyed by ``repo_key`` (``repo_index`` when the
+    underlying dataset exposes it, else ``repo_id``; sanitized: ``/`` → ``__``).
+    Using ``repo_index`` lets a single-task fine-tune cache multiple distinct
+    trajectories from the same ``repo_id``.
     On subsequent calls the cache is loaded instead of re-iterating the dataset.
 
     Multi-worker safe: every host calls this concurrently. Worker 0 is the
     full-coverage worker (caches all ``num_val_trajectories`` repos including
     non-required ones); workers > 0 only cache repos in ``include_repos``. Each
-    worker checks ``<sanitized_repo_id>.pkl`` existence at two points
+    worker checks ``<sanitized_repo_key>.pkl`` existence at two points
     — when deciding whether to claim the repo and again right before writing
     — and skips if another worker already produced that file.
 
@@ -388,7 +391,7 @@ def cache_val_episodes(
             applied to each frame before caching. Required when collecting, ignored when loading.
 
     Returns:
-        Dict mapping ``<sanitized_repo_id>`` (str) -> sorted list of frame dicts,
+        Dict mapping ``<sanitized_repo_key>`` (str) -> sorted list of frame dicts,
         or {} if save_only=True.
     """
     import jax  # local import to keep this util usable from non-JAX callers
@@ -486,7 +489,7 @@ def cache_val_episodes(
             if process_index == 0 and not is_required and num_non_required_slots <= 0:
                 continue
 
-            sanitized = _sanitize(repo_id)
+            sanitized = _sanitize(str(repo_key))
             cache_file = (
                 os.path.join(cache_dir, f"{sanitized}.pkl") if cache_dir else None
             )

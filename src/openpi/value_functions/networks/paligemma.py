@@ -195,13 +195,13 @@ def make_gemma4_attn_mask(
 
     mask = causal
 
-    if action_start is not None and action_length is not None and action_length > 0:
-        # Bidirectional attention within the action block: every action token
-        # can attend to every other action token (both directions).
-        positions = jnp.arange(seq_len)
-        in_action = (positions >= action_start) & (positions < action_start + action_length)
-        action_block = in_action[None, :] & in_action[:, None]  # [S, S]
-        mask = mask | action_block[None]
+    # if action_start is not None and action_length is not None and action_length > 0:
+    #     # Bidirectional attention within the action block: every action token
+    #     # can attend to every other action token (both directions).
+    #     positions = jnp.arange(seq_len)
+    #     in_action = (positions >= action_start) & (positions < action_start + action_length)
+    #     action_block = in_action[None, :] & in_action[:, None]  # [S, S]
+    #     mask = mask | action_block[None]
 
     valid = input_mask[:, None, :] & input_mask[:, :, None]
     mask = mask & valid
@@ -766,18 +766,18 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
                 seq_positions[None, :] < text_end
             )
 
-        if self._action_conditioned:
-            action_block_start = text_end + (0 if self._no_state else 1)
-            action_block_length = self._action_horizon
-        else:
-            action_block_start = None
-            action_block_length = None
+        # if self._action_conditioned:
+        #     action_block_start = text_end + (0 if self._no_state else 1)
+        #     action_block_length = self._action_horizon
+        # else:
+        #     action_block_start = None
+        #     action_block_length = None
 
         attn_mask = make_gemma4_attn_mask(
             input_mask,
             suffix_mask = suffix_mask,
-            action_start = action_block_start,
-            action_length = action_block_length,
+            # action_start = action_block_start,
+            # action_length = action_block_length,
         )
 
         return tokens, input_mask, attn_mask, token_ids

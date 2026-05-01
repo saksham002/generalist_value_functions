@@ -158,6 +158,9 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         """Extract trajectory fields used by the frame-level transform."""
         import tensorflow as tf
 
+        if self._subsample:
+            traj = self._subsample_trajectory(traj)
+
         if self._use_eef:
             eef_action = tf.cast(traj["eef_sim_pose_action"], tf.float32)
             eef_state = tf.cast(traj["eef_sim_pose_state"], tf.float32)
@@ -191,12 +194,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             state = tf.cast(traj["observation/state"], tf.float32)
         traj_len = tf.shape(state)[0]
         fps = traj["traj_metadata"]["episode_metadata"]["fps"]
-        if self._subsample:
-            tf.debugging.assert_equal(
-                tf.cast(fps, tf.int32), tf.constant(60, dtype = tf.int32),
-                message = "subsample=True requires the underlying dataset to be 60 Hz.",
-            )
-            fps = tf.fill(tf.shape(fps), tf.cast(30, fps.dtype))
         repo_id = traj["traj_metadata"]["episode_metadata"]["repo_id"]
         task_description = traj["traj_metadata"]["episode_metadata"]["task_description"]
         embodiment = tf.repeat(self._extract_embodiment(repo_id[0])[None], traj_len)
@@ -239,6 +236,48 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             result["video_latents"] = tf.cast(traj["video_latents"], tf.bfloat16)
 
         return result
+
+    def _subsample_trajectory(self, traj: dict) -> dict:
+        """Subsample a 60 Hz trajectory to 30 Hz before any field extraction.
+
+        - Leaves whose key contains ``"action"`` are sliced ``[1::2]`` so each kept
+          action sits at the half-step between the two surrounding 30 Hz states.
+        - All other leaves are sliced ``[0::2]``.
+        - All leaves are truncated to the same length ``M = traj_len // 2`` so
+          downstream ``from_tensor_slices`` sees consistent first-axis sizes for
+          odd-length trajectories.
+        - ``_frame_index``, ``index`` and ``steps_to_subtask_end`` are then divided
+          by 2 to convert from 60 Hz to 30 Hz units.
+        - ``traj_metadata.episode_metadata.fps`` is overwritten with 30.
+        """
+        import tensorflow as tf
+
+        fps = traj["traj_metadata"]["episode_metadata"]["fps"]
+        tf.debugging.assert_equal(
+            tf.cast(fps, tf.int32), tf.constant(60, dtype = tf.int32),
+            message = "subsample=True requires the underlying dataset to be 60 Hz.",
+        )
+
+        traj_len = tf.shape(traj["action"])[0]
+        m = traj_len // 2
+        end = 2 * m
+
+        def _walk(value, key: str):
+            if isinstance(value, dict):
+                return {k: _walk(v, k) for k, v in value.items()}
+            start = 1 if "action" in key else 0
+            return value[start:end:2]
+
+        out = {k: _walk(v, k) for k, v in traj.items()}
+
+        for halve_key in ("_frame_index", "index", "steps_to_subtask_end"):
+            if halve_key in out:
+                out[halve_key] = out[halve_key] // 2
+
+        ep_meta = out["traj_metadata"]["episode_metadata"]
+        ep_meta["fps"] = tf.fill(tf.shape(ep_meta["fps"]), tf.cast(30, ep_meta["fps"].dtype))
+
+        return out
 
     @staticmethod
     def _construct_eef_repr(data, eef_data):
@@ -392,20 +431,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
                         if key in mapped_traj:
                             mapped_traj[f"next_{key}"] = tf.gather(mapped_traj[key], next_indices)
 
-        if self._subsample:
-            # Drop every other action across the chunk axis (keep indices 1, 3, 5, ...).
-            mapped_traj["action_mask"] = mapped_traj["action_mask"][..., 1::2]
-            if "next_action_mask" in mapped_traj:
-                mapped_traj["next_action_mask"] = mapped_traj["next_action_mask"][..., 1::2]
-            mapped_traj["next_actions"] = mapped_traj["next_actions"][:, 1::2, :]
-
         return mapped_traj
-
-    def _chunk_actions(self, traj: dict, action_chunk_size: int) -> dict:
-        traj = super()._chunk_actions(traj, action_chunk_size)
-        if self._subsample:
-            traj["actions"] = traj["actions"][:, 1::2, :]
-        return traj
 
     def _restructure_images(self, frame: dict[str, Any], prefix: str = "") -> tuple[dict[str, Any], dict[str, Any]]:
         """Move camera images from observation dicts into the standard image/image_mask format."""
