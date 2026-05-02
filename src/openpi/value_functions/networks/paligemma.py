@@ -170,20 +170,19 @@ def make_gemma4_attn_mask(
     Sequence layout (value-network default):
         [BOS] [img_block_1] ... [img_block_N] [text] [state] [(actions)] [CLS]
 
-    Attention is causal throughout the visual/text/state/action stream,
-    including image soft tokens. When ``action_start`` and ``action_length`` are
-    provided, the action block is made bidirectional within itself: each action
-    token can attend to every other action token (in both directions), while
-    tokens outside the block remain governed by the causal rule.
+    Attention is causal throughout the visual/text/state/action stream by
+    default. When ``action_start`` and ``action_length`` are provided, the
+    action block is made bidirectional within itself: each action token can
+    attend to every other action token in both directions, while tokens
+    outside the block remain governed by the causal rule.
 
     Args:
         input_mask: bool[B, S] — True for valid positions, False for padding.
         suffix_mask: Optional bool[B, S]. True for subtask target text positions.
             Non-suffix queries are blocked from attending to suffix keys.
         action_start: absolute column index of the first action token, or None
-            if no action block is present.
-        action_length: number of action tokens in the action block, or None if
-            no action block is present.
+            if no bidirectional action block is requested.
+        action_length: number of action tokens in the action block, or None.
 
     Returns:
         Attention mask [B, S, S] where True means "can attend".
@@ -191,17 +190,13 @@ def make_gemma4_attn_mask(
     batch_size, seq_len = input_mask.shape
 
     causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype = jnp.bool_))
-    causal = jnp.broadcast_to(causal[None], (batch_size, seq_len, seq_len))
+    mask = jnp.broadcast_to(causal[None], (batch_size, seq_len, seq_len))
 
-    mask = causal
-
-    # if action_start is not None and action_length is not None and action_length > 0:
-    #     # Bidirectional attention within the action block: every action token
-    #     # can attend to every other action token (both directions).
-    #     positions = jnp.arange(seq_len)
-    #     in_action = (positions >= action_start) & (positions < action_start + action_length)
-    #     action_block = in_action[None, :] & in_action[:, None]  # [S, S]
-    #     mask = mask | action_block[None]
+    if action_start is not None and action_length is not None and action_length > 0:
+        positions = jnp.arange(seq_len)
+        in_action = (positions >= action_start) & (positions < action_start + action_length)
+        action_block = in_action[None, :] & in_action[:, None]  # [S, S]
+        mask = mask | action_block[None]
 
     valid = input_mask[:, None, :] & input_mask[:, :, None]
     mask = mask & valid
@@ -267,6 +262,16 @@ class PaliGemmaNetworkConfig:
     # ckpt scales have RMS≈14 vs gemma-3 ≈1).
     use_layernorm: bool = False
 
+    # Gemma 4 only: when True, action tokens attend bidirectionally within the
+    # action block (every action token attends to every other action token).
+    # Tokens outside the action block remain causal.
+    action_block_bidirectional: bool = False
+
+    # Gemma 4 only: when True, zero out the per-layer-input contribution at the
+    # action chunk positions and the CLS position. Image soft tokens, state,
+    # text, and BOS positions retain their per-layer-input contribution.
+    zero_per_layer_input_for_action_cls: bool = False
+
     def get_tokenizer(self, max_len: int | None = None):
         """Return the appropriate text tokenizer for this variant."""
         from openpi.models.tokenizer import Gemma3Tokenizer, Gemma4Tokenizer, PaligemmaTokenizer
@@ -326,9 +331,11 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
 
         logger.info(
             "PaliGemmaValueNetwork: variant=%s, is_gemma3=%s, is_gemma4=%s, action_conditioned=%s, "
-            "action_horizon=%s, no_state=%s",
+            "action_horizon=%s, no_state=%s, action_block_bidirectional=%s, "
+            "zero_per_layer_input_for_action_cls=%s",
             config.paligemma_variant, self._is_gemma3, self._is_gemma4, self._action_conditioned,
-            self._action_horizon, self._no_state,
+            self._action_horizon, self._no_state, config.action_block_bidirectional,
+            config.zero_per_layer_input_for_action_cls,
         )
 
         # Get config and module class based on variant
@@ -424,6 +431,9 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
 
         self._use_layernorm = config.use_layernorm
         self.cls_layer_norm = nnx.LayerNorm(embed_dim, rngs = rngs) if config.use_layernorm else None
+
+        self._gemma4_action_block_bidir = config.action_block_bidirectional
+        self._gemma4_zero_pli_action_cls = config.zero_per_layer_input_for_action_cls
 
     def _get_special_embeddings(self) -> jax.Array:
         """Return [BOS, \\n\\n, <SOI>, <EOI>] embeddings [1, 4, D]."""
@@ -766,21 +776,20 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
                 seq_positions[None, :] < text_end
             )
 
-        # if self._action_conditioned:
-        #     action_block_start = text_end + (0 if self._no_state else 1)
-        #     action_block_length = self._action_horizon
-        # else:
-        #     action_block_start = None
-        #     action_block_length = None
+        action_block_start = None
+        action_block_length = None
+        if self._action_conditioned:
+            action_block_start = text_end + (0 if self._no_state else 1)
+            action_block_length = self._action_horizon
 
         attn_mask = make_gemma4_attn_mask(
             input_mask,
             suffix_mask = suffix_mask,
-            # action_start = action_block_start,
-            # action_length = action_block_length,
+            action_start = action_block_start if self._gemma4_action_block_bidir else None,
+            action_length = action_block_length if self._gemma4_action_block_bidir else None,
         )
 
-        return tokens, input_mask, attn_mask, token_ids
+        return tokens, input_mask, attn_mask, token_ids, action_block_start, action_block_length
 
     def decode(self, x: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t v"]:
         return self.PaliGemma.llm(x, method = "decode")
@@ -928,8 +937,17 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
 
         # Build embeddings and attention mask
         gemma4_token_ids = None
+        gemma4_action_block_start: int | None = None
+        gemma4_action_block_length: int | None = None
         if self._is_gemma4:
-            tokens, input_mask, attn_mask, gemma4_token_ids = self._embed_sequence_gemma4(
+            (
+                tokens,
+                input_mask,
+                attn_mask,
+                gemma4_token_ids,
+                gemma4_action_block_start,
+                gemma4_action_block_length,
+            ) = self._embed_sequence_gemma4(
                 observation, action = action_array, action_mask = action_mask_array
             )
         elif self._is_gemma3:
@@ -951,6 +969,19 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             gemma4_per_layer_input = self.PaliGemma.llm(
                 tokens, gemma4_token_ids, method = "encode_per_layer_input",
             )
+            if self._gemma4_zero_pli_action_cls:
+                # Zero per-layer-input contribution at action chunk + CLS positions.
+                seq_len_pli = gemma4_per_layer_input.shape[1]
+                positions_pli = jnp.arange(seq_len_pli)
+                zero_pos = positions_pli == (seq_len_pli - 1)  # CLS is last
+                if gemma4_action_block_start is not None and gemma4_action_block_length is not None:
+                    in_action = (positions_pli >= gemma4_action_block_start) & (
+                        positions_pli < gemma4_action_block_start + gemma4_action_block_length
+                    )
+                    zero_pos = zero_pos | in_action
+                gemma4_per_layer_input = jnp.where(
+                    zero_pos[None, :, None, None], 0.0, gemma4_per_layer_input,
+                )
 
         llm_extra_kwargs: dict[str, jax.Array] = {}
         if self._is_gemma4:

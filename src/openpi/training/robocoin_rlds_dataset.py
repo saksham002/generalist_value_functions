@@ -31,6 +31,7 @@ SubtaskPromptMode = Literal[
     "all_subtasks",
     "all_subtasks_predict_current_subtask",
     "task_description_predict_current_subtask",
+    "task_description",
 ]
 
 ALL_SUBTASKS_HANG_PROMPT = (
@@ -101,6 +102,9 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
                 "variable_horizon=True requires td_n == action_chunk_size, "
                 f"got td_n={td_n}, action_chunk_size={action_chunk_size}"
             )
+        assert not (critic_mode and subtask_prompt_mode == "task_description"), (
+            "critic_mode=True is incompatible with subtask_prompt_mode='task_description'"
+        )
 
         self._split = split
         self._use_eef = use_eef
@@ -221,6 +225,8 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         }
         if self._filter_intervention:
             result["is_intervention"] = traj["is_intervention"]
+        if "has_subtask_annotations" in traj["traj_metadata"]["episode_metadata"]:
+            result["has_subtask_annotations"] = traj["traj_metadata"]["episode_metadata"]["has_subtask_annotations"]
         metadata_keys = ("index", "episode_index", "_frame_index", "_traj_index")
         if dataset_cfg.name != "robocoin":
             metadata_keys = metadata_keys + ("repo_index",)
@@ -598,6 +604,9 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         elif self._subtask_prompt_mode == "task_description_predict_current_subtask":
             frame["prompt"] = frame["task_description"]
             frame["subtask_text"] = subtask_texts[sampled_idx]
+        elif self._subtask_prompt_mode == "task_description":
+            frame["prompt"] = frame["task_description"]
+            frame["subtask_text"] = tf.constant(b"")
 
         selected_steps_f = tf.cast(selected_steps, tf.float32)
         frame["steps_to_subtask_end"] = selected_steps
@@ -676,6 +685,8 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             mask = tf.logical_and(mask, traj["steps_to_subtask_end"] >= filter_n_native)
         if self._filter_intervention:
             mask = tf.logical_and(mask, tf.cast(traj["is_intervention"], tf.bool))
+        if "has_subtask_annotations" in traj and self._subtask_prompt_mode != "task_description":
+            mask = tf.logical_and(mask, tf.cast(traj["has_subtask_annotations"], tf.bool))
         return tf.nest.map_structure(lambda x: tf.boolean_mask(x, mask), traj)
 
     def frame_filter(self, frame: dict) -> bool:
@@ -698,5 +709,8 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
 
         if self._filter_intervention:
             keep = tf.logical_and(keep, tf.cast(frame["is_intervention"], tf.bool))
+
+        if "has_subtask_annotations" in frame and self._subtask_prompt_mode != "task_description":
+            keep = tf.logical_and(keep, tf.cast(frame["has_subtask_annotations"], tf.bool))
 
         return keep

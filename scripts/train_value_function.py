@@ -1660,6 +1660,7 @@ def _render_and_log_plots(
     all_predictions: dict,
     all_predictions_neg: dict,
     all_predictions_random: dict,
+    all_predictions_shuffled: dict,
     all_attn_scores: dict,
     ep_mc_returns: dict,
     ep_frame_images: dict,
@@ -1742,6 +1743,17 @@ def _render_and_log_plots(
                 )
                 logging.info(f"Repo {repo_id}, episode {ep_idx} random action plot created")
 
+        predicted_values_shuffled = all_predictions_shuffled.get(traj_idx, [])
+        if len(predicted_values_shuffled) == len(predicted_values):
+            filtered_predictions_shuffled = [pred for pred, mask in zip(predicted_values_shuffled, include_masks) if mask]
+            if len(filtered_predictions_shuffled) == len(filtered_mc_returns) and len(filtered_predictions_shuffled) > 0:
+                images[f"{plot_key}_shuffled_actions"] = _create_value_plot(
+                    filtered_mc_returns, filtered_predictions_shuffled, ep_idx, step, " (Shuffled Actions)",
+                    oracle_values = None, subtask_texts = subtasks,
+                    output_dir = output_dir, plot_key = f"{plot_key}_shuffled_actions",
+                )
+                logging.info(f"Repo {repo_id}, episode {ep_idx} shuffled action plot created")
+
         predicted_values_counterfactual = all_predictions_counterfactual.get(traj_idx, []) if all_predictions_counterfactual is not None else []
         if len(predicted_values_counterfactual) == len(predicted_values):
             filtered_predictions_counterfactual = [
@@ -1761,7 +1773,7 @@ def _render_and_log_plots(
         # training steps have been logged.
         wandb.log(images)
     logging.info(f"Render thread finished: {'saved' if output_dir else 'logged'} {len(images)} plots for step {step}")
-    del images, ep_frame_images, all_predictions, all_predictions_neg, all_predictions_random, all_predictions_counterfactual, all_attn_scores
+    del images, ep_frame_images, all_predictions, all_predictions_neg, all_predictions_random, all_predictions_shuffled, all_predictions_counterfactual, all_attn_scores
 
 
 def generate_validation_plots_dlimp(
@@ -1826,6 +1838,7 @@ def generate_validation_plots_dlimp(
     all_predictions_neg: dict[str, list[float]] = {}
     all_predictions_random: dict[str, list[float]] = {}
     all_predictions_counterfactual: dict[str, list[float]] = {}
+    all_predictions_shuffled: dict[str, list[float]] = {}
     all_attn_scores: dict[str, list[np.ndarray]] = {}
 
     for traj_idx, cache_file in cache_files:
@@ -1864,6 +1877,15 @@ def generate_validation_plots_dlimp(
             if len(seg_frames) == 0:
                 continue
 
+            # Inject within-trajectory action permutation for the shuffled-actions plot.
+            # Deterministic per-segment seed so plots are reproducible across runs.
+            if action_conditioned and len(seg_frames) > 1 and "actions" in seg_frames[0]:
+                rng_perm = np.random.default_rng(seed = 86)
+                perm = rng_perm.permutation(len(seg_frames))
+                shuffled_arrays = [seg_frames[p]["actions"] for p in perm]
+                for i, frame in enumerate(seg_frames):
+                    frame["shuffled_actions"] = shuffled_arrays[i]
+
             traj_to_repo_ep[seg_key] = (repo_id_raw, ep_idx, part_suffix)
             ep_subtasks[seg_key] = seg_subtasks
             ep_mc_returns[seg_key] = [f["mc_return"] for f in seg_frames]
@@ -1886,7 +1908,7 @@ def generate_validation_plots_dlimp(
                 f"Traj {seg_key} (repo {repo_id_raw}, episode {ep_idx}{part_suffix}): "
                 f"running predictions on {len(seg_all_frames)} frames"
             )
-            preds, preds_neg, preds_random, preds_cf, attn = predict_values(
+            preds, preds_neg, preds_random, preds_cf, preds_shuffled, attn = predict_values(
                 model, seg_all_frames, seg_ep_mc_returns, action_conditioned,
                 batch_size = batch_size,
             )
@@ -1894,6 +1916,7 @@ def generate_validation_plots_dlimp(
             all_predictions_neg[seg_key] = preds_neg[seg_key]
             all_predictions_random[seg_key] = preds_random[seg_key]
             all_predictions_counterfactual[seg_key] = preds_cf[seg_key]
+            all_predictions_shuffled[seg_key] = preds_shuffled[seg_key]
             all_attn_scores[seg_key] = attn[seg_key]
 
             del seg_all_frames
@@ -1921,6 +1944,7 @@ def generate_validation_plots_dlimp(
             target = _render_and_log_plots,
             args = (
                 all_predictions, all_predictions_neg, all_predictions_random,
+                all_predictions_shuffled,
                 all_attn_scores,
                 ep_mc_returns, ep_frame_images, ep_fps, ep_include_masks,
                 ep_subtasks, ep_negative_subtasks,

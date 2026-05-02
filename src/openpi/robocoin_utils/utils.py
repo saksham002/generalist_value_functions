@@ -188,6 +188,13 @@ def get_obs_and_action(
         action_mask_key = "action_mask"
         prompt_key = "tokenized_prompt"
         prompt_mask_key = "tokenized_prompt_mask"
+    elif prefix == "shuffled_":
+        state_key = "state"
+        image_key = "image"
+        actions_key = "shuffled_actions"
+        action_mask_key = "action_mask"
+        prompt_key = "tokenized_prompt"
+        prompt_mask_key = "tokenized_prompt_mask"
     elif prefix == "counterfactual_":
         state_key = "state"
         image_key = "image"
@@ -594,16 +601,18 @@ def predict_values(
     dict[str, list[float]],
     dict[str, list[float]],
     dict[str, list[float]],
+    dict[str, list[float]],
     dict[str, list[np.ndarray]],
 ]:
     """Run batched value function inference on collected validation frames.
 
-    Performs three forward passes per batch where applicable: default prompt,
-    negative (counterfactual) prompt, and random actions.
+    Performs up to four forward passes per batch where applicable: default prompt,
+    negative (counterfactual) prompt, random actions, and shuffled actions
+    (within-trajectory permutation; injected upstream into each frame dict).
 
     When the network's compute_value returns (val, attn_scores) (e.g. PaliGemma at
     inference), attention scores are collected alongside predictions and returned as
-    the fourth element. Otherwise the fourth element is an empty dict.
+    the last element. Otherwise the last element is an empty dict.
 
     Args:
         model: The value function model.
@@ -617,6 +626,7 @@ def predict_values(
             all_predictions_neg,
             all_predictions_random,
             all_predictions_counterfactual,
+            all_predictions_shuffled,
             all_attn_scores,
         ).
     """
@@ -624,6 +634,7 @@ def predict_values(
     all_predictions_neg: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_predictions_random: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_predictions_counterfactual: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
+    all_predictions_shuffled: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_attn_scores: dict[str, list[np.ndarray]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
 
     for batch_start in range(0, len(all_frames), batch_size):
@@ -670,6 +681,11 @@ def predict_values(
                 _jitted_compute_value(model, obs_counterfactual, act_counterfactual)
             )
 
+        pred_values_shuffled_np = None
+        if "shuffled_actions" in frame_dicts[0]:
+            obs_shuffled, act_shuffled = get_obs_and_action(frame_dicts, prefix="shuffled_", action_conditioned=action_conditioned)
+            pred_values_shuffled_np, _ = jax.device_get(_jitted_compute_value(model, obs_shuffled, act_shuffled))
+
         for i, (ep_idx, _, _) in enumerate(batch_frames):
             all_predictions[ep_idx].append(float(pred_values_np[i]))
             all_attn_scores[ep_idx].append(attn_np[i])
@@ -679,11 +695,13 @@ def predict_values(
                 all_predictions_random[ep_idx].append(float(pred_values_random_np[i]))
             if pred_values_counterfactual_np is not None:
                 all_predictions_counterfactual[ep_idx].append(float(pred_values_counterfactual_np[i]))
+            if pred_values_shuffled_np is not None:
+                all_predictions_shuffled[ep_idx].append(float(pred_values_shuffled_np[i]))
 
     total_predictions = sum(len(preds) for preds in all_predictions.values())
     logger.info(f"Computed {total_predictions} predictions")
 
-    return all_predictions, all_predictions_neg, all_predictions_random, all_predictions_counterfactual, all_attn_scores
+    return all_predictions, all_predictions_neg, all_predictions_random, all_predictions_counterfactual, all_predictions_shuffled, all_attn_scores
 
 
 
