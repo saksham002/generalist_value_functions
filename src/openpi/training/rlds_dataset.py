@@ -156,6 +156,10 @@ class BaseRldsDataset:
             )
         else:
             local_batch_size = batch_size
+            if process_count > 1 and return_trajectories:
+                logging.info(
+                    f"Multi-host RLDS loading (trajectory mode): process {process_index}/{process_count}"
+                )
 
         def prepare_single_dataset(dataset_cfg: RLDSDataset, *, for_trajectories: bool):
             """Prepare a single dataset for either training or trajectory mode.
@@ -179,9 +183,22 @@ class BaseRldsDataset:
                     num_episodes = builder.info.splits[split].num_examples
                     stride = max(1, num_episodes // max_trajectories)
                     indices = list(range(0, num_episodes, stride))[:max_trajectories]
-                    split_to_use = "+".join(f"{split}[{i}:{i + 1}]" for i in indices)
+                    base_split = "+".join(f"{split}[{i}:{i + 1}]" for i in indices)
                 else:
-                    split_to_use = split
+                    base_split = split
+                # Shard trajectory-mode datasets across JAX processes the same
+                # way training does (see ``not for_trajectories`` branch
+                # below). Without this, every host iterates the full N-shard
+                # val dataset which accumulates host RAM until at least one
+                # worker is OOM-killed and drops the JAX coordinator.
+                split_to_use = (
+                    tfds.split_for_jax_process(base_split, process_index=process_index, process_count=process_count)
+                    if process_count > 1
+                    else base_split
+                )
+                logging.info(
+                    f"  Dataset {dataset_cfg.name} (trajectory mode): using split {split_to_use!r}"
+                )
                 do_shuffle = False
             else:
                 # Apply max_num_demos limit if specified (uses TFDS absolute-count slicing)

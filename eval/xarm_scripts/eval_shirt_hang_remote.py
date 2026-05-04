@@ -31,11 +31,12 @@ from scipy.spatial.transform import Rotation
 import tyro
 
 import openpi.models.model as _model
+import openpi.transforms as _transforms
 from openpi.models.best_of_n import BestOfNWrapper
 from openpi.shared.normalize import NormStats
 from openpi.value_functions import base_value_functions as _base_vf
 
-import ipdb
+import pdb
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 logger = logging.getLogger(__name__)
@@ -130,6 +131,9 @@ class Args:
     manual: bool = False
     """If set, advance subtasks manually by pressing Enter (auto heuristic is disabled)."""
 
+    debug_values: bool = False
+    """If set and BestOfN is in use, log the per-candidate Q-values inline with each replan log line."""
+
 
 # =============================================================================
 # Critic loading
@@ -141,23 +145,32 @@ def load_critic(
     checkpoint_path: str,
     fine_tune_config: str | None,
     step: int | None,
-) -> tuple[nnx.Module, dict[str, NormStats]]:
+) -> tuple[nnx.Module, dict[str, NormStats], dict[str, Any]]:
     """Load a value-function (critic) checkpoint for BestOfN action selection.
 
     Mirrors the loading pattern in scripts/evaluate_value_function.py: imports
     train_value_function.py to build the train state shape, restores params with
     explicit shardings, and merges into an nnx module. Norm stats are loaded
     from the checkpoint's saved assets directory.
+
+    Returns the critic module, its norm stats, and a critic_kwargs dict carrying
+    config-derived attributes that downstream code (BestOfNWrapper construction)
+    needs to know about the critic. New attributes can be added to this dict
+    without changing the function signature.
     """
     from openpi.robocoin_utils.load_model_utils import load_critic as _load_critic
 
-    critic_model, critic_norm_stats, _, _ = _load_critic(
+    critic_model, critic_norm_stats, critic_config, _ = _load_critic(
         config_name,
         checkpoint_path,
         fine_tune = fine_tune_config,
         step = step,
     )
-    return critic_model, critic_norm_stats
+    critic_kwargs = {
+        "action_horizon": critic_config.model.action_horizon,
+        "use_chunk_wise_delta": critic_config.data.use_chunk_wise_delta,
+    }
+    return critic_model, critic_norm_stats, critic_kwargs
 
 
 # =============================================================================
@@ -176,6 +189,7 @@ class LocalPolicy:
         fine_tune_config: str | None = None,
         critic_model: nnx.Module | None = None,
         critic_norm_stats: dict[str, NormStats] | None = None,
+        critic_kwargs: dict[str, Any] | None = None,
         num_samples: int = 8,
     ) -> None:
         import openpi.policies.policy as _policy_module
@@ -265,9 +279,27 @@ class LocalPolicy:
         self._bestofn = None
         if critic_model is not None:
             assert critic_norm_stats is not None, "critic_norm_stats required when critic_model is provided"
+            assert critic_kwargs is not None, "critic_kwargs required when critic_model is provided"
+            policy_use_chunk_wise_delta = config.data.use_chunk_wise_delta
+            critic_use_chunk_wise_delta = critic_kwargs["use_chunk_wise_delta"]
+            convert_to_global = (not critic_use_chunk_wise_delta) and policy_use_chunk_wise_delta
+            absolute_actions = None
+            if convert_to_global:
+                absolute_actions = next(
+                    (t for t in data_config.data_transforms.outputs if isinstance(t, _transforms.AbsoluteActions)),
+                    None,
+                )
+                assert absolute_actions is not None, (
+                    "convert_to_global=True but no AbsoluteActions transform found in "
+                    "data_config.data_transforms.outputs. Check that the policy's data "
+                    "config sets use_chunk_wise_delta=True."
+                )
             logger.info(
                 f"Building BestOfN wrapper with num_samples={num_samples}, "
-                f"action_dim_offset={self._action_dim_offset}"
+                f"action_dim_offset={self._action_dim_offset}, "
+                f"convert_to_global={convert_to_global} "
+                f"(policy_use_chunk_wise_delta={policy_use_chunk_wise_delta}, "
+                f"critic_use_chunk_wise_delta={critic_use_chunk_wise_delta})"
             )
             self._bestofn = BestOfNWrapper(
                 action_dim = self._model.action_dim,
@@ -277,25 +309,34 @@ class LocalPolicy:
                 num_samples = num_samples,
                 take_min_over_ensemble = True,
                 use_target_value = False,
-                convert_to_global = True,
+                convert_to_global = convert_to_global,
                 selection_mode = "argmax",
                 softmax_temperature = 1.0,
                 policy_norm_stats = norm_stats,
                 critic_norm_stats = critic_norm_stats,
                 critic_action_dim_offset = self._action_dim_offset,
+                critic_action_horizon = critic_kwargs["action_horizon"],
+                absolute_actions = absolute_actions,
             )
 
             @nnx.jit
             def _bestofn_sample(bon, vf, rng, transition):
+                # BestOfNWrapper.sample_actions returns (selected_action, q_values).
                 return bon.sample_actions(
                     rng, transition, compute_next_action = False, value_function = vf,
                 )
 
             self._bestofn_sample = _bestofn_sample
 
+        # Expose the policy's subtask prompt mode so the eval loop can decide whether
+        # to use the auto/manual subtask tracker or just feed a fixed task description.
+        self._subtask_prompt_mode = getattr(config.data, "subtask_prompt_mode", None)
+
         logger.info("Policy loaded and JIT-compiled successfully.")
 
-    def predict(self, obs_dict: dict[str, Any], initial_eef_pose: np.ndarray) -> np.ndarray:
+    def predict(
+        self, obs_dict: dict[str, Any], initial_eef_pose: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray | None]:
         """Run policy inference on a single observation.
 
         Args:
@@ -304,7 +345,9 @@ class LocalPolicy:
             initial_eef_pose: Current 14-D EEF pose in euler format from extract_eef_pose().
 
         Returns:
-            actions: float32 array of shape [30, 14] at the policy's native 30 Hz.
+            actions: float32 array of shape [60, 14] at the policy's native 60 Hz.
+            q_values: float32 array of shape (1, num_samples) when BestOfN is in use,
+                or None for the policy-only path.
         """
         raw_state = np.asarray(obs_dict["state"], dtype=np.float32)
         transformed = self._input_transform(obs_dict)
@@ -332,19 +375,22 @@ class LocalPolicy:
 
         self._rng, sample_rng = jax.random.split(self._rng)
 
+        q_values_np: np.ndarray | None = None
         if self._critic_model is not None:
             # BestOfN path: build a Transition manually with the 14-d initial EEF
             # pose as transition.action so the wrapper can convert chunk-wise-delta
             # candidates back to global before passing them to the critic.
             init_pose = jnp.asarray(initial_eef_pose, dtype = jnp.float32)[None, None, :]
             transition = _base_vf.Transition(observation = observation, action = init_pose)
-            actions_out = self._bestofn_sample(
+            actions_out, q_values = self._bestofn_sample(
                 self._bestofn, self._critic_model, sample_rng, transition,
             )
+            actions_out = jax.block_until_ready(actions_out)
+            q_values_np = np.asarray(jax.block_until_ready(q_values), dtype = np.float32)
         else:
             transition = _model.wrap_observation_as_transition(observation)
             actions_out = self._sample_actions_jit(sample_rng, transition, **self._sample_kwargs)
-        actions_out = jax.block_until_ready(actions_out)
+            actions_out = jax.block_until_ready(actions_out)
 
         start = self._action_dim_offset
         actions_np = np.asarray(
@@ -365,7 +411,7 @@ class LocalPolicy:
 
         #ipdb.set_trace()
 
-        return actions
+        return actions, q_values_np
 
 
 # =============================================================================
@@ -691,6 +737,9 @@ def extract_images_rgb(obs: dict[str, Any], camera_names: tuple[str, ...]) -> di
 # =============================================================================
 
 
+_TASK_DESCRIPTION_PROMPT = "Place the shirt on the hanger and hang it from the rod."
+
+
 def run_episode(
     env: Any,
     policy: LocalPolicy,
@@ -700,12 +749,20 @@ def run_episode(
     logger.info(f"Starting episode {episode_idx}")
     obs, _ = env.reset(seed=episode_idx)
 
-    tracker = SubtaskTracker(manual = args.manual)
-    if args.manual:
-        # Drain any Enter presses queued before this episode started.
-        while not _advance_q.empty():
-            _advance_q.get_nowait()
-        logger.info("Manual subtask switching enabled — press Enter to advance subtask.")
+    use_task_description = policy._subtask_prompt_mode == "task_description"
+    tracker: SubtaskTracker | None = None
+    if not use_task_description:
+        tracker = SubtaskTracker(manual = args.manual)
+        if args.manual:
+            # Drain any Enter presses queued before this episode started.
+            while not _advance_q.empty():
+                _advance_q.get_nowait()
+            logger.info("Manual subtask switching enabled — press Enter to advance subtask.")
+    else:
+        logger.info(
+            f"Policy uses subtask_prompt_mode='task_description'; using fixed prompt "
+            f"and skipping the auto/manual subtask tracker."
+        )
 
     action_plan: np.ndarray | None = None
     t = 0
@@ -713,15 +770,16 @@ def run_episode(
     truncated = False
 
     while not (terminated or truncated) and t < args.max_steps:
-        tracker.update(obs)
-        if args.manual:
-            while not _advance_q.empty():
-                _advance_q.get_nowait()
-                tracker.force_advance()
-                logger.info(f"Manual advance → subtask {tracker.subtask} ({tracker.prompt!r})")
+        if tracker is not None:
+            tracker.update(obs)
+            if args.manual:
+                while not _advance_q.empty():
+                    _advance_q.get_nowait()
+                    tracker.force_advance()
+                    logger.info(f"Manual advance → subtask {tracker.subtask} ({tracker.prompt!r})")
 
         if t % args.query_freq == 0:
-            prompt = tracker.prompt
+            prompt = _TASK_DESCRIPTION_PROMPT if use_task_description else tracker.prompt
             state, initial_eef_pose = extract_state(obs)
             images_rgb = extract_images_rgb(obs, args.camera_names)
 
@@ -732,17 +790,21 @@ def run_episode(
             }
 
             t0 = time.perf_counter()
-            full_actions = policy.predict(obs_dict, initial_eef_pose)
+            full_actions, q_values = policy.predict(obs_dict, initial_eef_pose)
             elapsed = time.perf_counter() - t0
 
             action_plan = full_actions[
                 :, args.real_action_start : args.real_action_start + args.real_action_dim
             ]
-            logger.info(
+            log_line = (
                 f"Episode {episode_idx} step {t}: prompt={prompt!r}, "
                 f"action_plan shape={action_plan.shape}, inference={elapsed:.3f}s"
             )
-            #ipdb.set_trace()
+            if args.debug_values and q_values is not None:
+                # B = 1 in the eval flow; flatten and format.
+                values_str = ", ".join(f"{v:.4f}" for v in q_values[0].tolist())
+                log_line += f", q_values=[{values_str}]"
+            logger.info(log_line)
             
 
         plan_idx = min(t % args.query_freq, action_plan.shape[0] - 1)
@@ -821,13 +883,14 @@ def main(args: Args) -> None:
 
     critic_model = None
     critic_norm_stats = None
+    critic_kwargs = None
     if args.critic_config is not None:
         assert args.critic_checkpoint is not None, "--args.critic-checkpoint required when --args.critic-config is set"
         logger.info(
             f"Loading critic: config={args.critic_config}, checkpoint={args.critic_checkpoint}, "
             f"fine_tune={args.critic_fine_tune_config}, step={args.critic_step}"
         )
-        critic_model, critic_norm_stats = load_critic(
+        critic_model, critic_norm_stats, critic_kwargs = load_critic(
             config_name = args.critic_config,
             checkpoint_path = args.critic_checkpoint,
             fine_tune_config = args.critic_fine_tune_config,
@@ -843,6 +906,7 @@ def main(args: Args) -> None:
         fine_tune_config=args.fine_tune_config,
         critic_model = critic_model,
         critic_norm_stats = critic_norm_stats,
+        critic_kwargs = critic_kwargs,
         num_samples = args.num_samples,
     )
 
@@ -855,7 +919,7 @@ def main(args: Args) -> None:
             run_episode(env, policy, args, episode_idx)
         except KeyboardInterrupt:
             logger.info(f"Episode {episode_idx} interrupted by Ctrl+C — dropping into ipdb")
-        ipdb.set_trace()
+        pdb.set_trace()
 
     env.close()
 

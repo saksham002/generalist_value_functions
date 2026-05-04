@@ -391,7 +391,7 @@ def log_memory_debug(step: int, data_loader=None, force_gc: bool = False, log_to
             wandb.log(wandb_stats, step=step)
         except Exception:
             pass
-    
+
     return stats
 
 
@@ -465,7 +465,7 @@ def init_train_state(
 
         if partial_params is not None:
             graphdef, state = nnx.split(model)
-            state.replace_by_pure_dict(partial_params)
+            nnx_utils.replace_state_from_pure_dict_numeric_key_compat(state, partial_params)
             model = nnx.merge(graphdef, state)
 
         params = nnx.state(model)
@@ -502,10 +502,18 @@ def init_train_state(
         policy_schedule = config.policy_lr_schedule if config.policy_lr_schedule is not None else config.lr_schedule
         policy_tx = _optimizer.create_optimizer(config.optimizer, policy_schedule, weight_decay_mask=None)
 
-    def init_policy(rng: at.KeyArrayLike) -> training_utils.TrainState:
+    def init_policy(
+        rng: at.KeyArrayLike, partial_params: at.Params | None = None
+    ) -> training_utils.TrainState:
         if config.policy is None or policy_tx is None:
             raise ValueError("Config does not specify a policy")
         policy_model = config.policy.create(rng)
+
+        if partial_params is not None:
+            graphdef, state = nnx.split(policy_model)
+            nnx_utils.replace_state_from_pure_dict_numeric_key_compat(state, partial_params)
+            policy_model = nnx.merge(graphdef, state)
+
         policy_params = nnx.state(policy_model)
         policy_params = nnx_utils.state_map(
             policy_params,
@@ -523,14 +531,16 @@ def init_train_state(
         )
 
     def init_actor_critic(
-        rng: at.KeyArrayLike, partial_params: at.Params | None = None
+        rng: at.KeyArrayLike,
+        critic_partial_params: at.Params | None = None,
+        policy_partial_params: at.Params | None = None,
     ) -> training_utils.ActorCriticTrainState:
         rng, critic_rng, policy_rng = jax.random.split(rng, 3)
-        critic_state = init_critic(critic_rng, partial_params)
+        critic_state = init_critic(critic_rng, critic_partial_params)
 
         policy_state = None
         if config.policy is not None:
-            policy_state = init_policy(policy_rng)
+            policy_state = init_policy(policy_rng, policy_partial_params)
 
         return training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
 
@@ -540,13 +550,17 @@ def init_train_state(
     if resume:
         return train_state_shape, state_sharding
 
-    partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.critic.params.to_pure_dict())
+    critic_partial_params = _load_weights_and_validate(
+        config.weight_loader, train_state_shape.critic.params.to_pure_dict()
+    )
+    policy_partial_params = None
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # Pre-shard partial_params to match the FSDP output sharding so each chip
     # only receives its shard (~x/N GB) instead of the full replicated copy
     # (~x GB). This avoids OOM during init on memory-constrained devices.
-    params_sharding = sharding.fsdp_sharding(partial_params, mesh)
+    critic_params_sharding = sharding.fsdp_sharding(critic_partial_params, mesh)
+    policy_params_sharding = None
 
     # `jax.device_put(tree, sharding)` calls `multihost_utils.assert_equal`
     # under the hood, which `broadcast_one_to_all`s each leaf with
@@ -567,14 +581,21 @@ def init_train_state(
         def _cb(idx):
             return np.asarray(arr[idx])
         return jax.make_array_from_callback(shape, sharding, _cb)
-    partial_params = jax.tree.map(_make_sharded_array, partial_params, params_sharding)
+    critic_partial_params = jax.tree.map(_make_sharded_array, critic_partial_params, critic_params_sharding)
+
+    donate_argnums = (1,) if policy_partial_params is None else (1, 2)
+    in_shardings = (
+        replicated_sharding,
+        critic_params_sharding,
+        policy_params_sharding,
+    )
 
     train_state = jax.jit(
         init_actor_critic,
-        donate_argnums = (1,),
-        in_shardings = (replicated_sharding, params_sharding),
+        donate_argnums = donate_argnums,
+        in_shardings = in_shardings,
         out_shardings = state_sharding,
-    )(init_rng, partial_params)
+    )(init_rng, critic_partial_params, policy_partial_params)
 
     return train_state, state_sharding
 
@@ -639,11 +660,14 @@ def value_function_train_step(
             ),
         )
 
+    # The trailing-name regex uses `[/_]` so it also matches the stacked-layer-params
+    # layout, where per-layer scales/biases live under names like
+    # `g0__pre_attention_norm__scale` (separator `__` instead of `/`).
     kernel_params = nnx.state(
         model,
         nnx.All(
             nnx.Param,
-            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            nnx.Not(nnx_utils.PathRegex(".*[/_](bias|scale|pos_embedding|input_embedding)")),
             nnx.Not(nnx_utils.PathRegex(".*target_(q_)?(network|head)/.*")),
             lambda _, x: x.value.ndim > 1,
         ),
@@ -653,7 +677,7 @@ def value_function_train_step(
         nnx.All(
             nnx.Param,
             nnx_utils.PathRegex(".*target_(q_)?(network|head)/.*"),
-            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            nnx.Not(nnx_utils.PathRegex(".*[/_](bias|scale|pos_embedding|input_embedding)")),
             lambda _, x: x.value.ndim > 1,
         ),
     )
@@ -1636,6 +1660,7 @@ def _render_and_log_plots(
     all_predictions: dict,
     all_predictions_neg: dict,
     all_predictions_random: dict,
+    all_predictions_shuffled: dict,
     all_attn_scores: dict,
     ep_mc_returns: dict,
     ep_frame_images: dict,
@@ -1718,6 +1743,17 @@ def _render_and_log_plots(
                 )
                 logging.info(f"Repo {repo_id}, episode {ep_idx} random action plot created")
 
+        predicted_values_shuffled = all_predictions_shuffled.get(traj_idx, [])
+        if len(predicted_values_shuffled) == len(predicted_values):
+            filtered_predictions_shuffled = [pred for pred, mask in zip(predicted_values_shuffled, include_masks) if mask]
+            if len(filtered_predictions_shuffled) == len(filtered_mc_returns) and len(filtered_predictions_shuffled) > 0:
+                images[f"{plot_key}_shuffled_actions"] = _create_value_plot(
+                    filtered_mc_returns, filtered_predictions_shuffled, ep_idx, step, " (Shuffled Actions)",
+                    oracle_values = None, subtask_texts = subtasks,
+                    output_dir = output_dir, plot_key = f"{plot_key}_shuffled_actions",
+                )
+                logging.info(f"Repo {repo_id}, episode {ep_idx} shuffled action plot created")
+
         predicted_values_counterfactual = all_predictions_counterfactual.get(traj_idx, []) if all_predictions_counterfactual is not None else []
         if len(predicted_values_counterfactual) == len(predicted_values):
             filtered_predictions_counterfactual = [
@@ -1737,7 +1773,7 @@ def _render_and_log_plots(
         # training steps have been logged.
         wandb.log(images)
     logging.info(f"Render thread finished: {'saved' if output_dir else 'logged'} {len(images)} plots for step {step}")
-    del images, ep_frame_images, all_predictions, all_predictions_neg, all_predictions_random, all_predictions_counterfactual, all_attn_scores
+    del images, ep_frame_images, all_predictions, all_predictions_neg, all_predictions_random, all_predictions_shuffled, all_predictions_counterfactual, all_attn_scores
 
 
 def generate_validation_plots_dlimp(
@@ -1779,12 +1815,11 @@ def generate_validation_plots_dlimp(
         "compressed val cache images at predict time."
     )
 
-    cache_files: list[tuple[int, str]] = []
-    for filename in os.listdir(cache_dir):
-        if filename.startswith("traj_") and filename.endswith(".pkl"):
-            traj_idx = int(filename.replace("traj_", "").replace(".pkl", ""))
+    cache_files: list[tuple[str, str]] = []
+    for filename in sorted(os.listdir(cache_dir)):
+        if filename.endswith(".pkl"):
+            traj_idx = filename[: -len(".pkl")]
             cache_files.append((traj_idx, os.path.join(cache_dir, filename)))
-    cache_files.sort()
     logging.info(f"Found {len(cache_files)} cached validation episodes in {cache_dir}")
 
     MAX_SUBTASK_SEGMENTS = 16
@@ -1803,6 +1838,7 @@ def generate_validation_plots_dlimp(
     all_predictions_neg: dict[str, list[float]] = {}
     all_predictions_random: dict[str, list[float]] = {}
     all_predictions_counterfactual: dict[str, list[float]] = {}
+    all_predictions_shuffled: dict[str, list[float]] = {}
     all_attn_scores: dict[str, list[np.ndarray]] = {}
 
     for traj_idx, cache_file in cache_files:
@@ -1841,6 +1877,15 @@ def generate_validation_plots_dlimp(
             if len(seg_frames) == 0:
                 continue
 
+            # Inject within-trajectory action permutation for the shuffled-actions plot.
+            # Deterministic per-segment seed so plots are reproducible across runs.
+            if action_conditioned and len(seg_frames) > 1 and "actions" in seg_frames[0]:
+                rng_perm = np.random.default_rng(seed = 86)
+                perm = rng_perm.permutation(len(seg_frames))
+                shuffled_arrays = [seg_frames[p]["actions"] for p in perm]
+                for i, frame in enumerate(seg_frames):
+                    frame["shuffled_actions"] = shuffled_arrays[i]
+
             traj_to_repo_ep[seg_key] = (repo_id_raw, ep_idx, part_suffix)
             ep_subtasks[seg_key] = seg_subtasks
             ep_mc_returns[seg_key] = [f["mc_return"] for f in seg_frames]
@@ -1863,7 +1908,7 @@ def generate_validation_plots_dlimp(
                 f"Traj {seg_key} (repo {repo_id_raw}, episode {ep_idx}{part_suffix}): "
                 f"running predictions on {len(seg_all_frames)} frames"
             )
-            preds, preds_neg, preds_random, preds_cf, attn = predict_values(
+            preds, preds_neg, preds_random, preds_cf, preds_shuffled, attn = predict_values(
                 model, seg_all_frames, seg_ep_mc_returns, action_conditioned,
                 batch_size = batch_size,
             )
@@ -1871,6 +1916,7 @@ def generate_validation_plots_dlimp(
             all_predictions_neg[seg_key] = preds_neg[seg_key]
             all_predictions_random[seg_key] = preds_random[seg_key]
             all_predictions_counterfactual[seg_key] = preds_cf[seg_key]
+            all_predictions_shuffled[seg_key] = preds_shuffled[seg_key]
             all_attn_scores[seg_key] = attn[seg_key]
 
             del seg_all_frames
@@ -1898,6 +1944,7 @@ def generate_validation_plots_dlimp(
             target = _render_and_log_plots,
             args = (
                 all_predictions, all_predictions_neg, all_predictions_random,
+                all_predictions_shuffled,
                 all_attn_scores,
                 ep_mc_returns, ep_frame_images, ep_fps, ep_include_masks,
                 ep_subtasks, ep_negative_subtasks,
@@ -2075,26 +2122,18 @@ def main(config: _config.TrainConfig):
         val_episodes_cache_dir = config.validation_cache_dir
         val_dataset = None
 
-        # Only process 0 writes the cache to avoid multi-worker NFS corruption.
-        if jax.process_index() == 0:
-            cache_val_episodes(
-                val_trajectory_dataset, config.num_val_trajectories, val_episodes_cache_dir,
-                include_repos = config.include_repos, save_only = True,
-                input_transform = val_input_transform,
-            )
+        # All workers participate in caching: worker 0 covers all repos up to
+        # num_val_trajectories; non-zero workers only cache include_repos. Each
+        # worker checks file existence before claiming/writing, so concurrent
+        # writes to NFS are safe.
+        cache_val_episodes(
+            val_trajectory_dataset, config.num_val_trajectories, val_episodes_cache_dir,
+            include_repos = config.include_repos, save_only = True,
+            input_transform = val_input_transform,
+        )
         if jax.process_count() > 1:
             jax.experimental.multihost_utils.sync_global_devices("val_cache_write")
-        # Aggressively free anything held by the val trajectory pipeline before
-        # we spin up the Gemma4 weight load — orbax restore stages the full
-        # 26.9 GB checkpoint through host RAM and we can't afford the val side
-        # holding tf.data threadpools / shuffle buffers.
         del val_trajectory_dataset, val_input_transform, _val_data_config, _val_rlds_kwargs
-        gc.collect()
-        try:
-            import ctypes as _ctypes
-            _ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except OSError:
-            pass
     else:
         # Non-RoboCOIN: use LeRobot dataset
         from lerobot.common.datasets import lerobot_dataset
@@ -2181,6 +2220,7 @@ def main(config: _config.TrainConfig):
                 action_conditioned = action_conditioned,
                 data_config = data_config,
                 cache_dir = val_episodes_cache_dir,
+                batch_size = 32,
             )
         else:
             plot_images = generate_validation_plots(
@@ -2246,11 +2286,21 @@ def main(config: _config.TrainConfig):
         )
 
     start_step = int(critic_state.step)
-    if start_step > 0:
+    # Fine-tune mode loads pretrained weights from a different dataset, so
+    # advancing the new data iterator by ``start_step`` batches has no resume
+    # semantics — skip the fast-forward and iterate only the fine-tune range.
+    skip_fast_forward = config.fine_tune is not None
+    if start_step > 0 and not skip_fast_forward:
         logging.info(f"Resuming with data-loader fast-forward through step {start_step}")
+    loop_range = (
+        range(start_step, config.num_train_steps)
+        if skip_fast_forward
+        else range(config.num_train_steps)
+    )
     pbar = tqdm.tqdm(
-        range(config.num_train_steps),
+        loop_range,
         total=config.num_train_steps,
+        initial=start_step if skip_fast_forward else 0,
         dynamic_ncols=True,
     )
 
@@ -2330,7 +2380,13 @@ def main(config: _config.TrainConfig):
                 _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step + 1)
 
         # Generate validation plots (all workers participate for FSDP, only worker 0 creates plots/logs)
-        if (step + 1) % config.plot_interval == 0 or step + 1 == config.num_train_steps:
+        # The third disjunct fires once at the resumed step so we can inspect the
+        # restored model state before further training shifts it.
+        if (
+            (step + 1) % config.plot_interval == 0
+            or step + 1 == config.num_train_steps
+            or (step % config.plot_interval == 0 and step == start_step and start_step > 0)
+        ):
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
@@ -2342,6 +2398,7 @@ def main(config: _config.TrainConfig):
                         action_conditioned = action_conditioned,
                         data_config = data_config,
                         cache_dir = val_episodes_cache_dir,
+                        batch_size = 16,
                     )
                 else:
                     plot_images = generate_validation_plots(
@@ -2358,7 +2415,8 @@ def main(config: _config.TrainConfig):
                             wandb.log(plot_images, step=step)
                         else:
                             logging.warning(f"No validation plots generated at step {step}")
-            
+                del model
+
         # Policy evaluation (only on worker 0)
         if eval_enabled and ((step + 1) % config.eval_interval == 0 or step + 1 == config.num_train_steps):
             with timer.context("policy_eval"):

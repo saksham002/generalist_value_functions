@@ -8,10 +8,10 @@ set -e
 # Configuration — edit these before running
 # =============================================================================
 
-CONFIG_NAME="real_hang_pi05_filter_intervention_60_Hz"
-CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention_60_Hz/"
+CONFIG_NAME="real_hang_pi05_filter_intervention_60_Hz_task_description"
+CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention_60_Hz_task_description/"
 FINE_TUNE_CONFIG=""  # Optional: FineTuneConfig name from config.py. Leave empty to skip.
-STEP=199999
+STEP=175000
 
 # Optional: enable BestOfN value-guided action selection by uncommenting these.
 # CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa"
@@ -25,7 +25,7 @@ ROBOT_PORT=8080
 
 NUM_EPISODES=30
 DEBUG=false  # Set to true to skip policy loading and just save images / print state
-MANUAL=false  # Set to true to advance subtasks manually by pressing Enter (auto heuristic disabled)
+MANUAL=true  # Set to true to advance subtasks manually by pressing Enter (auto heuristic disabled)
 
 # =============================================================================
 

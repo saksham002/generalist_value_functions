@@ -64,6 +64,20 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
     # EEF subset at offset 14. Must be set explicitly when dims differ.
     critic_action_dim_offset: int | None = None
 
+    # Critic's expected action horizon. Hard-coded for the 60 Hz policy + 50-step critic
+    # configuration: action_horizon must be 60 and critic_action_horizon must be 50.
+    # The wrapper subsamples the policy chunk along the time axis (`[:, :, 1::2, :]` →
+    # 30 steps), pads with zeros up to 50, and passes an action_mask of shape (B*N, 50)
+    # with the first 30 entries True so the critic only attends to the real subsampled
+    # actions. When None, the policy's action_horizon is forwarded to the critic unchanged.
+    critic_action_horizon: int | None = None
+
+    # Transform that converts chunk-wise-delta actions to absolute actions.
+    # Required when convert_to_global=True; ignored otherwise. The transform's
+    # __call__ runs in numpy/scipy (uses scipy.Rotation for rpy composition),
+    # so it is invoked via jax.pure_callback inside _renormalize_actions.
+    absolute_actions: _transforms.DataTransformFn | None = None
+
     # "argmax": pick action with highest Q-value.
     # "softmax": sample action with probability proportional to exp(Q / temperature).
     selection_mode: Literal["argmax", "softmax"] = "argmax"
@@ -109,6 +123,8 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
             policy_norm_stats=self.policy_norm_stats,
             critic_norm_stats=self.critic_norm_stats,
             critic_action_dim_offset=self.critic_action_dim_offset,
+            critic_action_horizon=self.critic_action_horizon,
+            absolute_actions=self.absolute_actions,
         )
 
     @override
@@ -146,6 +162,8 @@ class BestOfNWrapper(_model.BaseModel):
     policy_norm_stats: dict[str, NormStats] | None
     critic_norm_stats: dict[str, NormStats] | None
     critic_action_dim_offset: int | None
+    critic_action_horizon: int | None
+    absolute_actions: _transforms.DataTransformFn | None
 
     def __init__(
         self,
@@ -163,6 +181,8 @@ class BestOfNWrapper(_model.BaseModel):
         policy_norm_stats: dict[str, NormStats] | None = None,
         critic_norm_stats: dict[str, NormStats] | None = None,
         critic_action_dim_offset: int | None = None,
+        critic_action_horizon: int | None = None,
+        absolute_actions: _transforms.DataTransformFn | None = None,
     ):
         super().__init__(action_dim, action_horizon, max_token_len)
         self.base_model = base_model
@@ -175,6 +195,17 @@ class BestOfNWrapper(_model.BaseModel):
         self.policy_norm_stats = policy_norm_stats
         self.critic_norm_stats = critic_norm_stats
         self.critic_action_dim_offset = critic_action_dim_offset
+        if critic_action_horizon is not None and (action_horizon != 60 or critic_action_horizon != 50):
+            raise ValueError(
+                "critic_action_horizon is hard-coded to 50 with action_horizon hard-coded to 60. "
+                f"Got critic_action_horizon={critic_action_horizon}, action_horizon={action_horizon}."
+            )
+        self.critic_action_horizon = critic_action_horizon
+        if convert_to_global and absolute_actions is None:
+            raise ValueError(
+                "absolute_actions transform is required when convert_to_global=True."
+            )
+        self.absolute_actions = absolute_actions
 
     def _renormalize_actions(self, actions: at.Array, initial_pose: at.Array | None = None) -> at.Array:
         """Bring actions from policy normalized space into the critic's normalized action space.
@@ -212,8 +243,29 @@ class BestOfNWrapper(_model.BaseModel):
             assert initial_pose is not None, (
                 "initial_pose is required when convert_to_global=True. Pass transition.action[:, :1, :] as initial_pose."
             )
-            # initial_pose: [B, 1, ad] -> broadcast over [B, N, ah, ad]
-            data[action_key] = data[action_key] + initial_pose[:, None, :, :]
+            # AbsoluteActions runs in numpy/scipy (rpy composition uses scipy.Rotation),
+            # so dispatch via pure_callback to keep the surrounding sample_actions JIT-able.
+            actions_chunk = data[action_key]
+            batch_size, num_samples, action_horizon, ad = actions_chunk.shape
+            # Broadcast initial_pose [B, 1, ad] across the candidate axis and flatten the
+            # leading [B, N] dims so AbsoluteActions sees a standard [batch, ah, ad] chunk.
+            state_flat = jnp.broadcast_to(
+                initial_pose[:, :, :], (batch_size, num_samples, ad)
+            ).reshape(batch_size * num_samples, ad)
+            actions_flat = actions_chunk.reshape(batch_size * num_samples, action_horizon, ad)
+
+            def _absolute_callback(state_np, actions_np):
+                return self.absolute_actions(
+                    {"state": state_np, "actions": actions_np}
+                )["actions"]
+
+            absolute_flat = jax.pure_callback(
+                _absolute_callback,
+                jax.ShapeDtypeStruct(actions_flat.shape, actions_flat.dtype),
+                state_flat,
+                actions_flat,
+            )
+            data[action_key] = absolute_flat.reshape(batch_size, num_samples, action_horizon, ad)
         data = _transforms.Normalize(critic_action_stats)(data)
         return data[action_key]
 
@@ -275,7 +327,9 @@ class BestOfNWrapper(_model.BaseModel):
             **kwargs: Forwarded to base model's sample_actions (if base_model exists).
 
         Returns:
-            Actions of shape [batch, action_horizon, action_dim].
+            Tuple of:
+              - selected actions of shape [batch, action_horizon, action_dim].
+              - q_values of shape [batch, num_samples] (B always = 1 in the eval flow).
         """
         if value_function is None:
             raise ValueError("value_function is required for BestOfNWrapper")
@@ -316,7 +370,34 @@ class BestOfNWrapper(_model.BaseModel):
         else:
             eval_actions = all_actions
 
+        # Subsample along the time axis and rebuild the action_mask when the critic
+        # has its own action_horizon. The construction-time check enforces the only
+        # supported pair: action_horizon=60, critic_action_horizon=50.
+        # Subsample 1::2 → 30 real actions, pad with zeros up to 50, and feed an
+        # action_mask of shape (B*N, 50) with the first 30 entries True so the
+        # critic only attends to the real (non-padding) actions.
+        critic_action_mask = None
+        if self.critic_action_horizon is not None and self.critic_action_horizon != action_horizon:
+            eval_actions = eval_actions[:, :, 1::2, :]
+            real_len = eval_actions.shape[2]
+            pad_len = self.critic_action_horizon - real_len
+            padding = jnp.zeros(
+                (batch_size, n, pad_len, eval_actions.shape[-1]),
+                dtype = eval_actions.dtype,
+            )
+            eval_actions = jnp.concatenate([eval_actions, padding], axis = 2)
+            action_horizon = self.critic_action_horizon
+            mask_pattern = jnp.concatenate([
+                jnp.ones(real_len, dtype = jnp.bool_),
+                jnp.zeros(pad_len, dtype = jnp.bool_),
+            ])
+            critic_action_mask = jnp.broadcast_to(
+                mask_pattern[None, :], (batch_size * n, action_horizon)
+            )
+
         expanded_obs = expand_observation(observation, n)
+        if critic_action_mask is not None:
+            expanded_obs = dataclasses.replace(expanded_obs, action_mask = critic_action_mask)
         # eval_actions may have a different last dim than all_actions when the
         # critic consumes a sliced subset of the policy's action vector.
         flat_actions = eval_actions.reshape(batch_size * n, action_horizon, eval_actions.shape[-1])
@@ -361,7 +442,7 @@ class BestOfNWrapper(_model.BaseModel):
         else:
             raise ValueError(f"Unknown selection_mode: {self.selection_mode}")
 
-        return all_actions[jnp.arange(batch_size), indices]
+        return all_actions[jnp.arange(batch_size), indices], q_values
 
     @override
     def compute_loss(
@@ -401,7 +482,7 @@ class BestOfNWrapper(_model.BaseModel):
         # No base model: return deterministic distribution at best cached action
         import distrax
 
-        best_action = self.sample_actions(
+        best_action, _ = self.sample_actions(
             rng, transition, compute_next_action=compute_next_action, value_function=value_function, **kwargs
         )
         batch_size = best_action.shape[0]

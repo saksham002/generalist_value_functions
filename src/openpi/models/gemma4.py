@@ -305,6 +305,11 @@ class Module(nn.Module):
 
         # Per-group Block templates (Python objects, NOT registered as
         # submodules — we don't want their unstacked params auto-created).
+        block_cls = nn.remat(
+            _fork_mod.Block,
+            prevent_cse = False,
+            policy = jax.checkpoint_policies.nothing_saveable,
+        )
         templates: list[_fork_mod.Block | None] = []
         for group_idx in range(4):
             if not group_layers[group_idx]:
@@ -317,7 +322,7 @@ class Module(nn.Module):
                 config.override_kv_shared_ffw_hidden if is_shared else None
             )
             kwargs = _build_block_kwargs(config, attn_type, hidden_dim_override)
-            templates.append(_fork_mod.Block(**kwargs))
+            templates.append(block_cls(**kwargs))
         self._block_templates = tuple(templates)
 
         # Discover Block param tree shape via jax.eval_shape on init.
