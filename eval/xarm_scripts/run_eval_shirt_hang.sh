@@ -8,23 +8,24 @@ set -e
 # Configuration — edit these before running
 # =============================================================================
 
-CONFIG_NAME="real_hang_pi05_filter_intervention_60_Hz_task_description"
-CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention_60_Hz_task_description/"
+CONFIG_NAME="real_hang_pi05_filter_intervention_60_Hz"
+CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention_60_Hz/"
 FINE_TUNE_CONFIG=""  # Optional: FineTuneConfig name from config.py. Leave empty to skip.
-STEP=175000
+STEP=199999
 
-# Optional: enable BestOfN value-guided action selection by uncommenting these.
-# CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa"
-# CRITIC_CHECKPOINT="/data/group_data/rl/saksham3/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_q_sarsa/real_hang_finetune_75_tcp"
-# CRITIC_FINE_TUNE_CONFIG="real_hang_finetune_75_tcp"
-# CRITIC_STEP=232000
-# NUM_SAMPLES=8
+# Optional: enable BestOfN value-guided action selection.
+CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa"
+CRITIC_CHECKPOINT="/data/group_data/rl/saksham3/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_q_sarsa/real_hang_finetune_q_sarsa"
+CRITIC_FINE_TUNE_CONFIG="real_hang_finetune_q_sarsa"
+CRITIC_STEP=238000
+NUM_SAMPLES=8
 
 ROBOT_HOST="xarmpc.pc.cs.cmu.edu"
 ROBOT_PORT=8080
 
 NUM_EPISODES=30
 DEBUG=false  # Set to true to skip policy loading and just save images / print state
+DEBUG_VALUES=true  # Set to true to log critic Q-values for each BestOfN candidate during predict
 MANUAL=true  # Set to true to advance subtasks manually by pressing Enter (auto heuristic disabled)
 
 # =============================================================================
@@ -55,6 +56,7 @@ fi
 echo -e "  Robot:      ${YELLOW}${ROBOT_HOST}:${ROBOT_PORT}${NC}"
 echo -e "  Episodes:   ${YELLOW}${NUM_EPISODES}${NC}"
 echo -e "  Debug:      ${YELLOW}${DEBUG}${NC}"
+echo -e "  DebugValues:${YELLOW}${DEBUG_VALUES}${NC}"
 echo -e "  Manual:     ${YELLOW}${MANUAL}${NC}"
 echo ""
 
@@ -86,6 +88,9 @@ fi
 DEBUG_ARGS=""
 if [ "${DEBUG}" = true ]; then
     DEBUG_ARGS="--args.debug"
+fi
+if [ "${DEBUG_VALUES}" = true ]; then
+    DEBUG_ARGS="${DEBUG_ARGS} --args.debug-values"
 fi
 
 MANUAL=true

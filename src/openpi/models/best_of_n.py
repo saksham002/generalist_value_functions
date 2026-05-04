@@ -7,6 +7,8 @@ the underlying policy architecture.
 """
 
 import dataclasses
+import logging
+import os
 from typing import Literal
 
 import equinox as eqx
@@ -18,6 +20,12 @@ from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared.normalize import NormStats
+
+logger = logging.getLogger(__name__)
+
+# Set BESTOFN_DEBUG=1 in the environment to enable action-stat logging during
+# `BestOfNWrapper.sample_actions`. Read once at module import.
+_BESTOFN_DEBUG: bool = os.environ.get("BESTOFN_DEBUG", "0") == "1"
 from openpi.value_functions import base_value_functions as _base_vf
 
 
@@ -195,9 +203,9 @@ class BestOfNWrapper(_model.BaseModel):
         self.policy_norm_stats = policy_norm_stats
         self.critic_norm_stats = critic_norm_stats
         self.critic_action_dim_offset = critic_action_dim_offset
-        if critic_action_horizon is not None and (action_horizon != 60 or critic_action_horizon != 50):
+        if critic_action_horizon is not None and 2 * critic_action_horizon != action_horizon:
             raise ValueError(
-                "critic_action_horizon is hard-coded to 50 with action_horizon hard-coded to 60. "
+                "Expected 2 * critic_action_horizon == action_horizon. "
                 f"Got critic_action_horizon={critic_action_horizon}, action_horizon={action_horizon}."
             )
         self.critic_action_horizon = critic_action_horizon
@@ -238,6 +246,15 @@ class BestOfNWrapper(_model.BaseModel):
                 )
             start = self.critic_action_dim_offset
             data[action_key] = data[action_key][..., start : start + critic_action_dim]
+        if _BESTOFN_DEBUG:
+            jax.debug.print(
+                "[BestOfN.debug] _renorm pre-unnormalize (policy-normalized) "
+                "stats: min={min:.4f} max={max:.4f} mean={mean:.4f} std={std:.4f}",
+                min = jnp.min(data[action_key]),
+                max = jnp.max(data[action_key]),
+                mean = jnp.mean(data[action_key]),
+                std = jnp.std(data[action_key]),
+            )
         data = _transforms.Unnormalize(policy_action_stats)(data)
         if self.convert_to_global:
             assert initial_pose is not None, (
@@ -370,29 +387,25 @@ class BestOfNWrapper(_model.BaseModel):
         else:
             eval_actions = all_actions
 
-        # Subsample along the time axis and rebuild the action_mask when the critic
-        # has its own action_horizon. The construction-time check enforces the only
-        # supported pair: action_horizon=60, critic_action_horizon=50.
-        # Subsample 1::2 → 30 real actions, pad with zeros up to 50, and feed an
-        # action_mask of shape (B*N, 50) with the first 30 entries True so the
-        # critic only attends to the real (non-padding) actions.
+        if _BESTOFN_DEBUG:
+            jax.debug.print(
+                "[BestOfN.debug] post-renormalize stats: min={min:.4f} max={max:.4f} mean={mean:.4f} std={std:.4f}",
+                min = jnp.min(eval_actions),
+                max = jnp.max(eval_actions),
+                mean = jnp.mean(eval_actions),
+                std = jnp.std(eval_actions),
+            )
+
+        # Subsample along the time axis when the critic was trained at half the
+        # policy's horizon (2 * critic_action_horizon == action_horizon, enforced
+        # at construction time). Subsample 1::2 → critic_action_horizon real
+        # actions and feed an all-ones action_mask.
         critic_action_mask = None
         if self.critic_action_horizon is not None and self.critic_action_horizon != action_horizon:
             eval_actions = eval_actions[:, :, 1::2, :]
-            real_len = eval_actions.shape[2]
-            pad_len = self.critic_action_horizon - real_len
-            padding = jnp.zeros(
-                (batch_size, n, pad_len, eval_actions.shape[-1]),
-                dtype = eval_actions.dtype,
-            )
-            eval_actions = jnp.concatenate([eval_actions, padding], axis = 2)
             action_horizon = self.critic_action_horizon
-            mask_pattern = jnp.concatenate([
-                jnp.ones(real_len, dtype = jnp.bool_),
-                jnp.zeros(pad_len, dtype = jnp.bool_),
-            ])
-            critic_action_mask = jnp.broadcast_to(
-                mask_pattern[None, :], (batch_size * n, action_horizon)
+            critic_action_mask = jnp.ones(
+                (batch_size * n, action_horizon), dtype = jnp.bool_
             )
 
         expanded_obs = expand_observation(observation, n)
@@ -401,6 +414,15 @@ class BestOfNWrapper(_model.BaseModel):
         # eval_actions may have a different last dim than all_actions when the
         # critic consumes a sliced subset of the policy's action vector.
         flat_actions = eval_actions.reshape(batch_size * n, action_horizon, eval_actions.shape[-1])
+
+        if _BESTOFN_DEBUG:
+            jax.debug.print(
+                "[BestOfN.debug] critic input stats: min={min:.4f} max={max:.4f} mean={mean:.4f} std={std:.4f}",
+                min = jnp.min(flat_actions),
+                max = jnp.max(flat_actions),
+                mean = jnp.mean(flat_actions),
+                std = jnp.std(flat_actions),
+            )
         prefix_cache = None
         network = getattr(value_function, "q_network", getattr(value_function, "network", None))
         if network is not None and hasattr(network, "compute_prefix_cache"):

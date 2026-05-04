@@ -891,7 +891,10 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         action_mask_array = None
         if self._action_conditioned:
             action_array = action  # [B, action_horizon, action_dim]
-            assert action_array.shape[1] == self._action_horizon
+            assert action_array.shape[1] == self._action_horizon, (
+                f"action_array.shape[1] = {action_array.shape[1]} != "
+                f"self._action_horizon = {self._action_horizon}"
+            )
             action_mask_array = observation.action_mask  # [B, action_horizon] or None
 
         if prefix_cache is not None:

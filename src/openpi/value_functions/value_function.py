@@ -267,8 +267,10 @@ class ValueFunction(BaseValueFunction):
         action: _model.Actions | None = None,
         *,
         take_min_over_ensemble: bool = False,
+        prefix_cache: tuple[at.Array, at.Array] | None = None,
     ) -> at.Float[at.Array, "*b"] | tuple[at.Float[at.Array, "*b"], at.Float[at.Array, "*b _n"]]:
-        out = self.network.compute_features(observation, action)
+        feature_kwargs = {"prefix_cache": prefix_cache} if prefix_cache is not None else {}
+        out = self.network.compute_features(observation, action, **feature_kwargs)
         if isinstance(out, tuple):
             features, attn_scores = out[0], out[1]
             val = self.head(features)
@@ -287,9 +289,15 @@ class ValueFunction(BaseValueFunction):
         action: _model.Actions | None = None,
         *,
         take_min_over_ensemble: bool = False,
+        prefix_cache: tuple[at.Array, at.Array] | None = None,
     ) -> at.Float[at.Array, "*b"]:
         """For value functions without target network, return the same as compute_value."""
-        result = self.compute_value(observation, action, take_min_over_ensemble = take_min_over_ensemble)
+        result = self.compute_value(
+            observation,
+            action,
+            take_min_over_ensemble = take_min_over_ensemble,
+            prefix_cache = prefix_cache,
+        )
         if isinstance(result, tuple):
             return result[0]
         return result
@@ -344,9 +352,11 @@ class SARSAValueFunction(ValueFunction):
         action: _model.Actions | None = None,
         *,
         take_min_over_ensemble: bool = False,
+        prefix_cache: tuple[at.Array, at.Array] | None = None,
     ) -> at.Float[at.Array, "*b"]:
         """Compute target value using target network."""
-        target_out = self.target_network.compute_features(observation, action)
+        feature_kwargs = {"prefix_cache": prefix_cache} if prefix_cache is not None else {}
+        target_out = self.target_network.compute_features(observation, action, **feature_kwargs)
         target_features = target_out[0] if isinstance(target_out, tuple) else target_out
         val = self.target_head(target_features)
         if take_min_over_ensemble and val.ndim > 1:
@@ -379,6 +389,19 @@ class SARSAValueFunction(ValueFunction):
         """Polyak averaging for target network."""
         _polyak_update(self.target_network, self.network, self.tau)
         _polyak_update(self.target_head, self.head, self.tau)
+
+    def compute_prefix_cache(
+        self,
+        observation: _model.Observation,
+        use_target: bool = False,
+    ) -> tuple[at.Array, at.Array]:
+        network = self.target_network if use_target else self.network
+        if not hasattr(network, "compute_prefix_cache"):
+            raise AttributeError(
+                f"{type(network).__name__} does not support prefix caching. "
+                "Callers should check hasattr before invoking."
+            )
+        return network.compute_prefix_cache(observation)
 
 
 class IQLValueFunction(BaseValueFunction):

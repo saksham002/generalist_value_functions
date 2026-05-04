@@ -166,8 +166,11 @@ def load_critic(
         fine_tune = fine_tune_config,
         step = step,
     )
+    # action_horizon override from FineTuneConfig lands on TrainConfig.action_horizon;
+    # init_train_state pushes it into model.action_horizon at training time but does
+    # not mutate the config returned by load_critic, so prefer the TrainConfig field.
     critic_kwargs = {
-        "action_horizon": critic_config.model.action_horizon,
+        "action_horizon": critic_config.action_horizon or critic_config.model.action_horizon,
         "use_chunk_wise_delta": critic_config.data.use_chunk_wise_delta,
     }
     return critic_model, critic_norm_stats, critic_kwargs
