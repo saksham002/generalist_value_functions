@@ -489,6 +489,25 @@ def create_rlds_dataset(
             **data_config.rlds_kwargs,
         )
 
+    if data_config.rlds_dataset_class == "robocasa":
+        from openpi.training.robocasa_rlds_dataset import RoboCasaRldsDataset
+
+        return RoboCasaRldsDataset(
+            data_dir = data_config.rlds_data_dir,
+            batch_size = batch_size,
+            datasets = data_config.datasets,
+            shuffle = shuffle,
+            action_chunk_size = action_horizon,
+            critic_mode = data_config.critic_mode,
+            discount = data_config.discount,
+            reward_scale = data_config.reward_scale,
+            reward_bias = data_config.reward_bias,
+            return_trajectories = return_trajectories,
+            max_trajectories = max_trajectories,
+            max_num_demos = data_config.max_num_demos,
+            **data_config.rlds_kwargs,
+        )
+
     return DroidRldsDataset(
         data_dir = data_config.rlds_data_dir,
         batch_size = batch_size,
