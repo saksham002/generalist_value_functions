@@ -7,7 +7,6 @@ the underlying policy architecture.
 """
 
 import dataclasses
-import logging
 import os
 from typing import Literal
 
@@ -21,12 +20,77 @@ from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared.normalize import NormStats
 
-logger = logging.getLogger(__name__)
-
 # Set BESTOFN_DEBUG=1 in the environment to enable action-stat logging during
 # `BestOfNWrapper.sample_actions`. Read once at module import.
 _BESTOFN_DEBUG: bool = os.environ.get("BESTOFN_DEBUG", "0") == "1"
 from openpi.value_functions import base_value_functions as _base_vf
+
+
+def _log_model_inputs(
+    tag: str,
+    observation: _model.Observation,
+    *,
+    actions: jnp.ndarray | None = None,
+) -> None:
+    """Log key Observation fields (and optionally an action chunk) via jax.debug.print.
+
+    Used to inspect what the policy and the critic actually see at sample time. Only the
+    first element of the leading batch axis is shown to keep log lines compact. Fields
+    that are None are skipped at trace time (not added to the JIT graph).
+    """
+    jax.debug.print(
+        f"[BestOfN.debug] {tag} state shape={observation.state.shape} value={{v}}",
+        v = observation.state[0],
+    )
+    if observation.action_mask is not None:
+        jax.debug.print(
+            f"[BestOfN.debug] {tag} action_mask shape={observation.action_mask.shape} value={{v}}",
+            v = observation.action_mask[0],
+        )
+    if observation.tokenized_prompt is not None:
+        jax.debug.print(
+            f"[BestOfN.debug] {tag} tokenized_prompt shape={observation.tokenized_prompt.shape} value={{v}}",
+            v = observation.tokenized_prompt[0],
+        )
+        if observation.tokenized_prompt_mask is not None:
+            # Detokenize via host callback — PaligemmaTokenizer is numpy-only and
+            # can't run under jit. Lazy-import to avoid pulling SentencePiece into
+            # the import path of every BestOfN consumer.
+            from openpi.robocoin_utils.utils import detokenize_prompt
+
+            def _log_detokenized(token_ids, mask):
+                print(
+                    f"[BestOfN.debug] {tag} untokenized_prompt: "
+                    f"{detokenize_prompt(token_ids, mask)!r}"
+                )
+
+            jax.debug.callback(
+                _log_detokenized,
+                observation.tokenized_prompt[0],
+                observation.tokenized_prompt_mask[0],
+            )
+    if observation.tokenized_prompt_mask is not None:
+        jax.debug.print(
+            f"[BestOfN.debug] {tag} tokenized_prompt_mask shape={observation.tokenized_prompt_mask.shape} value={{v}}",
+            v = observation.tokenized_prompt_mask[0],
+        )
+    for cam_name, img in observation.images.items():
+        jax.debug.print(
+            f"[BestOfN.debug] {tag} image[{cam_name}] shape={img.shape} min={{mn:.4f}} max={{mx:.4f}}",
+            mn = jnp.min(img[0]), mx = jnp.max(img[0]),
+        )
+    for mask_name, mask in observation.image_masks.items():
+        jax.debug.print(
+            f"[BestOfN.debug] {tag} image_mask[{mask_name}] shape={mask.shape} value={{v}}",
+            v = mask[0],
+        )
+    if actions is not None:
+        # Print the full action chunk for the first batch element.
+        chunk = actions[0]
+        jax.debug.print(
+            f"[BestOfN.debug] {tag} actions[0] shape={chunk.shape} value={{v}}",
+            v = chunk,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,6 +122,12 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
     # Providing one without the other is not valid.
     policy_norm_stats: dict[str, NormStats] | None = None
     critic_norm_stats: dict[str, NormStats] | None = None
+
+    # Normalization mode flags for each side. Mirror `data_config.use_quantile_norm`
+    # for the policy and critic respectively, so that `_renormalize_actions` /
+    # `_renormalize_state` invert and re-apply the correct transform on each end.
+    policy_use_quantile_norm: bool = False
+    critic_use_quantile_norm: bool = False
 
     # When True, converts cached counterfactual actions from chunk-wise-delta
     # format (delta[i] = global[i] - global[0]) to global by adding initial_pose
@@ -130,6 +200,8 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
             softmax_temperature=self.softmax_temperature,
             policy_norm_stats=self.policy_norm_stats,
             critic_norm_stats=self.critic_norm_stats,
+            policy_use_quantile_norm=self.policy_use_quantile_norm,
+            critic_use_quantile_norm=self.critic_use_quantile_norm,
             critic_action_dim_offset=self.critic_action_dim_offset,
             critic_action_horizon=self.critic_action_horizon,
             absolute_actions=self.absolute_actions,
@@ -169,6 +241,8 @@ class BestOfNWrapper(_model.BaseModel):
     softmax_temperature: float
     policy_norm_stats: dict[str, NormStats] | None
     critic_norm_stats: dict[str, NormStats] | None
+    policy_use_quantile_norm: bool
+    critic_use_quantile_norm: bool
     critic_action_dim_offset: int | None
     critic_action_horizon: int | None
     absolute_actions: _transforms.DataTransformFn | None
@@ -188,6 +262,8 @@ class BestOfNWrapper(_model.BaseModel):
         softmax_temperature: float,
         policy_norm_stats: dict[str, NormStats] | None = None,
         critic_norm_stats: dict[str, NormStats] | None = None,
+        policy_use_quantile_norm: bool = False,
+        critic_use_quantile_norm: bool = False,
         critic_action_dim_offset: int | None = None,
         critic_action_horizon: int | None = None,
         absolute_actions: _transforms.DataTransformFn | None = None,
@@ -202,10 +278,13 @@ class BestOfNWrapper(_model.BaseModel):
         self.softmax_temperature = softmax_temperature
         self.policy_norm_stats = policy_norm_stats
         self.critic_norm_stats = critic_norm_stats
+        self.policy_use_quantile_norm = policy_use_quantile_norm
+        self.critic_use_quantile_norm = critic_use_quantile_norm
         self.critic_action_dim_offset = critic_action_dim_offset
-        if critic_action_horizon is not None and 2 * critic_action_horizon != action_horizon:
+        if critic_action_horizon is not None and 6 * critic_action_horizon != 5 * action_horizon:
             raise ValueError(
-                "Expected 2 * critic_action_horizon == action_horizon. "
+                "Expected 6/5 * critic_action_horizon == action_horizon "
+                "(60 Hz policy, action_horizon=60 + 30 Hz critic, action_horizon=50). "
                 f"Got critic_action_horizon={critic_action_horizon}, action_horizon={action_horizon}."
             )
         self.critic_action_horizon = critic_action_horizon
@@ -246,16 +325,7 @@ class BestOfNWrapper(_model.BaseModel):
                 )
             start = self.critic_action_dim_offset
             data[action_key] = data[action_key][..., start : start + critic_action_dim]
-        if _BESTOFN_DEBUG:
-            jax.debug.print(
-                "[BestOfN.debug] _renorm pre-unnormalize (policy-normalized) "
-                "stats: min={min:.4f} max={max:.4f} mean={mean:.4f} std={std:.4f}",
-                min = jnp.min(data[action_key]),
-                max = jnp.max(data[action_key]),
-                mean = jnp.mean(data[action_key]),
-                std = jnp.std(data[action_key]),
-            )
-        data = _transforms.Unnormalize(policy_action_stats)(data)
+        data = _transforms.Unnormalize(policy_action_stats, use_quantiles = self.policy_use_quantile_norm)(data)
         if self.convert_to_global:
             assert initial_pose is not None, (
                 "initial_pose is required when convert_to_global=True. Pass transition.action[:, :1, :] as initial_pose."
@@ -283,8 +353,18 @@ class BestOfNWrapper(_model.BaseModel):
                 actions_flat,
             )
             data[action_key] = absolute_flat.reshape(batch_size, num_samples, action_horizon, ad)
-        data = _transforms.Normalize(critic_action_stats)(data)
+        data = _transforms.Normalize(critic_action_stats, use_quantiles = self.critic_use_quantile_norm)(data)
         return data[action_key]
+
+    def _renormalize_state(self, state: at.Array) -> at.Array:
+        """Bring state from policy normalized space into the critic's normalized state space."""
+        state_key = "state"
+        data = {state_key: state}
+        policy_state_stats = {state_key: self.policy_norm_stats[state_key]}
+        critic_state_stats = {state_key: self.critic_norm_stats[state_key]}
+        data = _transforms.Unnormalize(policy_state_stats, use_quantiles = self.policy_use_quantile_norm)(data)
+        data = _transforms.Normalize(critic_state_stats, use_quantiles = self.critic_use_quantile_norm)(data)
+        return data[state_key]
 
     def _get_cached_actions(
         self,
@@ -329,6 +409,8 @@ class BestOfNWrapper(_model.BaseModel):
         *,
         compute_next_action: bool = False,
         value_function: _base_vf.BaseValueFunction | _base_vf.BaseMultiValueFunction | None = None,
+        critic_tokenized_prompt: at.Array | None = None,
+        critic_tokenized_prompt_mask: at.Array | None = None,
         **kwargs,
     ) -> _model.Actions:
         """Sample N actions and select best via Q-value.
@@ -341,6 +423,10 @@ class BestOfNWrapper(_model.BaseModel):
             transition: Transition containing observation and next_observation.
             compute_next_action: If True, use next_observation.
             value_function: Action-conditioned value function (required).
+            critic_tokenized_prompt: Optional [B, T] int prompt tokens produced by the
+                critic's own tokenizer. When provided, overrides expanded_obs.tokenized_prompt
+                before the critic forward so the critic sees its in-distribution token IDs.
+            critic_tokenized_prompt_mask: Matching [B, T] bool mask for critic_tokenized_prompt.
             **kwargs: Forwarded to base model's sample_actions (if base_model exists).
 
         Returns:
@@ -360,6 +446,8 @@ class BestOfNWrapper(_model.BaseModel):
         batch_size = observation.state.shape[0]
 
         if self.base_model is not None:
+            if _BESTOFN_DEBUG:
+                _log_model_inputs("policy", observation)
             # Sample from base model
             n = self.num_samples
             sample_rngs = jax.random.split(rng_sample, n)
@@ -380,49 +468,76 @@ class BestOfNWrapper(_model.BaseModel):
         n = all_actions.shape[1]
         action_horizon = all_actions.shape[2]
 
-        # Renormalize actions into critic space if critic norm stats were provided.
+        # Renormalize actions into critic space if self.critic_norm_stats was provided.
         if self.critic_norm_stats is not None:
             initial_pose = transition.action[:, :1, :] if self.convert_to_global else None
             eval_actions = self._renormalize_actions(all_actions, initial_pose=initial_pose)
         else:
             eval_actions = all_actions
 
-        if _BESTOFN_DEBUG:
-            jax.debug.print(
-                "[BestOfN.debug] post-renormalize stats: min={min:.4f} max={max:.4f} mean={mean:.4f} std={std:.4f}",
-                min = jnp.min(eval_actions),
-                max = jnp.max(eval_actions),
-                mean = jnp.mean(eval_actions),
-                std = jnp.std(eval_actions),
-            )
-
-        # Subsample along the time axis when the critic was trained at half the
-        # policy's horizon (2 * critic_action_horizon == action_horizon, enforced
-        # at construction time). Subsample 1::2 → critic_action_horizon real
-        # actions and feed an all-ones action_mask.
+        # When the critic was trained at a slower frame rate than the policy
+        # (60 Hz policy, action_horizon=60; 30 Hz critic, action_horizon=50 with the
+        # last 20 slots zero-padded via fps_mask_30 at training time), subsample the
+        # policy chunk at stride 2 (60 → 30 real actions) and zero-pad up to the
+        # critic's expected horizon (30 → 50). Subsample observation.action_mask the
+        # same way and pad with False so the critic only attends to the real
+        # subsampled actions, matching the fps_mask_30 mask the critic was trained on.
         critic_action_mask = None
         if self.critic_action_horizon is not None and self.critic_action_horizon != action_horizon:
-            eval_actions = eval_actions[:, :, 1::2, :]
-            action_horizon = self.critic_action_horizon
-            critic_action_mask = jnp.ones(
-                (batch_size * n, action_horizon), dtype = jnp.bool_
+            subsampled_actions = eval_actions[:, :, 1::2, :]
+            subsampled_horizon = subsampled_actions.shape[2]
+            pad_amount = self.critic_action_horizon - subsampled_horizon
+            eval_actions = jnp.pad(
+                subsampled_actions,
+                ((0, 0), (0, 0), (0, pad_amount), (0, 0)),
             )
 
-        expanded_obs = expand_observation(observation, n)
+            if observation.action_mask is not None:
+                subsampled_mask = observation.action_mask[:, 1::2]
+            else:
+                subsampled_mask = jnp.ones((batch_size, subsampled_horizon), dtype = jnp.bool_)
+            subsampled_mask_expanded = jnp.repeat(
+                subsampled_mask[:, None, :], n, axis = 1,
+            ).reshape(batch_size * n, subsampled_horizon)
+            critic_action_mask = jnp.pad(
+                subsampled_mask_expanded,
+                ((0, 0), (0, pad_amount)),
+                constant_values = False,
+            )
+
+            action_horizon = self.critic_action_horizon
+
+        # Renormalize state into critic space before expanding (one renorm vs. N redundant ones).
+        # Policy already sampled above using `observation` in its own normalized space.
+        critic_observation = observation
+        if self.critic_norm_stats is not None:
+            critic_state = self._renormalize_state(observation.state)
+            critic_observation = dataclasses.replace(observation, state = critic_state)
+
+        expanded_obs = expand_observation(critic_observation, n)
         if critic_action_mask is not None:
             expanded_obs = dataclasses.replace(expanded_obs, action_mask = critic_action_mask)
-        # eval_actions may have a different last dim than all_actions when the
+        if critic_tokenized_prompt is not None:
+            # Broadcast critic-tokenized prompt over the candidate axis: [B, T] -> [B*N, T].
+            critic_token_len = critic_tokenized_prompt.shape[-1]
+            critic_prompt_expanded = jnp.broadcast_to(
+                critic_tokenized_prompt[:, None, :], (batch_size, n, critic_token_len),
+            ).reshape(batch_size * n, critic_token_len)
+            critic_prompt_mask_expanded = jnp.broadcast_to(
+                critic_tokenized_prompt_mask[:, None, :], (batch_size, n, critic_token_len),
+            ).reshape(batch_size * n, critic_token_len)
+            expanded_obs = dataclasses.replace(
+                expanded_obs,
+                tokenized_prompt = critic_prompt_expanded,
+                tokenized_prompt_mask = critic_prompt_mask_expanded,
+            )
+        # actions to evaluate may have a different last dim than the policy actions when the
         # critic consumes a sliced subset of the policy's action vector.
         flat_actions = eval_actions.reshape(batch_size * n, action_horizon, eval_actions.shape[-1])
 
         if _BESTOFN_DEBUG:
-            jax.debug.print(
-                "[BestOfN.debug] critic input stats: min={min:.4f} max={max:.4f} mean={mean:.4f} std={std:.4f}",
-                min = jnp.min(flat_actions),
-                max = jnp.max(flat_actions),
-                mean = jnp.mean(flat_actions),
-                std = jnp.std(flat_actions),
-            )
+            _log_model_inputs("critic", expanded_obs, actions = flat_actions)
+
         prefix_cache = None
         network = getattr(value_function, "q_network", getattr(value_function, "network", None))
         if network is not None and hasattr(network, "compute_prefix_cache"):

@@ -35,6 +35,34 @@ def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BI
     return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
 
 
+def resize_stretch(images: np.ndarray, height: int, width: int, method=Image.BILINEAR) -> np.ndarray:
+    """Direct stretch resize for a batch of images using PIL.
+
+    Matches the tf.image.resize call used by the RoboCOIN data builder
+    (dexterous_hang_config.py:_decode_and_reencode_jpeg), which discards aspect
+    ratio. Use this at eval time so policy/critic inputs match the squashed
+    224x224 frames the model was trained on.
+
+    Args:
+        images: A batch of images in [..., height, width, channel] format.
+        height: The target height of the image.
+        width: The target width of the image.
+        method: The interpolation method to use. Default is bilinear.
+
+    Returns:
+        The resized images in [..., height, width, channel].
+    """
+    if images.shape[-3:-1] == (height, width):
+        return images
+
+    original_shape = images.shape
+    images = images.reshape(-1, *original_shape[-3:])
+    resized = np.stack(
+        [np.asarray(Image.fromarray(im).resize((width, height), resample = method)) for im in images]
+    )
+    return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
+
+
 def _resize_with_pad_pil(image: Image.Image, height: int, width: int, method: int) -> Image.Image:
     """Replicates tf.image.resize_with_pad for one image using PIL. Resizes an image to a target height and
     width without distortion by padding with zeros.

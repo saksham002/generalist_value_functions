@@ -23,8 +23,12 @@ from typing import Any
 
 import cv2
 import flax.nnx as nnx
+import imageio
 import jax
 import jax.numpy as jnp
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend; safe under SLURM/headless eval
+import matplotlib.pyplot as plt
 import numpy as np
 import requests
 from scipy.spatial.transform import Rotation
@@ -87,6 +91,11 @@ class Args:
     num_episodes: int = 1
     """Number of episodes to run."""
 
+    start_episode_idx: int = 0
+    """Index of the first episode. The loop runs for `num_episodes` indices starting here,
+    so resumed runs (e.g. after a crash at episode 2) keep the seed / log lines / video
+    filenames aligned and don't overwrite earlier output."""
+
     control_freq: int = 60
     """Frequency (Hz) at which the robot server expects actions. Passed to the
     RemoteEnvironmentAdapter so the server initializes its control loop accordingly."""
@@ -134,6 +143,10 @@ class Args:
     debug_values: bool = False
     """If set and BestOfN is in use, log the per-candidate Q-values inline with each replan log line."""
 
+    log_videos: bool = False
+    """If set AND BestOfN is in use, save a per-episode 4-panel mp4 (wrist + base + Q-value plot)
+    to eval/xarm_scripts/videos/episode_<n>.mp4 at FPS = control_freq / query_freq."""
+
 
 # =============================================================================
 # Critic loading
@@ -169,9 +182,14 @@ def load_critic(
     # action_horizon override from FineTuneConfig lands on TrainConfig.action_horizon;
     # init_train_state pushes it into model.action_horizon at training time but does
     # not mutate the config returned by load_critic, so prefer the TrainConfig field.
+    # Tokenizer comes from the critic's PaliGemmaNetworkConfig so we can re-tokenize
+    # the prompt for the critic at eval time (the policy's tokenized_prompt may
+    # contain trailing discrete-state digits the critic was not trained on).
     critic_kwargs = {
         "action_horizon": critic_config.action_horizon or critic_config.model.action_horizon,
         "use_chunk_wise_delta": critic_config.data.use_chunk_wise_delta,
+        "use_quantile_norm": critic_config.data.use_quantile_norm,
+        "tokenizer": critic_config.model.network_config.get_tokenizer(),
     }
     return critic_model, critic_norm_stats, critic_kwargs
 
@@ -278,13 +296,17 @@ class LocalPolicy:
         # Both modules are frozen during eval so module_jit works uniformly.
         # Plan: ~/.claude-personal/plans/starry-dazzling-meteor.md
         self._critic_model = critic_model
+        self._critic_tokenizer = critic_kwargs["tokenizer"] if critic_kwargs is not None else None
         self._bestofn_sample = None
         self._bestofn = None
         if critic_model is not None:
             assert critic_norm_stats is not None, "critic_norm_stats required when critic_model is provided"
             assert critic_kwargs is not None, "critic_kwargs required when critic_model is provided"
+            assert self._critic_tokenizer is not None, "critic tokenizer required when critic_model is provided"
             policy_use_chunk_wise_delta = config.data.use_chunk_wise_delta
             critic_use_chunk_wise_delta = critic_kwargs["use_chunk_wise_delta"]
+            policy_use_quantile_norm = data_config.use_quantile_norm
+            critic_use_quantile_norm = critic_kwargs["use_quantile_norm"]
             convert_to_global = (not critic_use_chunk_wise_delta) and policy_use_chunk_wise_delta
             absolute_actions = None
             if convert_to_global:
@@ -297,12 +319,30 @@ class LocalPolicy:
                     "data_config.data_transforms.outputs. Check that the policy's data "
                     "config sets use_chunk_wise_delta=True."
                 )
+            policy_action_horizon = self._model.action_horizon
+            critic_action_horizon = critic_kwargs["action_horizon"]
+            subsample_active = critic_action_horizon != policy_action_horizon
+            critic_action_dim = critic_norm_stats["actions"].mean.shape[-1]
+            absolute_actions_source = (
+                f"{type(absolute_actions).__name__} from data_config.data_transforms.outputs"
+                if absolute_actions is not None
+                else "none (convert_to_global=False)"
+            )
+            policy_subtask_prompt_mode = getattr(config.data, "subtask_prompt_mode", None)
             logger.info(
                 f"Building BestOfN wrapper with num_samples={num_samples}, "
                 f"action_dim_offset={self._action_dim_offset}, "
+                f"critic_action_dim={critic_action_dim} "
+                f"(policy action_dim={self._model.action_dim}), "
                 f"convert_to_global={convert_to_global} "
                 f"(policy_use_chunk_wise_delta={policy_use_chunk_wise_delta}, "
-                f"critic_use_chunk_wise_delta={critic_use_chunk_wise_delta})"
+                f"critic_use_chunk_wise_delta={critic_use_chunk_wise_delta}), "
+                f"subsample={subsample_active} "
+                f"(policy_action_horizon={policy_action_horizon}, critic_action_horizon={critic_action_horizon}), "
+                f"absolute_actions={absolute_actions_source}, "
+                f"subtask_prompt_mode={policy_subtask_prompt_mode!r}, "
+                f"policy_use_quantile_norm={policy_use_quantile_norm}, "
+                f"critic_use_quantile_norm={critic_use_quantile_norm}"
             )
             self._bestofn = BestOfNWrapper(
                 action_dim = self._model.action_dim,
@@ -317,16 +357,20 @@ class LocalPolicy:
                 softmax_temperature = 1.0,
                 policy_norm_stats = norm_stats,
                 critic_norm_stats = critic_norm_stats,
+                policy_use_quantile_norm = policy_use_quantile_norm,
+                critic_use_quantile_norm = critic_use_quantile_norm,
                 critic_action_dim_offset = self._action_dim_offset,
                 critic_action_horizon = critic_kwargs["action_horizon"],
                 absolute_actions = absolute_actions,
             )
 
             @nnx.jit
-            def _bestofn_sample(bon, vf, rng, transition):
+            def _bestofn_sample(bon, vf, rng, transition, critic_prompt, critic_prompt_mask):
                 # BestOfNWrapper.sample_actions returns (selected_action, q_values).
                 return bon.sample_actions(
                     rng, transition, compute_next_action = False, value_function = vf,
+                    critic_tokenized_prompt = critic_prompt,
+                    critic_tokenized_prompt_mask = critic_prompt_mask,
                 )
 
             self._bestofn_sample = _bestofn_sample
@@ -353,7 +397,11 @@ class LocalPolicy:
                 or None for the policy-only path.
         """
         raw_state = np.asarray(obs_dict["state"], dtype=np.float32)
+        # Capture the prompt string before _input_transform runs (TokenizePrompt pops it).
+        prompt_str = obs_dict.get("prompt")
         transformed = self._input_transform(obs_dict)
+
+        # pdb.set_trace()
 
         batched = {}
         for k, v in transformed.items():
@@ -380,6 +428,13 @@ class LocalPolicy:
 
         q_values_np: np.ndarray | None = None
         if self._critic_model is not None:
+            # Re-tokenize the prompt with the critic's tokenizer (no discrete-state digits;
+            # the critic was not trained on them). The result replaces the policy-tokenized
+            # prompt inside expanded_obs before the critic sees it.
+            critic_tokens, critic_token_mask = self._critic_tokenizer.tokenize(prompt_str, None)
+            critic_tokens_batched = jnp.asarray(critic_tokens)[None, ...]
+            critic_token_mask_batched = jnp.asarray(critic_token_mask)[None, ...]
+
             # BestOfN path: build a Transition manually with the 14-d initial EEF
             # pose as transition.action so the wrapper can convert chunk-wise-delta
             # candidates back to global before passing them to the critic.
@@ -387,6 +442,7 @@ class LocalPolicy:
             transition = _base_vf.Transition(observation = observation, action = init_pose)
             actions_out, q_values = self._bestofn_sample(
                 self._bestofn, self._critic_model, sample_rng, transition,
+                critic_tokens_batched, critic_token_mask_batched,
             )
             actions_out = jax.block_until_ready(actions_out)
             q_values_np = np.asarray(jax.block_until_ready(q_values), dtype = np.float32)
@@ -598,6 +654,154 @@ class SubtaskTracker:
 
 
 # =============================================================================
+# Video logging
+# =============================================================================
+
+
+# Each panel is a square. 256 satisfies libx264's "divisible by 16" requirement,
+# and the final 2x2 mosaic is 512x512 — small enough to keep encoding fast.
+_VIDEO_PANEL_SIZE = 256
+
+
+class VideoLogger:
+    """Buffers per-replan observations + Q-values and writes a 2x2 mp4 at episode end.
+
+    Layout (each panel _VIDEO_PANEL_SIZE x _VIDEO_PANEL_SIZE):
+
+        +-------------------+-------------------+
+        |  left wrist RGB   |  Q-value plot     |
+        +-------------------+-------------------+
+        |  right wrist RGB  |  base RGB         |
+        +-------------------+-------------------+
+
+    The Q-value plot is the only animated panel: lines = Q-values per candidate over
+    replan ticks (static across frames), blue verticals = manual subtask advances
+    (static), red vertical = current frame's tick (moves frame to frame).
+    """
+
+    def __init__(
+        self,
+        output_dir: str,
+        fps: float,
+        num_samples: int,
+        *,
+        has_critic: bool = True,
+    ) -> None:
+        self.output_dir = output_dir
+        self.fps = fps
+        self.num_samples = num_samples
+        # When False, the Q-value plot panel is replaced by a blank panel and the
+        # rest of the mosaic shows only the three camera feeds.
+        self.has_critic = has_critic
+        os.makedirs(output_dir, exist_ok = True)
+        self._reset()
+
+    def _reset(self) -> None:
+        self._images: list[dict[str, np.ndarray]] = []
+        self._q_values: list[np.ndarray] = []
+        self._steps: list[int] = []
+        self._advance_steps: list[int] = []
+        self._episode_idx: int | None = None
+
+    def start_episode(self, episode_idx: int) -> None:
+        self._reset()
+        self._episode_idx = episode_idx
+
+    def record_predict(
+        self,
+        images: dict[str, np.ndarray],
+        q_values: np.ndarray | None,
+        t: int,
+    ) -> None:
+        """Snapshot the latest cameras + Q-values at the env step where predict() ran."""
+        self._images.append({k: np.asarray(v).copy() for k, v in images.items()})
+        if q_values is None:
+            self._q_values.append(np.zeros(self.num_samples, dtype = np.float32))
+        else:
+            self._q_values.append(np.asarray(q_values[0], dtype = np.float32))
+        self._steps.append(t)
+
+    def record_advance(self, t: int) -> None:
+        """Mark an env step at which the user pressed Enter (manual subtask switch)."""
+        self._advance_steps.append(t)
+
+    def finish_episode(self) -> None:
+        if self._episode_idx is None or not self._images:
+            return
+        q_matrix = np.stack(self._q_values, axis = 0)  # (T_replans, N)
+        steps = np.asarray(self._steps, dtype = np.int64)
+        frames = [self._render_frame(i, q_matrix, steps) for i in range(len(self._images))]
+        out_path = os.path.join(self.output_dir, f"episode_{self._episode_idx}.mp4")
+        # imageio bundles its own ffmpeg with libx264; system ffmpeg on this cluster
+        # lacks libx264 (see CLAUDE.md > "Saving Videos on HPC").
+        imageio.mimsave(
+            out_path,
+            frames,
+            format = "mp4",
+            fps = self.fps,
+            codec = "libx264",
+            quality = 8,
+        )
+        logger.info(f"Saved episode video: {out_path}")
+
+    def _render_frame(self, frame_idx: int, q_matrix: np.ndarray, steps: np.ndarray) -> np.ndarray:
+        images = self._images[frame_idx]
+        current_step = int(steps[frame_idx])
+        size = _VIDEO_PANEL_SIZE
+
+        def _panel(img: np.ndarray | None) -> np.ndarray:
+            if img is None:
+                return np.zeros((size, size, 3), dtype = np.uint8)
+            return cv2.resize(img, (size, size), interpolation = cv2.INTER_AREA)
+
+        left_wrist = _panel(images.get("left_wrist_0_rgb"))
+        right_wrist = _panel(images.get("right_wrist_0_rgb"))
+        base_rgb = _panel(images.get("base_0_rgb"))
+        if self.has_critic:
+            value_panel = self._render_value_plot(size, q_matrix, steps, current_step)
+        else:
+            # No critic → no Q-values to plot; show a blank panel so the layout
+            # and mp4 dimensions stay constant.
+            value_panel = np.zeros((size, size, 3), dtype = np.uint8)
+
+        top = np.concatenate([left_wrist, value_panel], axis = 1)
+        bottom = np.concatenate([right_wrist, base_rgb], axis = 1)
+        return np.concatenate([top, bottom], axis = 0)
+
+    def _render_value_plot(
+        self,
+        size: int,
+        q_matrix: np.ndarray,
+        steps: np.ndarray,
+        current_step: int,
+    ) -> np.ndarray:
+        dpi = 100
+        figsize = (size / dpi, size / dpi)
+        fig, ax = plt.subplots(figsize = figsize, dpi = dpi)
+        for sample_idx in range(q_matrix.shape[1]):
+            ax.plot(steps, q_matrix[:, sample_idx], linewidth = 0.8)
+        for adv_step in self._advance_steps:
+            ax.axvline(x = adv_step, color = "blue", linewidth = 1.0, alpha = 0.7)
+        ax.axvline(x = current_step, color = "red", linewidth = 1.5)
+        x_lo = int(steps[0]) if len(steps) > 0 else 0
+        x_hi = int(steps[-1]) if len(steps) > 0 else 1
+        if x_hi == x_lo:
+            x_hi = x_lo + 1
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_xlabel("env step", fontsize = 6)
+        ax.set_ylabel("Q value", fontsize = 6)
+        ax.tick_params(labelsize = 5)
+        fig.tight_layout(pad = 0.5)
+        fig.canvas.draw()
+        # buffer_rgba is the matplotlib 3.x+ way; tostring_rgb was removed.
+        buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+        plt.close(fig)
+        if buf.shape[0] != size or buf.shape[1] != size:
+            buf = cv2.resize(buf, (size, size), interpolation = cv2.INTER_AREA)
+        return buf
+
+
+# =============================================================================
 # Observation extraction
 # =============================================================================
 
@@ -767,58 +971,80 @@ def run_episode(
             f"and skipping the auto/manual subtask tracker."
         )
 
+    # Per-episode video logger. With a critic, the Q-value plot panel is animated;
+    # without one, that panel is left blank and the video shows only the 3 cameras.
+    video_logger: VideoLogger | None = None
+    if args.log_videos:
+        video_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "videos")
+        video_fps = args.control_freq / args.query_freq
+        video_logger = VideoLogger(
+            output_dir = video_dir,
+            fps = video_fps,
+            num_samples = args.num_samples,
+            has_critic = policy._critic_model is not None,
+        )
+        video_logger.start_episode(episode_idx)
+
     action_plan: np.ndarray | None = None
     t = 0
     terminated = False
     truncated = False
 
-    while not (terminated or truncated) and t < args.max_steps:
-        if tracker is not None:
-            tracker.update(obs)
-            if args.manual:
-                while not _advance_q.empty():
-                    _advance_q.get_nowait()
-                    tracker.force_advance()
-                    logger.info(f"Manual advance → subtask {tracker.subtask} ({tracker.prompt!r})")
+    try:
+        while not (terminated or truncated) and t < args.max_steps:
+            if tracker is not None:
+                tracker.update(obs)
+                if args.manual:
+                    while not _advance_q.empty():
+                        _advance_q.get_nowait()
+                        tracker.force_advance()
+                        logger.info(f"Manual advance → subtask {tracker.subtask} ({tracker.prompt!r})")
+                        if video_logger is not None:
+                            video_logger.record_advance(t)
 
-        if t % args.query_freq == 0:
-            prompt = _TASK_DESCRIPTION_PROMPT if use_task_description else tracker.prompt
-            state, initial_eef_pose = extract_state(obs)
-            images_rgb = extract_images_rgb(obs, args.camera_names)
+            if t % args.query_freq == 0:
+                prompt = _TASK_DESCRIPTION_PROMPT if use_task_description else tracker.prompt
+                state, initial_eef_pose = extract_state(obs)
+                images_rgb = extract_images_rgb(obs, args.camera_names)
 
-            obs_dict = {
-                "image": images_rgb,
-                "state": state,
-                "prompt": prompt,
-            }
+                obs_dict = {
+                    "image": images_rgb,
+                    "state": state,
+                    "prompt": prompt,
+                }
 
-            t0 = time.perf_counter()
-            full_actions, q_values = policy.predict(obs_dict, initial_eef_pose)
-            elapsed = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                full_actions, q_values = policy.predict(obs_dict, initial_eef_pose)
+                elapsed = time.perf_counter() - t0
 
-            action_plan = full_actions[
-                :, args.real_action_start : args.real_action_start + args.real_action_dim
-            ]
-            log_line = (
-                f"Episode {episode_idx} step {t}: prompt={prompt!r}, "
-                f"action_plan shape={action_plan.shape}, inference={elapsed:.3f}s"
-            )
-            if args.debug_values and q_values is not None:
-                # B = 1 in the eval flow; flatten and format.
-                values_str = ", ".join(f"{v:.4f}" for v in q_values[0].tolist())
-                log_line += f", q_values=[{values_str}]"
-            logger.info(log_line)
-            
+                action_plan = full_actions[
+                    :, args.real_action_start : args.real_action_start + args.real_action_dim
+                ]
+                log_line = (
+                    f"Episode {episode_idx} step {t}: prompt={prompt!r}, "
+                    f"action_plan shape={action_plan.shape}, inference={elapsed:.3f}s"
+                )
+                if args.debug_values and q_values is not None:
+                    # B = 1 in the eval flow; flatten and format.
+                    values_str = ", ".join(f"{v:.4f}" for v in q_values[0].tolist())
+                    log_line += f", q_values=[{values_str}]"
+                logger.info(log_line)
+                if video_logger is not None:
+                    video_logger.record_predict(images_rgb, q_values, t)
 
-        plan_idx = min(t % args.query_freq, action_plan.shape[0] - 1)
-        # ipdb.set_trace()
-        action = action_plan[plan_idx]
-        # action = np.zeros_like(action)
-    
-        obs, reward, terminated, truncated, _ = env.step(action)
-        t += 1
 
-    logger.info(f"Episode {episode_idx} finished after {t} steps (terminated={terminated}, truncated={truncated})")
+            plan_idx = min(t % args.query_freq, action_plan.shape[0] - 1)
+            # ipdb.set_trace()
+            action = action_plan[plan_idx]
+            # action = np.zeros_like(action)
+
+            obs, reward, terminated, truncated, _ = env.step(action)
+            t += 1
+
+        logger.info(f"Episode {episode_idx} finished after {t} steps (terminated={terminated}, truncated={truncated})")
+    finally:
+        if video_logger is not None:
+            video_logger.finish_episode()
 
 
 # =============================================================================
@@ -917,12 +1143,15 @@ def main(args: Args) -> None:
     env = RemoteEnvironmentAdapter(host=args.robot_host, port=args.robot_port, control_freq=args.control_freq)
     logger.info("Connected to robot environment.")
 
-    for episode_idx in range(args.num_episodes):
+    for episode_idx in range(args.start_episode_idx, args.start_episode_idx + args.num_episodes):
         try:
             run_episode(env, policy, args, episode_idx)
         except KeyboardInterrupt:
-            logger.info(f"Episode {episode_idx} interrupted by Ctrl+C — dropping into ipdb")
-        pdb.set_trace()
+            logger.info(f"Episode {episode_idx} interrupted by Ctrl+C")
+        try:
+            input(f"Episode {episode_idx} done. Press Enter to continue to the next episode...")
+        except EOFError:
+            break
 
     env.close()
 

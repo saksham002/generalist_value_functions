@@ -303,10 +303,14 @@ class ResizeImages(DataTransformFn):
     width: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        # Direct stretch matches dexterous_hang_config.py:_decode_and_reencode_jpeg, which
+        # writes 224x224 training frames via tf.image.resize without aspect preservation.
+        # Using resize_with_pad here would letterbox the eval frames and the model has
+        # never seen black bars on top/bottom.
+        data["image"] = {k: image_tools.resize_stretch(v, self.height, self.width) for k, v in data["image"].items()}
         if "next_image" in data:
             data["next_image"] = {
-                k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["next_image"].items()
+                k: image_tools.resize_stretch(v, self.height, self.width) for k, v in data["next_image"].items()
             }
         return data
 
@@ -557,16 +561,28 @@ class PromptFromLeRobotTask(DataTransformFn):
 class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to the model action dimension.
 
-    When action_dim_offset > 0, values are placed at [offset : offset + d]
-    and an action_dim_mask (bool[model_action_dim]) marks the real positions.
+    When ``action_dim_mask`` is provided, source values are scattered into the
+    True positions of the mask in order (i.e. source[..., i] lands at the
+    i-th True index in mask). Number of source dims must equal the number of
+    True entries.
+
+    Otherwise, when ``action_dim_offset > 0``, values are placed at
+    [offset : offset + d].
     """
 
     model_action_dim: int
     action_dim_offset: int = 0
     pad_state: bool = True
+    action_dim_mask: tuple[bool, ...] | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
-        if self.action_dim_offset > 0:
+        if self.action_dim_mask is not None:
+            true_indices = tuple(i for i, m in enumerate(self.action_dim_mask) if m)
+            if self.pad_state:
+                data["state"] = _scatter_to_mask(data["state"], self.model_action_dim, true_indices)
+            if "actions" in data:
+                data["actions"] = _scatter_to_mask(data["actions"], self.model_action_dim, true_indices)
+        elif self.action_dim_offset > 0:
             if self.pad_state:
                 data["state"] = _insert_at_offset(data["state"], self.model_action_dim, self.action_dim_offset)
             if "actions" in data:
@@ -669,6 +685,25 @@ def _insert_at_offset(x: np.ndarray, target_dim: int, offset: int) -> np.ndarray
     out_shape = x.shape[:-1] + (target_dim,)
     out = np.zeros(out_shape, dtype = x.dtype)
     out[..., offset : offset + real_dim] = x
+    return out
+
+
+def _scatter_to_mask(x: np.ndarray, target_dim: int, true_indices: tuple[int, ...]) -> np.ndarray:
+    """Scatter x's last-axis values into true_indices of a zero array of size target_dim.
+
+    Source dim i lands at target index true_indices[i]. Asserts source dim count
+    equals len(true_indices).
+    """
+    real_dim = x.shape[-1]
+    assert real_dim == len(true_indices), (
+        f"source dim ({real_dim}) != number of True positions in mask ({len(true_indices)})"
+    )
+    assert all(0 <= idx < target_dim for idx in true_indices), (
+        f"true_indices out of range for target_dim={target_dim}: {true_indices}"
+    )
+    out_shape = x.shape[:-1] + (target_dim,)
+    out = np.zeros(out_shape, dtype = x.dtype)
+    out[..., list(true_indices)] = x
     return out
 
 
