@@ -39,6 +39,7 @@ import openpi.training.data_loader as _data_loader
 import openpi.training.evaluation as _evaluation
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
+import openpi.robocoin_utils.load_model_utils as _load_model_utils
 from openpi.training.time_utils import Timer
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
@@ -683,20 +684,25 @@ def value_function_train_step(
     )
 
     # Batch statistics
-    obs_state = transition.observation.state
+    # For RoboCasa configs the state and action are in bimanual-EEF layout: dims 0:7
+    # are the right arm (real values), dims 7:14 are zero-filler for the absent left
+    # arm. Restrict stats to the meaningful slice so the filler doesn't distort them.
+    is_robocasa = isinstance(config.data, _config.RLDSRoboCasaDataConfig)
+    obs_state = transition.observation.state[..., :7] if is_robocasa else transition.observation.state
+    action = transition.action[..., :7] if is_robocasa else transition.action
     batch_stats = {
         # Observation stats
         "batch/obs_mean": jnp.mean(obs_state),
         "batch/obs_std": jnp.std(obs_state),
         "batch/obs_min": jnp.min(obs_state),
         "batch/obs_max": jnp.max(obs_state),
-        "batch/obs_out_of_range_frac": jnp.mean((jnp.abs(obs_state) >= 1.0).astype(jnp.float32)),
+        "batch/obs_out_of_range_frac": jnp.mean((jnp.abs(obs_state) >= 1.001).astype(jnp.float32)),
         # Action stats
-        "batch/action_mean": jnp.mean(transition.action),
-        "batch/action_std": jnp.std(transition.action),
-        "batch/action_min": jnp.min(transition.action),
-        "batch/action_max": jnp.max(transition.action),
-        "batch/action_out_of_range_frac": jnp.mean((jnp.abs(transition.action) >= 1.0).astype(jnp.float32)),
+        "batch/action_mean": jnp.mean(action),
+        "batch/action_std": jnp.std(action),
+        "batch/action_min": jnp.min(action),
+        "batch/action_max": jnp.max(action),
+        "batch/action_out_of_range_frac": jnp.mean((jnp.abs(action) >= 1.001).astype(jnp.float32)),
         # Reward stats
         "batch/reward_mean": jnp.mean(transition.reward),
         "batch/reward_std": jnp.std(transition.reward),
@@ -724,7 +730,7 @@ def value_function_train_step(
         batch_stats["batch/counterfactual_next_actions_min"] = jnp.min(transition.counterfactual_next_actions)
         batch_stats["batch/counterfactual_next_actions_max"] = jnp.max(transition.counterfactual_next_actions)
         batch_stats["batch/counterfactual_next_actions_out_of_range_frac"] = jnp.mean(
-            (jnp.abs(transition.counterfactual_next_actions) >= 1.0).astype(jnp.float32)
+            (jnp.abs(transition.counterfactual_next_actions) >= 1.001).astype(jnp.float32)
         )
 
     batch_size = transition.reward.shape[0]
@@ -1807,8 +1813,10 @@ def generate_validation_plots_dlimp(
     """
     # Per-episode load → decode + resize → predict → free pipeline so peak host
     # RAM is bounded to one episode's decoded frames, not the entire val cache.
-    # Cached pkl files store raw image bytes (decode_images=False at the dataset
-    # level); decoding happens here, lazily.
+    # RoboCOIN cache pkls hold raw image bytes (decode_images=False at the dataset
+    # level) and `decode_episode_images` materializes them lazily; the RoboCasa
+    # branch caches already-decoded uint8 arrays (the data_transforms / model_transforms
+    # pipeline requires decoded images), so `decode_episode_images` is a no-op there.
     image_size = data_config.rlds_kwargs.get("image_size")
     assert image_size is not None, (
         "image_size missing from data_config.rlds_kwargs — required to decode/resize "
@@ -1855,7 +1863,14 @@ def generate_validation_plots_dlimp(
             repo_id_raw = repo_id_raw.item()
         if isinstance(repo_id_raw, bytes):
             repo_id_raw = repo_id_raw.decode("utf-8")
-        ep_idx = int(frames[0]["episode_index"])
+        # RoboCOIN frames carry "episode_index"; RoboCasa frames carry "_traj_index"
+        # (forwarded by the dataset and kept in _CACHE_KEYS).
+        ep_idx_raw = frames[0].get("episode_index")
+        if ep_idx_raw is None:
+            ep_idx_raw = frames[0]["_traj_index"]
+        if isinstance(ep_idx_raw, np.ndarray):
+            ep_idx_raw = ep_idx_raw.item()
+        ep_idx = int(ep_idx_raw)
 
         n_segments, split_frame_idx, segments = count_subtask_segments(frames)
         if n_segments > MAX_SUBTASK_SEGMENTS:
@@ -1899,8 +1914,13 @@ def generate_validation_plots_dlimp(
             ]
             ep_fps[seg_key] = int(seg_frames[0]["fps"])
             ep_include_masks[seg_key] = [bool(f.get("include_subtask", True)) for f in seg_frames]
-            _, _, negative_segments = count_subtask_segments(seg_frames, prefix = "negative_")
-            ep_negative_subtasks[seg_key] = negative_segments
+            # Negative-text variant is RoboCOIN-only; skip when the cached frames
+            # don't carry "negative_subtask_1_text".
+            if seg_frames and "negative_subtask_1_text" in seg_frames[0]:
+                _, _, negative_segments = count_subtask_segments(seg_frames, prefix = "negative_")
+                ep_negative_subtasks[seg_key] = negative_segments
+            else:
+                ep_negative_subtasks[seg_key] = []
 
             seg_all_frames = [(seg_key, idx, frame) for idx, frame in enumerate(seg_frames)]
             seg_ep_mc_returns = {seg_key: ep_mc_returns[seg_key]}
@@ -2079,6 +2099,53 @@ def main(config: _config.TrainConfig):
             reward_bias=data_config.reward_bias,
         )
         val_dataloader = None
+    elif data_config.rlds_dataset_class == "robocasa":
+        # Mirrors the RoboCOIN branch: cache transformed val trajectories to
+        # `validation_cache_dir` so generate_validation_plots_dlimp can render
+        # base + random + shuffled plots. Skips RoboCOIN-specific bits
+        # (val_dataset_dir override, AddValidationVariants(include_negative=True)).
+        action_horizon = config.action_horizon or config.model.action_horizon
+        val_tokenizer = config.data._get_critic_tokenizer(config.model)
+        assert val_tokenizer is not None, "RoboCasa validation requires a critic tokenizer."
+        import dataclasses as _dc
+        # RoboCasa data_transforms / model_transforms expect decoded uint8 arrays, so
+        # decode upstream rather than carrying raw JPEG bytes through.
+        _val_rlds_kwargs = {**data_config.rlds_kwargs, "decode_images": True}
+        _val_data_config = _dc.replace(data_config, rlds_kwargs = _val_rlds_kwargs)
+        val_trajectory_dataset = _data_loader.create_rlds_dataset(
+            _val_data_config,
+            action_horizon,
+            config.batch_size,
+            split = data_config.val_split,
+            shuffle = False,
+            return_trajectories = True,
+        )
+        val_input_transform = _transforms.compose([
+            *data_config.repack_transforms.inputs,
+            *data_config.data_transforms.inputs,
+            _transforms.Normalize(data_config.norm_stats, use_quantiles = data_config.use_quantile_norm),
+            *([_transforms.Clip(data_config.clip_normalized_bounds)] if data_config.clip_normalized_bounds is not None else []),
+            *data_config.model_transforms.inputs,
+            _config.AddValidationVariants(
+                val_tokenizer,
+                use_quantile_norm = data_config.use_quantile_norm,
+                include_negative = False,
+            ),
+        ])
+        val_episode_indices = list(range(config.num_val_trajectories))
+        val_episodes_cache_dir = config.validation_cache_dir
+        val_dataset = None
+
+        allow_duplicate_repos = ft_config is not None
+        cache_val_episodes(
+            val_trajectory_dataset, config.num_val_trajectories, val_episodes_cache_dir,
+            include_repos = config.include_repos, save_only = True,
+            input_transform = val_input_transform,
+            allow_duplicate_repos = allow_duplicate_repos,
+        )
+        if jax.process_count() > 1:
+            jax.experimental.multihost_utils.sync_global_devices("val_cache_write")
+        del val_trajectory_dataset, val_input_transform, _val_data_config, _val_rlds_kwargs
     elif data_config.rlds_dataset_class == "robocoin":
         action_horizon = config.action_horizon or config.model.action_horizon
         val_tokenizer = config.data._get_critic_tokenizer(config.model)
@@ -2113,7 +2180,7 @@ def main(config: _config.TrainConfig):
             _transforms.Normalize(data_config.norm_stats, use_quantiles = data_config.use_quantile_norm),
             *([_transforms.Clip(data_config.clip_normalized_bounds)] if data_config.clip_normalized_bounds is not None else []),
             *data_config.model_transforms.inputs,
-            _config.AddRoboCoinValidationVariants(
+            _config.AddValidationVariants(
                 val_tokenizer,
                 use_quantile_norm = data_config.use_quantile_norm,
             ),
@@ -2126,10 +2193,12 @@ def main(config: _config.TrainConfig):
         # num_val_trajectories; non-zero workers only cache include_repos. Each
         # worker checks file existence before claiming/writing, so concurrent
         # writes to NFS are safe.
+        allow_duplicate_repos = ft_config is not None
         cache_val_episodes(
             val_trajectory_dataset, config.num_val_trajectories, val_episodes_cache_dir,
             include_repos = config.include_repos, save_only = True,
             input_transform = val_input_transform,
+            allow_duplicate_repos = allow_duplicate_repos,
         )
         if jax.process_count() > 1:
             jax.experimental.multihost_utils.sync_global_devices("val_cache_write")
@@ -2190,7 +2259,10 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         logging.info("Resuming training from checkpoint")
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        # train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = _load_model_utils.restore_state_with_shardings(
+            checkpoint_manager, train_state, train_state_sharding,
+        )
 
     # Unpack state and sharding
     if not isinstance(train_state, training_utils.ActorCriticTrainState):
@@ -2212,7 +2284,7 @@ def main(config: _config.TrainConfig):
         step = int(critic_state.step)
         model = nnx.merge(critic_state.model_def, critic_state.params)
 
-        if data_config.rlds_dataset_class == "robocoin":
+        if data_config.rlds_dataset_class in ("robocoin", "robocasa"):
             generate_validation_plots_dlimp(
                 model = model,
                 val_episode_indices = val_episode_indices,
@@ -2385,12 +2457,12 @@ def main(config: _config.TrainConfig):
         if (
             (step + 1) % config.plot_interval == 0
             or step + 1 == config.num_train_steps
-            or (step % config.plot_interval == 0 and step == start_step and start_step > 0)
+            # or (step % config.plot_interval == 0 and step == start_step and start_step > 0)
         ):
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
-                if data_config.rlds_dataset_class == "robocoin":
+                if data_config.rlds_dataset_class in ("robocoin", "robocasa"):
                     generate_validation_plots_dlimp(
                         model = model,
                         val_episode_indices = val_episode_indices,

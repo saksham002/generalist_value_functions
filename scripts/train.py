@@ -211,17 +211,49 @@ def train_step(
         ),
     )
     observation, actions = batch
+
+    # For RoboCasa configs the state is in bimanual-EEF layout: dims 0:7 are the
+    # right arm (real values), dims 7:14 are zero-filler for the absent left arm.
+    # Restrict obs stats to the meaningful slice so the filler doesn't distort them.
+    is_robocasa = isinstance(config.data, _config.RLDSRoboCasaDataConfig)
+    obs_state = observation.state[..., :7] if is_robocasa else observation.state
+
+    # Mask action stats by config.model.action_dim_mask so the padded action dims
+    # (e.g. dims 14:32 for pi-0.5 robocasa) don't pull mean/std toward 0.
+    action_dim_mask_tuple = getattr(config.model, "action_dim_mask", None)
+    if action_dim_mask_tuple is not None:
+        dim_mask = jnp.array(action_dim_mask_tuple, dtype = jnp.float32)  # [action_dim]
+        valid_per_step = jnp.sum(dim_mask)
+        total_count = valid_per_step * actions.shape[0] * actions.shape[1]
+        action_sum = jnp.sum(actions * dim_mask)
+        action_mean = action_sum / jnp.maximum(total_count, 1.0)
+        action_var = jnp.sum(((actions - action_mean) ** 2) * dim_mask) / jnp.maximum(total_count, 1.0)
+        action_std = jnp.sqrt(action_var)
+        action_for_min = jnp.where(dim_mask > 0, actions, jnp.inf)
+        action_for_max = jnp.where(dim_mask > 0, actions, -jnp.inf)
+        action_min = jnp.min(action_for_min)
+        action_max = jnp.max(action_for_max)
+        action_out_of_range = jnp.sum(
+            (jnp.abs(actions) >= 1.001).astype(jnp.float32) * dim_mask
+        ) / jnp.maximum(total_count, 1.0)
+    else:
+        action_mean = jnp.mean(actions)
+        action_std = jnp.std(actions)
+        action_min = jnp.min(actions)
+        action_max = jnp.max(actions)
+        action_out_of_range = jnp.mean((jnp.abs(actions) >= 1.001).astype(jnp.float32))
+
     batch_stats = {
-        "batch/obs_mean": jnp.mean(observation.state),
-        "batch/obs_std": jnp.std(observation.state),
-        "batch/obs_min": jnp.min(observation.state),
-        "batch/obs_max": jnp.max(observation.state),
-        "batch/obs_out_of_range_frac": jnp.mean((jnp.abs(observation.state) >= 1.0).astype(jnp.float32)),
-        "batch/action_mean": jnp.mean(actions),
-        "batch/action_std": jnp.std(actions),
-        "batch/action_min": jnp.min(actions),
-        "batch/action_max": jnp.max(actions),
-        "batch/action_out_of_range_frac": jnp.mean((jnp.abs(actions) >= 1.0).astype(jnp.float32)),
+        "batch/obs_mean": jnp.mean(obs_state),
+        "batch/obs_std": jnp.std(obs_state),
+        "batch/obs_min": jnp.min(obs_state),
+        "batch/obs_max": jnp.max(obs_state),
+        "batch/obs_out_of_range_frac": jnp.mean((jnp.abs(obs_state) >= 1.001).astype(jnp.float32)),
+        "batch/action_mean": action_mean,
+        "batch/action_std": action_std,
+        "batch/action_min": action_min,
+        "batch/action_max": action_max,
+        "batch/action_out_of_range_frac": action_out_of_range,
     }
 
     grads_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), grads)

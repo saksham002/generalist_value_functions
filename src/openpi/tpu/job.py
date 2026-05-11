@@ -107,16 +107,16 @@ class JobRunner:
         )
 
         preamble = self._build_job_preamble()
+        # Tmux session exits as soon as the command finishes (success OR
+        # failure). The exit code persists in {self._exit_code_file} and the
+        # full output in {self._log_file}, so monitor_job + post-mortem
+        # debugging keep working without a sleep loop holding the session.
         full_command = (
             f"{preamble} && "
             f"cd {self.working_dir} && "
             f"( {command} ) 2>&1 | tee {self._log_file}; "
             f"job_exit_code=${{PIPESTATUS[0]}}; "
             f"echo ${{job_exit_code}} > {self._exit_code_file}; "
-            f"if [ ${{job_exit_code}} -ne 0 ]; then "
-            f"echo 'Job failed (exit ${{job_exit_code}}); keeping tmux session alive for 60s.' | tee -a {self._log_file}; "
-            f"sleep 60; "
-            f"fi; "
             f"exit ${{job_exit_code}}"
         )
 

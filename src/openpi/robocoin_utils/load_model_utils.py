@@ -120,7 +120,7 @@ def load_critic(
         config = ft_config.apply_overrides(config, pretrained_step = None)
     if config_override is not None:
         config = config_override(config)
-    config = dataclasses.replace(config, fsdp_devices = jax.local_device_count())
+    config = dataclasses.replace(config, fsdp_devices = 16)
 
     train_module = load_train_module()
     rng = jax.random.PRNGKey(86)
@@ -186,7 +186,7 @@ def load_policy(load_config: LoadPolicyConfig):
         ft_config = _config.get_fine_tune_config(load_config.fine_tune)
         config = ft_config.apply_overrides(config, pretrained_step = None)
 
-    config = dataclasses.replace(config, fsdp_devices = jax.local_device_count())
+    config = dataclasses.replace(config, fsdp_devices = 16)
 
     train_module = _load_script_module("train.py")
     rng = jax.random.PRNGKey(86)
@@ -199,9 +199,17 @@ def load_policy(load_config: LoadPolicyConfig):
         overwrite = False,
         resume = True,
     )
-    restored_params = restore_params_with_shardings(checkpoint_manager, train_state_shape, state_sharding, step = load_config.step)
-    params = restored_params["params"]
-    model = nnx.merge(train_state_shape.model_def, params)
+    # restore_params_with_shardings re-shards even when saved sharding matches
+    # the load-time mesh, silently producing wrong weights on (2,16) mesh.
+    # restore_state uses the saved sharding metadata directly.
+    class _DummyLoader:
+        def state_dict(self): return {}
+        def load_state_dict(self, *_args, **_kw): pass
+
+    restored_state = _checkpoints.restore_state(
+        checkpoint_manager, train_state_shape, _DummyLoader(), step = load_config.step,
+    )
+    model = nnx.merge(restored_state.model_def, restored_state.params)
     logger.info(f"Loaded policy from {load_config.checkpoint_path}")
 
     return model, config

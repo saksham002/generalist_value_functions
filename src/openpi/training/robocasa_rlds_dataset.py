@@ -232,6 +232,8 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
         post_traj_len = tf.shape(mapped_traj["actions"])[0]
         mapped_traj["repo_id"] = tf.fill([post_traj_len], dataset_cfg.name)
 
+        mapped_traj["action_mask"] = self._build_action_mask(post_traj_len)
+
         return mapped_traj
 
     def _interpolate_trajectory(self, raw_traj: dict, mapped_traj: dict) -> None:
@@ -303,6 +305,24 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
             value = mapped_traj["_traj_index"]
             mapped_traj["_traj_index"] = tf.fill([target_len], value[0]) if len(value.shape) > 0 else value
 
+    def _build_action_mask(self, traj_len, *, td_n_offset = 0):
+        """Per-step (T, action_chunk_size) bool mask. Same logic for policy and critic;
+        critic passes td_n_offset to shift the boundary for next_action_mask.
+        """
+        import tensorflow as tf
+        i = tf.range(traj_len)
+        steps_to_end = traj_len - 1 - i - td_n_offset
+        offsets = tf.range(self._action_chunk_size, dtype = tf.int32)
+        if self._mask_boundary_actions:
+            mask = offsets[None, :] <= steps_to_end[:, None]
+        else:
+            mask = tf.ones([traj_len, self._action_chunk_size], dtype = tf.bool)
+        if self._interpolation_config is not None and self._interpolation_config.target_fps == 30.0:
+            valid = 3 * self._action_chunk_size // 5
+            fps_mask = tf.sequence_mask(valid, self._action_chunk_size)
+            mask = tf.logical_and(mask, fps_mask[None, :])
+        return mask
+
     def _apply_rl_fields(self, raw_traj: dict, mapped_traj: dict, action_chunk_size: int) -> dict:
         """Compute MC return / reward / termination / td_discount RoboCOIN-style.
 
@@ -344,24 +364,9 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
 
         truncation = tf.zeros([traj_len], dtype = tf.bool)
 
-        # action_mask / next_action_mask: see RoboCoinRldsDataset:373-411 for the
-        # offsets <= steps_to_subtask_end pattern. False past the trajectory tail.
-        offsets = tf.range(action_chunk_size, dtype = tf.int32)
-        if self._mask_boundary_actions:
-            action_mask = offsets[None, :] <= steps_to_subtask_end[:, None]
-            next_action_mask = offsets[None, :] <= (steps_to_subtask_end - td_n_native)[:, None]
-        else:
-            action_mask = tf.ones([traj_len, action_chunk_size], dtype = tf.bool)
-            next_action_mask = tf.ones([traj_len, action_chunk_size], dtype = tf.bool)
-
-        # Mirror robocoin_rlds_dataset.py:652-661: at 30fps the chunk is sized in
-        # canonical 50Hz units, so only the first 3*action_chunk_size//5 slots
-        # represent ≤1 sec at the actual 30fps rate.
-        if self._interpolation_config is not None and self._interpolation_config.target_fps == 30.0:
-            valid_30fps_actions = 3 * action_chunk_size // 5
-            fps_mask_30 = tf.sequence_mask(valid_30fps_actions, action_chunk_size)
-            action_mask = tf.logical_and(action_mask, fps_mask_30[None, :])
-            next_action_mask = tf.logical_and(next_action_mask, fps_mask_30[None, :])
+        # action_mask is built in trajectory_transforms (applies to both modes).
+        # next_action_mask shifts the boundary by td_n_native (critic-only).
+        next_action_mask = self._build_action_mask(traj_len, td_n_offset = td_n_native)
 
         if self._interpolation_config is not None:
             fps_value = self._interpolation_config.target_fps
@@ -384,7 +389,6 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
         mapped_traj["truncation"] = truncation
         mapped_traj["td_discount"] = td_discount
         mapped_traj["steps_to_subtask_end"] = steps_to_subtask_end
-        mapped_traj["action_mask"] = action_mask
         mapped_traj["next_action_mask"] = next_action_mask
         mapped_traj["fps"] = fps_array
         mapped_traj["next_observation"] = next_observation
