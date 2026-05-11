@@ -267,11 +267,6 @@ class PaliGemmaNetworkConfig:
     # Tokens outside the action block remain causal.
     action_block_bidirectional: bool = False
 
-    # Gemma 4 only: when True, zero out the per-layer-input contribution at the
-    # action chunk positions and the CLS position. Image soft tokens, state,
-    # text, and BOS positions retain their per-layer-input contribution.
-    zero_per_layer_input_for_action_cls: bool = False
-
     def get_tokenizer(self, max_len: int | None = None):
         """Return the appropriate text tokenizer for this variant."""
         from openpi.models.tokenizer import Gemma3Tokenizer, Gemma4Tokenizer, PaligemmaTokenizer
@@ -331,11 +326,9 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
 
         logger.info(
             "PaliGemmaValueNetwork: variant=%s, is_gemma3=%s, is_gemma4=%s, action_conditioned=%s, "
-            "action_horizon=%s, no_state=%s, action_block_bidirectional=%s, "
-            "zero_per_layer_input_for_action_cls=%s",
+            "action_horizon=%s, no_state=%s, action_block_bidirectional=%s",
             config.paligemma_variant, self._is_gemma3, self._is_gemma4, self._action_conditioned,
             self._action_horizon, self._no_state, config.action_block_bidirectional,
-            config.zero_per_layer_input_for_action_cls,
         )
 
         # Get config and module class based on variant
@@ -433,7 +426,6 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         self.cls_layer_norm = nnx.LayerNorm(embed_dim, rngs = rngs) if config.use_layernorm else None
 
         self._gemma4_action_block_bidir = config.action_block_bidirectional
-        self._gemma4_zero_pli_action_cls = config.zero_per_layer_input_for_action_cls
 
     def _get_special_embeddings(self) -> jax.Array:
         """Return [BOS, \\n\\n, <SOI>, <EOI>] embeddings [1, 4, D]."""
@@ -789,7 +781,7 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             action_length = action_block_length if self._gemma4_action_block_bidir else None,
         )
 
-        return tokens, input_mask, attn_mask, token_ids, action_block_start, action_block_length
+        return tokens, input_mask, attn_mask, token_ids
 
     def decode(self, x: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t v"]:
         return self.PaliGemma.llm(x, method = "decode")
@@ -937,16 +929,12 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
 
         # Build embeddings and attention mask
         gemma4_token_ids = None
-        gemma4_action_block_start: int | None = None
-        gemma4_action_block_length: int | None = None
         if self._is_gemma4:
             (
                 tokens,
                 input_mask,
                 attn_mask,
                 gemma4_token_ids,
-                gemma4_action_block_start,
-                gemma4_action_block_length,
             ) = self._embed_sequence_gemma4(
                 observation, action = action_array, action_mask = action_mask_array
             )
@@ -969,19 +957,6 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             gemma4_per_layer_input = self.PaliGemma.llm(
                 tokens, gemma4_token_ids, method = "encode_per_layer_input",
             )
-            if self._gemma4_zero_pli_action_cls:
-                # Zero per-layer-input contribution at action chunk + CLS positions.
-                seq_len_pli = gemma4_per_layer_input.shape[1]
-                positions_pli = jnp.arange(seq_len_pli)
-                zero_pos = positions_pli == (seq_len_pli - 1)  # CLS is last
-                if gemma4_action_block_start is not None and gemma4_action_block_length is not None:
-                    in_action = (positions_pli >= gemma4_action_block_start) & (
-                        positions_pli < gemma4_action_block_start + gemma4_action_block_length
-                    )
-                    zero_pos = zero_pos | in_action
-                gemma4_per_layer_input = jnp.where(
-                    zero_pos[None, :, None, None], 0.0, gemma4_per_layer_input,
-                )
 
         llm_extra_kwargs: dict[str, jax.Array] = {}
         if self._is_gemma4:
