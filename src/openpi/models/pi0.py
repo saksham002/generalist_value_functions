@@ -220,9 +220,6 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         sq_err = jnp.square(v_t - u_t)
-        if self.action_dim_mask is not None:
-            dim_mask = jnp.array(self.action_dim_mask, dtype=jnp.float32)[None, None, :]  # (1, 1, ad)
-            return jnp.sum(sq_err * dim_mask, axis = -1) / jnp.sum(dim_mask)
         return jnp.mean(sq_err, axis = -1)
 
     def compute_prefix_cache(
