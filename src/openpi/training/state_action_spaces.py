@@ -411,7 +411,7 @@ ROBOCASA_NATIVE_ACTION_SPEC = StateActionSpaceSpec(
 
 
 # Bimanual-EEF specs (14D, left:7 + right:7) — kept for downstream uses that operate
-# on the post-mapping layout (e.g. `RoboCasaBimanualEEFInputs` consumers). Not used
+# on the post-mapping layout (e.g. `RoboCasaBimanualEEFRLInputs` consumers). Not used
 # by `_interpolate_trajectory` directly; see ROBOCASA_NATIVE_*_SPEC above.
 
 ROBOCASA_BIMANUAL_EEF_STATE_SPEC = StateActionSpaceSpec(

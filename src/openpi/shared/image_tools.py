@@ -18,17 +18,17 @@ def resize_stretch(
 ) -> at.UInt8[at.Array, "*b {height} {width} c"] | at.Float[at.Array, "*b {height} {width} c"]:
     """Direct bilinear resize that stretches each axis independently.
 
-    Matches the `tf.image.resize` call used by the RLDS dataset builder
-    (`src/openpi/training/rlds_dataset.py:805`), which discards aspect ratio.
-    Use this at eval time so policy/critic inputs match the squashed 224x224
-    frames the model was trained on. If the image is float32, it must be in
-    the range [-1, 1].
+    Matches the tf.image.resize call used by the RoboCOIN data builder
+    (dexterous_hang_config.py:_decode_and_reencode_jpeg), which discards aspect
+    ratio. Use this at eval time so policy/critic inputs match the squashed
+    224x224 frames the model was trained on. If the image is float32, it must
+    be in the range [-1, 1].
     """
     has_batch_dim = images.ndim == 4
     if not has_batch_dim:
         images = images[None]  # type: ignore
     resized_images = jax.image.resize(
-        images, (images.shape[0], height, width, images.shape[3]), method = method,
+        images, (images.shape[0], height, width, images.shape[3]), method = method
     )
     if images.dtype == jnp.uint8:
         resized_images = jnp.round(resized_images).clip(0, 255).astype(jnp.uint8)

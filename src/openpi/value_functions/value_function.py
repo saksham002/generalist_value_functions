@@ -293,7 +293,8 @@ class ValueFunction(BaseValueFunction):
     ) -> at.Float[at.Array, "*b"]:
         """For value functions without target network, return the same as compute_value."""
         result = self.compute_value(
-            observation, action,
+            observation,
+            action,
             take_min_over_ensemble = take_min_over_ensemble,
             prefix_cache = prefix_cache,
         )
@@ -394,13 +395,6 @@ class SARSAValueFunction(ValueFunction):
         observation: _model.Observation,
         use_target: bool = False,
     ) -> tuple[at.Array, at.Array]:
-        """Wrapper that exposes the underlying network's prefix-cache fast path.
-
-        Used by `BestOfNWrapper.sample_actions` to compute the critic's
-        per-prefix KV cache once and reuse it across the N candidate-action
-        evaluations (instead of re-encoding images + prompt N times). Mirrors
-        the sibling repo's wrapper at value_function.py:393.
-        """
         network = self.target_network if use_target else self.network
         if not hasattr(network, "compute_prefix_cache"):
             raise AttributeError(

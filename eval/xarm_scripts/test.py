@@ -2,16 +2,22 @@
 
 import logging
 
+logging.basicConfig(level = logging.INFO, format = "%(asctime)s %(levelname)s %(name)s: %(message)s", force = True)
+logger = logging.getLogger(__name__)
+
+logger.info("Importing openpi.robocoin_utils.load_model_utils.LoadPolicyConfig...")
 from openpi.robocoin_utils.load_model_utils import LoadPolicyConfig
+
+logger.info("Importing openpi.robocoin_utils.load_model_utils.load_policy...")
 from openpi.robocoin_utils.load_model_utils import load_policy
 
-logging.basicConfig(level = logging.INFO, format = "%(asctime)s %(levelname)s %(name)s: %(message)s", force = True)
+logger.info("All imports complete.")
 
 load_config = LoadPolicyConfig(
     config_name = "robocoin_bimanual_pi05",
-    checkpoint_path = "/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_finetune/",
+    checkpoint_path = "/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/robocoin_bimanual_pi05_rlds/real_hang_state_pi05_finetune/",
     fine_tune = "real_hang_pi05_finetune",
-    step = 275000,
+    step = 329999,
 )
 model, config = load_policy(load_config)
 print(f"Model type: {type(model).__name__}")

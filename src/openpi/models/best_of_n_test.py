@@ -1,15 +1,19 @@
 import dataclasses
 
 import equinox as eqx
+import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from typing_extensions import override
 
+import openpi.transforms as _transforms
 from openpi.models import best_of_n
 from openpi.models import model as _model
 from openpi.models import tanh_gaussian
 from openpi.shared import array_typing as at
+from openpi.shared.normalize import NormStats
 from openpi.value_functions import base_value_functions as _base_vf
 
 Transition = _base_vf.Transition
@@ -456,3 +460,106 @@ def test_best_of_n_uses_target_prefix_cache_when_configured():
     model.sample_actions(rng, transition, value_function = vf)
 
     assert vf.last_use_target is True
+
+
+def _make_renormalize_wrapper(
+    *,
+    batch_size: int,
+    num_samples: int,
+    action_horizon: int,
+    action_dim: int,
+) -> best_of_n.BestOfNWrapper:
+    """Build a cached-only wrapper exercising _renormalize_actions with identity norm stats.
+
+    Identity norm stats (mean=0, std=1) make Unnormalize/Normalize no-ops so any difference
+    between the eager and jit-traced outputs reflects the AbsoluteActions / pure_callback path.
+    """
+    identity_stats = {
+        "actions": NormStats(
+            mean = np.zeros((action_dim,), dtype = np.float32),
+            std = np.ones((action_dim,), dtype = np.float32),
+        )
+    }
+    # 14-d EEF layout used by the production data pipeline: positions and rpy are made
+    # absolute, gripper dims are left untouched.
+    delta_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+    absolute_actions = _transforms.AbsoluteActions(mask = delta_mask, rpy_index_start = (3, 10))
+    return best_of_n.BestOfNWrapper(
+        action_dim = action_dim,
+        action_horizon = action_horizon,
+        max_token_len = 0,
+        base_model = None,
+        num_samples = num_samples,
+        take_min_over_ensemble = True,
+        use_target_value = False,
+        convert_to_global = True,
+        selection_mode = "argmax",
+        softmax_temperature = 1.0,
+        policy_norm_stats = identity_stats,
+        critic_norm_stats = identity_stats,
+        critic_action_dim_offset = None,
+        critic_action_horizon = None,
+        absolute_actions = absolute_actions,
+    )
+
+
+def test_renormalize_actions_matches_absolute_actions_eager():
+    """The wrapper's renorm path with identity stats must equal a direct AbsoluteActions call."""
+    batch_size, num_samples, action_horizon, action_dim = 2, 3, 4, 14
+    wrapper = _make_renormalize_wrapper(
+        batch_size = batch_size,
+        num_samples = num_samples,
+        action_horizon = action_horizon,
+        action_dim = action_dim,
+    )
+
+    rng = np.random.default_rng(seed = 86)
+    actions = jnp.asarray(
+        rng.standard_normal((batch_size, num_samples, action_horizon, action_dim)).astype(np.float32)
+    )
+    initial_pose = jnp.asarray(
+        rng.standard_normal((batch_size, 1, action_dim)).astype(np.float32)
+    )
+
+    out = wrapper._renormalize_actions(actions, initial_pose = initial_pose)
+
+    delta_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+    abs_transform = _transforms.AbsoluteActions(mask = delta_mask, rpy_index_start = (3, 10))
+    state_flat = np.broadcast_to(
+        np.asarray(initial_pose), (batch_size, num_samples, action_dim)
+    ).reshape(batch_size * num_samples, action_dim)
+    actions_flat = np.asarray(actions).reshape(batch_size * num_samples, action_horizon, action_dim)
+    expected_flat = abs_transform({"state": state_flat, "actions": actions_flat})["actions"]
+    expected = expected_flat.reshape(batch_size, num_samples, action_horizon, action_dim)
+
+    assert jnp.allclose(out, jnp.asarray(expected), atol = 1e-5)
+
+
+def test_renormalize_actions_runs_inside_nnx_jit():
+    """jax.pure_callback must let _renormalize_actions execute under nnx.jit and match eager."""
+    batch_size, num_samples, action_horizon, action_dim = 2, 3, 4, 14
+    wrapper = _make_renormalize_wrapper(
+        batch_size = batch_size,
+        num_samples = num_samples,
+        action_horizon = action_horizon,
+        action_dim = action_dim,
+    )
+
+    rng = np.random.default_rng(seed = 86)
+    actions = jnp.asarray(
+        rng.standard_normal((batch_size, num_samples, action_horizon, action_dim)).astype(np.float32)
+    )
+    initial_pose = jnp.asarray(
+        rng.standard_normal((batch_size, 1, action_dim)).astype(np.float32)
+    )
+
+    eager = wrapper._renormalize_actions(actions, initial_pose = initial_pose)
+
+    @nnx.jit
+    def _renorm_jit(model, acts, pose):
+        return model._renormalize_actions(acts, initial_pose = pose)
+
+    jitted = _renorm_jit(wrapper, actions, initial_pose)
+
+    assert jitted.shape == eager.shape
+    assert jnp.allclose(jitted, eager, atol = 1e-5)

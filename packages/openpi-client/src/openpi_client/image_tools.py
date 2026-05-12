@@ -38,11 +38,10 @@ def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BI
 def resize_stretch(images: np.ndarray, height: int, width: int, method=Image.BILINEAR) -> np.ndarray:
     """Direct stretch resize for a batch of images using PIL.
 
-    Matches the `tf.image.resize` call used by the RLDS dataset builder
-    (`src/openpi/training/rlds_dataset.py:805`), which discards aspect ratio.
-    Use this at eval time so policy/critic inputs match the squashed 224x224
-    frames the model was trained on. Mirrors
-    `openpi.shared.image_tools.resize_stretch` (the JAX server-side version).
+    Matches the tf.image.resize call used by the RoboCOIN data builder
+    (dexterous_hang_config.py:_decode_and_reencode_jpeg), which discards aspect
+    ratio. Use this at eval time so policy/critic inputs match the squashed
+    224x224 frames the model was trained on.
 
     Args:
         images: A batch of images in [..., height, width, channel] format.

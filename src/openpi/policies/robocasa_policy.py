@@ -116,75 +116,13 @@ def _parse_image(image) -> np.ndarray:
     return image
 
 
-def _robocasa_observation(
-    data: dict,
-    *,
-    prefix: str,
-    action_dim: int,
-    model_type: _model.ModelType,
-    unified_state_mapping: Any | None,
-) -> tuple[np.ndarray, dict, dict]:
-    """Shared shape-up for current/next observation in the non-bimanual layout.
-
-    Returns (state_padded, image_dict, image_mask_dict). `prefix` is "" for current,
-    "next_" for critic next-state.
-    """
-    mask_padding = model_type == _model.ModelType.PI0
-    state_key = f"{prefix}observation/state"
-    base_image_key = f"{prefix}observation/image"
-    image_right_key = f"{prefix}observation/image_right"
-    wrist_image_key = f"{prefix}observation/wrist_image"
-
-    state = np.asarray(data[state_key], dtype = np.float32)
-    if state.shape[-1] == ROBOCASA_RAW_STATE_DIM:
-        state = convert_raw_state_to_model_state(state)
-    assert state.shape[-1] == ROBOCASA_STATE_DIM, (
-        f"Expected 13D converted state or 16D raw state, got {state.shape[-1]}D."
-    )
-    if unified_state_mapping is not None:
-        state = unified_state_mapping.apply_mapping_np(state)
-    else:
-        state = transforms.pad_to_dim(state, action_dim)
-
-    base_image = _parse_image(data[base_image_key])
-    wrist_image = _parse_image(data[wrist_image_key])
-
-    if image_right_key in data:
-        image_right = _parse_image(data[image_right_key])
-        image = {
-            "base_0_rgb": base_image,
-            "left_wrist_0_rgb": image_right,
-            "right_wrist_0_rgb": wrist_image,
-        }
-        image_mask = {
-            "base_0_rgb": np.True_,
-            "left_wrist_0_rgb": np.True_,
-            "right_wrist_0_rgb": np.True_,
-        }
-    else:
-        image = {
-            "base_0_rgb": base_image,
-            "left_wrist_0_rgb": wrist_image,
-            "right_wrist_0_rgb": np.zeros_like(base_image),
-        }
-        image_mask = {
-            "base_0_rgb": np.True_,
-            "left_wrist_0_rgb": np.True_,
-            "right_wrist_0_rgb": np.False_ if mask_padding else np.True_,
-        }
-    return state, image, image_mask
-
-
 @dataclasses.dataclass(frozen = True)
 class RoboCasaInputs(transforms.DataTransformFn):
     """Convert RoboCasa observations to model input format.
 
-    Expects 13D converted state (from RLDS trajectory_transforms for training, or from
-    `convert_raw_state_to_model_state` for inference). Pads to action_dim and maps
-    cameras to the 3-slot image interface. `next_observation/*` and RL fields (reward,
-    mc_return, termination, truncation, td_discount, action_mask, next_action_mask, fps)
-    are passed through when present — that's the only difference between supervised and
-    critic-mode usage.
+    Expects 13D converted state (from RLDS trajectory_transforms for training,
+    or from convert_raw_state_to_model_state for inference).
+    Pads to action_dim and maps cameras to the 3-slot image interface.
     """
 
     action_dim: int
@@ -196,49 +134,57 @@ class RoboCasaInputs(transforms.DataTransformFn):
     unified_state_mapping: Any | None = None
 
     def __call__(self, data: dict) -> dict:
-        state, image, image_mask = _robocasa_observation(
-            data, prefix = "",
-            action_dim = self.action_dim,
-            model_type = self.model_type,
-            unified_state_mapping = self.unified_state_mapping,
+        mask_padding = self.model_type == _model.ModelType.PI0
+
+        state = np.asarray(data["observation/state"], dtype = np.float32)
+        if state.shape[-1] == ROBOCASA_RAW_STATE_DIM:
+            state = convert_raw_state_to_model_state(state)
+        assert state.shape[-1] == ROBOCASA_STATE_DIM, (
+            f"Expected 13D converted state or 16D raw state, got {state.shape[-1]}D."
         )
-        inputs: dict = {"state": state, "image": image, "image_mask": image_mask}
+        if self.unified_state_mapping is not None:
+            state = self.unified_state_mapping.apply_mapping_np(state)
+        else:
+            state = transforms.pad_to_dim(state, self.action_dim)
+
+        base_image = _parse_image(data["observation/image"])
+        wrist_image = _parse_image(data["observation/wrist_image"])
+
+        if "observation/image_right" in data:
+            image_right = _parse_image(data["observation/image_right"])
+            inputs = {
+                "state": state,
+                "image": {
+                    "base_0_rgb": base_image,
+                    "left_wrist_0_rgb": image_right,
+                    "right_wrist_0_rgb": wrist_image,
+                },
+                "image_mask": {
+                    "base_0_rgb": np.True_,
+                    "left_wrist_0_rgb": np.True_,
+                    "right_wrist_0_rgb": np.True_,
+                },
+            }
+        else:
+            inputs = {
+                "state": state,
+                "image": {
+                    "base_0_rgb": base_image,
+                    "left_wrist_0_rgb": wrist_image,
+                    "right_wrist_0_rgb": np.zeros_like(base_image),
+                },
+                "image_mask": {
+                    "base_0_rgb": np.True_,
+                    "left_wrist_0_rgb": np.True_,
+                    "right_wrist_0_rgb": np.False_ if mask_padding else np.True_,
+                },
+            }
 
         if "actions" in data:
             inputs["actions"] = transforms.pad_to_dim(data["actions"], self.action_dim)
 
-        if "next_observation/state" in data:
-            next_state, next_image, next_image_mask = _robocasa_observation(
-                data, prefix = "next_",
-                action_dim = self.action_dim,
-                model_type = self.model_type,
-                unified_state_mapping = self.unified_state_mapping,
-            )
-            inputs["next_state"] = next_state
-            inputs["next_image"] = next_image
-            inputs["next_image_mask"] = next_image_mask
-        if "next_actions" in data:
-            inputs["next_actions"] = transforms.pad_to_dim(data["next_actions"], self.action_dim)
-
-        for rl_key, rl_dtype in (
-            ("reward", np.float32),
-            ("mc_return", np.float32),
-            ("termination", np.bool_),
-            ("truncation", np.bool_),
-            ("td_discount", np.float32),
-            ("action_mask", np.bool_),
-            ("next_action_mask", np.bool_),
-            ("fps", np.float32),
-        ):
-            if rl_key in data:
-                inputs[rl_key] = np.asarray(data[rl_key], dtype = rl_dtype)
-
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
-
-        for metadata_key in ("_frame_index", "_traj_index", "repo_id"):
-            if metadata_key in data:
-                inputs[metadata_key] = data[metadata_key]
 
         return inputs
 
@@ -347,38 +293,38 @@ class RoboCasaUnifiedOutputs(transforms.DataTransformFn):
 BIMANUAL_EEF_ACTION_DIM = 14
 
 
-def _to_bimanual_arm_first_state(state: np.ndarray) -> np.ndarray:
-    """Map 13D RoboCasa state to arm-first 14D bimanual-EEF layout.
+def _to_bimanual_right_arm_state(state: np.ndarray) -> np.ndarray:
+    """Map a 13D RoboCasa converted state into the 14D bimanual-EEF layout (right arm only).
 
-    Output layout (14D):
-        [0:3]   = state[..., 6:9]         # eef_position
-        [3:6]   = state[..., 9:12]        # eef_rotation (extrinsic-xyz Euler)
-        [6:7]   = state[..., 12:13]       # gripper
-        [7:14]  = 0                       # padding for the absent second arm
+    Layout produced (14D):
+        [0:7]   = 0                       # left arm placeholder (zeros)
+        [7:10]  = state[..., 6:9]         # right eef_position
+        [10:13] = state[..., 9:12]        # right eef_rotation
+        [13:14] = state[..., 12:13]       # right gripper
     Drops state[..., 0:6] (base_position, base_rotation).
     """
     assert state.shape[-1] == ROBOCASA_STATE_DIM, (
         f"Expected 13D converted state, got {state.shape[-1]}D"
     )
-    arm = state[..., 6:13]  # eef_pos:3, eef_rot:3, gripper:1
-    zeros = np.zeros((*state.shape[:-1], 7), dtype = state.dtype)
-    return np.concatenate([arm, zeros], axis = -1)
+    zeros_left = np.zeros((*state.shape[:-1], 7), dtype = state.dtype)
+    right_arm = state[..., 6:13]  # eef_pos:3, eef_rot:3, gripper:1
+    return np.concatenate([zeros_left, right_arm], axis = -1)
 
 
-def _to_bimanual_arm_first_action(action: np.ndarray) -> np.ndarray:
-    """Map 12D RoboCasa native action to arm-first 14D bimanual-EEF layout.
+def _to_bimanual_right_arm_action(action: np.ndarray) -> np.ndarray:
+    """Map a 12D RoboCasa native action into the 14D bimanual-EEF layout (right arm only).
 
-    Output layout (14D):
-        [0:3]   = action[..., 5:8]        # eef_position
-        [3:6]   = action[..., 8:11]       # eef_rotation
-        [6:7]   = action[..., 11:12]      # gripper
-        [7:14]  = 0                       # padding
-    Drops action[..., 0:5] (base_motion, control_mode).
+    Drops action[..., 0:5] (base_motion, control_mode). Output layout (14D):
+        [0:7]   = 0                       # left arm placeholder
+        [7:10]  = action[..., 5:8]        # right eef_position
+        [10:13] = action[..., 8:11]       # right eef_rotation
+        [13:14] = action[..., 11:12]      # right gripper
     """
     assert action.shape[-1] == ROBOCASA_ACTION_DIM, (
         f"Expected 12D RoboCasa action, got {action.shape[-1]}D"
     )
-    arm = np.concatenate(
+    zeros_left = np.zeros((*action.shape[:-1], 7), dtype = action.dtype)
+    right_arm = np.concatenate(
         [
             action[..., 5:8],   # eef_position
             action[..., 8:11],  # eef_rotation
@@ -386,97 +332,269 @@ def _to_bimanual_arm_first_action(action: np.ndarray) -> np.ndarray:
         ],
         axis = -1,
     )
-    zeros = np.zeros((*action.shape[:-1], 7), dtype = action.dtype)
-    return np.concatenate([arm, zeros], axis = -1)
-
-
-def _bimanual_eef_observation(data: dict, prefix: str) -> tuple[np.ndarray, dict, dict]:
-    """Shared shape-up for current/next observation in the bimanual-EEF layout.
-
-    Returns (state_14d, image_dict, image_mask_dict). `prefix` is "" for the current
-    observation and "next_" for next-state critic inputs.
-    """
-    state_key = f"{prefix}observation/state"
-    base_image_key = f"{prefix}observation/image_right"
-    wrist_image_key = f"{prefix}observation/wrist_image"
-
-    state = np.asarray(data[state_key], dtype = np.float32)
-    if state.shape[-1] == ROBOCASA_RAW_STATE_DIM:
-        state = convert_raw_state_to_model_state(state)
-    state_14d = _to_bimanual_arm_first_state(state)
-
-    base_image = _parse_image(data[base_image_key])
-    wrist_image = _parse_image(data[wrist_image_key])
-    image = {
-        "base_0_rgb": base_image,
-        "left_wrist_0_rgb": wrist_image,
-        "right_wrist_0_rgb": np.zeros_like(base_image),
-    }
-    image_mask = {
-        "base_0_rgb": np.True_,
-        "left_wrist_0_rgb": np.True_,
-        "right_wrist_0_rgb": np.False_,
-    }
-    return state_14d, image, image_mask
+    return np.concatenate([zeros_left, right_arm], axis = -1)
 
 
 @dataclasses.dataclass(frozen = True)
 class RoboCasaBimanualEEFInputs(transforms.DataTransformFn):
-    """Map RoboCasa observations to arm-first 14D bimanual-EEF layout.
+    """Map RoboCasa observations into the RoboCOIN bimanual-EEF layout for supervised
+    fine-tuning of bimanual configs (e.g. pi-0.5 with action_dim_offset=14).
 
-    Drops base_motion + control_mode from actions and base_position + base_rotation from
-    state, placing the single arm in the FIRST 7 slots of the 14D vector and zero-padding
-    the remaining 7. Same layout for supervised pi-0.5 fine-tuning (matches
-    `action_dim_mask = (T)*7 + (F)*25`) and for value-function fine-tuning.
+    Drops base_motion + control_mode from action and base_position + base_rotation from
+    state, placing the single arm into the right-arm slot of the 14D bimanual-EEF
+    convention. Cameras follow the RoboCOIN bimanual 3-cam layout with the left wrist
+    masked out (RoboCasa is single-arm).
 
-    Output layout (state and action):
-        [0:7]   = arm (eef_pos:3, eef_rot:3, gripper:1)
-        [7:14]  = 0 (padding)
+    Action: 12D RoboCasa native -> 14D bimanual EEF (right arm only). NOT padded to
+    model action_dim — downstream PadStatesAndActions handles the offset insertion.
 
-    Camera mapping (same for current + next observations):
-        base_0_rgb        <- observation/image_right    mask=True
-        left_wrist_0_rgb  <- observation/wrist_image    mask=True
-        right_wrist_0_rgb <- zeros_like(base_0_rgb)     mask=False
-
-    `next_observation/*` and RL fields (reward, mc_return, termination, truncation,
-    td_discount, action_mask, next_action_mask, fps) are passed through when present
-    — that's the only difference between supervised and critic-mode usage.
+    Camera mapping:
+        base_0_rgb        <- observation/image_right    (agentview_right)   mask=True
+        left_wrist_0_rgb  <- observation/wrist_image    (eye_in_hand)       mask=True
+        right_wrist_0_rgb <- zeros_like(base_0_rgb)                          mask=False
     """
 
     action_dim: int  # Unused (kept for API parity with RoboCasaInputs).
     model_type: _model.ModelType = _model.ModelType.PI0
 
     def __call__(self, data: dict) -> dict:
-        state, image, image_mask = _bimanual_eef_observation(data, prefix = "")
-        inputs: dict = {"state": state, "image": image, "image_mask": image_mask}
+        state = np.asarray(data["observation/state"], dtype = np.float32)
+        if state.shape[-1] == ROBOCASA_RAW_STATE_DIM:
+            state = convert_raw_state_to_model_state(state)
+        bimanual_state = _to_bimanual_right_arm_state(state)
+
+        base_image = _parse_image(data["observation/image_right"])
+        wrist_image = _parse_image(data["observation/wrist_image"])
+
+        inputs = {
+            "state": bimanual_state,
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": wrist_image,
+                "right_wrist_0_rgb": np.zeros_like(base_image),
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.False_,
+            },
+        }
 
         if "actions" in data:
-            inputs["actions"] = _to_bimanual_arm_first_action(
+            inputs["actions"] = _to_bimanual_right_arm_action(
                 np.asarray(data["actions"], dtype = np.float32)
             )
 
-        if f"next_observation/state" in data:
-            next_state, next_image, next_image_mask = _bimanual_eef_observation(data, prefix = "next_")
-            inputs["next_state"] = next_state
-            inputs["next_image"] = next_image
-            inputs["next_image_mask"] = next_image_mask
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen = True)
+class RoboCasaBimanualEEFOutputs(transforms.DataTransformFn):
+    """Convert model outputs from bimanual-EEF layout back to RoboCasa-native 12D actions.
+
+    The model emits a 14D bimanual action ([left:7, right:7]); we drop the left arm
+    slot and reassemble the RoboCasa-native layout. Base motion and control mode are
+    zero-filled — bimanual-EEF fine-tunes intentionally do not predict them.
+
+    RoboCasa native 12D layout:
+        [0:4]   base_motion       <- 0
+        [4:5]   control_mode      <- 0
+        [5:8]   eef_position      <- bimanual[..., 7:10]
+        [8:11]  eef_rotation      <- bimanual[..., 10:13]
+        [11:12] gripper           <- bimanual[..., 13:14]
+    """
+
+    def __call__(self, data: dict) -> dict:
+        actions = np.asarray(data["actions"])
+        # actions shape: [..., action_horizon, 14] (bimanual EEF) or larger if upstream
+        # padding was not stripped — slice the last dim defensively.
+        eef_pos = actions[..., 7:10]
+        eef_rot = actions[..., 10:13]
+        gripper = actions[..., 13:14]
+        zeros = np.zeros(
+            (*actions.shape[:-1], 5),  # base_motion (4) + control_mode (1)
+            dtype = actions.dtype,
+        )
+        robocasa_actions = np.concatenate([zeros, eef_pos, eef_rot, gripper], axis = -1)
+        return {"actions": robocasa_actions}
+
+
+@dataclasses.dataclass(frozen = True)
+class RoboCasaRLInputs(transforms.DataTransformFn):
+    """Transform RoboCasa observations and RL fields for value function training.
+
+    Handles both current observation (state, image) and next_observation
+    (next_state, next_image) for TD learning with image-based value functions.
+
+    Expects 13D converted state from RLDS pipeline (after trajectory_transforms).
+
+    Expected input keys from RLDS dataset (after repack):
+        - observation/state (13D), observation/image, observation/image_right, observation/wrist_image
+        - next_observation/state (13D), next_observation/image, next_observation/image_right, next_observation/wrist_image
+        - actions, next_actions
+        - reward, mc_return, termination, truncation
+        - prompt
+    """
+
+    action_dim: int
+
+    def __call__(self, data: dict) -> dict:
+        # Process current observation
+        base_image = _parse_image(data["observation/image"])
+        base_image_right = _parse_image(data["observation/image_right"])
+        wrist_image = _parse_image(data["observation/wrist_image"])
+
+        state = np.asarray(data["observation/state"], dtype = np.float32)
+        assert state.shape[-1] == ROBOCASA_STATE_DIM, (
+            f"Expected 13D converted state from RLDS pipeline, got {state.shape[-1]}D"
+        )
+        inputs = {
+            "state": transforms.pad_to_dim(state, self.action_dim),
+            "image": {
+                "base_0_rgb": base_image,
+                "base_1_rgb": base_image_right,
+                "left_wrist_0_rgb": wrist_image,
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "base_1_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+            },
+        }
+
+        # Process next observation
+        next_base_image = _parse_image(data["next_observation/image"])
+        next_base_image_right = _parse_image(data["next_observation/image_right"])
+        next_wrist_image = _parse_image(data["next_observation/wrist_image"])
+
+        next_state = np.asarray(data["next_observation/state"], dtype = np.float32)
+        assert next_state.shape[-1] == ROBOCASA_STATE_DIM, (
+            f"Expected 13D converted state from RLDS pipeline, got {next_state.shape[-1]}D"
+        )
+        inputs["next_state"] = transforms.pad_to_dim(next_state, self.action_dim)
+        inputs["next_image"] = {
+            "base_0_rgb": next_base_image,
+            "base_1_rgb": next_base_image_right,
+            "left_wrist_0_rgb": next_wrist_image,
+        }
+        inputs["next_image_mask"] = {
+            "base_0_rgb": np.True_,
+            "base_1_rgb": np.True_,
+            "left_wrist_0_rgb": np.True_,
+        }
+
+        # Pass through actions
+        if "actions" in data:
+            inputs["actions"] = transforms.pad_to_dim(data["actions"], self.action_dim)
         if "next_actions" in data:
-            inputs["next_actions"] = _to_bimanual_arm_first_action(
+            inputs["next_actions"] = transforms.pad_to_dim(data["next_actions"], self.action_dim)
+
+        # Pass through RL fields
+        if "reward" in data:
+            inputs["reward"] = np.asarray(data["reward"], dtype = np.float32)
+        if "mc_return" in data:
+            inputs["mc_return"] = np.asarray(data["mc_return"], dtype = np.float32)
+        if "termination" in data:
+            inputs["termination"] = np.asarray(data["termination"], dtype = np.bool_)
+        if "truncation" in data:
+            inputs["truncation"] = np.asarray(data["truncation"], dtype = np.bool_)
+
+        # Pass through prompt
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen = True)
+class RoboCasaBimanualEEFRLInputs(transforms.DataTransformFn):
+    """Critic-mode counterpart of RoboCasaBimanualEEFInputs.
+
+    Maps RoboCasa observations + RL fields (current + next) into the RoboCOIN
+    bimanual-EEF layout for value-function fine-tuning (e.g.
+    `robocasa_paligemma_q_sarsa_finetune`). Drops base_motion + control_mode from
+    actions and base_position + base_rotation from state. The single arm goes to
+    the right-arm slot; left-arm slots are zero-filled.
+
+    Actions stay absolute (NO chunk-wise delta is applied in the RoboCasa pipeline;
+    `RoboCasaRldsDataset.trajectory_transforms` already converted RoboCasa's native
+    delta eef actions to absolute base-frame poses, matching the RoboCOIN bimanual
+    EEF convention).
+
+    Camera mapping (matches `RoboCasaBimanualEEFInputs`):
+        base_0_rgb        <- observation/image_right    (agentview_right)   mask=True
+        left_wrist_0_rgb  <- observation/wrist_image    (eye_in_hand)       mask=True
+        right_wrist_0_rgb <- zeros_like(base_0_rgb)                         mask=False
+    """
+
+    action_dim: int  # Unused (kept for API parity with RoboCasaRLInputs).
+
+    def __call__(self, data: dict) -> dict:
+        # Current observation
+        base_image = _parse_image(data["observation/image_right"])
+        wrist_image = _parse_image(data["observation/wrist_image"])
+        state = np.asarray(data["observation/state"], dtype = np.float32)
+
+        inputs = {
+            "state": _to_bimanual_right_arm_state(state),
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": wrist_image,
+                "right_wrist_0_rgb": np.zeros_like(base_image),
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.False_,
+            },
+        }
+
+        # Next observation
+        next_base_image = _parse_image(data["next_observation/image_right"])
+        next_wrist_image = _parse_image(data["next_observation/wrist_image"])
+        next_state = np.asarray(data["next_observation/state"], dtype = np.float32)
+        inputs["next_state"] = _to_bimanual_right_arm_state(next_state)
+        inputs["next_image"] = {
+            "base_0_rgb": next_base_image,
+            "left_wrist_0_rgb": next_wrist_image,
+            "right_wrist_0_rgb": np.zeros_like(next_base_image),
+        }
+        inputs["next_image_mask"] = {
+            "base_0_rgb": np.True_,
+            "left_wrist_0_rgb": np.True_,
+            "right_wrist_0_rgb": np.False_,
+        }
+
+        # Actions
+        if "actions" in data:
+            inputs["actions"] = _to_bimanual_right_arm_action(
+                np.asarray(data["actions"], dtype = np.float32)
+            )
+        if "next_actions" in data:
+            inputs["next_actions"] = _to_bimanual_right_arm_action(
                 np.asarray(data["next_actions"], dtype = np.float32)
             )
 
-        for rl_key, rl_dtype in (
-            ("reward", np.float32),
-            ("mc_return", np.float32),
-            ("termination", np.bool_),
-            ("truncation", np.bool_),
-            ("td_discount", np.float32),
-            ("action_mask", np.bool_),
-            ("next_action_mask", np.bool_),
-            ("fps", np.float32),
-        ):
-            if rl_key in data:
-                inputs[rl_key] = np.asarray(data[rl_key], dtype = rl_dtype)
+        # RL fields
+        if "reward" in data:
+            inputs["reward"] = np.asarray(data["reward"], dtype = np.float32)
+        if "mc_return" in data:
+            inputs["mc_return"] = np.asarray(data["mc_return"], dtype = np.float32)
+        if "termination" in data:
+            inputs["termination"] = np.asarray(data["termination"], dtype = np.bool_)
+        if "truncation" in data:
+            inputs["truncation"] = np.asarray(data["truncation"], dtype = np.bool_)
+        if "td_discount" in data:
+            inputs["td_discount"] = np.asarray(data["td_discount"], dtype = np.float32)
+        if "action_mask" in data:
+            inputs["action_mask"] = np.asarray(data["action_mask"], dtype = np.bool_)
+        if "next_action_mask" in data:
+            inputs["next_action_mask"] = np.asarray(data["next_action_mask"], dtype = np.bool_)
+        if "fps" in data:
+            inputs["fps"] = np.asarray(data["fps"], dtype = np.float32)
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
@@ -486,43 +604,3 @@ class RoboCasaBimanualEEFInputs(transforms.DataTransformFn):
                 inputs[metadata_key] = data[metadata_key]
 
         return inputs
-
-
-@dataclasses.dataclass(frozen = True)
-class RoboCasaBimanualEEFOutputs(transforms.DataTransformFn):
-    """Convert model outputs from arm-first 14D bimanual-EEF layout back to RoboCasa-native 12D actions.
-
-    The model emits a 14D action where the right arm sits in the first 7 slots
-    (mirror of `RoboCasaBimanualEEFInputs`); we drop the trailing 7 zero placeholders
-    and reassemble the RoboCasa-native layout. Base motion stays zero-filled —
-    bimanual-EEF fine-tunes intentionally do not predict it. Control mode is
-    set to -1, which signals arm-only mode to the RoboCasa env: the controller
-    ignores base_motion and executes only the eef + gripper sub-action. All of
-    the current target tasks (close_blender_lid, etc.) are arm-only manipulation,
-    so -1 is the correct value to emit here.
-
-    RoboCasa native 12D layout:
-        [0:4]   base_motion       <- 0
-        [4:5]   control_mode      <- -1   (arm-only mode)
-        [5:8]   eef_position      <- arm_first[..., 0:3]
-        [8:11]  eef_rotation      <- arm_first[..., 3:6]
-        [11:12] gripper           <- arm_first[..., 6:7]
-    """
-
-    def __call__(self, data: dict) -> dict:
-        actions = np.asarray(data["actions"])
-        # actions shape: [..., action_horizon, 14] (arm-first bimanual EEF) or larger if
-        # upstream padding was not stripped — slice the last dim defensively.
-        eef_pos = actions[..., 0:3]
-        eef_rot = actions[..., 3:6]
-        gripper = actions[..., 6:7]
-        # base_motion stays zero; control_mode = -1 means arm-only mode
-        # (current target tasks are all arm-only manipulation).
-        base_motion = np.zeros((*actions.shape[:-1], 4), dtype = actions.dtype)
-        control_mode = -np.ones((*actions.shape[:-1], 1), dtype = actions.dtype)
-        robocasa_actions = np.concatenate(
-            [base_motion, control_mode, eef_pos, eef_rot, gripper], axis = -1,
-        )
-        return {"actions": robocasa_actions}
-
-

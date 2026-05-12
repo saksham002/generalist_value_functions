@@ -285,7 +285,7 @@ _CACHE_KEYS = {
     "tokenized_negative_prompt", "tokenized_negative_prompt_mask",
     "negative_subtask_1_text", "random_actions", "counterfactual_actions",
     "mc_return", "include_subtask", "fps",
-    "repo_id", "episode_index", "_frame_index", "_traj_index",
+    "repo_id", "episode_index", "_frame_index",
 }
 
 
@@ -369,7 +369,6 @@ def cache_val_episodes(
     include_repos: tuple[str, ...],
     save_only: bool,
     input_transform = None,
-    allow_duplicate_repos: bool = False,
 ) -> dict[str, list[dict]]:
     """Load or collect validation episodes, optionally caching them to disk.
 
@@ -458,9 +457,6 @@ def cache_val_episodes(
 
         seen_repo_keys: set[int | str] = set()
         seen_required_repo_ids: set[str] = set()
-        # Per-repo counter for allow_duplicate_repos=True: pkls saved as
-        # `<repo_key>_<num>.pkl` so multiple trajectories from the same repo coexist.
-        repo_counters: dict[str, int] = {}
         num_non_required_slots = num_val_trajectories - len(include_repos)
         collected_count = 0
         logger.info(
@@ -489,7 +485,7 @@ def cache_val_episodes(
             repo_id = _decode_repo_id(traj["repo_id"][0])
             repo_key: int | str = int(traj["repo_index"][0]) if "repo_index" in traj else repo_id
 
-            if not allow_duplicate_repos and repo_key in seen_repo_keys:
+            if repo_key in seen_repo_keys:
                 continue
 
             # Worker > 0: only claim repos in include_repos.
@@ -500,13 +496,7 @@ def cache_val_episodes(
             if process_index == 0 and not is_required and num_non_required_slots <= 0:
                 continue
 
-            sanitized_base = _sanitize(str(repo_key))
-            if allow_duplicate_repos:
-                idx = repo_counters.get(sanitized_base, 0)
-                repo_counters[sanitized_base] = idx + 1
-                sanitized = f"{sanitized_base}_{idx}"
-            else:
-                sanitized = sanitized_base
+            sanitized = _sanitize(str(repo_key))
             cache_file = (
                 os.path.join(cache_dir, f"{sanitized}.pkl") if cache_dir else None
             )
