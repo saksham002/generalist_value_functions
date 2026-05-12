@@ -1,7 +1,10 @@
 import dataclasses
 import enum
 import logging
+import os
 import socket
+import time
+from typing import Literal
 
 import tyro
 
@@ -28,6 +31,44 @@ class Checkpoint:
     config: str
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
+    # Optional explicit checkpoint step. Only consulted by the BestOfN
+    # critic-aware loading path (when --critic.* is set); the default policy
+    # loader points `dir` at a step subdirectory directly.
+    step: int | None = None
+    # Optional FineTuneConfig name. Only consulted by the BestOfN loading path.
+    fine_tune_config: str | None = None
+
+
+@dataclasses.dataclass
+class CriticArgs:
+    """Optional critic / value-function args for BestOfN action selection.
+
+    When set, scripts/serve_policy.py loads a critic checkpoint alongside the
+    policy and wraps both in BestOfNPolicy. When unset, behavior is byte-
+    identical to the policy-only serving path.
+    """
+
+    # Critic train config name (e.g., "robocoin_bimanual_paligemma_q_sarsa").
+    config: str
+    # Critic checkpoint directory.
+    dir: str
+    # Optional explicit critic step. None → use the latest step subdir.
+    step: int | None = None
+    # Optional FineTuneConfig name (e.g., "robocasa_paligemma_q_sarsa_finetune").
+    fine_tune_config: str | None = None
+    # Number of policy samples to draw per inference call (1 ≤ N ≤ ~16).
+    num_samples: int = 8
+    # Action selection mode after the critic scores all N samples.
+    selection_mode: Literal["argmax", "softmax"] = "argmax"
+    # Temperature for softmax selection (ignored when selection_mode="argmax").
+    softmax_temperature: float = 1.0
+    # If True, takes the elementwise min over the critic ensemble before
+    # selecting; matches the LocalPolicy / shirt-hang default.
+    take_min_over_ensemble: bool = True
+    # Optional override for the slice [offset:offset+critic_action_dim] of the
+    # policy action that the critic consumes. None → use the policy config's
+    # action_dim_offset.
+    critic_action_dim_offset: int | None = None
 
 
 @dataclasses.dataclass
@@ -53,6 +94,17 @@ class Args:
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
+
+    # Optional critic config for BestOfN action selection. Default behavior
+    # (no critic) is unchanged. Only valid in combination with `policy:checkpoint`.
+    critic: CriticArgs | None = None
+
+    # Force routing through BestOfNPolicy even when no critic args are given.
+    # Required for RoboCasa-style policies (bimanual_eef_layout, action_dim 32
+    # padded down to 14): the BestOfNPolicy infer path applies the manual
+    # action-dim slice before Unnormalize, which the default Policy.infer
+    # path does not. Implied (no need to set) when --critic.* is set.
+    use_bestofn_loader: bool = False
 
 
 # Default checkpoints that should be used for each environment.
@@ -85,8 +137,50 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
     raise ValueError(f"Unsupported environment mode: {env}")
 
 
-def create_policy(args: Args) -> _policy.Policy:
+def create_policy(args: Args) -> _policy.BasePolicy:
     """Create a policy from the given arguments."""
+    if args.critic is not None or args.use_bestofn_loader:
+        # BestOfN path: requires a Checkpoint policy spec (not Default), since
+        # the BestOfN loader needs an explicit policy config + checkpoint dir.
+        if not isinstance(args.policy, Checkpoint):
+            raise ValueError(
+                "--critic.* / --use-bestofn-loader requires "
+                "`policy:checkpoint --policy.config <name> --policy.dir <dir>`. "
+                "Default-environment policies cannot be combined with the BestOfN loader."
+            )
+        # Lazy import: BestOfNPolicy pulls in JAX value-function modules that
+        # the policy-only default path doesn't need.
+        from openpi.policies.best_of_n_policy import create_bestofn_policy
+
+        if args.critic is not None:
+            return create_bestofn_policy(
+                policy_config_name = args.policy.config,
+                policy_checkpoint_dir = args.policy.dir,
+                policy_step = args.policy.step,
+                policy_fine_tune_config = args.policy.fine_tune_config,
+                critic_config_name = args.critic.config,
+                critic_checkpoint_dir = args.critic.dir,
+                critic_step = args.critic.step,
+                critic_fine_tune_config = args.critic.fine_tune_config,
+                num_samples = args.critic.num_samples,
+                take_min_over_ensemble = args.critic.take_min_over_ensemble,
+                selection_mode = args.critic.selection_mode,
+                softmax_temperature = args.critic.softmax_temperature,
+                critic_action_dim_offset = args.critic.critic_action_dim_offset,
+                default_prompt = args.default_prompt,
+            )
+        # use_bestofn_loader=True without critic: load policy through
+        # BestOfNPolicy (which applies the bimanual-EEF action-dim slice)
+        # but skip the critic + BestOfN sampling — infer() falls back to the
+        # plain policy sampling path internally.
+        return create_bestofn_policy(
+            policy_config_name = args.policy.config,
+            policy_checkpoint_dir = args.policy.dir,
+            policy_step = args.policy.step,
+            policy_fine_tune_config = args.policy.fine_tune_config,
+            default_prompt = args.default_prompt,
+        )
+
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
@@ -97,12 +191,57 @@ def create_policy(args: Args) -> _policy.Policy:
 
 
 def main(args: Args) -> None:
+    # Multi-host JAX init for TPU pods. Must run before any other JAX call;
+    # load_policy reads jax.local_device_count() and would otherwise hang on
+    # multi-host pods waiting for peers. The mapping from JAX process_index
+    # to TPU worker IP is deterministic per pod — log it on every worker so
+    # you can read off which IP corresponds to rank 0 and point
+    # run_eval_robocasa.sh at it.
+    if os.environ.get("PLATFORM", "gpu") == "tpu":
+        import jax
+
+        jax.distributed.initialize()
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+        logging.info(
+            "JAX distributed: process_index=%d/%d, devices=%d (local=%d), host=%s, ip=%s",
+            jax.process_index(), jax.process_count(),
+            jax.device_count(), jax.local_device_count(),
+            hostname, local_ip,
+        )
+
     policy = create_policy(args)
     policy_metadata = policy.metadata
 
     # Record the policy's behavior.
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
+
+    # Multi-host serving split. JAX rank 0 binds the websocket; every other
+    # rank enters BestOfNPolicy.participate_loop so the JIT'd inference
+    # function (compiled across all hosts) doesn't deadlock on rank 0.
+    import jax
+
+    if jax.process_count() > 1 and jax.process_index() != 0:
+        from openpi.policies.best_of_n_policy import BestOfNPolicy
+
+        if isinstance(policy, BestOfNPolicy):
+            logging.info(
+                "JAX rank %d/%d: entering inference participation loop "
+                "(rank 0 binds the websocket).",
+                jax.process_index(), jax.process_count(),
+            )
+            policy.participate_loop()
+        else:
+            logging.warning(
+                "JAX rank %d/%d: standard Policy doesn't support multi-host "
+                "inference; sleeping. Rank 0 will hang waiting for collectives "
+                "unless you launch with --use-bestofn-loader.",
+                jax.process_index(), jax.process_count(),
+            )
+            while True:
+                time.sleep(3600)
+        return
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)

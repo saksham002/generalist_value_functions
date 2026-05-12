@@ -12,6 +12,18 @@ openpi is Physical Intelligence's open-source repository for Vision-Language-Act
 
 The repository supports both JAX and PyTorch implementations, with JAX being the primary framework and PyTorch support validated on LIBERO benchmark.
 
+## Project Status / Session Context
+
+**Always read every file in `project_status/` at the start of a session** — those files give you the current branch's goal, what's running, recent experiments, and the user's open TODOs. They are intentionally brief (combined budget ~10k tokens).
+
+**Update them whenever appropriate**:
+- `current_focus.md`: when the branch goal, scope, or blockers change.
+- `experiments.md`: after the user confirms a takeaway worth logging from a run (ask first; log only if asked).
+- `todos.md`: when a TODO is completed, blocked, or a new one surfaces.
+- `overview.md`: rarely — only when the project's setup or scope shifts.
+
+The folder is gitignored (per-user state). If combined size grows past ~10k tokens, ask the user what to prune.
+
 ## Error Notifications
 
 When you encounter an unexpected failure, error, or bug (e.g., a command fails, a job crashes, a test produces wrong results), send exactly one Slack message with a brief description of the issue:
@@ -38,15 +50,18 @@ git submodule update --init --recursive
 **Note**: The virtualenv is already sourced in `~/.bashrc`, so `python` can be used directly instead of `uv run` for running scripts.
 
 ### Testing
+
+**Always source the project virtualenv before running tests** — the Bash tool's shell does not always pick up `~/.bashrc`, so the venv may not be active by default. Run `source /data/user_data/saksham3/vla/bin/activate` (or chain it with `&&` in the test command) before any `pytest` / `python` invocation.
+
 ```bash
 # Run all non-manual tests
-uv run pytest --strict-markers -m "not manual"
+source /data/user_data/saksham3/vla/bin/activate && pytest --strict-markers -m "not manual"
 
 # Run specific test file
-uv run pytest src/openpi/models/model_test.py
+source /data/user_data/saksham3/vla/bin/activate && pytest src/openpi/models/model_test.py
 
 # Run single test
-uv run pytest src/openpi/models/model_test.py::test_name
+source /data/user_data/saksham3/vla/bin/activate && pytest src/openpi/models/model_test.py::test_name
 ```
 
 ### Code Quality
@@ -426,9 +441,39 @@ If the user asks to run on the cluster (e.g., for GPU access, legacy D4RL with m
    - A pre-compiled mujoco_py .so file exists in the `parl` conda env and can be copied if build fails
 
 ### Running on TPU Pods
+
+#### TPU Pods (europe-west4-b)
+
+All pods: software version `v2-alpha-tpuv5-lite`
+
+**Chip layout**: every TPU worker (host) on these pods has **4 chips** (`/dev/vfio/{0,1,2,3}` per worker, confirmed via `ls /dev/vfio/`). The pod size in the type string is the *total chip count*, so worker count = total chips / 4:
+- v5litepod-32  → 8 workers × 4 chips = 32 chips total
+- v5litepod-64  → 16 workers × 4 chips
+- v5litepod-128 → 32 workers × 4 chips
+
+`jax.local_device_count()` returns 4 on every worker; `jax.device_count()` returns the total chips after `jax.distributed.initialize()`.
+
+| Name           | Type             | Worker 0 IP    |
+| -------------- | ---------------- | -------------- |
+| v5e-tpu-32-0   | v5litepod-32     | 34.178.30.85   |
+| v5e-tpu-32-1   | v5litepod-32     | 35.204.123.212 |
+| v5e-tpu-64-0   | v5litepod-64     | 34.141.141.13  |
+| v5e-tpu-64-1   | v5litepod-64     | 34.12.90.170   |
+| v5e-0          | v5litepod-64     | 34.90.166.195  |
+| v5e-128-0      | v5litepod-128    | 34.32.213.142  |
+
 When setting up a new TPU pod, refer to `TPU_GUIDE.md` for important setup steps (GCS authentication, NFS permissions).
 
 **IMPORTANT**: Any `/nfs/` paths (e.g. `/nfs/aidm_nfs/saksham3/...`) are mounted on the TPU pods, NOT on the local development machine. Do not attempt to access, list, or read `/nfs/` paths locally — they will not exist. To inspect files at `/nfs/` paths, SSH into the TPU pod first.
+
+**File-ownership on shared NFS is unreliable**: `ls -l` of a `/nfs/` path can show files with a `uid:gid` of an unrelated user. This happens because uid mappings are inconsistent across workers — a file's apparent owner depends on which worker's `getpwuid` table is consulted, not on who actually wrote it. Do **not** treat the displayed owner as the real one (e.g. don't assume "another user is running here, back off" just because a file in your own job's output dir shows up owned by `kshitiz` / `gene` / etc.). Cross-check by mtime, file content, or which user's command actually wrote the file before drawing conclusions.
+
+**TPU Python environment**: The project venv on TPU workers is at `/nfs/aidm_nfs/saksham3/uv/vla/`. The system `python` (`/usr/bin/python`) does **not** have tensorflow / jax / project deps. Either activate the venv or call its python directly:
+```bash
+source /nfs/aidm_nfs/saksham3/uv/vla/bin/activate
+# or
+/nfs/aidm_nfs/saksham3/uv/vla/bin/python <script>
+```
 
 **CRITICAL**: Never modify or delete files on a TPU pod. If a user request seems to involve modifying or deleting files on a TPU pod, ask for explicit confirmation before even requesting permission to run the involved commands.
 
@@ -460,6 +505,11 @@ python scripts/run_on_tpu.py --tpu-type v5e-64 --tpu-name <pod-name> \
     --wandb-group='Value Functions'"
 ```
 
+W&B group conventions:
+- `Policies` — policy models (π-0, π-0.5, etc.)
+- `Value Functions` — value function pre-training runs
+- `Fine-Tuned Value Functions` — value function fine-tuning runs (i.e., when `--fine-tune <name>` is set)
+
 #### TPU job logs
 Jobs launched via `run_on_tpu.py` write output to `~/tpu_job_output.log` on each worker. The exit code is written to `~/tpu_job_exit_code`. To check logs:
 ```bash
@@ -473,9 +523,11 @@ gcloud compute tpus tpu-vm ssh <pod-name> --zone=europe-west4-b --worker=all --c
 If any worker shows a process holding `/dev/vfio/0`, the TPU is busy. Ask the user how to proceed before taking any action.
 
 #### Killing all processes on a TPU pod
+Use `sudo pkill -9 python` (under `--worker=all`). Do NOT bother with `pkill -f tpc_launch_script` — it doesn't reliably take down the launch-script tmux session, and python kill alone is sufficient to free `/dev/vfio/*` for the next run:
 ```bash
-gcloud compute tpus tpu-vm ssh <pod-name> --zone=europe-west4-b --worker=all --command="pkill -9 python"
+gcloud compute tpus tpu-vm ssh <pod-name> --zone=europe-west4-b --worker=all --command="sudo pkill -9 python"
 ```
+Always confirm with the user before killing if the busy process is owned by another user — they may have an active training run.
 
 #### Stale TPU lockfile
 JAX acquires `/tmp/libtpu_lockfile` on TPU init. If a job crashes without cleanup, the lockfile remains and blocks subsequent runs. To fix:

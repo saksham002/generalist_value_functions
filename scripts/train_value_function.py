@@ -8,6 +8,7 @@ Supports:
 
 import dataclasses
 import functools
+import gc
 import logging
 import platform as _platform
 import os
@@ -38,6 +39,7 @@ import openpi.training.data_loader as _data_loader
 import openpi.training.evaluation as _evaluation
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
+import openpi.robocoin_utils.load_model_utils as _load_model_utils
 from openpi.training.time_utils import Timer
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
@@ -47,6 +49,7 @@ import openpi.value_functions.value_function as _value_fn_impl
 from openpi.robocoin_utils.utils import (
     cache_val_episodes,
     count_subtask_segments,
+    decode_episode_images,
     get_obs_and_action,
     predict_values,
     stack_frames,
@@ -196,6 +199,40 @@ def get_memory_stats() -> dict[str, float]:
                 logging.info(f"[MemoryDebug] backend has no 'memory_stats' attr. Platform={backend.platform}")
         except Exception as e:
             logging.info(f"[MemoryDebug] TPU backend memory_stats error: {e}")
+        # Modern JAX exposes HBM stats per-device. Sum across local devices for
+        # an aggregate, plus log per-device peak (useful when devices diverge).
+        try:
+            local_devs = jax.local_devices()
+            used_total = 0
+            limit_total = 0
+            peak_total = 0
+            for di, dev in enumerate(local_devs):
+                if not hasattr(dev, "memory_stats"):
+                    continue
+                ms = dev.memory_stats()
+                if not ms:
+                    continue
+                used = ms.get("bytes_in_use", 0)
+                peak = ms.get("peak_bytes_in_use", 0)
+                limit = ms.get("bytes_limit", 0) or ms.get("bytes_reservable_limit", 0)
+                used_total += used
+                peak_total += peak
+                limit_total += limit
+                stats[f"hbm_dev{di}_used_gb"] = used / 1e9
+                stats[f"hbm_dev{di}_peak_gb"] = peak / 1e9
+                stats[f"hbm_dev{di}_limit_gb"] = limit / 1e9
+            if limit_total > 0:
+                stats["hbm_used_gb_total"] = used_total / 1e9
+                stats["hbm_peak_gb_total"] = peak_total / 1e9
+                stats["hbm_limit_gb_total"] = limit_total / 1e9
+                logging.info(
+                    f"[MemoryDebug] HBM (sum over {len(local_devs)} local devs): "
+                    f"used={used_total / 1e9:.2f} GB, "
+                    f"peak={peak_total / 1e9:.2f} GB, "
+                    f"limit={limit_total / 1e9:.2f} GB"
+                )
+        except Exception as e:
+            logging.info(f"[MemoryDebug] device.memory_stats error: {e}")
     except Exception as e:
         logging.info(f"[MemoryDebug] TF device listing error: {e}")
     
@@ -355,7 +392,7 @@ def log_memory_debug(step: int, data_loader=None, force_gc: bool = False, log_to
             wandb.log(wandb_stats, step=step)
         except Exception:
             pass
-    
+
     return stats
 
 
@@ -366,6 +403,7 @@ def init_wandb(
     log_code: bool = False,
     enabled: bool = True,
     ft_config: _config.FineTuneConfig | None = None,
+    start_new: bool = False,
 ):
     # Only worker 0 should initialize wandb to avoid file conflicts and duplicate runs
     if not enabled or jax.process_index() != 0:
@@ -375,7 +413,7 @@ def init_wandb(
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
+    if resuming and not start_new:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
         wandb.init(id=run_id, resume="must", project=config.project_name)
     else:
@@ -428,7 +466,7 @@ def init_train_state(
 
         if partial_params is not None:
             graphdef, state = nnx.split(model)
-            state.replace_by_pure_dict(partial_params)
+            nnx_utils.replace_state_from_pure_dict_numeric_key_compat(state, partial_params)
             model = nnx.merge(graphdef, state)
 
         params = nnx.state(model)
@@ -438,6 +476,7 @@ def init_train_state(
             lambda p: p.replace(p.value.astype(jnp.bfloat16)),
         )
         weight_dtype = jnp.dtype(model_config.weight_dtype) if hasattr(model_config, "weight_dtype") else jnp.float32
+        target_dtype = jnp.dtype(model_config.target_dtype) if hasattr(model_config, "target_dtype") else jnp.float32
         params = nnx_utils.state_map(
             params,
             config.trainable_filter,
@@ -446,7 +485,7 @@ def init_train_state(
         params = nnx_utils.state_map(
             params,
             nnx_utils.PathRegex(".*target_(q_)?(network|head)/.*"),
-            lambda p: p.replace(p.value.astype(jnp.bfloat16)),
+            lambda p: p.replace(p.value.astype(target_dtype)),
         )
 
         return training_utils.TrainState(
@@ -464,10 +503,18 @@ def init_train_state(
         policy_schedule = config.policy_lr_schedule if config.policy_lr_schedule is not None else config.lr_schedule
         policy_tx = _optimizer.create_optimizer(config.optimizer, policy_schedule, weight_decay_mask=None)
 
-    def init_policy(rng: at.KeyArrayLike) -> training_utils.TrainState:
+    def init_policy(
+        rng: at.KeyArrayLike, partial_params: at.Params | None = None
+    ) -> training_utils.TrainState:
         if config.policy is None or policy_tx is None:
             raise ValueError("Config does not specify a policy")
         policy_model = config.policy.create(rng)
+
+        if partial_params is not None:
+            graphdef, state = nnx.split(policy_model)
+            nnx_utils.replace_state_from_pure_dict_numeric_key_compat(state, partial_params)
+            policy_model = nnx.merge(graphdef, state)
+
         policy_params = nnx.state(policy_model)
         policy_params = nnx_utils.state_map(
             policy_params,
@@ -485,14 +532,16 @@ def init_train_state(
         )
 
     def init_actor_critic(
-        rng: at.KeyArrayLike, partial_params: at.Params | None = None
+        rng: at.KeyArrayLike,
+        critic_partial_params: at.Params | None = None,
+        policy_partial_params: at.Params | None = None,
     ) -> training_utils.ActorCriticTrainState:
         rng, critic_rng, policy_rng = jax.random.split(rng, 3)
-        critic_state = init_critic(critic_rng, partial_params)
+        critic_state = init_critic(critic_rng, critic_partial_params)
 
         policy_state = None
         if config.policy is not None:
-            policy_state = init_policy(policy_rng)
+            policy_state = init_policy(policy_rng, policy_partial_params)
 
         return training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
 
@@ -502,21 +551,52 @@ def init_train_state(
     if resume:
         return train_state_shape, state_sharding
 
-    partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.critic.params.to_pure_dict())
+    critic_partial_params = _load_weights_and_validate(
+        config.weight_loader, train_state_shape.critic.params.to_pure_dict()
+    )
+    policy_partial_params = None
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # Pre-shard partial_params to match the FSDP output sharding so each chip
     # only receives its shard (~x/N GB) instead of the full replicated copy
     # (~x GB). This avoids OOM during init on memory-constrained devices.
-    params_sharding = sharding.fsdp_sharding(partial_params, mesh)
-    partial_params = jax.device_put(partial_params, params_sharding)
+    critic_params_sharding = sharding.fsdp_sharding(critic_partial_params, mesh)
+    policy_params_sharding = None
+
+    # `jax.device_put(tree, sharding)` calls `multihost_utils.assert_equal`
+    # under the hood, which `broadcast_one_to_all`s each leaf with
+    # `out_shardings=PartitionSpec()` (REPLICATED). For very large param trees
+    # like Gemma 4 e2b (~27 GB total, largest leaf ~9 GB), this replicated
+    # output overflows TPU HBM (16 GiB per chip on v5litepod) — the chip can't
+    # hold a full unsharded copy of the largest leaf. PaliGemma (224x224)
+    # works because its largest leaf is small.
+    #
+    # Workaround: each host already loaded the *same* deterministic .npz, so
+    # the assert_equal step is redundant. Construct each leaf's sharded
+    # `jax.Array` directly from local numpy via `make_array_from_callback` —
+    # each chip materialises only its own shard, no global broadcast.
+    def _make_sharded_array(arr, sharding):
+        if not hasattr(arr, "shape") or not hasattr(arr, "dtype"):
+            return arr
+        shape = arr.shape
+        def _cb(idx):
+            return np.asarray(arr[idx])
+        return jax.make_array_from_callback(shape, sharding, _cb)
+    critic_partial_params = jax.tree.map(_make_sharded_array, critic_partial_params, critic_params_sharding)
+
+    donate_argnums = (1,) if policy_partial_params is None else (1, 2)
+    in_shardings = (
+        replicated_sharding,
+        critic_params_sharding,
+        policy_params_sharding,
+    )
 
     train_state = jax.jit(
         init_actor_critic,
-        donate_argnums = (1,),
-        in_shardings = (replicated_sharding, params_sharding),
+        donate_argnums = donate_argnums,
+        in_shardings = in_shardings,
         out_shardings = state_sharding,
-    )(init_rng, partial_params)
+    )(init_rng, critic_partial_params, policy_partial_params)
 
     return train_state, state_sharding
 
@@ -581,11 +661,14 @@ def value_function_train_step(
             ),
         )
 
+    # The trailing-name regex uses `[/_]` so it also matches the stacked-layer-params
+    # layout, where per-layer scales/biases live under names like
+    # `g0__pre_attention_norm__scale` (separator `__` instead of `/`).
     kernel_params = nnx.state(
         model,
         nnx.All(
             nnx.Param,
-            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            nnx.Not(nnx_utils.PathRegex(".*[/_](bias|scale|pos_embedding|input_embedding)")),
             nnx.Not(nnx_utils.PathRegex(".*target_(q_)?(network|head)/.*")),
             lambda _, x: x.value.ndim > 1,
         ),
@@ -595,26 +678,31 @@ def value_function_train_step(
         nnx.All(
             nnx.Param,
             nnx_utils.PathRegex(".*target_(q_)?(network|head)/.*"),
-            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            nnx.Not(nnx_utils.PathRegex(".*[/_](bias|scale|pos_embedding|input_embedding)")),
             lambda _, x: x.value.ndim > 1,
         ),
     )
 
     # Batch statistics
-    obs_state = transition.observation.state
+    # For RoboCasa configs the state and action are in bimanual-EEF layout: dims 0:7
+    # are the right arm (real values), dims 7:14 are zero-filler for the absent left
+    # arm. Restrict stats to the meaningful slice so the filler doesn't distort them.
+    is_robocasa = isinstance(config.data, _config.RLDSRoboCasaDataConfig)
+    obs_state = transition.observation.state[..., :7] if is_robocasa else transition.observation.state
+    action = transition.action[..., :7] if is_robocasa else transition.action
     batch_stats = {
         # Observation stats
         "batch/obs_mean": jnp.mean(obs_state),
         "batch/obs_std": jnp.std(obs_state),
         "batch/obs_min": jnp.min(obs_state),
         "batch/obs_max": jnp.max(obs_state),
-        "batch/obs_out_of_range_frac": jnp.mean((jnp.abs(obs_state) >= 1.0).astype(jnp.float32)),
+        "batch/obs_out_of_range_frac": jnp.mean((jnp.abs(obs_state) >= 1.001).astype(jnp.float32)),
         # Action stats
-        "batch/action_mean": jnp.mean(transition.action),
-        "batch/action_std": jnp.std(transition.action),
-        "batch/action_min": jnp.min(transition.action),
-        "batch/action_max": jnp.max(transition.action),
-        "batch/action_out_of_range_frac": jnp.mean((jnp.abs(transition.action) >= 1.0).astype(jnp.float32)),
+        "batch/action_mean": jnp.mean(action),
+        "batch/action_std": jnp.std(action),
+        "batch/action_min": jnp.min(action),
+        "batch/action_max": jnp.max(action),
+        "batch/action_out_of_range_frac": jnp.mean((jnp.abs(action) >= 1.001).astype(jnp.float32)),
         # Reward stats
         "batch/reward_mean": jnp.mean(transition.reward),
         "batch/reward_std": jnp.std(transition.reward),
@@ -641,6 +729,9 @@ def value_function_train_step(
         batch_stats["batch/counterfactual_next_actions_std"] = jnp.std(transition.counterfactual_next_actions)
         batch_stats["batch/counterfactual_next_actions_min"] = jnp.min(transition.counterfactual_next_actions)
         batch_stats["batch/counterfactual_next_actions_max"] = jnp.max(transition.counterfactual_next_actions)
+        batch_stats["batch/counterfactual_next_actions_out_of_range_frac"] = jnp.mean(
+            (jnp.abs(transition.counterfactual_next_actions) >= 1.001).astype(jnp.float32)
+        )
 
     batch_size = transition.reward.shape[0]
 
@@ -661,6 +752,10 @@ def value_function_train_step(
     if "mc_loss" in value_info:
         mc_loss_arr = value_info.pop("mc_loss")
         value_stats["mc_loss"] = jnp.mean(mc_loss_arr)
+
+    if "next_token_loss" in value_info:
+        next_token_loss_arr = value_info.pop("next_token_loss")
+        value_stats["next_token_loss"] = jnp.mean(next_token_loss_arr)
 
     grads_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), grads)
     kernel_params_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), kernel_params)
@@ -1571,6 +1666,7 @@ def _render_and_log_plots(
     all_predictions: dict,
     all_predictions_neg: dict,
     all_predictions_random: dict,
+    all_predictions_shuffled: dict,
     all_attn_scores: dict,
     ep_mc_returns: dict,
     ep_frame_images: dict,
@@ -1653,6 +1749,17 @@ def _render_and_log_plots(
                 )
                 logging.info(f"Repo {repo_id}, episode {ep_idx} random action plot created")
 
+        predicted_values_shuffled = all_predictions_shuffled.get(traj_idx, [])
+        if len(predicted_values_shuffled) == len(predicted_values):
+            filtered_predictions_shuffled = [pred for pred, mask in zip(predicted_values_shuffled, include_masks) if mask]
+            if len(filtered_predictions_shuffled) == len(filtered_mc_returns) and len(filtered_predictions_shuffled) > 0:
+                images[f"{plot_key}_shuffled_actions"] = _create_value_plot(
+                    filtered_mc_returns, filtered_predictions_shuffled, ep_idx, step, " (Shuffled Actions)",
+                    oracle_values = None, subtask_texts = subtasks,
+                    output_dir = output_dir, plot_key = f"{plot_key}_shuffled_actions",
+                )
+                logging.info(f"Repo {repo_id}, episode {ep_idx} shuffled action plot created")
+
         predicted_values_counterfactual = all_predictions_counterfactual.get(traj_idx, []) if all_predictions_counterfactual is not None else []
         if len(predicted_values_counterfactual) == len(predicted_values):
             filtered_predictions_counterfactual = [
@@ -1672,7 +1779,7 @@ def _render_and_log_plots(
         # training steps have been logged.
         wandb.log(images)
     logging.info(f"Render thread finished: {'saved' if output_dir else 'logged'} {len(images)} plots for step {step}")
-    del images, ep_frame_images, all_predictions, all_predictions_neg, all_predictions_random, all_predictions_counterfactual, all_attn_scores
+    del images, ep_frame_images, all_predictions, all_predictions_neg, all_predictions_random, all_predictions_shuffled, all_predictions_counterfactual, all_attn_scores
 
 
 def generate_validation_plots_dlimp(
@@ -1684,6 +1791,7 @@ def generate_validation_plots_dlimp(
     data_config: _config.DataConfig,
     cache_dir: str,
     output_dir: str | None = None,
+    batch_size: int = 64,
 ) -> dict:
     """Generate validation plots for RoboCOIN.
 
@@ -1703,101 +1811,147 @@ def generate_validation_plots_dlimp(
     Returns:
         Empty dict (plots are logged/saved asynchronously by a background thread).
     """
-    traj_frames: dict[int, list[dict]] = {}
-    logging.info(f"Loading cached validation episodes from {cache_dir}")
-    for filename in os.listdir(cache_dir):
-        if filename.startswith("traj_") and filename.endswith(".pkl"):
-            traj_idx = int(filename.replace("traj_", "").replace(".pkl", ""))
-            cache_file = os.path.join(cache_dir, filename)
-            with open(cache_file, "rb") as f:
-                traj_frames[traj_idx] = pickle.load(f)
-    logging.info(f"Loaded {len(traj_frames)} trajectories from cache")
+    # Per-episode load → decode + resize → predict → free pipeline so peak host
+    # RAM is bounded to one episode's decoded frames, not the entire val cache.
+    # RoboCOIN cache pkls hold raw image bytes (decode_images=False at the dataset
+    # level) and `decode_episode_images` materializes them lazily; the RoboCasa
+    # branch caches already-decoded uint8 arrays (the data_transforms / model_transforms
+    # pipeline requires decoded images), so `decode_episode_images` is a no-op there.
+    image_size = data_config.rlds_kwargs.get("image_size")
+    assert image_size is not None, (
+        "image_size missing from data_config.rlds_kwargs — required to decode/resize "
+        "compressed val cache images at predict time."
+    )
 
-    # Build traj_idx -> (repo_id, episode_index) mapping for plot names
-    traj_to_repo_ep: dict[int, tuple[str, int]] = {}
-    for traj_idx, frames in traj_frames.items():
-        ep_idx = int(frames[0]["episode_index"])
-        repo_id = frames[0]["repo_id"]
-        if isinstance(repo_id, np.ndarray):
-            repo_id = repo_id.item()
-        if isinstance(repo_id, bytes):
-            repo_id = repo_id.decode("utf-8")
-        traj_to_repo_ep[traj_idx] = (repo_id, ep_idx)
+    cache_files: list[tuple[str, str]] = []
+    for filename in sorted(os.listdir(cache_dir)):
+        if filename.endswith(".pkl"):
+            traj_idx = filename[: -len(".pkl")]
+            cache_files.append((traj_idx, os.path.join(cache_dir, filename)))
+    logging.info(f"Found {len(cache_files)} cached validation episodes in {cache_dir}")
 
     MAX_SUBTASK_SEGMENTS = 16
-    split_traj_frames = {}
-    split_traj_to_repo_ep: dict[str, tuple[str, int, str]] = {}
+
+    # Accumulators populated one episode at a time. Heavy per-episode arrays
+    # (decoded images, frame dicts) are dropped after predict; we keep only
+    # what the renderer needs.
+    traj_to_repo_ep: dict[str, tuple[str, int, str]] = {}
     ep_subtasks: dict[str, list[str]] = {}
-    for traj_idx, frames in traj_frames.items():
-        repo_id, ep_idx = traj_to_repo_ep[traj_idx]
+    ep_mc_returns: dict[str, list] = {}
+    ep_frame_images: dict[str, list[np.ndarray]] = {}
+    ep_fps: dict[str, int] = {}
+    ep_include_masks: dict[str, list[bool]] = {}
+    ep_negative_subtasks: dict[str, list[str]] = {}
+    all_predictions: dict[str, list[float]] = {}
+    all_predictions_neg: dict[str, list[float]] = {}
+    all_predictions_random: dict[str, list[float]] = {}
+    all_predictions_counterfactual: dict[str, list[float]] = {}
+    all_predictions_shuffled: dict[str, list[float]] = {}
+    all_attn_scores: dict[str, list[np.ndarray]] = {}
+
+    for traj_idx, cache_file in cache_files:
+        with open(cache_file, "rb") as f:
+            frames = pickle.load(f)
+        if not frames:
+            logging.warning(f"Traj {traj_idx} cache empty, skipping")
+            continue
+
+        decode_episode_images(frames, image_size)
+
+        repo_id_raw = frames[0]["repo_id"]
+        if isinstance(repo_id_raw, np.ndarray):
+            repo_id_raw = repo_id_raw.item()
+        if isinstance(repo_id_raw, bytes):
+            repo_id_raw = repo_id_raw.decode("utf-8")
+        # RoboCOIN frames carry "episode_index"; RoboCasa frames carry "_traj_index"
+        # (forwarded by the dataset and kept in _CACHE_KEYS).
+        ep_idx_raw = frames[0].get("episode_index")
+        if ep_idx_raw is None:
+            ep_idx_raw = frames[0]["_traj_index"]
+        if isinstance(ep_idx_raw, np.ndarray):
+            ep_idx_raw = ep_idx_raw.item()
+        ep_idx = int(ep_idx_raw)
+
         n_segments, split_frame_idx, segments = count_subtask_segments(frames)
         if n_segments > MAX_SUBTASK_SEGMENTS:
             split_seg_idx = n_segments // 2
-            key_p0 = f"{traj_idx}_p0"
-            key_p1 = f"{traj_idx}_p1"
-            split_traj_frames[key_p0] = frames[:split_frame_idx]
-            split_traj_frames[key_p1] = frames[split_frame_idx:]
-            split_traj_to_repo_ep[key_p0] = (repo_id, ep_idx, "_part0")
-            split_traj_to_repo_ep[key_p1] = (repo_id, ep_idx, "_part1")
-            ep_subtasks[key_p0] = segments[:split_seg_idx]
-            ep_subtasks[key_p1] = segments[split_seg_idx:]
-            logging.info(f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}): {n_segments} subtask segments > {MAX_SUBTASK_SEGMENTS}, splitting at segment {split_seg_idx}, frame {split_frame_idx} ({split_frame_idx} + {len(frames) - split_frame_idx} frames)")
+            segment_specs = [
+                (f"{traj_idx}_p0", "_part0", frames[:split_frame_idx], segments[:split_seg_idx]),
+                (f"{traj_idx}_p1", "_part1", frames[split_frame_idx:], segments[split_seg_idx:]),
+            ]
+            logging.info(
+                f"Traj {traj_idx} (repo {repo_id_raw}, episode {ep_idx}): "
+                f"{n_segments} subtask segments > {MAX_SUBTASK_SEGMENTS}, splitting at "
+                f"segment {split_seg_idx}, frame {split_frame_idx} "
+                f"({split_frame_idx} + {len(frames) - split_frame_idx} frames)"
+            )
         else:
-            key = str(traj_idx)
-            split_traj_frames[key] = frames
-            split_traj_to_repo_ep[key] = (repo_id, ep_idx, "")
-            ep_subtasks[key] = segments
-    traj_frames = split_traj_frames
-    traj_to_repo_ep = split_traj_to_repo_ep
-    del split_traj_frames, split_traj_to_repo_ep
+            segment_specs = [(str(traj_idx), "", frames, segments)]
 
-    for traj_key, frames in traj_frames.items():
-        frame_keys = list(frames[0].keys()) if frames else []
-        repo_id, ep_idx, part = traj_to_repo_ep[traj_key]
-        logging.info(f"  Traj {traj_key} (repo {repo_id}, episode {ep_idx}{part}): {len(frames)} frames, keys: {frame_keys}")
-    total_frames = sum(len(frames) for frames in traj_frames.values())
-    logging.info(f"Processing {len(traj_frames)} trajectory segments, total_frames={total_frames}")
+        for seg_key, part_suffix, seg_frames, seg_subtasks in segment_specs:
+            if len(seg_frames) == 0:
+                continue
 
-    all_frames = []
-    ep_mc_returns = {}
-    ep_frame_images = {}
-    ep_fps = {}
-    ep_include_masks = {}
-    ep_negative_subtasks = {}
+            # Inject within-trajectory action permutation for the shuffled-actions plot.
+            # Deterministic per-segment seed so plots are reproducible across runs.
+            if action_conditioned and len(seg_frames) > 1 and "actions" in seg_frames[0]:
+                rng_perm = np.random.default_rng(seed = 86)
+                perm = rng_perm.permutation(len(seg_frames))
+                shuffled_arrays = [seg_frames[p]["actions"] for p in perm]
+                for i, frame in enumerate(seg_frames):
+                    frame["shuffled_actions"] = shuffled_arrays[i]
 
-    for ep_idx, frames in traj_frames.items():
-        if len(frames) == 0:
-            continue
+            traj_to_repo_ep[seg_key] = (repo_id_raw, ep_idx, part_suffix)
+            ep_subtasks[seg_key] = seg_subtasks
+            ep_mc_returns[seg_key] = [f["mc_return"] for f in seg_frames]
+            ep_frame_images[seg_key] = [
+                np.stack([
+                    np.asarray(f["image"]["left_wrist_0_rgb"]),
+                    np.asarray(f["image"]["right_wrist_0_rgb"]),
+                    np.asarray(f["image"]["base_0_rgb"]),
+                ])
+                for f in seg_frames
+            ]
+            ep_fps[seg_key] = int(seg_frames[0]["fps"])
+            ep_include_masks[seg_key] = [bool(f.get("include_subtask", True)) for f in seg_frames]
+            # Negative-text variant is RoboCOIN-only; skip when the cached frames
+            # don't carry "negative_subtask_1_text".
+            if seg_frames and "negative_subtask_1_text" in seg_frames[0]:
+                _, _, negative_segments = count_subtask_segments(seg_frames, prefix = "negative_")
+                ep_negative_subtasks[seg_key] = negative_segments
+            else:
+                ep_negative_subtasks[seg_key] = []
 
-        ep_mc_returns[ep_idx] = [f["mc_return"] for f in frames]
+            seg_all_frames = [(seg_key, idx, frame) for idx, frame in enumerate(seg_frames)]
+            seg_ep_mc_returns = {seg_key: ep_mc_returns[seg_key]}
+            logging.info(
+                f"Traj {seg_key} (repo {repo_id_raw}, episode {ep_idx}{part_suffix}): "
+                f"running predictions on {len(seg_all_frames)} frames"
+            )
+            preds, preds_neg, preds_random, preds_cf, preds_shuffled, attn = predict_values(
+                model, seg_all_frames, seg_ep_mc_returns, action_conditioned,
+                batch_size = batch_size,
+            )
+            all_predictions[seg_key] = preds[seg_key]
+            all_predictions_neg[seg_key] = preds_neg[seg_key]
+            all_predictions_random[seg_key] = preds_random[seg_key]
+            all_predictions_counterfactual[seg_key] = preds_cf[seg_key]
+            all_predictions_shuffled[seg_key] = preds_shuffled[seg_key]
+            all_attn_scores[seg_key] = attn[seg_key]
 
-        ep_frame_images[ep_idx] = [
-            np.stack([
-                np.asarray(f["image"]["left_wrist_0_rgb"]),
-                np.asarray(f["image"]["right_wrist_0_rgb"]),
-                np.asarray(f["image"]["base_0_rgb"]),
-            ])
-            for f in frames
-        ]
-        ep_fps[ep_idx] = int(frames[0]["fps"])
-        ep_include_masks[ep_idx] = [bool(f.get("include_subtask", True)) for f in frames]
+            del seg_all_frames
 
-        _, _, negative_segments = count_subtask_segments(frames, prefix="negative_")
-        ep_negative_subtasks[ep_idx] = negative_segments
+        # Drop the decoded frames for this trajectory before loading the next.
+        del frames
+        gc.collect()
 
-        for frame_idx, frame in enumerate(frames):
-            all_frames.append((ep_idx, frame_idx, frame))
-
-    if len(all_frames) == 0:
+    if not all_predictions:
         logging.warning("No valid frames found across all episodes")
         return {}
 
-    logging.info(f"Processing {len(all_frames)} total frames across {len(ep_mc_returns)} episodes in batches of 64")
-
-    all_predictions, all_predictions_neg, all_predictions_random, all_predictions_counterfactual, all_attn_scores = predict_values(
-        model, all_frames, ep_mc_returns, action_conditioned
+    logging.info(
+        f"Computed predictions for {len(all_predictions)} trajectory segments"
     )
-    del all_frames, traj_frames
 
     if jax.process_index() == 0:
         global _render_thread
@@ -1810,6 +1964,7 @@ def generate_validation_plots_dlimp(
             target = _render_and_log_plots,
             args = (
                 all_predictions, all_predictions_neg, all_predictions_random,
+                all_predictions_shuffled,
                 all_attn_scores,
                 ep_mc_returns, ep_frame_images, ep_fps, ep_include_masks,
                 ep_subtasks, ep_negative_subtasks,
@@ -1828,15 +1983,18 @@ def generate_validation_plots_dlimp(
 
 def main(config: _config.TrainConfig):
     """Train a value function."""
+    init_logging()
+    logger = logging.getLogger(__name__)
+
     # Initialize distributed training for TPU pods
     # Set PLATFORM=tpu environment variable to enable
     platform = os.environ.get("PLATFORM", "gpu")
     if platform == "tpu":
+        logger.info("Calling jax.distributed.initialize()")
         jax.distributed.initialize()
-        logging.info(f"Initialized JAX distributed: process {jax.process_index()} of {jax.process_count()}")
-    
-    init_logging()
-    logging.info(f"Running on: {_platform.node()}, platform: {platform}")
+        logger.info(f"Initialized JAX distributed: process {jax.process_index()} of {jax.process_count()}")
+
+    logger.info(f"Running on: {_platform.node()}, platform: {platform}")
 
     if not isinstance(config.model, _value_fn.BaseValueFunctionConfig):
         raise TypeError(
@@ -1891,7 +2049,13 @@ def main(config: _config.TrainConfig):
         resume=config.resume,
     )
     wandb_resuming = resuming and ft_config is None
-    init_wandb(config, resuming=wandb_resuming, enabled=config.wandb_enabled, ft_config=ft_config)
+    init_wandb(
+        config,
+        resuming = wandb_resuming,
+        enabled = config.wandb_enabled,
+        ft_config = ft_config,
+        start_new = config.wandb_new,
+    )
     logging.info(f"Initialized checkpoint manager with resuming={resuming}, config.resume={config.resume}")
 
     data_loader = _data_loader.create_data_loader(
@@ -1935,12 +2099,21 @@ def main(config: _config.TrainConfig):
             reward_bias=data_config.reward_bias,
         )
         val_dataloader = None
-    elif data_config.rlds_dataset_class == "robocoin":
+    elif data_config.rlds_dataset_class == "robocasa":
+        # Mirrors the RoboCOIN branch: cache transformed val trajectories to
+        # `validation_cache_dir` so generate_validation_plots_dlimp can render
+        # base + random + shuffled plots. Skips RoboCOIN-specific bits
+        # (val_dataset_dir override, AddValidationVariants(include_negative=True)).
         action_horizon = config.action_horizon or config.model.action_horizon
         val_tokenizer = config.data._get_critic_tokenizer(config.model)
-        assert val_tokenizer is not None, "RoboCOIN validation variants require a critic tokenizer."
+        assert val_tokenizer is not None, "RoboCasa validation requires a critic tokenizer."
+        import dataclasses as _dc
+        # RoboCasa data_transforms / model_transforms expect decoded uint8 arrays, so
+        # decode upstream rather than carrying raw JPEG bytes through.
+        _val_rlds_kwargs = {**data_config.rlds_kwargs, "decode_images": True}
+        _val_data_config = _dc.replace(data_config, rlds_kwargs = _val_rlds_kwargs)
         val_trajectory_dataset = _data_loader.create_rlds_dataset(
-            data_config,
+            _val_data_config,
             action_horizon,
             config.batch_size,
             split = data_config.val_split,
@@ -1953,7 +2126,61 @@ def main(config: _config.TrainConfig):
             _transforms.Normalize(data_config.norm_stats, use_quantiles = data_config.use_quantile_norm),
             *([_transforms.Clip(data_config.clip_normalized_bounds)] if data_config.clip_normalized_bounds is not None else []),
             *data_config.model_transforms.inputs,
-            _config.AddRoboCoinValidationVariants(
+            _config.AddValidationVariants(
+                val_tokenizer,
+                use_quantile_norm = data_config.use_quantile_norm,
+                include_negative = False,
+            ),
+        ])
+        val_episode_indices = list(range(config.num_val_trajectories))
+        val_episodes_cache_dir = config.validation_cache_dir
+        val_dataset = None
+
+        allow_duplicate_repos = ft_config is not None
+        cache_val_episodes(
+            val_trajectory_dataset, config.num_val_trajectories, val_episodes_cache_dir,
+            include_repos = config.include_repos, save_only = True,
+            input_transform = val_input_transform,
+            allow_duplicate_repos = allow_duplicate_repos,
+        )
+        if jax.process_count() > 1:
+            jax.experimental.multihost_utils.sync_global_devices("val_cache_write")
+        del val_trajectory_dataset, val_input_transform, _val_data_config, _val_rlds_kwargs
+    elif data_config.rlds_dataset_class == "robocoin":
+        action_horizon = config.action_horizon or config.model.action_horizon
+        val_tokenizer = config.data._get_critic_tokenizer(config.model)
+        assert val_tokenizer is not None, "RoboCOIN validation variants require a critic tokenizer."
+        # Build a val-only data_config that (a) optionally points at val_dataset_dir
+        # (a smaller variant of the same dataset) and (b) leaves images compressed.
+        # `decode_images=False` keeps cam_X as the raw JPEG/PNG bytes coming out
+        # of the TFRecord rather than decoded uint8 arrays, so the trajectory
+        # iterator does not blow up host RAM during caching. The downstream
+        # consumer (utils.cache_val_episodes → utils.load_episode_for_predict)
+        # decodes + resizes lazily, one episode at a time, at prediction time.
+        # These overrides only affect val trajectory caching — the training
+        # data_config and loader are untouched.
+        import dataclasses as _dc
+        _val_rlds_kwargs = {**data_config.rlds_kwargs, "decode_images": False}
+        _val_data_config = _dc.replace(
+            data_config,
+            rlds_data_dir = data_config.val_dataset_dir or data_config.rlds_data_dir,
+            rlds_kwargs = _val_rlds_kwargs,
+        )
+        val_trajectory_dataset = _data_loader.create_rlds_dataset(
+            _val_data_config,
+            action_horizon,
+            config.batch_size,
+            split = data_config.val_split,
+            shuffle = False,
+            return_trajectories = True,
+        )
+        val_input_transform = _transforms.compose([
+            *data_config.repack_transforms.inputs,
+            *data_config.data_transforms.inputs,
+            _transforms.Normalize(data_config.norm_stats, use_quantiles = data_config.use_quantile_norm),
+            *([_transforms.Clip(data_config.clip_normalized_bounds)] if data_config.clip_normalized_bounds is not None else []),
+            *data_config.model_transforms.inputs,
+            _config.AddValidationVariants(
                 val_tokenizer,
                 use_quantile_norm = data_config.use_quantile_norm,
             ),
@@ -1962,16 +2189,20 @@ def main(config: _config.TrainConfig):
         val_episodes_cache_dir = config.validation_cache_dir
         val_dataset = None
 
-        # Only process 0 writes the cache to avoid multi-worker NFS corruption.
-        if jax.process_index() == 0:
-            cache_val_episodes(
-                val_trajectory_dataset, config.num_val_trajectories, val_episodes_cache_dir,
-                include_repos = config.include_repos, save_only = True,
-                input_transform = val_input_transform,
-            )
+        # All workers participate in caching: worker 0 covers all repos up to
+        # num_val_trajectories; non-zero workers only cache include_repos. Each
+        # worker checks file existence before claiming/writing, so concurrent
+        # writes to NFS are safe.
+        allow_duplicate_repos = ft_config is not None
+        cache_val_episodes(
+            val_trajectory_dataset, config.num_val_trajectories, val_episodes_cache_dir,
+            include_repos = config.include_repos, save_only = True,
+            input_transform = val_input_transform,
+            allow_duplicate_repos = allow_duplicate_repos,
+        )
         if jax.process_count() > 1:
             jax.experimental.multihost_utils.sync_global_devices("val_cache_write")
-        del val_trajectory_dataset, val_input_transform
+        del val_trajectory_dataset, val_input_transform, _val_data_config, _val_rlds_kwargs
     else:
         # Non-RoboCOIN: use LeRobot dataset
         from lerobot.common.datasets import lerobot_dataset
@@ -2028,7 +2259,10 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         logging.info("Resuming training from checkpoint")
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        # train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = _load_model_utils.restore_state_with_shardings(
+            checkpoint_manager, train_state, train_state_sharding,
+        )
 
     # Unpack state and sharding
     if not isinstance(train_state, training_utils.ActorCriticTrainState):
@@ -2050,7 +2284,7 @@ def main(config: _config.TrainConfig):
         step = int(critic_state.step)
         model = nnx.merge(critic_state.model_def, critic_state.params)
 
-        if data_config.rlds_dataset_class == "robocoin":
+        if data_config.rlds_dataset_class in ("robocoin", "robocasa"):
             generate_validation_plots_dlimp(
                 model = model,
                 val_episode_indices = val_episode_indices,
@@ -2058,6 +2292,7 @@ def main(config: _config.TrainConfig):
                 action_conditioned = action_conditioned,
                 data_config = data_config,
                 cache_dir = val_episodes_cache_dir,
+                batch_size = 32,
             )
         else:
             plot_images = generate_validation_plots(
@@ -2123,10 +2358,21 @@ def main(config: _config.TrainConfig):
         )
 
     start_step = int(critic_state.step)
+    # Fine-tune mode loads pretrained weights from a different dataset, so
+    # advancing the new data iterator by ``start_step`` batches has no resume
+    # semantics — skip the fast-forward and iterate only the fine-tune range.
+    skip_fast_forward = config.fine_tune is not None
+    if start_step > 0 and not skip_fast_forward:
+        logging.info(f"Resuming with data-loader fast-forward through step {start_step}")
+    loop_range = (
+        range(start_step, config.num_train_steps)
+        if skip_fast_forward
+        else range(config.num_train_steps)
+    )
     pbar = tqdm.tqdm(
-        range(start_step, config.num_train_steps),
-        initial=start_step,
+        loop_range,
         total=config.num_train_steps,
+        initial=start_step if skip_fast_forward else 0,
         dynamic_ncols=True,
     )
 
@@ -2138,6 +2384,18 @@ def main(config: _config.TrainConfig):
     for step in pbar:
         # Split rng for this step
         rng, step_rng = jax.random.split(rng)
+        if step < start_step:
+            with timer.context("data_fetch"):
+                raw_batch = next(data_iter)
+
+            with timer.context("data_postprocess"):
+                if isinstance(raw_batch, tuple):
+                    obs, _ = raw_batch
+                    batch = {"state": obs.state}
+                else:
+                    batch = raw_batch
+            continue
+
         with timer.context("train_step_compute"), sharding.set_mesh(mesh):
             critic_state, info = ptrain_step(critic_state, policy_state, batch, step_rng)
 
@@ -2194,11 +2452,17 @@ def main(config: _config.TrainConfig):
                 _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step + 1)
 
         # Generate validation plots (all workers participate for FSDP, only worker 0 creates plots/logs)
-        if (step + 1) % config.plot_interval == 0 or step + 1 == config.num_train_steps:
+        # The third disjunct fires once at the resumed step so we can inspect the
+        # restored model state before further training shifts it.
+        if (
+            (step + 1) % config.plot_interval == 0
+            or step + 1 == config.num_train_steps
+            # or (step % config.plot_interval == 0 and step == start_step and start_step > 0)
+        ):
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
-                if data_config.rlds_dataset_class == "robocoin":
+                if data_config.rlds_dataset_class in ("robocoin", "robocasa"):
                     generate_validation_plots_dlimp(
                         model = model,
                         val_episode_indices = val_episode_indices,
@@ -2206,6 +2470,7 @@ def main(config: _config.TrainConfig):
                         action_conditioned = action_conditioned,
                         data_config = data_config,
                         cache_dir = val_episodes_cache_dir,
+                        batch_size = 16,
                     )
                 else:
                     plot_images = generate_validation_plots(
@@ -2222,7 +2487,8 @@ def main(config: _config.TrainConfig):
                             wandb.log(plot_images, step=step)
                         else:
                             logging.warning(f"No validation plots generated at step {step}")
-            
+                del model
+
         # Policy evaluation (only on worker 0)
         if eval_enabled and ((step + 1) % config.eval_interval == 0 or step + 1 == config.num_train_steps):
             with timer.context("policy_eval"):

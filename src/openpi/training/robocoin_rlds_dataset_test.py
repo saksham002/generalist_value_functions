@@ -27,6 +27,7 @@ def _make_robocoin_dataset_for_unit_tests(
     filter_n: int | None = None,
     mask_50fps: bool = False,
     use_chunk_wise_delta: bool = False,
+    state_dim: int = 14,
 ):
     dataset = robocoin_rlds_dataset.RoboCoinRldsDataset.__new__(robocoin_rlds_dataset.RoboCoinRldsDataset)
     dataset._discount = 0.99  # noqa: SLF001
@@ -41,6 +42,7 @@ def _make_robocoin_dataset_for_unit_tests(
     dataset._state_dim = state_dim  # noqa: SLF001
     dataset._state_dim_checked = False  # noqa: SLF001
     dataset._image_obs_keys = ("cam_0", "cam_1", "cam_2")  # noqa: SLF001
+    dataset._image_size = None  # noqa: SLF001
     dataset._action_chunk_size = 10  # noqa: SLF001
     dataset._return_trajectories = False  # noqa: SLF001
     dataset._include_images = True  # noqa: SLF001
@@ -154,7 +156,7 @@ class TestTrajectoryTransforms:
         np.testing.assert_array_equal(mapped["observation"]["state"].numpy()[0], np.arange(14, dtype = np.float32) + 500.0)
         assert mapped["repo_id"].numpy()[0] == b"RoboCOIN/Split_aloha_plate_storage"
 
-    def test_trajectory_transforms_uses_eef_actions_but_keeps_joint_state(self):
+    def test_trajectory_transforms_uses_eef_actions_and_eef_state(self):
         dataset = _make_robocoin_dataset_for_unit_tests(use_eef = True)
         mapped = dataset.trajectory_transforms(_make_mock_trajectory(), dataset_cfg = None)
 
@@ -162,7 +164,17 @@ class TestTrajectoryTransforms:
             mapped["actions"].numpy()[0],
             [1000, 1001, 1002, 1003, 1004, 1005, 6, 1006, 1007, 1008, 1009, 1010, 1011, 13],
         )
-        np.testing.assert_array_equal(mapped["observation"]["state"].numpy()[0], np.arange(14, dtype = np.float32) + 500.0)
+        np.testing.assert_array_equal(
+            mapped["observation"]["state"].numpy()[0],
+            [2000, 2001, 2002, 2003, 2004, 2005, 506, 2006, 2007, 2008, 2009, 2010, 2011, 513],
+        )
+
+    def test_frame_transforms_keeps_eef_state_14d_when_state_dim_is_16(self):
+        dataset = _make_robocoin_dataset_for_unit_tests(use_eef = True, state_dim = 16)
+        result = dataset.frame_transforms(_make_frame_for_transforms())
+
+        assert result["state"].shape == (14,)
+        assert result["next_state"].shape == (14,)
 
     def test_prepare_trajectory_uses_td_n_with_fps_aware_offset(self):
         dataset = _make_robocoin_dataset_for_unit_tests(critic_mode = True, td_n = 10)

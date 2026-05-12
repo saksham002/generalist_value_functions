@@ -7,6 +7,7 @@ import flax.traverse_util as traverse_util
 import jax
 import numpy as np
 from openpi_client import image_tools
+from scipy.spatial.transform import Rotation
 
 from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
@@ -122,6 +123,7 @@ class Normalize(DataTransformFn):
     def __post_init__(self):
         if self.norm_stats is not None and self.use_quantiles:
             _assert_quantile_stats(self.norm_stats)
+            object.__setattr__(self, "norm_stats", _sanitize_quantile_norm_stats(self.norm_stats))
 
     def __call__(self, data: DataDict) -> DataDict:
         if self.norm_stats is None:
@@ -159,11 +161,13 @@ class Normalize(DataTransformFn):
         return self.norm_stats[embodiment]
 
     def _normalize(self, x, stats: NormStats):
+        _assert_norm_shape_match(x, stats.mean)
         return (x - stats.mean) / (stats.std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
+        _assert_norm_shape_match(x, stats.q01)
         return (x - stats.q01) / (stats.q99 - stats.q01 + 1e-6) * 2.0 - 1.0
 
 
@@ -245,6 +249,7 @@ class Unnormalize(DataTransformFn):
     def __post_init__(self):
         if self.norm_stats is not None and self.use_quantiles:
             _assert_quantile_stats(self.norm_stats)
+            object.__setattr__(self, "norm_stats", _sanitize_quantile_norm_stats(self.norm_stats))
 
     def __call__(self, data: DataDict) -> DataDict:
         if self.norm_stats is None:
@@ -283,17 +288,14 @@ class Unnormalize(DataTransformFn):
         return self.norm_stats[embodiment]
 
     def _unnormalize(self, x, stats: NormStats):
-        mean = pad_to_dim(stats.mean, x.shape[-1], axis=-1, value=0.0)
-        std = pad_to_dim(stats.std, x.shape[-1], axis=-1, value=1.0)
-        return x * (std + 1e-6) + mean
+        _assert_norm_shape_match(x, stats.mean)
+        return x * (stats.std + 1e-6) + stats.mean
 
     def _unnormalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
-        q01, q99 = stats.q01, stats.q99
-        if (dim := q01.shape[-1]) < x.shape[-1]:
-            return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
-        return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+        _assert_norm_shape_match(x, stats.q01)
+        return (x + 1.0) / 2.0 * (stats.q99 - stats.q01 + 1e-6) + stats.q01
 
 
 @dataclasses.dataclass(frozen=True)
@@ -302,10 +304,14 @@ class ResizeImages(DataTransformFn):
     width: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        # Direct stretch matches the tf.image.resize call in the RLDS dataset
+        # builder (src/openpi/training/rlds_dataset.py:805), which discards
+        # aspect ratio. Using resize_with_pad here would letterbox eval frames
+        # and the model has never seen black bars on top/bottom.
+        data["image"] = {k: image_tools.resize_stretch(v, self.height, self.width) for k, v in data["image"].items()}
         if "next_image" in data:
             data["next_image"] = {
-                k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["next_image"].items()
+                k: image_tools.resize_stretch(v, self.height, self.width) for k, v in data["next_image"].items()
             }
         return data
 
@@ -321,51 +327,119 @@ class SubsampleActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class DeltaActions(DataTransformFn):
-    """Repacks absolute actions into delta action space."""
+    """Repacks absolute actions into delta action space.
+
+    Position dims (mask=True) become `action - state`. Orientation blocks
+    starting at each index in `rpy_index_start` (treated as three extrinsic
+    xyz euler angles) become the euler angles of `R_action @ R_state.inv()`.
+    Dims outside both the mask and the rpy blocks stay absolute.
+    """
 
     # Boolean mask for the action dimensions to be repacked into delta action space. Length
     # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
     # See `make_bool_mask` for more details.
     mask: Sequence[bool] | None
+    # Starting indices of 3-wide extrinsic-xyz euler blocks to be composed as relative rotations.
+    rpy_index_start: Sequence[int] | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "actions" not in data or self.mask is None:
+        if self.mask is None and self.rpy_index_start is None:
             return data
 
-        state, actions = data["state"], data["actions"]
-        mask = np.asarray(self.mask)
-        dims = mask.shape[-1]
-        actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
-        data["actions"] = actions
+        if self.mask is not None:
+            mask = np.asarray(self.mask).copy()
+            # Zero the mask over rpy slots so they are not double-processed by the subtraction below.
+            if self.rpy_index_start is not None:
+                for s in self.rpy_index_start:
+                    mask[s : s + 3] = False
+            dims = mask.shape[-1]
+        else:
+            mask = None
+            dims = 0
+
+        for state_key, action_key in (("state", "actions"), ("next_state", "next_actions")):
+            if action_key not in data or state_key not in data:
+                continue
+            state = data[state_key]
+            # Force a copy so in-place updates below do not mutate the caller's array.
+            actions = np.array(data[action_key])
+            if mask is not None:
+                actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis = -2)
+            if self.rpy_index_start is not None:
+                _apply_rpy_delta(state, actions, self.rpy_index_start)
+            data[action_key] = actions
 
         return data
 
 
 @dataclasses.dataclass(frozen=True)
 class AbsoluteActions(DataTransformFn):
-    """Repacks delta actions into absolute action space."""
+    """Repacks delta actions into absolute action space.
+
+    Inverse of `DeltaActions`: position dims (mask=True) add state back,
+    and rpy blocks are recomposed via `R_delta @ R_state` before being
+    written back as extrinsic xyz euler angles.
+    """
 
     # Boolean mask for the action dimensions to be repacked into absolute action space. Length
     # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
     # See `make_bool_mask` for more details.
     mask: Sequence[bool] | None
+    # Starting indices of 3-wide extrinsic-xyz euler blocks that were composed as relative rotations.
+    rpy_index_start: Sequence[int] | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "actions" not in data or self.mask is None:
+        if "actions" not in data or (self.mask is None and self.rpy_index_start is None):
             return data
 
-        state, actions = data["state"], data["actions"]
-        mask = np.asarray(self.mask)
-        dims = mask.shape[-1]
-        actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+        # Force a copy so in-place updates below do not mutate the caller's array.
+        state, actions = data["state"], np.array(data["actions"])
+        if self.mask is not None:
+            mask = np.asarray(self.mask).copy()
+            if self.rpy_index_start is not None:
+                for s in self.rpy_index_start:
+                    mask[s : s + 3] = False
+            dims = mask.shape[-1]
+            actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis = -2)
+        if self.rpy_index_start is not None:
+            _apply_rpy_absolute(state, actions, self.rpy_index_start)
         data["actions"] = actions
 
         return data
 
 
+def _apply_rpy_delta(state, actions, rpy_index_start: Sequence[int]) -> None:
+    """In-place: write extrinsic-xyz euler angles of R_action @ R_state.inv() into each rpy block."""
+    state = np.asarray(state)
+    for s in rpy_index_start:
+        state_rpy = state[..., s : s + 3]
+        action_rpy = actions[..., s : s + 3]
+        # Broadcast state over the chunk axis so each action in the chunk composes with the same state.
+        state_rpy_b = np.broadcast_to(state_rpy[..., None, :], action_rpy.shape)
+        leading = action_rpy.shape[:-1]
+        r_state = Rotation.from_euler("xyz", state_rpy_b.reshape(-1, 3))
+        r_action = Rotation.from_euler("xyz", action_rpy.reshape(-1, 3))
+        r_delta = r_action * r_state.inv()
+        actions[..., s : s + 3] = r_delta.as_euler("xyz").reshape(*leading, 3)
+
+
+def _apply_rpy_absolute(state, actions, rpy_index_start: Sequence[int]) -> None:
+    """In-place: write extrinsic-xyz euler angles of R_delta @ R_state into each rpy block."""
+    state = np.asarray(state)
+    for s in rpy_index_start:
+        state_rpy = state[..., s : s + 3]
+        action_rpy = actions[..., s : s + 3]
+        state_rpy_b = np.broadcast_to(state_rpy[..., None, :], action_rpy.shape)
+        leading = action_rpy.shape[:-1]
+        r_state = Rotation.from_euler("xyz", state_rpy_b.reshape(-1, 3))
+        r_delta = Rotation.from_euler("xyz", action_rpy.reshape(-1, 3))
+        r_abs = r_delta * r_state
+        actions[..., s : s + 3] = r_abs.as_euler("xyz").reshape(*leading, 3)
+
+
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
-    tokenizer: _tokenizer.PaligemmaTokenizer
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer
     discrete_state_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
@@ -383,6 +457,47 @@ class TokenizePrompt(DataTransformFn):
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeRoboCoinSubtaskPrompt(DataTransformFn):
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer
+    prefix_text: str | None = None
+    discrete_state_input: bool = False
+
+    def __call__(self, data: DataDict) -> DataDict:
+        prefix = data.pop("prompt", None)
+        suffix = data.pop("subtask_text", None)
+        if prefix is None or suffix is None:
+            raise ValueError("Both prompt and subtask_text are required")
+
+        if not isinstance(prefix, str):
+            prefix = prefix.item()
+        if not isinstance(suffix, str):
+            suffix = suffix.item()
+
+        if self.prefix_text is not None and prefix != self.prefix_text:
+            raise ValueError(f"Expected prefix {self.prefix_text!r}, got {prefix!r}")
+
+        if self.discrete_state_input:
+            if (state := data.get("state", None)) is None:
+                raise ValueError("State is required.")
+        else:
+            state = None
+
+        tokens, token_masks, subtask_start_index, subtask_end_index = _tokenize_robocoin_subtask_prompt(
+            self.tokenizer,
+            prefix,
+            suffix,
+            state = state,
+        )
+        return {
+            **data,
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": token_masks,
+            "subtask_start_index": np.int32(subtask_start_index),
+            "subtask_end_index": np.int32(subtask_end_index),
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -447,23 +562,43 @@ class PromptFromLeRobotTask(DataTransformFn):
 class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to the model action dimension.
 
-    When action_dim_offset > 0, values are placed at [offset : offset + d]
-    and an action_dim_mask (bool[model_action_dim]) marks the real positions.
+    When ``action_dim_mask`` is provided, the True positions must form a
+    contiguous block; the offset is taken from the first True index and source
+    values are placed at ``[offset : offset + d]``.
+
+    Otherwise, when ``action_dim_offset > 0``, values are placed at
+    [offset : offset + d].
     """
 
     model_action_dim: int
     action_dim_offset: int = 0
+    pad_state: bool = True
+    action_dim_mask: tuple[bool, ...] | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
-        if self.action_dim_offset > 0:
-            data["state"] = _insert_at_offset(data["state"], self.model_action_dim, self.action_dim_offset)
+        offset = self._resolve_offset()
+        if offset > 0:
+            if self.pad_state:
+                data["state"] = _insert_at_offset(data["state"], self.model_action_dim, offset)
             if "actions" in data:
-                data["actions"] = _insert_at_offset(data["actions"], self.model_action_dim, self.action_dim_offset)
+                data["actions"] = _insert_at_offset(data["actions"], self.model_action_dim, offset)
         else:
-            data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis = -1)
+            if self.pad_state:
+                data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis = -1)
             if "actions" in data:
                 data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis = -1)
         return data
+
+    def _resolve_offset(self) -> int:
+        if self.action_dim_mask is None:
+            return self.action_dim_offset
+        true_indices = [i for i, m in enumerate(self.action_dim_mask) if m]
+        if not true_indices:
+            return self.action_dim_offset
+        assert true_indices == list(range(true_indices[0], true_indices[-1] + 1)), (
+            f"action_dim_mask must be a contiguous True block, got {self.action_dim_mask}"
+        )
+        return true_indices[0]
 
 
 def flatten_dict(tree: at.PyTree) -> dict:
@@ -559,6 +694,59 @@ def _insert_at_offset(x: np.ndarray, target_dim: int, offset: int) -> np.ndarray
     return out
 
 
+
+
+def _clean_prompt_text(prompt: str) -> str:
+    return prompt.strip().replace("_", " ").replace("\n", " ")
+
+
+def _tokenize_robocoin_subtask_prompt(
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer,
+    prefix: str,
+    suffix: str,
+    *,
+    state: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    if state is not None:
+        raise NotImplementedError("TokenizeRoboCoinSubtaskPrompt does not support discrete state input.")
+
+    cleaned_prefix = _clean_prompt_text(prefix)
+    cleaned_suffix = _clean_prompt_text(suffix)
+    prefix_with_separator = f"{cleaned_prefix} " if cleaned_prefix else cleaned_prefix
+
+    # Tokenize prefix and suffix separately so the split index is correct by construction.
+    # SentencePiece is non-compositional across boundaries — joining the strings before
+    # encoding can shift tokens at the boundary and invalidate len(prefix_tokens) as the split.
+    add_bos = getattr(tokenizer, "_use_bos", True)
+    prefix_tokens = tokenizer._tokenizer.encode(prefix_with_separator, add_bos = add_bos)
+    suffix_tokens = tokenizer._tokenizer.encode(cleaned_suffix, add_bos = False)
+    newline_tokens = tokenizer._tokenizer.encode("\n")
+    raw_tokens = prefix_tokens + suffix_tokens + newline_tokens
+    subtask_start_index = len(prefix_tokens)
+    subtask_end_index = subtask_start_index + len(suffix_tokens) - 1
+
+    image_tokenizer = isinstance(tokenizer, (_tokenizer.Gemma3Tokenizer, _tokenizer.Gemma4Tokenizer))
+    if image_tokenizer and tokenizer._num_images > 0:
+        soi_markers = [tokenizer.START_OF_IMAGE_ID] * tokenizer._num_images
+        raw_tokens = [raw_tokens[0]] + soi_markers + raw_tokens[1:]
+        subtask_start_index += tokenizer._num_images
+        subtask_end_index += tokenizer._num_images
+
+    max_len = tokenizer._max_len + (tokenizer._num_images if image_tokenizer else 0)
+    tokens_len = len(raw_tokens)
+    if tokens_len < max_len:
+        padding = [False] * (max_len - tokens_len)
+        token_mask = [True] * tokens_len + padding
+        raw_tokens = raw_tokens + padding
+    else:
+        raw_tokens = raw_tokens[:max_len]
+        token_mask = [True] * max_len
+        subtask_start_index = min(subtask_start_index, max_len)
+        subtask_end_index = min(subtask_end_index, max_len - 1)
+
+    return np.asarray(raw_tokens), np.asarray(token_mask), subtask_start_index, subtask_end_index
+
+
 def pad_to_dim(x: np.ndarray, target_dim: int, axis: int = -1, value: float = 0.0) -> np.ndarray:
     """Pad an array to the target dimension with zeros along the specified axis."""
     current_dim = x.shape[axis]
@@ -597,3 +785,62 @@ def _assert_quantile_stats(norm_stats: at.PyTree[NormStats]) -> None:
             raise ValueError(
                 f"quantile stats must be provided if use_quantile_norm is True. Key {k} is missing q01 or q99."
             )
+
+
+def _sanitize_quantile_norm_stats(
+    norm_stats: at.PyTree[NormStats] | None,
+) -> at.PyTree[NormStats] | None:
+    """Expand degenerate quantile bounds so 0-valued constants normalize to 0.
+
+    Where q01[i] == q99[i], assert the common value is 0 and replace with
+    q01[i] = -1, q99[i] = +1. The formula `(x - q01) / (q99 - q01 + eps) * 2 - 1`
+    then maps x = 0 to 0 (without this fix, a degenerate (q01 = q99 = 0)
+    collapses x = 0 to -1).
+
+    Used for padded/masked dims (e.g. the bimanual-EEF left-arm slot, which
+    is constant 0 in the dataset and so has q01 = q99 = 0 in norm_stats).
+    The mean/std path is naturally well-behaved at x = 0, mean = 0, std = 0
+    because (0 - 0) / (0 + eps) = 0, so no analogous fix is needed there.
+    """
+    if norm_stats is None or not norm_stats:
+        return norm_stats
+
+    def _fix_one(stats: NormStats) -> NormStats:
+        if stats.q01 is None or stats.q99 is None:
+            return stats
+        q01 = np.asarray(stats.q01)
+        q99 = np.asarray(stats.q99)
+        degenerate = q01 == q99
+        if not degenerate.any():
+            return stats
+        assert np.all(q01[degenerate] == 0), (
+            f"Quantile-norm sanitize: q01 == q99 at some indices but value is not 0: "
+            f"{q01[degenerate]}"
+        )
+        new_q01 = np.where(degenerate, -1.0, q01)
+        new_q99 = np.where(degenerate, 1.0, q99)
+        return _normalize.NormStats(mean = stats.mean, std = stats.std, q01 = new_q01, q99 = new_q99)
+
+    first_value = next(iter(norm_stats.values()))
+    if isinstance(first_value, NormStats):
+        return {k: _fix_one(v) for k, v in norm_stats.items()}
+    return {emb: {k: _fix_one(v) for k, v in inner.items()} for emb, inner in norm_stats.items()}
+
+
+def _assert_norm_shape_match(x: np.ndarray, stats_arr: np.ndarray) -> None:
+    """Assert that x's last K dims match stats_arr.shape, where K = stats_arr.ndim.
+
+    Catches mismatches between 1-D stats (D,) applied to (B, ..., D) data, or
+    2-D stats (H, D) applied to (B, ..., H, D) data, before silent broadcasting
+    produces the wrong result.
+    """
+    stats_shape = np.shape(stats_arr)
+    K = len(stats_shape)
+    if K == 0:
+        return
+    actual = np.shape(x)[-K:]
+    if actual != stats_shape:
+        raise AssertionError(
+            f"Norm-stats shape mismatch: array shape {np.shape(x)} "
+            f"vs stats shape {stats_shape}; last {K} dim(s) must match."
+        )

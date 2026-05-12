@@ -75,6 +75,7 @@ def sync_code(
         "--exclude=third_party/aloha",  # large third-party dir
         "--exclude=third_party/libero",  # large third-party dir
         "--exclude=.claude/worktrees",  # worktrees have permission issues on NFS
+        "--exclude=logs",  # local debug logs; TPU-side copies often have stale uid/gid
         "-e",
         ssh_cmd,  # use gcloud SSH as transport
         f"{local_dir}/",  # trailing slash = contents

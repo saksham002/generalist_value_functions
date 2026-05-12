@@ -4,24 +4,57 @@ import dataclasses
 import logging
 import os
 import pickle
-import tempfile
 
 import flax.nnx as nnx
 import jax
 import numpy as np
 
 from openpi.models.best_of_n import BestOfNWrapper
-import openpi.models.model as _model
-from openpi.robocoin_utils.load_model_utils import load_train_module, restore_params_with_shardings
-from openpi.robocoin_utils.utils import cache_val_episodes, count_subtask_segments, get_obs_and_action
-import openpi.training.checkpoints as _checkpoints
+from openpi.models.best_of_n import BestOfNWrapperConfig
+from openpi.robocoin_utils.load_model_utils import load_critic
+from openpi.robocoin_utils.load_model_utils import load_train_module
+from openpi.robocoin_utils.utils import cache_val_episodes
+from openpi.robocoin_utils.utils import count_subtask_segments
+from openpi.robocoin_utils.utils import get_obs_and_action
+import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
-import openpi.training.sharding as sharding
 import openpi.transforms as _transforms
 import openpi.value_functions.base_value_functions as _base_vf
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Named BestOfN policy configs for counterfactual evaluation.
+# Pass the name via --policy-config on the CLI.
+# =============================================================================
+_POLICY_CONFIGS: dict[str, BestOfNWrapperConfig] = {
+    "robocoin_bimanual_sarsa": BestOfNWrapperConfig(
+        action_dim=14,
+        action_horizon=50,
+        base_model_config=None,
+        num_samples=8,
+        use_target_value=False,
+        convert_to_global=True,
+    ),
+    "robocoin_bimanual_cql": BestOfNWrapperConfig(
+        action_dim=14,
+        action_horizon=50,
+        base_model_config=None,
+        num_samples=8,
+        use_target_value=True,
+        convert_to_global=False,
+    ),
+}
+
+
+def get_policy_config(name: str) -> BestOfNWrapperConfig:
+    if name not in _POLICY_CONFIGS:
+        raise ValueError(
+            f"Unknown policy config '{name}'. Available: {sorted(_POLICY_CONFIGS.keys())}"
+        )
+    return _POLICY_CONFIGS[name]
 
 
 @dataclasses.dataclass(frozen = True)
@@ -39,18 +72,15 @@ class EvalConfig:
     project_name: str = "robocoin_value_eval"
     counterfactual_best_of_n: bool = False
     counterfactual_action_store_dir: str | None = None
+    policy_config: str | None = None
+    policy_checkpoint_path: str | None = None
+    # Critic checkpoint step to load. If None, uses the latest step.
+    step: int | None = None
 
 
 def _resolve_eval_cache_dir(eval_config: EvalConfig) -> str:
     if eval_config.cache_dir is not None:
         return eval_config.cache_dir
-    if eval_config.checkpoint_path.startswith("gs://"):
-        return os.path.join(
-            tempfile.gettempdir(),
-            "openpi_eval_cache",
-            eval_config.config_name,
-            eval_config.split,
-        )
     return os.path.join(eval_config.checkpoint_path, "eval_cache", eval_config.split)
 
 
@@ -110,6 +140,8 @@ def main(eval_config: EvalConfig):
         raise ValueError(f"--split must be 'train' or 'val', got {eval_config.split!r}.")
     if eval_config.counterfactual_best_of_n and eval_config.counterfactual_action_store_dir is None:
         raise ValueError("--counterfactual-action-store-dir is required with --counterfactual-best-of-n.")
+    if eval_config.counterfactual_best_of_n and eval_config.policy_checkpoint_path is None:
+        raise ValueError("--policy-checkpoint-path is required with --counterfactual-best-of-n.")
 
     platform = os.environ.get("PLATFORM", "gpu")
     if platform == "tpu":
@@ -118,39 +150,26 @@ def main(eval_config: EvalConfig):
 
     jax.config.update("jax_compilation_cache_dir", os.path.expanduser("~/.cache/jax"))
 
-    config = _config.get_config(eval_config.config_name)
-    if eval_config.fine_tune is not None:
-        ft_config = _config.get_fine_tune_config(eval_config.fine_tune)
-        config = ft_config.apply_overrides(config, pretrained_step = None)
-
-    if eval_config.include_repos:
-        config = dataclasses.replace(config, include_repos = eval_config.include_repos)
-    if eval_config.counterfactual_action_store_dir is not None:
-        config = dataclasses.replace(
-            config,
-            data = dataclasses.replace(config.data, counterfactual_action_store_dir = eval_config.counterfactual_action_store_dir),
-        )
-    config = dataclasses.replace(
-        config,
-        num_val_trajectories = eval_config.num_trajectories,
-        fsdp_devices = jax.local_device_count(),
-    )
-
     train_module = load_train_module()
-    rng = jax.random.PRNGKey(86)
-    mesh = sharding.make_mesh(config.fsdp_devices)
-    train_state_shape, state_sharding = train_module.init_train_state(config, rng, mesh, resume = True)
+    def _config_override(config):
+        config = dataclasses.replace(config, include_repos = eval_config.include_repos)
+        if eval_config.counterfactual_action_store_dir is not None:
+            config = dataclasses.replace(
+                config,
+                data = dataclasses.replace(config.data, counterfactual_action_store_dir = eval_config.counterfactual_action_store_dir),
+            )
+        return dataclasses.replace(
+            config,
+            num_val_trajectories = eval_config.num_trajectories,
+        )
 
-    checkpoint_manager, _ = _checkpoints.initialize_checkpoint_dir(
+    model, critic_norm_stats, config, critic_step = load_critic(
+        eval_config.config_name,
         eval_config.checkpoint_path,
-        keep_period = None,
-        overwrite = False,
-        resume = True,
+        fine_tune = eval_config.fine_tune,
+        step = eval_config.step,
+        config_override = _config_override,
     )
-    restored_params = restore_params_with_shardings(checkpoint_manager, train_state_shape, state_sharding)
-    critic_state_shape = train_state_shape.critic
-    critic_params = restored_params["params"]["critic"]["params"]
-    model = nnx.merge(critic_state_shape.model_def, critic_params)
     action_conditioned = model.network.action_conditioned
     logger.info(f"Loaded model from {eval_config.checkpoint_path}, action_conditioned={action_conditioned}")
 
@@ -212,11 +231,19 @@ def main(eval_config: EvalConfig):
         data_config = data_config,
         cache_dir = cache_dir,
         output_dir = eval_config.output_dir,
+        batch_size = 8,
     )
 
     if eval_config.counterfactual_best_of_n and action_conditioned:
         logger.info("Running BestOfN counterfactual evaluation...")
         import jax.numpy as jnp
+
+        if eval_config.policy_config is None:
+            raise ValueError(
+                "counterfactual_best_of_n requires --policy-config. "
+                f"Available: {sorted(_POLICY_CONFIGS.keys())}"
+            )
+        policy_cfg = get_policy_config(eval_config.policy_config)
 
         traj_frames = _load_cached_trajectories(cache_dir)
         split_traj_frames, traj_to_repo_ep, ep_subtasks = _split_trajectory_frames(traj_frames)
@@ -225,22 +252,30 @@ def main(eval_config: EvalConfig):
         num_samples = first_frames[0]["counterfactual_actions"].shape[0]
         network_config = config.model.network_config
 
+        policy_norm_stats_dir = os.path.join(eval_config.policy_checkpoint_path, "assets", data_config.asset_id)
+        policy_norm_stats = _normalize.load(policy_norm_stats_dir)
+        logger.info(f"Loaded policy norm stats from {policy_norm_stats_dir}")
+
         bon_model = BestOfNWrapper(
             action_dim = network_config.action_dim,
             action_horizon = action_horizon,
             max_token_len = network_config.max_token_len,
             base_model = None,
             num_samples = num_samples,
-            take_min_over_ensemble = True,
-            use_target_value = False,
-            selection_mode = "argmax",
-            softmax_temperature = 1.0,
+            take_min_over_ensemble = policy_cfg.take_min_over_ensemble,
+            use_target_value = policy_cfg.use_target_value,
+            convert_to_global = policy_cfg.convert_to_global,
+            selection_mode = policy_cfg.selection_mode,
+            softmax_temperature = policy_cfg.softmax_temperature,
+            policy_norm_stats = policy_norm_stats,
+            critic_norm_stats = critic_norm_stats,
         )
 
         @nnx.jit
-        def _jitted_bon_eval(bon, vf, rng, obs, cf_actions):
+        def _jitted_bon_eval(bon, vf, rng, obs, action, cf_actions):
             transition = _base_vf.Transition(
                 observation = obs,
+                action = action,
                 counterfactual_actions = cf_actions,
             )
             best_action = bon.sample_actions(rng, transition, compute_next_action = False, value_function = vf)
@@ -272,10 +307,10 @@ def main(eval_config: EvalConfig):
 
             for batch_start in range(0, len(frames), BATCH_SIZE):
                 batch_frames = frames[batch_start : batch_start + BATCH_SIZE]
-                obs, _ = get_obs_and_action(batch_frames, prefix = "", action_conditioned = True)
+                obs, action = get_obs_and_action(batch_frames, prefix = "", action_conditioned = True)
                 cf_actions = jnp.asarray(np.stack([f["counterfactual_actions"] for f in batch_frames], axis = 0))
                 bon_rng, step_rng = jax.random.split(bon_rng)
-                q_values = jax.device_get(_jitted_bon_eval(bon_model, model, step_rng, obs, cf_actions))
+                q_values = jax.device_get(_jitted_bon_eval(bon_model, model, step_rng, obs, action, cf_actions))
                 bon_predictions[traj_idx].extend(q_values.tolist())
 
         total = sum(len(preds) for preds in bon_predictions.values())

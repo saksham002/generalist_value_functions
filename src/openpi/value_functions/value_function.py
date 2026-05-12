@@ -118,6 +118,11 @@ class SARSAValueFunctionConfig(ValueFunctionConfig):
 
     discount: float = 0.99
     tau: float = 0.005
+    next_token_loss_weight: float = 0.0
+    # Read by init_critic in train_value_function.py to cast params after init. 
+    # Polyak updates cast the
+    # aggregated target back to target_dtype so the dtype is preserved.
+    target_dtype: str = "float32"
 
     @override
     def create(self, rng: at.KeyArrayLike) -> SARSAValueFunction:
@@ -140,6 +145,7 @@ class SARSAValueFunctionConfig(ValueFunctionConfig):
             target_head=target_head,
             discount=self.discount,
             tau=self.tau,
+            next_token_loss_weight=self.next_token_loss_weight,
         )
 
 
@@ -261,8 +267,10 @@ class ValueFunction(BaseValueFunction):
         action: _model.Actions | None = None,
         *,
         take_min_over_ensemble: bool = False,
+        prefix_cache: tuple[at.Array, at.Array] | None = None,
     ) -> at.Float[at.Array, "*b"] | tuple[at.Float[at.Array, "*b"], at.Float[at.Array, "*b _n"]]:
-        out = self.network.compute_features(observation, action)
+        feature_kwargs = {"prefix_cache": prefix_cache} if prefix_cache is not None else {}
+        out = self.network.compute_features(observation, action, **feature_kwargs)
         if isinstance(out, tuple):
             features, attn_scores = out[0], out[1]
             val = self.head(features)
@@ -281,9 +289,14 @@ class ValueFunction(BaseValueFunction):
         action: _model.Actions | None = None,
         *,
         take_min_over_ensemble: bool = False,
+        prefix_cache: tuple[at.Array, at.Array] | None = None,
     ) -> at.Float[at.Array, "*b"]:
         """For value functions without target network, return the same as compute_value."""
-        result = self.compute_value(observation, action, take_min_over_ensemble = take_min_over_ensemble)
+        result = self.compute_value(
+            observation, action,
+            take_min_over_ensemble = take_min_over_ensemble,
+            prefix_cache = prefix_cache,
+        )
         if isinstance(result, tuple):
             return result[0]
         return result
@@ -312,6 +325,7 @@ class SARSAValueFunction(ValueFunction):
     target_head: ValueHead
     discount: float
     tau: float
+    next_token_loss_weight: float
 
     def __init__(
         self,
@@ -321,12 +335,14 @@ class SARSAValueFunction(ValueFunction):
         target_head: ValueHead,
         discount: float,
         tau: float,
+        next_token_loss_weight: float,
     ):
         super().__init__(network, head)
         self.target_network = target_network
         self.target_head = target_head
         self.discount = discount
         self.tau = tau
+        self.next_token_loss_weight = next_token_loss_weight
 
     @override
     def compute_target_value(
@@ -335,9 +351,11 @@ class SARSAValueFunction(ValueFunction):
         action: _model.Actions | None = None,
         *,
         take_min_over_ensemble: bool = False,
+        prefix_cache: tuple[at.Array, at.Array] | None = None,
     ) -> at.Float[at.Array, "*b"]:
         """Compute target value using target network."""
-        target_out = self.target_network.compute_features(observation, action)
+        feature_kwargs = {"prefix_cache": prefix_cache} if prefix_cache is not None else {}
+        target_out = self.target_network.compute_features(observation, action, **feature_kwargs)
         target_features = target_out[0] if isinstance(target_out, tuple) else target_out
         val = self.target_head(target_features)
         if take_min_over_ensemble and val.ndim > 1:
@@ -361,6 +379,7 @@ class SARSAValueFunction(ValueFunction):
             self.target_network,
             self.target_head,
             discount=self.discount,
+            next_token_loss_weight=self.next_token_loss_weight,
             rng=rng,
         )
 
@@ -369,6 +388,26 @@ class SARSAValueFunction(ValueFunction):
         """Polyak averaging for target network."""
         _polyak_update(self.target_network, self.network, self.tau)
         _polyak_update(self.target_head, self.head, self.tau)
+
+    def compute_prefix_cache(
+        self,
+        observation: _model.Observation,
+        use_target: bool = False,
+    ) -> tuple[at.Array, at.Array]:
+        """Wrapper that exposes the underlying network's prefix-cache fast path.
+
+        Used by `BestOfNWrapper.sample_actions` to compute the critic's
+        per-prefix KV cache once and reuse it across the N candidate-action
+        evaluations (instead of re-encoding images + prompt N times). Mirrors
+        the sibling repo's wrapper at value_function.py:393.
+        """
+        network = self.target_network if use_target else self.network
+        if not hasattr(network, "compute_prefix_cache"):
+            raise AttributeError(
+                f"{type(network).__name__} does not support prefix caching. "
+                "Callers should check hasattr before invoking."
+            )
+        return network.compute_prefix_cache(observation)
 
 
 class IQLValueFunction(BaseValueFunction):
@@ -1200,11 +1239,17 @@ class MultiIQLValueFunction(BaseMultiValueFunction):
 
 
 def _polyak_update(target_module: nnx.Module, online_module: nnx.Module, tau: float) -> None:
-    """Polyak averaging: target = tau * online + (1 - tau) * target."""
+    """Polyak averaging: target = tau * online + (1 - tau) * target.
+
+    JAX type-promotes the aggregate to the wider of the two operand dtypes, so a
+    bf16 target mixed with an fp32 online would silently drift to fp32 after one
+    update. Cast the final aggregate back to the target's original dtype to keep
+    the target stack's dtype stable across steps.
+    """
     target_state = nnx.state(target_module)
     online_state = nnx.state(online_module)
     new_target_state = jax.tree.map(
-        lambda t, o: tau * o + (1.0 - tau) * t,
+        lambda t, o: (tau * o + (1.0 - tau) * t).astype(t.dtype),
         target_state,
         online_state,
     )

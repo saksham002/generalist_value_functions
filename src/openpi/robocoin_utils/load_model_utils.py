@@ -1,15 +1,18 @@
 """Utilities for loading policy and value function models from checkpoints."""
 
+from collections.abc import Callable
 import dataclasses
 import importlib
 import logging
 import os
+from typing import Any
 
 import flax.nnx as nnx
 import jax
 import orbax.checkpoint as ocp
 
 import openpi.shared.array_typing as at
+import openpi.shared.normalize as _normalize
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.sharding as _sharding
@@ -90,6 +93,72 @@ def restore_params_with_shardings(checkpoint_manager, state_shape, state_shardin
     return restored["params"]
 
 
+def load_critic(
+    config_name: str,
+    checkpoint_path: str,
+    fine_tune: str | None = None,
+    step: int | None = None,
+    config_override: Callable[[Any], Any] | None = None,
+) -> tuple[nnx.Module, dict[str, _normalize.NormStats], Any, int]:
+    """Load a value-function checkpoint plus norm stats.
+
+    Args:
+        config_name: Registered train config name.
+        checkpoint_path: Critic checkpoint directory.
+        fine_tune: Optional fine-tune config name.
+        step: Optional explicit checkpoint step. If None, uses the latest numeric step dir.
+        config_override: Optional callback to apply additional config overrides before
+            train-state initialization. This keeps the loader reusable across scripts
+            that need task-specific config edits.
+
+    Returns:
+        Tuple of (critic_model, critic_norm_stats, resolved_config, resolved_step).
+    """
+    config = _config.get_config(config_name)
+    if fine_tune is not None:
+        ft_config = _config.get_fine_tune_config(fine_tune)
+        config = ft_config.apply_overrides(config, pretrained_step = None)
+    if config_override is not None:
+        config = config_override(config)
+    config = dataclasses.replace(config, fsdp_devices = 16)
+
+    train_module = load_train_module()
+    rng = jax.random.PRNGKey(86)
+    mesh = _sharding.make_mesh(config.fsdp_devices)
+    train_state_shape, state_sharding = train_module.init_train_state(
+        config, rng, mesh, resume = True,
+    )
+
+    checkpoint_manager, _ = _checkpoints.initialize_checkpoint_dir(
+        checkpoint_path,
+        keep_period = None,
+        overwrite = False,
+        resume = True,
+    )
+    restored = restore_params_with_shardings(
+        checkpoint_manager, train_state_shape, state_sharding, step = step,
+    )
+    critic_model = nnx.merge(
+        train_state_shape.critic.model_def,
+        restored["params"]["critic"]["params"],
+    )
+
+    data_config = config.data.create(config.assets_dirs, config.model)
+    if step is not None:
+        resolved_step = step
+    else:
+        step_dirs = sorted(
+            (d for d in os.listdir(checkpoint_path) if d.isdigit()),
+            key = int,
+        )
+        resolved_step = int(step_dirs[-1])
+    norm_stats_dir = os.path.join(checkpoint_path, str(resolved_step), "assets", data_config.asset_id)
+    logger.info(f"Loading critic norm stats from {norm_stats_dir}")
+    critic_norm_stats = _normalize.load(norm_stats_dir)
+    logger.info(f"Loaded critic from {checkpoint_path}")
+    return critic_model, critic_norm_stats, config, resolved_step
+
+
 # =============================================================================
 # Policy loading
 # =============================================================================
@@ -117,7 +186,7 @@ def load_policy(load_config: LoadPolicyConfig):
         ft_config = _config.get_fine_tune_config(load_config.fine_tune)
         config = ft_config.apply_overrides(config, pretrained_step = None)
 
-    config = dataclasses.replace(config, fsdp_devices = jax.local_device_count())
+    config = dataclasses.replace(config, fsdp_devices = 16)
 
     train_module = _load_script_module("train.py")
     rng = jax.random.PRNGKey(86)
@@ -130,9 +199,17 @@ def load_policy(load_config: LoadPolicyConfig):
         overwrite = False,
         resume = True,
     )
-    restored_params = restore_params_with_shardings(checkpoint_manager, train_state_shape, state_sharding, step = load_config.step)
-    params = restored_params["params"]
-    model = nnx.merge(train_state_shape.model_def, params)
+    # restore_params_with_shardings re-shards even when saved sharding matches
+    # the load-time mesh, silently producing wrong weights on (2,16) mesh.
+    # restore_state uses the saved sharding metadata directly.
+    class _DummyLoader:
+        def state_dict(self): return {}
+        def load_state_dict(self, *_args, **_kw): pass
+
+    restored_state = _checkpoints.restore_state(
+        checkpoint_manager, train_state_shape, _DummyLoader(), step = load_config.step,
+    )
+    model = nnx.merge(restored_state.model_def, restored_state.params)
     logger.info(f"Loaded policy from {load_config.checkpoint_path}")
 
     return model, config

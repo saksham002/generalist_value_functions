@@ -52,7 +52,7 @@ class BaseRldsDataset:
         *,
         split: str = "train",
         shuffle: bool = True,
-        shuffle_seed: int = 42,
+        shuffle_seed: int = 86,
         action_chunk_size: int = 16,
         shuffle_buffer_size: int = 250_000,
         num_parallel_reads: int = -1,
@@ -62,7 +62,9 @@ class BaseRldsDataset:
         reward_scale: float = 1.0,
         reward_bias: float = 0.0,
         image_obs_keys: Sequence[str] = (),
+        image_size: tuple[int, int] | None = None,
         include_images: bool = True,
+        decode_images: bool = True,
         return_trajectories: bool = False,
         max_trajectories: int | None = None,
         latent_store_dir: str | None = None,
@@ -94,6 +96,8 @@ class BaseRldsDataset:
         self._reward_bias = reward_bias
         self._include_images = include_images
         self._image_obs_keys = tuple(image_obs_keys) if include_images else ()
+        self._image_size = image_size
+        self._decode_images = decode_images
         self._return_trajectories = return_trajectories
         self._max_trajectories = max_trajectories
         self._latent_store_dir = latent_store_dir
@@ -152,6 +156,10 @@ class BaseRldsDataset:
             )
         else:
             local_batch_size = batch_size
+            if process_count > 1 and return_trajectories:
+                logging.info(
+                    f"Multi-host RLDS loading (trajectory mode): process {process_index}/{process_count}"
+                )
 
         def prepare_single_dataset(dataset_cfg: RLDSDataset, *, for_trajectories: bool):
             """Prepare a single dataset for either training or trajectory mode.
@@ -175,9 +183,22 @@ class BaseRldsDataset:
                     num_episodes = builder.info.splits[split].num_examples
                     stride = max(1, num_episodes // max_trajectories)
                     indices = list(range(0, num_episodes, stride))[:max_trajectories]
-                    split_to_use = "+".join(f"{split}[{i}:{i + 1}]" for i in indices)
+                    base_split = "+".join(f"{split}[{i}:{i + 1}]" for i in indices)
                 else:
-                    split_to_use = split
+                    base_split = split
+                # Shard trajectory-mode datasets across JAX processes the same
+                # way training does (see ``not for_trajectories`` branch
+                # below). Without this, every host iterates the full N-shard
+                # val dataset which accumulates host RAM until at least one
+                # worker is OOM-killed and drops the JAX coordinator.
+                split_to_use = (
+                    tfds.split_for_jax_process(base_split, process_index=process_index, process_count=process_count)
+                    if process_count > 1
+                    else base_split
+                )
+                logging.info(
+                    f"  Dataset {dataset_cfg.name} (trajectory mode): using split {split_to_use!r}"
+                )
                 do_shuffle = False
             else:
                 # Apply max_num_demos limit if specified (uses TFDS absolute-count slicing)
@@ -761,8 +782,14 @@ class BaseRldsDataset:
     def frame_transforms(self, frame: dict) -> dict:
         """Apply per-frame transforms. Override in subclasses for custom transforms.
 
-        Default implementation decodes images from bytes to uint8 arrays.
+        Default implementation decodes images from bytes to uint8 arrays. When
+        `decode_images=False` is set on the dataset, raw image bytes are passed
+        through unchanged so a downstream consumer (e.g. validation cache) can
+        decode lazily and avoid holding decoded multi-MB arrays in host RAM.
         """
+        if not self._decode_images:
+            return frame
+
         import tensorflow as tf
 
         for key in self._image_obs_keys:
@@ -770,9 +797,19 @@ class BaseRldsDataset:
                 raise ValueError(
                     f"Configured image observation key '{key}' not found under frame['observation'] during decoding."
                 )
-            frame["observation"][key] = tf.io.decode_image(
-                frame["observation"][key], expand_animations=False, dtype=tf.uint8
+            image = tf.io.decode_image(
+                frame["observation"][key], expand_animations = False, dtype = tf.uint8
             )
+            if self._image_size is not None:
+                # Resize here to avoid batching errors when a dataset contains different image sizes.
+                image = tf.image.resize(
+                    image,
+                    self._image_size,
+                    method = tf.image.ResizeMethod.BILINEAR,
+                    antialias = True,
+                )
+                image = tf.cast(tf.clip_by_value(tf.round(image), 0.0, 255.0), tf.uint8)
+            frame["observation"][key] = image
 
         if "next_observation" in frame:
             for key in self._image_obs_keys:
@@ -781,9 +818,19 @@ class BaseRldsDataset:
                         f"Configured image observation key '{key}' not found under frame['next_observation'] during "
                         "decoding."
                     )
-                frame["next_observation"][key] = tf.io.decode_image(
-                    frame["next_observation"][key], expand_animations=False, dtype=tf.uint8
+                image = tf.io.decode_image(
+                    frame["next_observation"][key], expand_animations = False, dtype = tf.uint8
                 )
+                if self._image_size is not None:
+                    # Resize here to avoid batching errors when a dataset contains different image sizes.
+                    image = tf.image.resize(
+                        image,
+                        self._image_size,
+                        method = tf.image.ResizeMethod.BILINEAR,
+                        antialias = True,
+                    )
+                    image = tf.cast(tf.clip_by_value(tf.round(image), 0.0, 255.0), tf.uint8)
+                frame["next_observation"][key] = image
 
         return frame
 

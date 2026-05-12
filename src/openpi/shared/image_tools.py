@@ -10,6 +10,39 @@ import openpi.shared.array_typing as at
 
 @functools.partial(jax.jit, static_argnums=(1, 2, 3))
 @at.typecheck
+def resize_stretch(
+    images: at.UInt8[at.Array, "*b h w c"] | at.Float[at.Array, "*b h w c"],
+    height: int,
+    width: int,
+    method: jax.image.ResizeMethod = jax.image.ResizeMethod.LINEAR,
+) -> at.UInt8[at.Array, "*b {height} {width} c"] | at.Float[at.Array, "*b {height} {width} c"]:
+    """Direct bilinear resize that stretches each axis independently.
+
+    Matches the `tf.image.resize` call used by the RLDS dataset builder
+    (`src/openpi/training/rlds_dataset.py:805`), which discards aspect ratio.
+    Use this at eval time so policy/critic inputs match the squashed 224x224
+    frames the model was trained on. If the image is float32, it must be in
+    the range [-1, 1].
+    """
+    has_batch_dim = images.ndim == 4
+    if not has_batch_dim:
+        images = images[None]  # type: ignore
+    resized_images = jax.image.resize(
+        images, (images.shape[0], height, width, images.shape[3]), method = method,
+    )
+    if images.dtype == jnp.uint8:
+        resized_images = jnp.round(resized_images).clip(0, 255).astype(jnp.uint8)
+    elif images.dtype == jnp.float32:
+        resized_images = resized_images.clip(-1.0, 1.0)
+    else:
+        raise ValueError(f"Unsupported image dtype: {images.dtype}")
+    if not has_batch_dim:
+        resized_images = resized_images[0]
+    return resized_images
+
+
+@functools.partial(jax.jit, static_argnums=(1, 2, 3))
+@at.typecheck
 def resize_with_pad(
     images: at.UInt8[at.Array, "*b h w c"] | at.Float[at.Array, "*b h w c"],
     height: int,

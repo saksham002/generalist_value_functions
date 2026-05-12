@@ -25,6 +25,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.d4rl_policy as d4rl_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.robocasa_policy as robocasa_policy
 import openpi.robocoin_utils.utils as _robocoin_utils
 from openpi.policy_extraction import objectives as _policy_extraction
 import openpi.shared.download as _download
@@ -41,7 +42,9 @@ import openpi.training.latent_store as latent_store
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
+import openpi.training.robocoin_rlds_dataset as robocoin_rlds_dataset
 import openpi.training.rlds_dataset as rlds_dataset
+import openpi.training.state_action_spaces as state_action_spaces
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 import openpi.value_functions.base_value_functions as _value_functions_base
@@ -115,6 +118,10 @@ class DataConfig:
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
+    # Optional override RLDS dir for validation trajectory caching only. When set,
+    # `val_trajectory_dataset` reads from here instead of `rlds_data_dir` so we
+    # can use a lighter (e.g. resized) variant for val without affecting training.
+    val_dataset_dir: str | None = None
     rlds_dataset_class: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
@@ -195,7 +202,12 @@ class ModelTransformFactory(GroupFactory):
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
-                        _transforms.PadStatesAndActions(model_config.action_dim, action_dim_offset = model_config.action_dim_offset),
+                        _transforms.PadStatesAndActions(
+                            model_config.action_dim,
+                            action_dim_offset = model_config.action_dim_offset,
+                            pad_state = model_config.pad_state_to_action_dim,
+                            action_dim_mask = model_config.action_dim_mask,
+                        ),
                     ],
                 )
             case _model.ModelType.PI0_FAST:
@@ -234,29 +246,32 @@ class DecodeRoboCoinPromptBytes:
     """Decode RoboCOIN prompt bytes before generic tokenization."""
 
     def __call__(self, data: _transforms.DataDict) -> _transforms.DataDict:
-        prompt = data["prompt"]
-        if hasattr(prompt, "item"):
-            prompt = prompt.item()
-        if isinstance(prompt, bytes):
-            prompt = prompt.decode("utf-8")
-        data["prompt"] = prompt
+        for key in ("prompt", "subtask_text"):
+            if key not in data:
+                continue
+            value = data[key]
+            if hasattr(value, "item"):
+                value = value.item()
+            if isinstance(value, bytes):
+                value = value.decode("utf-8")
+            data[key] = value
         return data
 
 
 @dataclasses.dataclass(frozen=True)
-class AddRoboCoinValidationVariants:
-    """Add RoboCOIN negative-text and random-action validation variants."""
+class AddValidationVariants:
+    """Add validation variants (random actions + optional negative-text prompt)."""
 
-    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer
     use_quantile_norm: bool = False
+    # When True (default), produce a negative-prompt variant via the RoboCOIN-specific
+    # `generate_negative_subtask_text` heuristic; requires "subtask_1" to be present.
+    # Set False for non-RoboCOIN datasets that only need random_actions.
+    include_negative: bool = True
 
     def __call__(self, data: _transforms.DataDict) -> _transforms.DataDict:
-        if "subtask_1" not in data or "actions" not in data:
+        if "actions" not in data:
             return data
-
-        subtask_text = _robocoin_utils.decode_text(data["subtask_1"])
-        negative_subtask_text = _robocoin_utils.generate_negative_subtask_text(subtask_text)
-        negative_tokens, negative_mask = self.tokenizer.tokenize(negative_subtask_text, state = None)
 
         traj_index = None
         frame_index = None
@@ -265,9 +280,14 @@ class AddRoboCoinValidationVariants:
         if "_frame_index" in data:
             frame_index = int(np.asarray(data["_frame_index"]).item())
 
-        data["negative_subtask_1_text"] = negative_subtask_text
-        data["tokenized_negative_prompt"] = negative_tokens
-        data["tokenized_negative_prompt_mask"] = negative_mask
+        if self.include_negative and "subtask_1" in data:
+            subtask_text = _robocoin_utils.decode_text(data["subtask_1"])
+            negative_subtask_text = _robocoin_utils.generate_negative_subtask_text(subtask_text)
+            negative_tokens, negative_mask = self.tokenizer.tokenize(negative_subtask_text, state = None)
+            data["negative_subtask_1_text"] = negative_subtask_text
+            data["tokenized_negative_prompt"] = negative_tokens
+            data["tokenized_negative_prompt_mask"] = negative_mask
+
         data["random_actions"] = _robocoin_utils.sample_random_actions(
             np.asarray(data["actions"]),
             use_quantile_norm = self.use_quantile_norm,
@@ -306,7 +326,9 @@ class DataConfigFactory(abc.ABC):
             return None
         try:
             data_assets_dir = str(assets_dir / asset_id)
-            norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
+            # Always re-download norm_stats: the files are tiny and stale per-pod caches
+            # silently break runs when the on-disk schema changes (e.g. action_diff added).
+            norm_stats = _normalize.load(_download.maybe_download(data_assets_dir, force_download = True))
             logging.info(f"Loaded norm stats from {data_assets_dir}")
             return norm_stats
         except FileNotFoundError:
@@ -854,6 +876,10 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
 
     # RLDS dataset loading
     rlds_data_dir: str = "gs://saksham-euw4/robocoin_bimanual"
+    # Optional override RLDS dir used only for validation trajectory caching.
+    # Useful when training reads from an _unresized variant whose 480x720 raw
+    # images blow up host RAM during val caching; set this to a resized variant.
+    val_dataset_dir: str | None = None
     datasets: Sequence[rlds_dataset.RLDSDataset] = (
         rlds_dataset.RLDSDataset(name = "robocoin_bimanual", version = "1.0.0", weight = 1.0),
     )
@@ -881,15 +907,24 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
     use_eef: bool = False
     use_quantile_norm: bool = False
     filter_n: int | None = None
+    filter_intervention: bool = False
     mask_50fps: bool = False
     mask_boundary_actions: bool = True
     replace_boundary_actions: bool = False
+    variable_horizon: bool = False
     use_chunk_wise_delta: bool = False
     state_dim: int = 14
+    subtask_prompt_mode: robocoin_rlds_dataset.SubtaskPromptMode = "subtask_only"
+    # Subsample 60 Hz raw actions to an effective 30 Hz: drop every other action in each chunk
+    # (keep indices 1, 3, 5, ...). Halves both the action-chunk axis and the chunk-aware
+    # norm-stat axis, and overrides the per-trajectory fps from 60 to 30.
+    subsample: bool = False
 
     def __post_init__(self) -> None:
         if self.mask_boundary_actions and self.replace_boundary_actions:
             raise ValueError("At most one of mask_boundary_actions and replace_boundary_actions can be True.")
+        if self.variable_horizon and self.mask_boundary_actions:
+            raise ValueError("variable_horizon=True requires mask_boundary_actions=False")
         if self.latent_views and self.latent_store_dir is None:
             raise ValueError("latent_views requires latent_store_dir to be set.")
 
@@ -950,42 +985,78 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
             q01 = np.array(state_stats["q01"]) if self.use_quantile_norm else None,
             q99 = np.array(state_stats["q99"]) if self.use_quantile_norm else None,
         )
-        if self.state_dim == 14:
-            assert raw_state_stats.mean.shape[-1] == 14, (
-                f"state_dim=14 but norm stats have {raw_state_stats.mean.shape[-1]}D state"
+        state_norm_stats = raw_state_stats
+        if self.use_eef:
+            eef_state_stats = data["eef_sim_pose_state"]
+            combined_state = {}
+            stat_keys = ("mean", "std", "q01", "q99") if self.use_quantile_norm else ("mean", "std")
+            for stat_key in stat_keys:
+                eef_arr = np.array(eef_state_stats[stat_key])
+                joint_arr = np.array(state_stats[stat_key])
+                combined_state[stat_key] = self._combine_eef_and_gripper_stats(eef_arr, joint_arr)
+            state_norm_stats = _transforms.NormStats(**combined_state)
+        if self.use_eef:
+            assert state_norm_stats.mean.shape[-1] == 14, (
+                f"use_eef=True requires 14D state norm stats inside the data pipeline, "
+                f"got {state_norm_stats.mean.shape[-1]}D"
             )
-            norm_stats["state"] = raw_state_stats
+            norm_stats["state"] = state_norm_stats
+        elif self.state_dim == 14:
+            assert state_norm_stats.mean.shape[-1] == 14, (
+                f"state_dim=14 but norm stats have {state_norm_stats.mean.shape[-1]}D state"
+            )
+            norm_stats["state"] = state_norm_stats
         elif self.state_dim == 16:
-            if raw_state_stats.mean.shape[-1] == 16:
-                norm_stats["state"] = raw_state_stats
+            if state_norm_stats.mean.shape[-1] == 16:
+                norm_stats["state"] = state_norm_stats
             else:
-                norm_stats["state"] = self._pad_state_norm_stats_14_to_16(raw_state_stats)
+                norm_stats["state"] = self._pad_state_norm_stats_14_to_16(state_norm_stats)
         else:
             raise ValueError(f"Unsupported state_dim={self.state_dim}, expected 14 or 16")
 
-        action_key = "action_diff" if self.use_chunk_wise_delta else "action"
         eef_action_key = "eef_sim_pose_action_diff" if self.use_chunk_wise_delta else "eef_sim_pose_action"
         ax = -1 if self.use_chunk_wise_delta else 0
 
-        if action_key in data:
-            action_stats = data[action_key]
-
-            if self.use_eef:
+        if "action" in data:
+            if self.use_eef or self.use_chunk_wise_delta:
+                # Chunk-wise delta actions are 14D EEF-layout (6 pose + gripper + 6 pose + gripper);
+                # non-gripper dims come from eef_sim_pose_action_diff and gripper dims (6, 13) stay
+                # absolute from "action". `*_diff` stats can carry an extra leading chunk dim, so
+                # broadcast the absolute gripper slice to match before concat.
                 eef_action_stats = data[eef_action_key]
+                gripper_action_stats = data["action"]
                 combined = {}
                 stat_keys = ("mean", "std", "q01", "q99") if self.use_quantile_norm else ("mean", "std")
                 for stat_key in stat_keys:
+                    eef_arr = np.array(eef_action_stats[stat_key])
+                    abs_arr = np.array(gripper_action_stats[stat_key])
+                    # Grippers sit at dim//2 - 1 (left) and dim - 1 (right) of the raw action,
+                    # matching `_construct_eef_repr`. Works for both 14D (6, 13) and 16D (7, 15).
+                    raw_action_dim = abs_arr.shape[-1]
+                    left_gripper_idx = raw_action_dim // 2 - 1
+                    right_gripper_idx = raw_action_dim - 1
+                    left_grip = self._broadcast_gripper_stats(
+                        abs_arr[..., left_gripper_idx:left_gripper_idx + 1], eef_arr[..., :1]
+                    )
+                    right_grip = self._broadcast_gripper_stats(
+                        abs_arr[..., right_gripper_idx:right_gripper_idx + 1], eef_arr[..., :1]
+                    )
                     combined[stat_key] = np.concatenate(
                         [
-                            np.array(eef_action_stats[stat_key])[..., :6],
-                            np.array(action_stats[stat_key])[..., 6:7],
-                            np.array(eef_action_stats[stat_key])[..., 6:12],
-                            np.array(action_stats[stat_key])[..., 13:14],
+                            eef_arr[..., :6],
+                            left_grip,
+                            eef_arr[..., 6:12],
+                            right_grip,
                         ],
                         axis = ax,
                     )
+                    # Mirror the action-chunk subsampling: keep indices 1, 3, 5, ... along
+                    # the chunk axis. Only chunk-wise stats have a leading chunk dim.
+                    if self.subsample and combined[stat_key].ndim >= 2:
+                        combined[stat_key] = combined[stat_key][1::2]
                 norm_stats["actions"] = _transforms.NormStats(**combined)
             else:
+                action_stats = data["action"]
                 norm_stats["actions"] = _transforms.NormStats(
                     mean = np.array(action_stats["mean"]),
                     std = np.array(action_stats["std"]),
@@ -997,10 +1068,47 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
             norm_stats["next_state"] = norm_stats["state"]
         if "actions" in norm_stats:
             norm_stats["next_actions"] = norm_stats["actions"]
-            norm_stats["counterfactual_actions"] = norm_stats["actions"]
-            norm_stats["counterfactual_next_actions"] = norm_stats["actions"]
+            # TODO: If action unnormalization is fixed in the compute_counterfactual_actions then renormalize here.
+            # norm_stats["counterfactual_actions"] = norm_stats["actions"]
+            # norm_stats["counterfactual_next_actions"] = norm_stats["actions"]
 
         return norm_stats
+
+    @staticmethod
+    def _broadcast_gripper_stats(abs_slice, ref_slice):
+        """Broadcast absolute gripper stats to the rank of reference (possibly chunked) stats."""
+        import numpy as np
+
+        if abs_slice.ndim < ref_slice.ndim:
+            return np.broadcast_to(abs_slice, ref_slice.shape).copy()
+        return abs_slice
+
+    @staticmethod
+    def _combine_eef_and_gripper_stats(eef_arr, joint_arr):
+        """Combine EEF pose stats with the left/right gripper slots from the joint-state stats.
+
+        EEF stats are always 12D (xyz+rpy per arm); the grippers come from the joint-state
+        stats at dim//2-1 (left) and dim-1 (right), matching the layout produced by the
+        RLDS dataset's `_construct_eef_repr` helper.
+        """
+        import numpy as np
+
+        total_dim = joint_arr.shape[-1]
+        assert eef_arr.shape[-1] == 12, (
+            f"Expected EEF stats to have 12 dims (xyz+rpy per arm), got {eef_arr.shape}"
+        )
+        left_gripper_index = total_dim // 2 - 1
+        right_gripper_index = total_dim - 1
+
+        return np.concatenate(
+            [
+                eef_arr[..., :6],
+                joint_arr[..., left_gripper_index:left_gripper_index + 1],
+                eef_arr[..., 6:12],
+                joint_arr[..., right_gripper_index:right_gripper_index + 1],
+            ],
+            axis = -1,
+        )
 
     @staticmethod
     def _pad_14_to_16(x, fill_value):
@@ -1031,18 +1139,34 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
 
     def _get_critic_tokenizer(
         self, model_config: _model.BaseModelConfig
-    ) -> _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | None:
-        network_config = None
-        if isinstance(model_config, _value_function.ValueFunctionConfig):
-            network_config = model_config.network_config
-        elif isinstance(model_config, _value_function.CQLValueFunctionConfig):
-            network_config = model_config.q_network_config
-        elif isinstance(model_config, _value_function.IQLValueFunctionConfig):
-            network_config = model_config.q_network_config
-
+    ) -> _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer | None:
+        network_config = self._get_critic_network_config(model_config)
         if isinstance(network_config, _paligemma_network.PaliGemmaNetworkConfig):
             return network_config.get_tokenizer(max_len = self.max_token_len)
         return None
+
+    def _get_critic_network_config(self, model_config: _model.BaseModelConfig):
+        if isinstance(model_config, _value_function.ValueFunctionConfig):
+            return model_config.network_config
+        if isinstance(model_config, _value_function.CQLValueFunctionConfig):
+            return model_config.q_network_config
+        if isinstance(model_config, _value_function.IQLValueFunctionConfig):
+            return model_config.q_network_config
+        return None
+
+    def _get_action_dim(self, model_config: _model.BaseModelConfig) -> int:
+        network_config = self._get_critic_network_config(model_config)
+        if network_config is not None and hasattr(network_config, "action_dim"):
+            return network_config.action_dim
+        if isinstance(model_config, pi0_config.Pi0Config):
+            # Real (pre-padding) action dim. When an explicit mask is provided it is the
+            # source of truth; otherwise fall back to action_dim - action_dim_offset.
+            if model_config.action_dim_mask is not None:
+                return int(sum(model_config.action_dim_mask))
+            return model_config.action_dim - model_config.action_dim_offset
+        raise ValueError(
+            f"Cannot derive action_dim from model_config of type {type(model_config).__name__}"
+        )
 
     def _create_model_transforms(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         if not self.critic_mode:
@@ -1060,11 +1184,22 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
         if self.replace_boundary_actions:
             transforms.append(_transforms.ReplaceMaskedActions(use_quantile_norm = self.use_quantile_norm))
         if tokenizer is not None:
+            if self.subtask_prompt_mode == "all_subtasks_predict_current_subtask":
+                tokenize_transform: _transforms.DataTransformFn = _transforms.TokenizeRoboCoinSubtaskPrompt(
+                    tokenizer = tokenizer,
+                    prefix_text = robocoin_rlds_dataset.ALL_SUBTASKS_HANG_PROMPT,
+                )
+            elif self.subtask_prompt_mode == "task_description_predict_current_subtask":
+                tokenize_transform = _transforms.TokenizeRoboCoinSubtaskPrompt(
+                    tokenizer = tokenizer,
+                )
+            else:
+                tokenize_transform = _transforms.TokenizePrompt(tokenizer)
+            # Image resizing is handled inside BaseRldsDataset before TF batching.
             transforms.extend(
                 [
-                    _transforms.ResizeImages(self.image_size[0], self.image_size[1]),
                     DecodeRoboCoinPromptBytes(),
-                    _transforms.TokenizePrompt(tokenizer),
+                    tokenize_transform,
                 ]
             )
         return _transforms.Group(inputs = transforms, outputs = [])
@@ -1077,12 +1212,32 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
         asset_id = self.assets.asset_id or self.datasets[0].name
         norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
 
+        data_transforms_inputs: list[_transforms.DataTransformFn] = []
+        data_transforms_outputs: list[_transforms.DataTransformFn] = []
+        if self.use_chunk_wise_delta:
+            action_dim = self._get_action_dim(model_config)
+            assert self.state_dim == action_dim, (
+                f"chunk-wise delta requires state_dim == action_dim, "
+                f"got state_dim={self.state_dim}, action_dim={action_dim}"
+            )
+            # 14D EEF layout: left xyz (0-2), left rpy (3-5), left gripper (6),
+            # right xyz (7-9), right rpy (10-12), right gripper (13).
+            # Mask is True for non-gripper dims; the rpy slots are additionally overridden
+            # by rpy_index_start so they use relative-rotation composition.
+            delta_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms_inputs.append(
+                _transforms.DeltaActions(mask = delta_mask, rpy_index_start = (3, 10))
+            )
+            data_transforms_outputs.append(
+                _transforms.AbsoluteActions(mask = delta_mask, rpy_index_start = (3, 10))
+            )
+
         return DataConfig(
             repo_id = self.repo_id,
             asset_id = asset_id,
             norm_stats = norm_stats,
             repack_transforms = _transforms.Group(inputs = []),
-            data_transforms = _transforms.Group(inputs = [], outputs = []),
+            data_transforms = _transforms.Group(inputs = data_transforms_inputs, outputs = data_transforms_outputs),
             model_transforms = self._create_model_transforms(model_config),
             use_quantile_norm = self.use_quantile_norm,
             critic_mode = self.critic_mode,
@@ -1090,6 +1245,7 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
             reward_scale = self.reward_scale,
             reward_bias = self.reward_bias,
             rlds_data_dir = self.rlds_data_dir,
+            val_dataset_dir = self.val_dataset_dir,
             rlds_dataset_class = "robocoin",
             datasets = self.datasets,
             robocoin_use_eef = self.use_eef,
@@ -1102,16 +1258,394 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
             rlds_kwargs = {
                 "td_n": self.td_n,
                 "filter_n": self.filter_n,
+                "filter_intervention": self.filter_intervention,
                 "mask_50fps": self.mask_50fps,
                 "mask_boundary_actions": self.mask_boundary_actions or self.replace_boundary_actions,
+                "variable_horizon": self.variable_horizon,
                 "use_chunk_wise_delta": self.use_chunk_wise_delta,
                 "shuffle_buffer_size": self.shuffle_buffer_size,
                 "num_parallel_reads": self.num_parallel_reads,
                 "num_parallel_calls": self.num_parallel_calls,
+                "image_size": self.image_size,
                 "state_dim": self.state_dim,
-                "counterfactual_action_dim_offset": 14,
+                "subtask_prompt_mode": self.subtask_prompt_mode,
+                "subsample": self.subsample,
             },
         )
+
+
+def _slice_action_diff_norm_stats(
+    stats: _transforms.NormStats, action_horizon: int,
+) -> _transforms.NormStats:
+    """Slice the leading time axis of a 2-D `(H, D)` NormStats to `(action_horizon, D)`.
+
+    `compute_norm_stats` writes `action_diff` stats at a fixed length covering the
+    longest action_horizon any consumer uses; the runtime config slices down to its
+    own action_horizon when routing `action_diff` into the `actions` key.
+    """
+    return _transforms.NormStats(
+        mean = stats.mean[:action_horizon],
+        std = stats.std[:action_horizon],
+        q01 = None if stats.q01 is None else stats.q01[:action_horizon],
+        q99 = None if stats.q99 is None else stats.q99[:action_horizon],
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class RLDSRoboCasaDataConfig(DataConfigFactory):
+    """Config for training on RoboCasa using RLDS data format.
+
+    Expects data converted by scripts/convert_robocasa_to_rlds.py with flat
+    {split}__{category}__{task} naming convention. Data dir points to the root
+    directory containing all dataset subdirectories.
+
+    Camera mapping:
+        robot0_agentview_left  -> observation/image
+        robot0_agentview_right -> observation/image_right
+        robot0_eye_in_hand     -> observation/wrist_image
+    """
+
+    repo_id: str | None = None
+    rlds_data_dir: str = "gs://saksham-euw4/robocasa"
+    datasets: Sequence[rlds_dataset.RLDSDataset] = (
+        rlds_dataset.RLDSDataset(name = "target__composite__load_dishwasher", version = "1.0.0", weight = 1.0),
+    )
+
+    critic_mode: bool = False
+    image_size: int = 224
+    max_num_demos: int | None = None
+
+    # If True, map RoboCasa's single-arm 12D action / 13D state into the RoboCOIN
+    # bimanual-EEF 14D layout (right-arm slot only, left-arm zeros, base/control_mode
+    # dropped) and use the bimanual 3-camera layout (right_wrist masked). Enables
+    # drop-in fine-tuning of bimanual configs such as `robocoin_bimanual_paligemma_q_sarsa`.
+    # Actions stay absolute base-frame poses (no chunk-wise delta) unless
+    # use_chunk_wise_delta=True.
+    bimanual_eef_layout: bool = False
+
+    # RoboCOIN-style chunk-wise-delta normalization (mirrors `RoboCoinRldsDataConfig.use_chunk_wise_delta`).
+    # When True, DeltaActions runs as input transform and AbsoluteActions as output transform,
+    # with `rpy_index_start` covering the right-arm euler-xyz rotation block. Default False —
+    # the model trains on absolute eef pose targets.
+    use_chunk_wise_delta: bool = False
+
+    # None = inherit `create_base_config`'s default (True for non-PI0 model_type).
+    use_quantile_norm: bool | None = None
+
+    # FPS interpolation. When `interpolation_config` is set, RoboCasaRldsDataset resamples
+    # each trajectory from `native_fps` to `interpolation_config.target_fps`. Required to
+    # match the 30-fps convention of the RoboCOIN-pretrained value head / π-0.5 policy.
+    interpolation_config: state_action_spaces.InterpolationConfig | None = None
+    native_fps: float | None = None
+
+    # Mirrors RoboCoinRldsDataConfig: at most one True. mask=True emits
+    # tail-False action_mask; replace=True also runs ReplaceMaskedActions.
+    mask_boundary_actions: bool = True
+    replace_boundary_actions: bool = False
+
+    shuffle_buffer_size: int = 25_000
+
+    # RL training parameters
+    discount: float = 0.99
+    reward_scale: float = 1.0
+    reward_bias: float = 0.0
+    # n-step horizon used for TD targets, in canonical 50Hz units. Mirrors RoboCOIN:
+    # at 30fps the dataset uses 3*td_n/5 native steps.
+    td_n: int = 50
+
+    def __post_init__(self) -> None:
+        if self.mask_boundary_actions and self.replace_boundary_actions:
+            raise ValueError(
+                "At most one of mask_boundary_actions and replace_boundary_actions can be True."
+            )
+        if self.td_n % 5 != 0:
+            raise ValueError(f"td_n must be a multiple of 5, got {self.td_n}")
+
+    # Mirror RoboCoinRldsDataConfig for the val plotting path.
+    def _get_critic_network_config(self, model_config: _model.BaseModelConfig):
+        if isinstance(model_config, _value_function.ValueFunctionConfig):
+            return model_config.network_config
+        if isinstance(model_config, _value_function.IQLValueFunctionConfig):
+            return model_config.q_network_config
+        if isinstance(model_config, _value_function.CQLValueFunctionConfig):
+            return model_config.q_network_config
+        return None
+
+    def _get_critic_tokenizer(
+        self, model_config: _model.BaseModelConfig
+    ) -> _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer | None:
+        network_config = self._get_critic_network_config(model_config)
+        if isinstance(network_config, _paligemma_network.PaliGemmaNetworkConfig):
+            return network_config.get_tokenizer()
+        return None
+
+    def _create_clip_normalized_bounds(self) -> dict[str, tuple[float, float]]:
+        clip_bound = 1.25 if bool(self.use_quantile_norm) else 5.0
+        return {
+            "state": (-clip_bound, clip_bound),
+            "actions": (-clip_bound, clip_bound),
+            "next_state": (-clip_bound, clip_bound),
+            "next_actions": (-clip_bound, clip_bound),
+        }
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.interpolation_config is not None:
+            ic = self.interpolation_config
+            if ic.target_fps != 30.0:
+                raise ValueError(
+                    f"RLDSRoboCasaDataConfig only supports target_fps=30.0, got {ic.target_fps}"
+                )
+            if self.native_fps is None:
+                raise ValueError("interpolation_config requires native_fps to be set.")
+            expected_horizon = round(ic.action_horizon_seconds * ic.target_fps)
+            # Pi0Config exposes action_horizon directly; value-function configs leave it as
+            # None and the chunk size comes from TrainConfig.action_horizon (which the
+            # FineTuneConfig overrides for fine-tunes). Only enforce when the model carries
+            # action_horizon explicitly.
+            model_action_horizon = getattr(model_config, "action_horizon", None)
+            if model_action_horizon is not None and model_action_horizon != expected_horizon:
+                raise ValueError(
+                    f"model.action_horizon ({model_action_horizon}) must equal "
+                    f"action_horizon_seconds * target_fps ({expected_horizon}) when "
+                    f"interpolation_config is set."
+                )
+        # Resolve action_dim: Pi0Config exposes it directly; value-function configs
+        # (SARSAValueFunctionConfig, etc.) keep it under network_config.
+        if hasattr(model_config, "action_dim"):
+            model_action_dim = model_config.action_dim
+        elif hasattr(model_config, "network_config") and hasattr(model_config.network_config, "action_dim"):
+            model_action_dim = model_config.network_config.action_dim
+        else:
+            raise ValueError(f"Cannot resolve action_dim from {type(model_config).__name__}")
+
+        # Repack: RoboCasaRldsDataset.trajectory_transforms already remaps cameras to
+        # cam_0/cam_1/cam_2 (left/right/eye_in_hand) for joint-pipeline compatibility,
+        # so we re-key from there into the policy-side image / image_right / wrist_image
+        # slots that RoboCasaInputs / RoboCasaBimanualEEFInputs expect.
+        repack_mapping = {
+            "observation/image": "observation/cam_0",
+            "observation/image_right": "observation/cam_1",
+            "observation/wrist_image": "observation/cam_2",
+            "observation/state": "observation/state",
+            "actions": "actions",
+            "prompt": "prompt",
+            "_frame_index": "_frame_index",
+            "_traj_index": "_traj_index",
+            "repo_id": "repo_id",
+        }
+
+        rlds_kwargs: dict[str, Any] = {
+            "image_size": (self.image_size, self.image_size),
+            "shuffle_buffer_size": self.shuffle_buffer_size,
+            "mask_boundary_actions": self.mask_boundary_actions or self.replace_boundary_actions,
+        }
+        if self.interpolation_config is not None:
+            # Interpolation runs INSIDE trajectory_transforms, before any bimanual-EEF
+            # remapping, so the specs match RoboCasa-native shapes (12D action, 13D state).
+            rlds_kwargs["interpolation_config"] = self.interpolation_config
+            rlds_kwargs["action_space_spec"] = state_action_spaces.ROBOCASA_NATIVE_ACTION_SPEC
+            rlds_kwargs["state_space_spec"] = state_action_spaces.ROBOCASA_NATIVE_STATE_SPEC
+            rlds_kwargs["native_fps"] = self.native_fps
+        repack_mapping["action_mask"] = "action_mask"
+
+        if self.critic_mode:
+            rlds_kwargs["td_n"] = self.td_n
+
+            repack_mapping.update(
+                {
+                    "next_observation/image": "next_observation/cam_0",
+                    "next_observation/image_right": "next_observation/cam_1",
+                    "next_observation/wrist_image": "next_observation/cam_2",
+                    "next_observation/state": "next_observation/state",
+                    "next_actions": "next_actions",
+                    "reward": "reward",
+                    "mc_return": "mc_return",
+                    "termination": "termination",
+                    "truncation": "truncation",
+                    "td_discount": "td_discount",
+                    "next_action_mask": "next_action_mask",
+                    "fps": "fps",
+                }
+            )
+            repack_transform = _transforms.Group(inputs = [_transforms.RepackTransform(repack_mapping)])
+            data_transforms_inputs: list[_transforms.DataTransformFn]
+            data_transforms_outputs: list[_transforms.DataTransformFn]
+            if self.bimanual_eef_layout:
+                data_transforms_inputs = [
+                    robocasa_policy.RoboCasaBimanualEEFInputs(action_dim = model_action_dim)
+                ]
+                data_transforms_outputs = [
+                    robocasa_policy.RoboCasaBimanualEEFOutputs(),
+                    robocasa_policy.RoboCasaEefRotEulerXYZToAxisAngle(),
+                ]
+            else:
+                data_transforms_inputs = [robocasa_policy.RoboCasaInputs(action_dim = model_action_dim)]
+                data_transforms_outputs = [robocasa_policy.RoboCasaOutputs()]
+
+            if self.use_chunk_wise_delta:
+                if not self.bimanual_eef_layout:
+                    raise ValueError(
+                        "use_chunk_wise_delta=True is only supported under bimanual_eef_layout=True "
+                        "(rpy_index_start hardcoded for the right-arm slot at 3)."
+                    )
+                delta_mask = _transforms.make_bool_mask(6, -8)
+                # DeltaActions runs AFTER bimanual_input_transform so it sees the 14D arm-first
+                # bimanual layout (eef_pos:[0:3], eef_rot:[3:6], gripper:[6], padding:[7:14]).
+                data_transforms_inputs.append(
+                    _transforms.DeltaActions(mask = delta_mask, rpy_index_start = (3,))
+                )
+                # AbsoluteActions undoes chunk-wise-delta BEFORE the bimanual output transform
+                # slices the arm dims out for RoboCasa-native action assembly.
+                data_transforms_outputs.insert(
+                    0, _transforms.AbsoluteActions(mask = delta_mask, rpy_index_start = (3,))
+                )
+
+            data_transforms = _transforms.Group(
+                inputs = data_transforms_inputs, outputs = data_transforms_outputs,
+            )
+
+            # Build model_transforms: ResizeImages, optional ReplaceMaskedActions,
+            # and (for paligemma value backbones) decode + tokenize.
+            model_inputs: list[_transforms.DataTransformFn] = [
+                _transforms.ResizeImages(self.image_size, self.image_size),
+            ]
+            if self.replace_boundary_actions:
+                model_inputs.append(_transforms.ReplaceMaskedActions(use_quantile_norm = bool(self.use_quantile_norm)))
+            critic_network_config = None
+            if isinstance(model_config, _value_function.ValueFunctionConfig):
+                critic_network_config = model_config.network_config
+            elif isinstance(model_config, _value_function.IQLValueFunctionConfig):
+                critic_network_config = model_config.q_network_config
+            elif isinstance(model_config, _value_function.CQLValueFunctionConfig):
+                critic_network_config = model_config.q_network_config
+            if isinstance(critic_network_config, _paligemma_network.PaliGemmaNetworkConfig):
+                tokenizer = critic_network_config.get_tokenizer()
+                model_inputs.append(DecodeRoboCoinPromptBytes())
+                model_inputs.append(_transforms.TokenizePrompt(tokenizer))
+            model_transforms = _transforms.Group(inputs = model_inputs)
+
+            asset_id = self.assets.asset_id
+            norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
+            if norm_stats is not None:
+                # compute_norm_stats writes both 'actions' (1-D, action[0] absolute) and
+                # 'action_diff' (2-D, per-step DeltaActions output of length ACTION_DIFF_HORIZON).
+                # Route the runtime 'actions' key to whichever flavor matches the data
+                # pipeline: when use_chunk_wise_delta=True the data has DeltaActions applied,
+                # so we use the per-step delta stats sliced down to action_horizon.
+                if self.use_chunk_wise_delta:
+                    norm_stats["actions"] = _slice_action_diff_norm_stats(
+                        norm_stats["action_diff"], model_config.action_horizon,
+                    )
+                if "state" in norm_stats:
+                    norm_stats["next_state"] = norm_stats["state"]
+                if "actions" in norm_stats:
+                    norm_stats["next_actions"] = norm_stats["actions"]
+
+            return DataConfig(
+                repo_id = "robocasa",
+                asset_id = asset_id,
+                norm_stats = norm_stats,
+                repack_transforms = repack_transform,
+                data_transforms = data_transforms,
+                model_transforms = model_transforms,
+                use_quantile_norm = bool(self.use_quantile_norm),
+                clip_normalized_bounds = self._create_clip_normalized_bounds(),
+                critic_mode = True,
+                discount = self.discount,
+                reward_scale = self.reward_scale,
+                reward_bias = self.reward_bias,
+                rlds_data_dir = self.rlds_data_dir,
+                rlds_dataset_class = "robocasa",
+                datasets = self.datasets,
+                max_num_demos = self.max_num_demos,
+                rlds_kwargs = rlds_kwargs,
+                val_split = "train",
+            )
+
+        repack_transform = _transforms.Group(inputs = [_transforms.RepackTransform(repack_mapping)])
+
+        sup_inputs: list[_transforms.DataTransformFn]
+        sup_outputs: list[_transforms.DataTransformFn]
+        if self.bimanual_eef_layout:
+            sup_inputs = [
+                robocasa_policy.RoboCasaBimanualEEFInputs(
+                    action_dim = model_action_dim, model_type = model_config.model_type
+                )
+            ]
+            sup_outputs = [
+                robocasa_policy.RoboCasaBimanualEEFOutputs(),
+                robocasa_policy.RoboCasaEefRotEulerXYZToAxisAngle(),
+            ]
+        else:
+            sup_inputs = [
+                robocasa_policy.RoboCasaInputs(
+                    action_dim = model_action_dim, model_type = model_config.model_type
+                )
+            ]
+            sup_outputs = [robocasa_policy.RoboCasaOutputs()]
+
+        if self.use_chunk_wise_delta:
+            if not self.bimanual_eef_layout:
+                raise ValueError(
+                    "use_chunk_wise_delta=True is only supported under bimanual_eef_layout=True "
+                    "(rpy_index_start hardcoded for the right-arm slot at 3)."
+                )
+            delta_mask = _transforms.make_bool_mask(6, -8)
+            sup_inputs.append(
+                _transforms.DeltaActions(mask = delta_mask, rpy_index_start = (3,))
+            )
+            sup_outputs.insert(
+                0, _transforms.AbsoluteActions(mask = delta_mask, rpy_index_start = (3,))
+            )
+
+        data_transforms = _transforms.Group(inputs = sup_inputs, outputs = sup_outputs)
+
+        # The RLDS prompt arrives as numpy bytes (TFDS string encoding); TokenizePrompt
+        # only handles str / numpy 0-d arrays. Decode upfront so the rest of model_transforms
+        # sees a Python str. Mirrors the RoboCOIN model_transforms pipeline (config.py:1174).
+        base_model_transforms = ModelTransformFactory()(model_config)
+        model_transforms = _transforms.Group(
+            inputs = (DecodeRoboCoinPromptBytes(), *base_model_transforms.inputs),
+            outputs = base_model_transforms.outputs,
+        )
+
+        # Load and route norm_stats so the runtime 'actions' / 'next_actions' keys point
+        # at the right flavor for this pipeline. compute_norm_stats writes 'actions'
+        # (1-D, action[0] absolute) and 'action_diff' (2-D, per-step DeltaActions output
+        # of length ACTION_DIFF_HORIZON); when use_chunk_wise_delta=True the data
+        # pipeline applies DeltaActions, so Normalize must use the delta stats sliced
+        # to action_horizon. Mirrors the critic-mode branch above.
+        asset_id = self.assets.asset_id
+        norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
+        if norm_stats is not None:
+            if self.use_chunk_wise_delta:
+                norm_stats["actions"] = _slice_action_diff_norm_stats(
+                    norm_stats["action_diff"], model_config.action_horizon,
+                )
+            if "state" in norm_stats:
+                norm_stats["next_state"] = norm_stats["state"]
+            if "actions" in norm_stats:
+                norm_stats["next_actions"] = norm_stats["actions"]
+
+        cfg = dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repo_id = "robocasa",
+            repack_transforms = repack_transform,
+            data_transforms = data_transforms,
+            model_transforms = model_transforms,
+            rlds_data_dir = self.rlds_data_dir,
+            rlds_dataset_class = "robocasa",
+            datasets = self.datasets,
+            max_num_demos = self.max_num_demos,
+            rlds_kwargs = rlds_kwargs,
+            norm_stats = norm_stats,
+            asset_id = asset_id,
+            clip_normalized_bounds = self._create_clip_normalized_bounds(),
+        )
+        if self.use_quantile_norm is not None:
+            cfg = dataclasses.replace(cfg, use_quantile_norm = self.use_quantile_norm)
+        return cfg
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1159,9 +1693,14 @@ class FineTuneConfig:
     name: str = ""
 
     # Dataset overrides (applied via dataclasses.replace on config.data).
-    # Special keys: "data_dir" -> rlds_data_dir, "dataset_name" -> splits "name:version" into datasets tuple,
-    # "norm_stats_path" -> derives AssetsConfig. All other keys pass through directly.
+    # Special keys: "data_dir" -> rlds_data_dir, "dataset_name" -> splits "name:version" into datasets tuple.
+    # All other keys pass through directly.
     data_overrides: dict[str, Any] = dataclasses.field(default_factory = dict)
+
+    # Full data-factory replacement. When set, replaces config.data entirely (e.g. to swap
+    # from RoboCoinRldsDataConfig to RLDSRoboCasaDataConfig). data_overrides is ignored
+    # if this is non-None.
+    data_factory: "DataConfigFactory | None" = None
 
     # Validation overrides
     include_repos: tuple[str, ...] | None = None
@@ -1181,6 +1720,8 @@ class FineTuneConfig:
     keep_period: int | None = None
     log_interval: int | None = None
 
+    action_horizon: int | None = None
+
     # Model config overrides (applied via dataclasses.replace on config.model)
     model_overrides: dict[str, Any] = dataclasses.field(default_factory = dict)
 
@@ -1193,12 +1734,13 @@ class FineTuneConfig:
     _TRAIN_CONFIG_FIELDS: ClassVar[tuple[str, ...]] = (
         "save_interval", "plot_interval", "keep_period", "log_interval",
         "include_repos", "validation_cache_dir", "num_val_trajectories",
+        "action_horizon",
     )
 
     def apply_overrides(self, config: "TrainConfig", pretrained_step: int | None = None) -> "TrainConfig":
         """Apply all non-None overrides from this FineTuneConfig to the given TrainConfig.
 
-        Handles data overrides (data_dir, dataset_name, norm_stats_path, assets),
+        Handles data overrides (data_dir, dataset_name, assets),
         direct field overrides (save_interval, log_interval, etc.), and — when
         pretrained_step is provided — num_train_steps (offset to absolute) and
         lr_schedule (wrapped with step offset).
@@ -1273,16 +1815,23 @@ class FineTuneConfig:
         Special keys handled before passthrough:
         - "data_dir": mapped to rlds_data_dir
         - "dataset_name": split "name:version" into a new datasets tuple
-        - "norm_stats_path": derives an AssetsConfig (ignored if "assets" is also present)
         """
+        # Full factory replacement takes precedence over data_overrides.
+        if self.data_factory is not None:
+            logging.info(
+                "Applied FineTuneConfig data_factory replacement: %s -> %s",
+                type(config.data).__name__, type(self.data_factory).__name__,
+            )
+            return dataclasses.replace(config, data = self.data_factory)
+
         if not self.data_overrides:
             return config
 
         data_factory = config.data
-        if not isinstance(data_factory, RoboCoinRldsDataConfig):
+        if not isinstance(data_factory, RoboCoinRldsDataConfig | RLDSRoboCasaDataConfig):
             raise TypeError(
-                f"FineTuneConfig data overrides are only supported for RoboCoinRldsDataConfig, "
-                f"got {type(data_factory).__name__}"
+                f"FineTuneConfig data overrides are only supported for RoboCoinRldsDataConfig "
+                f"or RLDSRoboCasaDataConfig, got {type(data_factory).__name__}"
             )
 
         overrides = dict(self.data_overrides)
@@ -1305,13 +1854,6 @@ class FineTuneConfig:
 
         if "assets" in overrides:
             replacements["assets"] = overrides.pop("assets")
-            overrides.pop("norm_stats_path", None)
-        elif "norm_stats_path" in overrides:
-            norm_stats_path = overrides.pop("norm_stats_path")
-            norm_path = pathlib.PurePosixPath(norm_stats_path)
-            asset_id = norm_path.parent.name
-            assets_dir = str(norm_path.parent.parent)
-            replacements["assets"] = AssetsConfig(assets_dir = assets_dir, asset_id = asset_id)
 
         replacements.update(overrides)
 
@@ -1392,6 +1934,11 @@ class TrainConfig:
     wandb_enabled: bool = True
     # Optional wandb group name for organizing runs within a project.
     wandb_group: str | None = None
+    # If true, on --resume start a brand-new wandb run (and overwrite
+    # wandb_id.txt) instead of continuing the existing run. Useful when logs
+    # have advanced past the checkpoint step and would collide with wandb's
+    # monotonic step requirement.
+    wandb_new: bool = False
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -1402,7 +1949,8 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
-    # Backbone variant for tokenizer selection: "gemma3" uses Gemma3Tokenizer, None uses PaligemmaTokenizer.
+    # Backbone variant for tokenizer selection: "gemma<i>" uses Gemma<i>Tokenizer,
+    # None uses PaligemmaTokenizer.
     backbone_variant: str | None = None
     # Number of actions in the action chunk. None means V(s), not Q(s,a).
     action_horizon: int | None = None
@@ -2371,13 +2919,121 @@ def _make_antmaze_large_diverse_v2_legacy_configs_safe() -> list[TrainConfig]:
 # =============================================================================
 
 _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
+    # Fine-tune the RoboCOIN-pretrained Q-SARSA value function on RoboCasa.
+    # Use the no-suffix `robocasa_paligemma_q_sarsa_finetune` variant below for TPU runs
+    # (GCS paths). The base config provides the model architecture and weights are loaded
+    # from the base TrainConfig's checkpoint dir; this FineTuneConfig only swaps the data
+    # factory to RLDSRoboCasaDataConfig (single-arm → bimanual right-arm slot,
+    # base/control_mode dropped, right_wrist masked) and lowers the LR.
+    FineTuneConfig(
+        name = "robocasa_paligemma_q_sarsa_finetune_gpu",
+        data_factory = RLDSRoboCasaDataConfig(
+            rlds_data_dir = "/data/group_data/rl/datasets/robocasa_rlds",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "target__atomic__close_blender_lid", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "/data/group_data/rl/saksham3/datasets/robocasa/norm_stats",
+                asset_id = "target__atomic__close_blender_lid",
+            ),
+            critic_mode = True,
+            bimanual_eef_layout = True,
+            image_size = 224,
+            discount = 0.999,
+            # FPS interpolation: 20 Hz native → 30 Hz target (matches RoboCOIN-pretrained
+            # value head's training rate). action_horizon_seconds=1.0 → 30 valid frames.
+            native_fps = 20.0,
+            interpolation_config = state_action_spaces.InterpolationConfig(
+                target_fps = 30.0, action_horizon_seconds = 1.0,
+            ),
+            replace_boundary_actions = False,
+            shuffle_buffer_size = 100_000,
+        ),
+        num_train_steps = 5_000,
+        save_interval = 2_500,
+        plot_interval = 2_500,
+        keep_period = 2_500,
+        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
+        num_val_trajectories = 2,
+        validation_cache_dir = "/data/user_data/saksham3/generalist_value_function/validation_cache_dir_robocasa/",
+        include_repos = (),
+    ),
+    # GCS-paths mirror of robocasa_paligemma_q_sarsa_finetune_gpu for TPU runs.
+    FineTuneConfig(
+        name = "robocasa_paligemma_q_sarsa_finetune",
+        data_factory = RLDSRoboCasaDataConfig(
+            rlds_data_dir = "gs://saksham-euw4/robocasa",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "target__atomic__close_blender_lid", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/robocasa/norm_stats",
+                asset_id = "target__atomic__close_blender_lid",
+            ),
+            critic_mode = True,
+            bimanual_eef_layout = True,
+            image_size = 224,
+            discount = 0.999,
+            native_fps = 20.0,
+            interpolation_config = state_action_spaces.InterpolationConfig(
+                target_fps = 30.0, action_horizon_seconds = 1.0,
+            ),
+            replace_boundary_actions = False,
+            shuffle_buffer_size = 50_000,
+            use_quantile_norm = False,
+        ),
+        num_train_steps = 5_000,
+        save_interval = 2_500,
+        plot_interval = 2_500,
+        keep_period = 2_500,
+        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
+        num_val_trajectories = 2,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocasa/validation_cache_dir/",
+        include_repos = (),
+    ),
+    # chunk-wise-delta + quantile-norm variant for fine-tuning the
+    # robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta base.
+    FineTuneConfig(
+        name = "robocasa_paligemma_q_sarsa_finetune_chunk_wise_delta",
+        data_factory = RLDSRoboCasaDataConfig(
+            rlds_data_dir = "gs://saksham-euw4/robocasa",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "target__atomic__close_blender_lid", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/robocasa/norm_stats",
+                asset_id = "target__atomic__close_blender_lid",
+            ),
+            critic_mode = True,
+            bimanual_eef_layout = True,
+            image_size = 224,
+            discount = 0.999,
+            native_fps = 20.0,
+            interpolation_config = state_action_spaces.InterpolationConfig(
+                target_fps = 30.0, action_horizon_seconds = 1.0,
+            ),
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+        ),
+        num_train_steps = 5_000,
+        save_interval = 2_500,
+        plot_interval = 2_500,
+        keep_period = 2_500,
+        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
+        num_val_trajectories = 2,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocasa/validation_cache_dir_chunk_wise_delta/",
+        include_repos = (),
+    ),
     FineTuneConfig(
         name = "real_hang_pi05_finetune",
         data_overrides = {
-            "data_dir": "gs://saksham-euw4/hdf5/real_hang/",
+            "data_dir": "gs://saksham-euw4/hdf5/",
             "dataset_name": "real_hang:1.0.0",
             "assets": AssetsConfig(
-                assets_dir = "/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_finetune/",
+                assets_dir = "gs://saksham-euw4/checkpoints/robocoin/pi05_finetune/robocoin_bimanual_pi05/robocoin_bimanual_pi05/real_hang_pi05_finetune/250000/assets",
                 asset_id = "norm_stats",
             ),
             "mask_boundary_actions": False,
@@ -2389,50 +3045,16 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
     ),
     FineTuneConfig(
-        name = "real_hang_val_only",
-        data_overrides = {
-            "data_dir": "gs://saksham-euw4/hdf5/",
-            "dataset_name": "real_hang:1.0.0",
-            "assets": AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
-                asset_id = "norm_stats",
-            ),
-        },
-        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang/",
-        num_val_trajectories = 1,
-        include_repos = (),
-        val_only = True,
-    ),
-    FineTuneConfig(
-        name = "real_hang_finetune_300",
-        data_overrides = {
-            "data_dir": "gs://saksham-euw4/hdf5/",
-            "dataset_name": "real_hang:1.0.0",
-            "assets": AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
-                asset_id = "norm_stats",
-            ),
-        },
-        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang/",
-        num_val_trajectories = 1,
-        include_repos = (),
-        num_train_steps = 300,
-        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
-        save_interval = 50,
-        plot_interval = 50,
-        keep_period = 50,
-    ),
-    FineTuneConfig(
         name = "real_hang_finetune_75",
         data_overrides = {
-            "data_dir": "gs://saksham-euw4/hdf5/",
+            "data_dir": "gs://saksham-euw4/hdf5/real_hang/75",
             "dataset_name": "real_hang:1.0.0",
             "assets": AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
-                asset_id = "norm_stats_75",
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang/75",
+                asset_id = "norm_stats",
             ),
         },
-        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang_75/",
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang_75_tcp/",
         num_val_trajectories = 2,
         include_repos = (),
         num_train_steps = 2000,
@@ -2442,12 +3064,34 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         keep_period = 500,
     ),
     FineTuneConfig(
-        name = "real_hang_state_ablation_finetune",
+        name = "real_hang_finetune_q_sarsa",
         data_overrides = {
-            "data_dir": "gs://saksham-euw4/hdf5/real_hang_state",
+            "data_dir": "gs://saksham-euw4/hdf5/real_hang_60_Hz",
             "dataset_name": "real_hang:1.0.0",
             "assets": AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang_state",
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang_60_Hz",
+                asset_id = "norm_stats",
+            ),
+            "state_dim": 14,
+            "subsample": True,
+            "replace_boundary_actions": False,
+        },
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang_q_sarsa/",
+        num_val_trajectories = 5,
+        include_repos = (),
+        num_train_steps = 8000,
+        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
+        save_interval = 2000,
+        plot_interval = 2000,
+        keep_period = 2000,
+    ),
+    FineTuneConfig(
+        name = "real_hang_state_ablation_finetune",
+        data_overrides = {
+            "data_dir": "gs://saksham-euw4/hdf5/real_hang",
+            "dataset_name": "real_hang:1.0.0",
+            "assets": AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
                 asset_id = "norm_stats",
             ),
             "state_dim": 16,
@@ -2459,10 +3103,10 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
     FineTuneConfig(
         name = "real_hang_state_ablation_no_state_finetune",
         data_overrides = {
-            "data_dir": "gs://saksham-euw4/hdf5/real_hang_state",
+            "data_dir": "gs://saksham-euw4/hdf5/real_hang",
             "dataset_name": "real_hang:1.0.0",
             "assets": AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang_state",
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
                 asset_id = "norm_stats",
             ),
             "state_dim": 16,
@@ -2470,6 +3114,23 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         model_overrides = {"discrete_state_input": False},
         num_train_steps = 10_000,
         save_interval = 10_000,
+        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-5),
+    ),
+    FineTuneConfig(
+        name = "real_hang_state_pi05_finetune",
+        data_overrides = {
+            "data_dir": "gs://saksham-euw4/hdf5/real_hang/",
+            # "data_dir": "/data/group_data/rl/saksham3/hdf5/",
+            "dataset_name": "real_hang:1.0.0",
+            "assets": AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
+                # assets_dir = "/data/group_data/rl/saksham3/hdf5/real_hang",
+                asset_id = "norm_stats",
+            ),
+        },
+        num_train_steps = 100_000,
+        save_interval = 20_000,
+        keep_period = 20_000,
         lr_schedule = _optimizer.ConstantSchedule(lr = 1e-5),
     ),
 ]
@@ -2948,10 +3609,10 @@ _CONFIGS = [
             head_config=_heads.RegressionHeadConfig(),
         ),
         data=RoboCoinRldsDataConfig(
-            rlds_data_dir="/data/group_data/rl/datasets/",
+            rlds_data_dir="gs://saksham-euw4/robocoin_bimanual/",
             assets=AssetsConfig(
-                assets_dir="gs://saksham-euw4/robocoin_bimanual/norm_stats",
-                asset_id=".",
+                assets_dir="gs://saksham-euw4/robocoin_bimanual/",
+                asset_id="norm_stats",
             ),
             datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
             discount=0.999,
@@ -2984,9 +3645,10 @@ _CONFIGS = [
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
     ),
-    # RoboCOIN Q(s,a) SARSA with bimanual dataset using the RLDS pipeline, chunk-wise delta actions, quantile norm.
+    # Identical to robocoin_bimanual_paligemma_q_sarsa, but with quantile-norm + chunk-wise delta
+    # actions and embodiment-wise norm stats.
     TrainConfig(
-        name="robocoin_bimanual_paligemma_q_sarsa_chunk_wise_rlds",
+        name="robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta",
         model=_value_function.SARSAValueFunctionConfig(
             network_config=_paligemma_network.PaliGemmaNetworkConfig(
                 state_dim=14,
@@ -2999,16 +3661,21 @@ _CONFIGS = [
             head_config=_heads.RegressionHeadConfig(),
         ),
         data=RoboCoinRldsDataConfig(
-            rlds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            rlds_data_dir="gs://saksham-euw4/robocoin_bimanual/",
+            assets=AssetsConfig(
+                assets_dir="gs://saksham-euw4/robocoin_bimanual/norm_stats",
+                asset_id="embodiment_wise",
+            ),
             datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
             discount=0.999,
             td_n=50,
             use_eef=True,
-            use_chunk_wise_delta=True,
             use_quantile_norm=True,
             shuffle_buffer_size=50_000,
             mask_boundary_actions=False,
-            replace_boundary_actions=True,
+            replace_boundary_actions=False,
+            use_chunk_wise_delta=True,
+            state_dim=14,
         ),
         weight_loader=weight_loaders.PaliGemmaWeightLoader(),
         num_train_steps=230_000,
@@ -3022,13 +3689,234 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(weight_decay=1e-6),
         num_workers=0,
         log_interval=100,
-        plot_interval=100,
+        plot_interval=50_000,
         save_interval=50_000,
         fsdp_devices=16,
         action_horizon=50,
         num_val_trajectories=10,
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_rlds/",
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
+    ),
+    TrainConfig(
+        name="robocoin_bimanual_paligemma_q_sarsa_task_description",
+        model=_value_function.SARSAValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(224, 224),
+                max_token_len=48,
+                action_dim=14,
+                dtype="float32",
+                no_state=True,
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+            next_token_loss_weight=0.1,
+        ),
+        data=RoboCoinRldsDataConfig(
+            rlds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            assets=AssetsConfig(
+                assets_dir="gs://saksham-euw4/robocoin_bimanual",
+                asset_id="norm_stats",
+            ),
+            datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            use_quantile_norm=False,
+            shuffle_buffer_size=50_000,
+            mask_boundary_actions=False,
+            replace_boundary_actions=False,
+            use_chunk_wise_delta=False,
+            state_dim=14,
+            subtask_prompt_mode="task_description_predict_current_subtask",
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=230_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=50_000,
+        save_interval=50_000,
+        fsdp_devices=16,
+        action_horizon=50,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_task_description/",
+    ),
+    TrainConfig(
+        name="robocoin_bimanual_paligemma_q_sarsa_variable_horizon",
+        model=_value_function.SARSAValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(224, 224),
+                max_token_len=48,
+                action_dim=14,
+                dtype="float32",
+                no_state=True,
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCoinRldsDataConfig(
+            rlds_data_dir="/data/group_data/rl/datasets/",
+            assets=AssetsConfig(
+                assets_dir="gs://saksham-euw4/robocoin_bimanual/norm_stats",
+                asset_id=".",
+            ),
+            datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            use_quantile_norm=False,
+            shuffle_buffer_size=50_000,
+            mask_boundary_actions=False,
+            replace_boundary_actions=False,
+            use_chunk_wise_delta=False,
+            variable_horizon=True,
+            state_dim=14,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=230_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=50_000,
+        save_interval=50_000,
+        fsdp_devices=16,
+        action_horizon=50,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_variable_horizon/",
+    ),
+    # Direct training of paligemma Q(s,a) SARSA on real_hang (skips robocoin pretraining).
+    # Mirrors the model + data settings of robocoin_bimanual_paligemma_q_sarsa
+    # combined with the real_hang_finetune_q_sarsa overrides (subsample=True, action_horizon=30).
+    TrainConfig(
+        name="real_hang_paligemma_q_sarsa",
+        model=_value_function.SARSAValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(224, 224),
+                max_token_len=48,
+                action_dim=14,
+                dtype="float32",
+                no_state=True,
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCoinRldsDataConfig(
+            rlds_data_dir="gs://saksham-euw4/hdf5/real_hang_60_Hz",
+            assets=AssetsConfig(
+                assets_dir="gs://saksham-euw4/hdf5/real_hang_60_Hz",
+                asset_id="norm_stats",
+            ),
+            datasets=(rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            use_quantile_norm=False,
+            shuffle_buffer_size=50_000,
+            mask_boundary_actions=False,
+            replace_boundary_actions=True,
+            use_chunk_wise_delta=False,
+            state_dim=14,
+            subsample=True,
+        ),
+        weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps=25_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=25_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=5_000,
+        save_interval=12_500,
+        fsdp_devices=16,
+        action_horizon=30,
+        num_val_trajectories=2,
+        include_repos=(),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang_q_sarsa/",
+    ),
+    # RoboCOIN Q(s,a) SARSA with Gemma 4 (E4B) backbone. Uses the Gemma-4 vision
+    # encoder at 480x720 (30x45 patches → 10x15 pooled → 150 soft tokens/image)
+    # instead of SigLIP.
+    TrainConfig(
+        name="robocoin_bimanual_gemma4_q_sarsa",
+        model=_value_function.SARSAValueFunctionConfig(
+            network_config=_paligemma_network.PaliGemmaNetworkConfig(
+                state_dim=14,
+                num_cameras=3,
+                image_size=(480, 480),
+                max_token_len=48,
+                action_dim=14,
+                dtype="float32",
+                paligemma_variant="gemma4_e2b",
+                use_layernorm=True,
+            ),
+            head_config=_heads.RegressionHeadConfig(),
+        ),
+        data=RoboCoinRldsDataConfig(
+            rlds_data_dir="gs://saksham-euw4/robocoin_bimanual_unresized",
+            assets=AssetsConfig(
+                assets_dir="gs://saksham-euw4/robocoin_bimanual/norm_stats",
+                asset_id="embodiment_wise",
+            ),
+            datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            use_quantile_norm=True,
+            image_size=(480, 480),
+            shuffle_buffer_size=7_500,
+            num_parallel_reads=4,
+            num_parallel_calls=4,
+            mask_boundary_actions=False,
+            replace_boundary_actions=False,
+            use_chunk_wise_delta=True,
+            state_dim=14,
+        ),
+        weight_loader=weight_loaders.Gemma4WeightLoader(
+            checkpoint_path="gs://gemma-data/checkpoints/gemma4-e2b-pt",
+        ),
+        num_train_steps=230_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5000,
+            peak_lr=1e-5,
+            decay_steps=230_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-6),
+        num_workers=0,
+        log_interval=100,
+        plot_interval=50_000,
+        save_interval=25_000,
+        fsdp_devices=16,
+        action_horizon=50,
+        num_val_trajectories=10,
+        include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_gemma4/",
+        backbone_variant="gemma4",
     ),
     # RoboCOIN CQL Q(s,a) with pi-0.5 (PaliGemma) backbone, Best-of-N policy wrapper, HL-Gauss head.
     TrainConfig(
@@ -3074,8 +3962,8 @@ _CONFIGS = [
             use_quantile_norm=True,
             shuffle_buffer_size=50_000,
             mask_boundary_actions=False,
-            replace_boundary_actions=True,
-            counterfactual_action_store_dir="gs://saksham-euw4/robocoin/cached_actions/pi05_finetune_8",
+            replace_boundary_actions=False,
+            counterfactual_action_store_dir="gs://saksham-euw4/robocoin/cached_actions/pi05_finetune_8_rlds",
             # counterfactual_action_store_dir="/data/group_data/rl/saksham3/robocoin/cached_actions/pi05_finetune_8",
             state_dim=16,
             filter_n=5,
@@ -3097,7 +3985,7 @@ _CONFIGS = [
         action_horizon=50,
         num_val_trajectories=10,
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_cql/",
+        validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_cql_rlds/",
     ),
     # =========================================================================
     # Reference: CQL + Best-of-N config (from main branch, cosmos backbone).
@@ -3173,6 +4061,7 @@ _CONFIGS = [
             discrete_state_input=True,
             action_dim_offset=14,
             action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
+            pad_state_to_action_dim=False,
             dtype="float32",
         ),
         data=RoboCoinRldsDataConfig(
@@ -3219,13 +4108,17 @@ _CONFIGS = [
             discrete_state_input=True,
             action_dim_offset=14,
             action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
+            pad_state_to_action_dim=False,
             dtype="float32",
         ),
         data=RoboCoinRldsDataConfig(
-            rlds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            # rlds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            # rlds_data_dir="/data/group_data/rl/datasets",
+            rlds_data_dir="/data/group_data/rl/saksham3/datasets",
             datasets=(rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
             assets=AssetsConfig(
-                assets_dir = "gs://saksham-euw4/robocoin_bimanual/norm_stats",
+                # assets_dir = "gs://saksham-euw4/robocoin_bimanual/norm_stats",
+                assets_dir = "/data/group_data/rl/saksham3/robocoin/norm_stats",
                 asset_id = "embodiment_wise",
             ),
             discount=0.999,
@@ -3237,7 +4130,7 @@ _CONFIGS = [
             filter_n=5,
             shuffle_buffer_size=50_000,
             mask_boundary_actions=False,
-            state_dim=16,
+            state_dim=14,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=230_000,
@@ -3254,6 +4147,286 @@ _CONFIGS = [
         save_interval=50_000,
         fsdp_devices=16,
         action_horizon=50,
+    ),
+    # π-0.5 RoboCasa fine-tune: action loss is gated to the first 7 right-arm dims
+    # (eef_pos:3, eef_rot:3, gripper:1); the remaining 25 dims are masked out.
+    # `_gpu` variant uses cluster paths; the no-suffix variant below mirrors it with GCS
+    # paths for TPU runs.
+    TrainConfig(
+        name = "robocasa_pi05_finetune_gpu",
+        model = pi0_config.Pi0Config(
+            paligemma_variant = "gemma_2b",
+            action_expert_variant = "gemma_300m",
+            action_dim = 32,
+            action_horizon = 30,
+            max_token_len = 96,
+            pi05 = True,
+            discrete_state_input = False,
+            action_dim_offset = 0,
+            # 32 = 7 (right arm, real) + 25 (masked).
+            action_dim_mask = (True,) * 7 + (False,) * 25,
+            pad_state_to_action_dim = False,
+            dtype = "float32",
+        ),
+        data = RLDSRoboCasaDataConfig(
+            rlds_data_dir = "/data/group_data/rl/datasets/robocasa_rlds",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "target__atomic__close_blender_lid", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "/data/group_data/rl/saksham3/datasets/robocasa/norm_stats",
+                asset_id = "target__atomic__close_blender_lid",
+            ),
+            critic_mode = False,
+            bimanual_eef_layout = True,
+            image_size = 224,
+            # FPS interpolation: 20 Hz native → 30 Hz target (matches the π-0.5 base
+            # policy's training rate). action_horizon_seconds=1.0 → 30 valid frames,
+            # which matches Pi0Config.action_horizon=30 above.
+            native_fps = 20.0,
+            interpolation_config = state_action_spaces.InterpolationConfig(
+                target_fps = 30.0, action_horizon_seconds = 1.0,
+            ),
+            shuffle_buffer_size = 100_000,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            mask_boundary_actions = False,
+        ),
+        weight_loader = weight_loaders.CheckpointWeightLoader("/data/group_data/rl/saksham3/pi05_base_params/params/"),
+        num_train_steps = 50_000,
+        batch_size = 128,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1_000,
+            peak_lr = 5e-5,
+            decay_steps = 50_000,
+            decay_lr = 5e-6,
+        ),
+        optimizer = _optimizer.AdamW(),
+        num_workers = 0,
+        log_interval = 100,
+        save_interval = 10_000,
+        keep_period = 10_000,
+        fsdp_devices = 4,
+        action_horizon = 30,
+    ),
+    # GCS-paths mirror of robocasa_pi05_finetune_gpu for TPU runs.
+    TrainConfig(
+        name = "robocasa_pi05_finetune",
+        model = pi0_config.Pi0Config(
+            paligemma_variant = "gemma_2b",
+            action_expert_variant = "gemma_300m",
+            action_dim = 32,
+            action_horizon = 30,
+            max_token_len = 96,
+            pi05 = True,
+            discrete_state_input = False,
+            action_dim_offset = 0,
+            action_dim_mask = (True,) * 7 + (False,) * 25,
+            pad_state_to_action_dim = False,
+            dtype = "float32",
+        ),
+        data = RLDSRoboCasaDataConfig(
+            rlds_data_dir = "gs://saksham-euw4/robocasa",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "target__atomic__close_blender_lid", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/robocasa/norm_stats",
+                asset_id = "target__atomic__close_blender_lid",
+            ),
+            critic_mode = False,
+            bimanual_eef_layout = True,
+            image_size = 224,
+            native_fps = 20.0,
+            interpolation_config = state_action_spaces.InterpolationConfig(
+                target_fps = 30.0, action_horizon_seconds = 1.0,
+            ),
+            shuffle_buffer_size = 50_000,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            mask_boundary_actions = False,
+        ),
+        weight_loader = weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps = 70_000,
+        batch_size = 128,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1_000,
+            peak_lr = 5e-5,
+            decay_steps = 70_000,
+            decay_lr = 5e-6,
+        ),
+        optimizer = _optimizer.AdamW(),
+        num_workers = 0,
+        log_interval = 100,
+        save_interval = 10_000,
+        keep_period = 10_000,
+        fsdp_devices = 16,
+        action_horizon = 30,
+    ),
+    # Same as robocoin_bimanual_pi05_rlds, but trained on the real_hang_state dataset/norm-stats.
+    TrainConfig(
+        name="real_hang_pi05_filter_intervention",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            action_dim=32,
+            # The dataset chunks 60 raw 60Hz actions and the data pipeline subsamples to 30.
+            action_horizon=30,
+            max_token_len=96,
+            pi05=True,
+            discrete_state_input=True,
+            action_dim_offset=14,
+            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
+            pad_state_to_action_dim=False,
+            dtype="float32",
+        ),
+        data=RoboCoinRldsDataConfig(
+            rlds_data_dir="gs://saksham-euw4/hdf5/real_hang_60_Hz/",
+            # rlds_data_dir="/data/group_data/rl/saksham3/hdf5/real_hang_60_Hz/",
+            datasets=(rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
+            assets=AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang_60_Hz",
+                asset_id = "norm_stats",
+            ),
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            critic_mode=False,
+            use_chunk_wise_delta=True,
+            use_quantile_norm=True,
+            filter_n=5,
+            filter_intervention=True,
+            shuffle_buffer_size=50_000,
+            mask_boundary_actions=False,
+            state_dim=14,
+            subsample=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=200_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=200_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(),
+        num_workers=0,
+        log_interval=100,
+        save_interval=25_000,
+        keep_period=25_000,
+        fsdp_devices=16,
+        # Top-level action_horizon controls dataset chunking (60 raw 60Hz frames per chunk);
+        # data.subsample=True then halves it to 30 to match model.action_horizon.
+        action_horizon=30,
+    ),
+    # Same as real_hang_pi05_filter_intervention, but with action_horizon=60.
+    TrainConfig(
+        name="real_hang_pi05_filter_intervention_60_Hz",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            action_dim=32,
+            action_horizon=60,
+            max_token_len=96,
+            pi05=True,
+            discrete_state_input=True,
+            action_dim_offset=14,
+            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
+            pad_state_to_action_dim=False,
+            dtype="float32",
+        ),
+        data=RoboCoinRldsDataConfig(
+            rlds_data_dir="gs://saksham-euw4/hdf5/real_hang_60_Hz/",
+            # rlds_data_dir="/data/group_data/rl/saksham3/hdf5/real_hang_60_Hz/",
+            datasets=(rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
+            assets=AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang_60_Hz",
+                asset_id = "norm_stats",
+            ),
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            critic_mode=False,
+            use_chunk_wise_delta=True,
+            use_quantile_norm=True,
+            filter_n=5,
+            filter_intervention=True,
+            shuffle_buffer_size=50_000,
+            mask_boundary_actions=False,
+            state_dim=14,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=200_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=200_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(),
+        num_workers=0,
+        log_interval=100,
+        save_interval=25_000,
+        keep_period=25_000,
+        fsdp_devices=16,
+        action_horizon=60,
+    ),
+    # Same as real_hang_pi05_filter_intervention_60_Hz, but uses the task description as the
+    # prompt with no subtask conditioning (subtask_prompt_mode="task_description").
+    TrainConfig(
+        name="real_hang_pi05_filter_intervention_60_Hz_task_description",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            action_dim=32,
+            action_horizon=60,
+            max_token_len=96,
+            pi05=True,
+            discrete_state_input=True,
+            action_dim_offset=14,
+            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
+            pad_state_to_action_dim=False,
+            dtype="float32",
+        ),
+        data=RoboCoinRldsDataConfig(
+            rlds_data_dir="gs://saksham-euw4/hdf5/real_hang_60_Hz/",
+            # rlds_data_dir="/data/group_data/rl/saksham3/hdf5/real_hang_60_Hz/",
+            datasets=(rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
+            assets=AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/real_hang_60_Hz",
+                asset_id = "norm_stats",
+            ),
+            discount=0.999,
+            td_n=50,
+            use_eef=True,
+            critic_mode=False,
+            use_chunk_wise_delta=True,
+            use_quantile_norm=True,
+            filter_n=5,
+            filter_intervention=True,
+            shuffle_buffer_size=50_000,
+            mask_boundary_actions=False,
+            state_dim=14,
+            subtask_prompt_mode="task_description",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=200_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=200_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(),
+        num_workers=0,
+        log_interval=100,
+        save_interval=25_000,
+        keep_period=25_000,
+        fsdp_devices=16,
+        action_horizon=60,
     ),
     # Same as robocoin_bimanual_pi05_no_mask but with state_dim=16 and discrete_state_input=True
     TrainConfig(
