@@ -680,7 +680,21 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # must preserve that or the model will attend to a zero-image.
         action_horizon = self._model.action_horizon
         if "action_mask" not in batched:
-            batched["action_mask"] = jnp.ones(action_horizon, dtype = jnp.bool_)[None, :]
+            # action_horizon=50 with RoboCasa target_fps=30 → only the first
+            # 3*50//5 = 30 steps correspond to the 1-second model window;
+            # last 20 are zero-padding the training-time fps_mask_30 masked
+            # out (see RoboCasaRldsDataset._build_action_mask). Carry the
+            # same 30 / 20 split here so policy attention + critic
+            # observation match training. Other horizons (30, 60) default
+            # to all-True; their adapt-time mask logic in
+            # BestOfNWrapper.sample_actions handles subsample / pad.
+            if action_horizon == 50:
+                fps_mask = jnp.concatenate(
+                    [jnp.ones(30, dtype = jnp.bool_), jnp.zeros(20, dtype = jnp.bool_)]
+                )
+                batched["action_mask"] = fps_mask[None, :]
+            else:
+                batched["action_mask"] = jnp.ones(action_horizon, dtype = jnp.bool_)[None, :]
         if "image_mask" not in batched:
             batched["image_mask"] = {k: jnp.array([True]) for k in batched.get("image", {})}
 

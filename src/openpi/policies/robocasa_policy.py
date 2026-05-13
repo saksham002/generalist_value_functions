@@ -229,6 +229,7 @@ class RoboCasaInputs(transforms.DataTransformFn):
             ("action_mask", np.bool_),
             ("next_action_mask", np.bool_),
             ("fps", np.float32),
+            ("steps_to_subtask_end", np.int32),
         ):
             if rl_key in data:
                 inputs[rl_key] = np.asarray(data[rl_key], dtype = rl_dtype)
@@ -474,6 +475,7 @@ class RoboCasaBimanualEEFInputs(transforms.DataTransformFn):
             ("action_mask", np.bool_),
             ("next_action_mask", np.bool_),
             ("fps", np.float32),
+            ("steps_to_subtask_end", np.int32),
         ):
             if rl_key in data:
                 inputs[rl_key] = np.asarray(data[rl_key], dtype = rl_dtype)

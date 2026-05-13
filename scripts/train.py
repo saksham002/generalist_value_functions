@@ -373,16 +373,34 @@ def main(config: _config.TrainConfig):
     )
 
     start_step = int(train_state.step)
+    # When resuming a non-fine-tune run, fast-forward the data iterator past the
+    # checkpoint step so batches keep the same shuffle ordering as the original
+    # run. Fine-tune mode loads pretrained weights from a different dataset, so
+    # advancing the iterator by `start_step` has no resume semantics — skip the
+    # fast-forward and iterate only the fine-tune range.
+    skip_fast_forward = is_fine_tuning
+    if start_step > 0 and not skip_fast_forward:
+        logging.info(f"Resuming with data-loader fast-forward through step {start_step}")
+    loop_range = (
+        range(start_step, config.num_train_steps)
+        if skip_fast_forward
+        else range(config.num_train_steps)
+    )
     pbar = tqdm.tqdm(
-        range(start_step, config.num_train_steps),
-        initial=start_step,
+        loop_range,
         total=config.num_train_steps,
+        initial=start_step if skip_fast_forward else 0,
         dynamic_ncols=True,
     )
 
     timer = Timer()
 
     for step in pbar:
+        if step < start_step:
+            with timer.context("data_fetch"):
+                batch = next(data_iter)
+            continue
+
         with timer.context("train_step_compute"), sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
 

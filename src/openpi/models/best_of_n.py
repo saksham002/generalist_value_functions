@@ -282,18 +282,20 @@ class BestOfNWrapper(_model.BaseModel):
         self.policy_use_quantile_norm = policy_use_quantile_norm
         self.critic_use_quantile_norm = critic_use_quantile_norm
         self.critic_action_dim_offset = critic_action_dim_offset
-        # Two supported (action_horizon, critic_action_horizon) regimes:
-        #   - (60, 50): 60 Hz policy + 30 Hz critic. The sample-time path stride-2
-        #     subsamples the policy chunk (60 -> 30) before zero-padding to 50.
-        #     Detected by `6 * critic_action_horizon == 5 * action_horizon`.
-        #   - (30, 50): same-fps policy + critic. The sample-time path skips the
-        #     stride-2 subsample and just zero-pads (30 -> 50). Detected by
-        #     `critic_action_horizon - action_horizon == 20`.
+        # Three supported (action_horizon, critic_action_horizon) regimes:
+        #   - (60, 50): 60 Hz policy + 30 Hz critic. Stride-2 subsample
+        #     (60 -> 30), then zero-pad to 50.
+        #   - (30, 50): same-fps policy + critic. Skip subsample, zero-pad
+        #     30 -> 50.
+        #   - (50, 50): matched-horizon policy + critic. No subsample, no
+        #     pad — the chunk is forwarded as-is to the critic. The 30 / 20
+        #     valid / invalid split is carried entirely by `action_mask`.
         if critic_action_horizon is not None and not (
-            critic_action_horizon == 50 and action_horizon in (30, 60)
+            critic_action_horizon == 50 and action_horizon in (30, 50, 60)
         ):
             raise ValueError(
-                "Only (action_horizon=30, critic_action_horizon=50) "
+                "Only (action_horizon=30, critic_action_horizon=50), "
+                "(action_horizon=50, critic_action_horizon=50), "
                 "and (action_horizon=60, critic_action_horizon=50) are supported. "
                 f"Got action_horizon={action_horizon}, critic_action_horizon={critic_action_horizon}."
             )

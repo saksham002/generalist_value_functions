@@ -110,6 +110,9 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
                 f"{interpolation_config.action_horizon_seconds})"
             )
 
+        if interpolation_config is None or interpolation_config.target_fps != 30.0:
+            raise ValueError("RoboCasaRldsDataset only supports target_fps = 30.0")
+
         # BaseRldsDataset asserts sum(weights) == 1.0 with strict equality.
         # Floating-point accumulation breaks this for many equal-weight datasets
         # (e.g., sum([0.02] * 50) = 1.0000000000000002). Fix the last weight
@@ -328,10 +331,7 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
 
         Overrides BaseRldsDataset's reverse-scan MC return with the closed-form
         γ^(exp_per_step · steps_to_end) used by RoboCOIN at 30 fps
-        (robocoin_rlds_dataset.py:614-650). At target_fps=30 with γ=0.999 and
-        exp_per_step=5.0, the per-frame decay factor is γ^5 ≈ 0.995 — same
-        per-frame decay as the pretrained RoboCOIN value head, so γ^150 over one
-        second matches what the head was trained against.
+        (robocoin_rlds_dataset.py:614-650).
 
         steps_to_subtask_end is steps-from-current-frame to end-of-episode (RoboCasa
         does not have multi-subtask episodes); termination fires inside the n-step

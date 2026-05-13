@@ -1,5 +1,6 @@
 # Scratch / one-off scripts
 random/
+flow_test/
 
 # Per-user project status snapshots (see CLAUDE.md "Project Status / Session Context")
 project_status/
