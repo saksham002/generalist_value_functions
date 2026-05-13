@@ -75,7 +75,6 @@ _BROADCAST_RESTORE_DTYPES: dict[str, Any] = {
     "action_mask": jnp.bool_,
     "token_ar_mask": jnp.bool_,
     "token_loss_mask": jnp.bool_,
-    "loss_mask": jnp.bool_,
     # Critic-side extras
     "critic_token_mask": jnp.bool_,
 }

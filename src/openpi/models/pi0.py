@@ -333,8 +333,6 @@ class Pi0(_model.BaseModel):
         mask = jnp.ones((batch_size, action_horizon))
         if observation.action_mask is not None:
             mask = mask * observation.action_mask
-        if observation.loss_mask is not None:
-            mask = mask * observation.loss_mask[:, None]
         num_valid = jnp.maximum(jnp.sum(mask), 1.0)
 
         l1 = jnp.sum(l1_per_step * mask) / num_valid

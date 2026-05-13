@@ -173,8 +173,6 @@ def train_step(
         mask = jnp.ones((batch_size, action_horizon))
         if observation.action_mask is not None:
             mask = mask * observation.action_mask
-        if observation.loss_mask is not None:
-            mask = mask * observation.loss_mask[:, None]
         return jnp.sum(chunked_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
 
     train_rng = jax.random.fold_in(rng, state.step)
@@ -266,9 +264,6 @@ def train_step(
         "learning_rate": lr_schedule(state.step),
         **batch_stats,
     }
-
-    if observation.loss_mask is not None:
-        info["batch/loss_mask_valid_fraction"] = jnp.mean(observation.loss_mask)
 
     return new_state, info
 
