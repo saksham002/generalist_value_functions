@@ -132,7 +132,7 @@ def verify_setup(tpu_name: str, config: TPUConfigWithType, nfs_user: str = "saks
                 "uv --version"
             ),
             project=project,
-            worker="all",
+            worker="0",
             check=False,
         )
         if result.returncode == 0:
