@@ -124,21 +124,15 @@ def verify_setup(tpu_name: str, config: TPUConfigWithType, nfs_user: str = "saks
         result = ssh_command(
             tpu_name,
             zone,
-            (
-                f"mountpoint -q {mount_path} && "
-                f"source {mount_path}/{nfs_user}/uv/vla/bin/activate && "
-                f'export PATH="{mount_path}/{nfs_user}/uv/bin:$PATH" && '
-                f'export UV_PROJECT_ENVIRONMENT="{mount_path}/{nfs_user}/uv/vla" && '
-                "uv --version"
-            ),
+            f"mountpoint -q {mount_path}",
             project=project,
             worker="0",
             check=False,
         )
         if result.returncode == 0:
-            logger.info("TPU %s setup verified: NFS mounted and shared environment available", tpu_name)
+            logger.info("TPU %s setup verified: NFS mounted", tpu_name)
             return True
-        logger.info("TPU %s setup incomplete", tpu_name)
+        logger.info("TPU %s setup incomplete: NFS not mounted", tpu_name)
         return False
     except Exception as e:
         logger.warning("Failed to verify TPU %s setup: %s", tpu_name, e)
