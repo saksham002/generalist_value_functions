@@ -103,7 +103,7 @@ def fix_val_cache_permissions(tpu_name: str, zone: str, project: str, nfs_mount_
     )
 
 
-def verify_setup(tpu_name: str, config: TPUConfigWithType) -> bool:
+def verify_setup(tpu_name: str, config: TPUConfigWithType, nfs_user: str = "saksham3") -> bool:
     """Verify that TPU setup is complete.
 
     Checks that NFS is mounted and the shared TPU environment is available.
@@ -111,6 +111,7 @@ def verify_setup(tpu_name: str, config: TPUConfigWithType) -> bool:
     Args:
         tpu_name: TPU VM name
         config: TPU configuration
+        nfs_user: NFS username whose venv to verify
 
     Returns:
         True if setup is verified, False otherwise
@@ -125,9 +126,9 @@ def verify_setup(tpu_name: str, config: TPUConfigWithType) -> bool:
             zone,
             (
                 f"mountpoint -q {mount_path} && "
-                f"source {mount_path}/saksham3/uv/vla/bin/activate && "
-                f'export PATH="{mount_path}/saksham3/uv/bin:$PATH" && '
-                f'export UV_PROJECT_ENVIRONMENT="{mount_path}/saksham3/uv/vla" && '
+                f"source {mount_path}/{nfs_user}/uv/vla/bin/activate && "
+                f'export PATH="{mount_path}/{nfs_user}/uv/bin:$PATH" && '
+                f'export UV_PROJECT_ENVIRONMENT="{mount_path}/{nfs_user}/uv/vla" && '
                 "uv --version"
             ),
             project=project,

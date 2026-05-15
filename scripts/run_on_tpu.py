@@ -236,7 +236,7 @@ def run_job(config: TPUJobConfig) -> int:
             notifier.notify_error("N/A", str(e), config.command)
             return 1
 
-        if not verify_setup(tpu_name, tpu_config):
+        if not verify_setup(tpu_name, tpu_config, nfs_user=config.nfs_user):
             logger.info("Setting up TPU %s...", tpu_name)
             try:
                 setup_tpu(tpu_name, tpu_config)
