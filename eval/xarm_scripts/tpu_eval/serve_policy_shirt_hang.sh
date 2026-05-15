@@ -65,4 +65,5 @@ cd "${REPO_ROOT}"
 exec python scripts/run_on_tpu.py \
     --tpu-type "${TPU_TYPE}" \
     --tpu-name "${TPU_NAME}" \
+    --nfs-user jeffyu \
     --command "${COMMAND}"
