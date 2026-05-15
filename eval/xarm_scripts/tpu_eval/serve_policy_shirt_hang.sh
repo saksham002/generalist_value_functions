@@ -8,7 +8,7 @@ set -e
 # Configuration — edit these before running
 # =============================================================================
 TPU_TYPE="v5e-32"
-TPU_NAME="v5e-tpu-32-0"
+TPU_NAME="v5e-tpu-32-1"
 PORT=8000
 
 POLICY_CONFIG="robocasa_pi05_finetune"
