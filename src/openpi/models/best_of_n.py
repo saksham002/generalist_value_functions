@@ -13,9 +13,9 @@ from typing import Literal
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing_extensions import override
 
-from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared.normalize import NormStats
@@ -116,24 +116,16 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
 
     use_target_value: bool = False
 
-    # Norm stats for renormalizing actions before passing to the critic.
-    # Two valid modes:
-    #   - both None: no renormalization (actions are already in critic space)
-    #   - both provided: unnormalize from policy space, then normalize into critic space
-    # Providing one without the other is not valid.
+    # Norm stats referenced for the action-dim slice and the policy/critic
+    # equality guard. Both None (cached path) or both provided.
     policy_norm_stats: dict[str, NormStats] | None = None
     critic_norm_stats: dict[str, NormStats] | None = None
 
-    # Normalization mode flags for each side. Mirror `data_config.use_quantile_norm`
-    # for the policy and critic respectively, so that `_renormalize_actions` /
-    # `_renormalize_state` invert and re-apply the correct transform on each end.
-    policy_use_quantile_norm: bool = False
-    critic_use_quantile_norm: bool = False
-
-    # When True, converts cached counterfactual actions from chunk-wise-delta
-    # format (delta[i] = global[i] - global[0]) to global by adding initial_pose
-    # before normalizing into critic space.
-    convert_to_global: bool = False
+    # Policy/critic chunk-wise-delta format. Asserted equal in the wrapper: a
+    # shared format means the policy's normalized output is already in the
+    # critic's space, so no renormalization is applied.
+    policy_use_chunk_wise_delta: bool = False
+    critic_use_chunk_wise_delta: bool = False
 
     # When the policy and critic have different action dimensions, slice the policy
     # action down to the critic's action dim before applying critic norm stats. The
@@ -153,12 +145,6 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
     # critics): same stride-2 subsample but zero-padded to 60 → action_mask 30 True + 30
     # False. See the regime list and gate in BestOfNWrapper for the full set.
     critic_action_horizon: int | None = None
-
-    # Transform that converts chunk-wise-delta actions to absolute actions.
-    # Required when convert_to_global=True; ignored otherwise. The transform's
-    # __call__ runs in numpy/scipy (uses scipy.Rotation for rpy composition),
-    # so it is invoked via jax.pure_callback inside _renormalize_actions.
-    absolute_actions: _transforms.DataTransformFn | None = None
 
     # "argmax": pick action with highest Q-value.
     # "softmax": sample action with probability proportional to exp(Q / temperature).
@@ -199,16 +185,14 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
             num_samples=self.num_samples,
             take_min_over_ensemble=self.take_min_over_ensemble,
             use_target_value=self.use_target_value,
-            convert_to_global=self.convert_to_global,
             selection_mode=self.selection_mode,
             softmax_temperature=self.softmax_temperature,
             policy_norm_stats=self.policy_norm_stats,
             critic_norm_stats=self.critic_norm_stats,
-            policy_use_quantile_norm=self.policy_use_quantile_norm,
-            critic_use_quantile_norm=self.critic_use_quantile_norm,
+            policy_use_chunk_wise_delta=self.policy_use_chunk_wise_delta,
+            critic_use_chunk_wise_delta=self.critic_use_chunk_wise_delta,
             critic_action_dim_offset=self.critic_action_dim_offset,
             critic_action_horizon=self.critic_action_horizon,
-            absolute_actions=self.absolute_actions,
         )
 
     @override
@@ -240,16 +224,14 @@ class BestOfNWrapper(_model.BaseModel):
     num_samples: int
     take_min_over_ensemble: bool
     use_target_value: bool
-    convert_to_global: bool
     selection_mode: Literal["argmax", "softmax"]
     softmax_temperature: float
     policy_norm_stats: dict[str, NormStats] | None
     critic_norm_stats: dict[str, NormStats] | None
-    policy_use_quantile_norm: bool
-    critic_use_quantile_norm: bool
+    policy_use_chunk_wise_delta: bool
+    critic_use_chunk_wise_delta: bool
     critic_action_dim_offset: int | None
     critic_action_horizon: int | None
-    absolute_actions: _transforms.DataTransformFn | None
 
     def __init__(
         self,
@@ -261,30 +243,64 @@ class BestOfNWrapper(_model.BaseModel):
         num_samples: int,
         take_min_over_ensemble: bool,
         use_target_value: bool,
-        convert_to_global: bool = False,
         selection_mode: Literal["argmax", "softmax"],
         softmax_temperature: float,
         policy_norm_stats: dict[str, NormStats] | None = None,
         critic_norm_stats: dict[str, NormStats] | None = None,
-        policy_use_quantile_norm: bool = False,
-        critic_use_quantile_norm: bool = False,
+        policy_use_chunk_wise_delta: bool = False,
+        critic_use_chunk_wise_delta: bool = False,
         critic_action_dim_offset: int | None = None,
         critic_action_horizon: int | None = None,
-        absolute_actions: _transforms.DataTransformFn | None = None,
     ):
         super().__init__(action_dim, action_horizon, max_token_len)
         self.base_model = base_model
         self.num_samples = num_samples
         self.take_min_over_ensemble = take_min_over_ensemble
         self.use_target_value = use_target_value
-        self.convert_to_global = convert_to_global
         self.selection_mode = selection_mode
         self.softmax_temperature = softmax_temperature
         self.policy_norm_stats = policy_norm_stats
         self.critic_norm_stats = critic_norm_stats
-        self.policy_use_quantile_norm = policy_use_quantile_norm
-        self.critic_use_quantile_norm = critic_use_quantile_norm
+        self.policy_use_chunk_wise_delta = policy_use_chunk_wise_delta
+        self.critic_use_chunk_wise_delta = critic_use_chunk_wise_delta
         self.critic_action_dim_offset = critic_action_dim_offset
+        # This path scores the policy's normalized output with the critic
+        # directly (no renorm), so it requires both ends to share the
+        # chunk-wise-delta format and the exact norm stats. Fail fast otherwise.
+        if policy_use_chunk_wise_delta != critic_use_chunk_wise_delta:
+            raise ValueError(
+                "BestOfNWrapper requires policy and critic to use the same "
+                f"use_chunk_wise_delta. Got policy={policy_use_chunk_wise_delta}, "
+                f"critic={critic_use_chunk_wise_delta}."
+            )
+        if (policy_norm_stats is None) != (critic_norm_stats is None):
+            raise ValueError(
+                "policy_norm_stats and critic_norm_stats must both be provided or both be None."
+            )
+        if policy_norm_stats is not None:
+            if set(policy_norm_stats) != set(critic_norm_stats):
+                raise ValueError(
+                    "BestOfNWrapper requires identical policy/critic norm stats; key sets "
+                    f"differ: {sorted(policy_norm_stats)} vs {sorted(critic_norm_stats)}."
+                )
+            for stats_key in policy_norm_stats:
+                p_stats = policy_norm_stats[stats_key]
+                c_stats = critic_norm_stats[stats_key]
+                for field_name in ("mean", "std", "q01", "q99"):
+                    p_val = getattr(p_stats, field_name)
+                    c_val = getattr(c_stats, field_name)
+                    if (p_val is None) != (c_val is None):
+                        raise ValueError(
+                            "BestOfNWrapper requires identical policy/critic norm stats; "
+                            f"'{stats_key}'.{field_name} presence differs."
+                        )
+                    if p_val is not None and not np.array_equal(
+                        np.asarray(p_val), np.asarray(c_val)
+                    ):
+                        raise ValueError(
+                            "BestOfNWrapper requires identical policy/critic norm stats; "
+                            f"'{stats_key}'.{field_name} differs."
+                        )
         # Four supported (action_horizon, critic_action_horizon) regimes:
         #   - (60, 50): 60 Hz policy + 30 Hz critic. Stride-2 subsample
         #     (60 -> 30), then zero-pad to 50.
@@ -308,98 +324,6 @@ class BestOfNWrapper(_model.BaseModel):
                 f"Got action_horizon={action_horizon}, critic_action_horizon={critic_action_horizon}."
             )
         self.critic_action_horizon = critic_action_horizon
-        if convert_to_global and absolute_actions is None:
-            raise ValueError(
-                "absolute_actions transform is required when convert_to_global=True."
-            )
-        self.absolute_actions = absolute_actions
-
-    def _unnormalize_policy_actions(
-        self, actions: at.Array, initial_pose: at.Array | None = None,
-    ) -> at.Array:
-        """Slice action_dim, undo policy normalization, optionally convert to global.
-
-        Returns actions in raw policy-output space (e.g. metric eef_pos / radian
-        eef_rot / [-1,1] gripper). The caller is then responsible for adapting
-        the horizon (subsample / pad) before applying `_normalize_critic_actions`.
-
-        Splitting this out from the original `_renormalize_actions` is required
-        when the policy and critic use different action_horizons and per-position
-        chunk-wise-delta norm-stats: critic stats have shape
-        (critic_action_horizon, action_dim), so `Normalize(critic_stats)` cannot
-        be applied to a chunk that's still at the policy's horizon. The horizon
-        adapt has to happen between Unnormalize-with-policy-stats and
-        Normalize-with-critic-stats.
-        """
-        action_key = "actions"
-        data = {action_key: actions}
-        # Filter to just the "actions" key — Normalize/Unnormalize use strict=True and would
-        # fail if norm_stats contains keys (e.g. "state") not present in data.
-        policy_action_stats = {action_key: self.policy_norm_stats[action_key]}
-        critic_action_stats = {action_key: self.critic_norm_stats[action_key]}
-        # When the policy and critic have different action dims (e.g. 32-d padded
-        # policy action vs 14-d EEF critic action), slice down to the critic's
-        # action dim before applying any norm stats. policy_norm_stats for "actions"
-        # are stored at the *unpadded* (critic) dim, so this slice must happen
-        # before Unnormalize.
-        critic_action_dim = critic_action_stats[action_key].mean.shape[-1]
-        if data[action_key].shape[-1] != critic_action_dim:
-            if self.critic_action_dim_offset is None:
-                raise ValueError(
-                    f"Action dim mismatch: input has {data[action_key].shape[-1]} but critic expects {critic_action_dim}. "
-                    f"Set critic_action_dim_offset to specify which slice of the input to use."
-                )
-            start = self.critic_action_dim_offset
-            data[action_key] = data[action_key][..., start : start + critic_action_dim]
-        data = _transforms.Unnormalize(policy_action_stats, use_quantiles = self.policy_use_quantile_norm)(data)
-        if self.convert_to_global:
-            assert initial_pose is not None, (
-                "initial_pose is required when convert_to_global=True. Pass transition.action[:, :1, :] as initial_pose."
-            )
-            # AbsoluteActions runs in numpy/scipy (rpy composition uses scipy.Rotation),
-            # so dispatch via pure_callback to keep the surrounding sample_actions JIT-able.
-            actions_chunk = data[action_key]
-            batch_size, num_samples, action_horizon, ad = actions_chunk.shape
-            # Broadcast initial_pose [B, 1, ad] across the candidate axis and flatten the
-            # leading [B, N] dims so AbsoluteActions sees a standard [batch, ah, ad] chunk.
-            state_flat = jnp.broadcast_to(
-                initial_pose[:, :, :], (batch_size, num_samples, ad)
-            ).reshape(batch_size * num_samples, ad)
-            actions_flat = actions_chunk.reshape(batch_size * num_samples, action_horizon, ad)
-
-            def _absolute_callback(state_np, actions_np):
-                return self.absolute_actions(
-                    {"state": state_np, "actions": actions_np}
-                )["actions"]
-
-            absolute_flat = jax.pure_callback(
-                _absolute_callback,
-                jax.ShapeDtypeStruct(actions_flat.shape, actions_flat.dtype),
-                state_flat,
-                actions_flat,
-            )
-            data[action_key] = absolute_flat.reshape(batch_size, num_samples, action_horizon, ad)
-        return data[action_key]
-
-    def _normalize_critic_actions(self, actions: at.Array) -> at.Array:
-        """Apply Normalize-with-critic-stats. Caller must have already adapted
-        the horizon to `critic_action_horizon` (or skipped if horizons match)."""
-        action_key = "actions"
-        critic_action_stats = {action_key: self.critic_norm_stats[action_key]}
-        data = _transforms.Normalize(
-            critic_action_stats, use_quantiles = self.critic_use_quantile_norm,
-        )({action_key: actions})
-        return data[action_key]
-
-    def _renormalize_state(self, state: at.Array) -> at.Array:
-        """Bring state from policy normalized space into the critic's normalized state space."""
-        state_key = "state"
-        data = {state_key: state}
-        policy_state_stats = {state_key: self.policy_norm_stats[state_key]}
-        critic_state_stats = {state_key: self.critic_norm_stats[state_key]}
-        data = _transforms.Unnormalize(policy_state_stats, use_quantiles = self.policy_use_quantile_norm)(data)
-        data = _transforms.Normalize(critic_state_stats, use_quantiles = self.critic_use_quantile_norm)(data)
-        return data[state_key]
 
     def _get_cached_actions(
         self,
@@ -567,21 +491,22 @@ class BestOfNWrapper(_model.BaseModel):
         n = all_actions.shape[1]
         action_horizon = all_actions.shape[2]
 
-        # Bring actions into critic space. The order is deliberate:
-        #   (1) Unnormalize policy stats — requires actions at policy_action_horizon
-        #       since policy norm-stats are per-position, shape (policy_ah, ad).
-        #   (2) Adapt horizon (subsample / pad) to critic_action_horizon.
-        #   (3) Normalize critic stats — requires actions at critic_action_horizon
-        #       since critic norm-stats are per-position, shape (critic_ah, ad).
-        # Doing (3) before (2) was the prior bug (asserted on shape mismatch
-        # between policy-horizon actions and critic-horizon stats).
+        # Policy and critic share norm stats + chunk-wise-delta format (asserted
+        # in __init__), so the policy's normalized output is already in the
+        # critic's space — only the action-dim slice (the policy may zero-pad
+        # above the critic's action dim) and the horizon adapt remain.
+        eval_actions = all_actions
         if self.critic_norm_stats is not None:
-            initial_pose = transition.action[:, :1, :] if self.convert_to_global else None
-            eval_actions = self._unnormalize_policy_actions(
-                all_actions, initial_pose = initial_pose,
-            )
-        else:
-            eval_actions = all_actions
+            critic_action_dim = self.critic_norm_stats["actions"].mean.shape[-1]
+            if eval_actions.shape[-1] != critic_action_dim:
+                if self.critic_action_dim_offset is None:
+                    raise ValueError(
+                        f"Action dim mismatch: input has {eval_actions.shape[-1]} but critic "
+                        f"expects {critic_action_dim}. Set critic_action_dim_offset to specify "
+                        f"which slice of the input to use."
+                    )
+                start = self.critic_action_dim_offset
+                eval_actions = eval_actions[..., start : start + critic_action_dim]
 
         # Adapt the policy chunk to the critic's expected horizon. Regimes are
         # supported (validated in __init__):
@@ -630,16 +555,9 @@ class BestOfNWrapper(_model.BaseModel):
 
             action_horizon = self.critic_action_horizon
 
-        # (3) Apply Normalize-with-critic-stats now that the horizon matches.
-        if self.critic_norm_stats is not None:
-            eval_actions = self._normalize_critic_actions(eval_actions)
-
-        # Renormalize state into critic space before expanding (one renorm vs. N redundant ones).
-        # Policy already sampled above using `observation` in its own normalized space.
+        # Shared norm stats => the policy-normalized state is already in the
+        # critic's space; no state renorm needed.
         critic_observation = observation
-        if self.critic_norm_stats is not None:
-            critic_state = self._renormalize_state(observation.state)
-            critic_observation = dataclasses.replace(observation, state = critic_state)
 
         expanded_obs = expand_observation(critic_observation, n)
         if critic_action_mask is not None:

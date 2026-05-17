@@ -26,8 +26,6 @@ os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 import collections
 import dataclasses
-from datetime import UTC
-from datetime import datetime
 import json
 import logging
 import os
@@ -74,6 +72,7 @@ def _interpolate_action_chunk(
     return out
 import tqdm
 import tyro
+
 
 # 256 -> 512x512 final, satisfies libx264's "divisible by 16".
 _VIDEO_PANEL_SIZE = 256
@@ -222,6 +221,13 @@ class Args:
 
     # Logging
     log_dir: str | None = None
+    # Sub-directory under <log_dir>/<env> selecting the eval method
+    # ("bc" | "bestofn8" | "bestofn64"); set by the launching bash script to
+    # match the served critic config. Empty => no method subdir.
+    method: str = ""
+    # Leaf run-tag sub-dir under <log_dir>/<env>/<method> (a date-time stamp);
+    # set by the launching bash script. Empty => no run-tag subdir.
+    run_tag: str = ""
     seed: int = 7
     # Save per-episode 2x2 mosaic mp4 (cameras + Q-value plot if available).
     log_videos: bool = False
@@ -232,6 +238,17 @@ class Args:
     # smaller wins, so max_steps acts as a ceiling for tasks with very long
     # horizons.
     max_steps: int = 1200
+
+    # Resume support. Skip the first `start_episode_idx` indices in the
+    # per-episode loop, preserving the deterministic per-index reset seed
+    # (`seed + 100 * episode_idx`) so the resumed run sees the same starting
+    # configurations a fresh run would have. If `resume_from_dir` is set, the
+    # client writes into that existing run-date subdir instead of generating a
+    # new timestamp; prior successes/failures are recovered by counting
+    # `videos/successes/*.mp4` and `videos/failures/*.mp4` so the running
+    # tally + final stats.json success_rate cover all completed episodes.
+    start_episode_idx: int = 0
+    resume_from_dir: str | None = None
 
 
 def eval_main(args: Args) -> None:
@@ -252,6 +269,8 @@ def eval_main(args: Args) -> None:
             env_name,
             split=args.split,
             log_dir=args.log_dir,
+            method=args.method,
+            run_tag=args.run_tag,
             num_trials=args.num_trials,
             resize_size=args.resize_size,
             replan_steps=args.replan_steps,
@@ -262,6 +281,8 @@ def eval_main(args: Args) -> None:
             model_action_fps=args.model_action_fps,
             env_action_fps=args.env_action_fps,
             max_steps=args.max_steps,
+            start_episode_idx=args.start_episode_idx,
+            resume_from_dir=args.resume_from_dir,
         )
 
 
@@ -269,6 +290,8 @@ def eval_env(
     env_name: str,
     split: str,
     log_dir: str | None,
+    method: str,
+    run_tag: str,
     num_trials: int,
     resize_size: int,
     replan_steps: int,
@@ -279,6 +302,8 @@ def eval_env(
     model_action_fps: float = ...,
     env_action_fps: float = ...,
     max_steps: int = 1200,
+    start_episode_idx: int = 0,
+    resume_from_dir: str | None = None,
 ) -> None:
     task_horizon = get_task_horizon(env_name)
     # Cap the per-episode horizon at `max_steps` so tasks with long horizons
@@ -288,15 +313,37 @@ def eval_env(
     # Set up logging directory
     log_path = None
     file_handler: logging.FileHandler | None = None
-    if log_dir is not None:
-        now_formatted = datetime.now(tz=UTC).strftime("%Y-%m-%d-%H-%M")
-        log_path = pathlib.Path(log_dir) / "evals" / split / env_name / now_formatted
+    resuming = resume_from_dir is not None
+    if resuming:
+        # Reuse the previous run-date dir: keep its videos in place, append to
+        # its eval.log, write the final stats.json there at the end.
+        log_path = pathlib.Path(resume_from_dir)
+        assert log_path.exists(), f"resume_from_dir does not exist: {log_path}"
+        assert not (log_path / "stats.json").exists(), (
+            f"stats.json already exists at {log_path}; that run already finished. "
+            "Refusing to resume."
+        )
+        file_handler = logging.FileHandler(log_path / "eval.log", mode = "a")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logging.getLogger().addHandler(file_handler)
+        logging.info(
+            f"Resuming eval in {log_path} from start_episode_idx={start_episode_idx}"
+        )
+    elif log_dir is not None:
+        # log_dir is a pure base (no task — the gym env names the task).
+        # Final tree: <log_dir>/<env>/<method>/<run_tag>/ , where method and
+        # run_tag (a date-time stamp) are passed by the launching bash script.
+        log_path = pathlib.Path(log_dir) / env_name
+        if method:
+            log_path = log_path / method
+        if run_tag:
+            log_path = log_path / run_tag
 
-        # Skip if already evaluated
-        for _root, _dirs, files in os.walk(os.path.dirname(str(log_path))):
-            if "stats.json" in files:
-                logging.info(f"{env_name}/{split}, stats path exists, skipping.")
-                return
+        # Skip if this exact run dir was already evaluated.
+        if (log_path / "stats.json").exists():
+            logging.info(f"stats.json exists at {log_path}, skipping.")
+            return
 
         log_path.mkdir(parents=True, exist_ok=True)
 
@@ -317,6 +364,19 @@ def eval_env(
         video_logger = "pending"
 
     total_episodes, total_successes = 0, 0
+    if resuming and log_path is not None:
+        # Recover prior counts by listing already-saved per-episode videos.
+        # Per-call variance buffers aren't recoverable from the prior log, so
+        # the final variance fields cover only the resumed segment.
+        prior_succ = sorted((log_path / "videos" / "successes").glob("episode_*.mp4"))
+        prior_fail = sorted((log_path / "videos" / "failures").glob("episode_*.mp4"))
+        total_successes = len(prior_succ)
+        total_episodes = total_successes + len(prior_fail)
+        logging.info(
+            f"Recovered prior counts from {log_path}: "
+            f"{total_successes} successes, {len(prior_fail)} failures, "
+            f"{total_episodes} total."
+        )
     # Flat per-replan-call variance buffers, tagged by episode outcome.
     # (1) cross-sample q-value variance per call; (2) within-chunk per-dim
     # action variance (pre-interpolation, averaged over dims) per call.
@@ -325,7 +385,7 @@ def eval_env(
     call_q_var_fail: list[float] = []
     call_act_var_succ: list[float] = []
     call_act_var_fail: list[float] = []
-    for episode_idx in tqdm.tqdm(range(num_trials), desc=env_name):
+    for episode_idx in tqdm.tqdm(range(start_episode_idx, num_trials), desc=env_name, initial=start_episode_idx, total=num_trials):
         # Per-episode reset seed: deterministic across runs (same `seed` →
         # same starting configuration for episode_idx), and spaced enough
         # apart to keep adjacent episodes' RNG streams disjoint.
