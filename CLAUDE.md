@@ -441,9 +441,32 @@ If the user asks to run on the cluster (e.g., for GPU access, legacy D4RL with m
    - A pre-compiled mujoco_py .so file exists in the `parl` conda env and can be copied if build fails
 
 ### Running on TPU Pods
+
+#### TPU Pods (europe-west4-b)
+
+All pods: software version `v2-alpha-tpuv5-lite`
+
+**Chip layout**: every TPU worker (host) on these pods has **4 chips** (`/dev/vfio/{0,1,2,3}` per worker, confirmed via `ls /dev/vfio/`). The pod size in the type string is the *total chip count*, so worker count = total chips / 4:
+- v5litepod-32  → 8 workers × 4 chips = 32 chips total
+- v5litepod-64  → 16 workers × 4 chips
+- v5litepod-128 → 32 workers × 4 chips
+
+`jax.local_device_count()` returns 4 on every worker; `jax.device_count()` returns the total chips after `jax.distributed.initialize()`.
+
+| Name           | Type             | Worker 0 IP    |
+| -------------- | ---------------- | -------------- |
+| v5e-tpu-32-0   | v5litepod-32     | 34.178.30.85   |
+| v5e-tpu-32-1   | v5litepod-32     | 35.204.123.212 |
+| v5e-tpu-64-0   | v5litepod-64     | 34.141.141.13  |
+| v5e-tpu-64-1   | v5litepod-64     | 34.12.90.170   |
+| v5e-0          | v5litepod-64     | 34.90.166.195  |
+| v5e-128-0      | v5litepod-128    | 34.32.213.142  |
+
 When setting up a new TPU pod, refer to `TPU_GUIDE.md` for important setup steps (GCS authentication, NFS permissions).
 
 **IMPORTANT**: Any `/nfs/` paths (e.g. `/nfs/aidm_nfs/saksham3/...`) are mounted on the TPU pods, NOT on the local development machine. Do not attempt to access, list, or read `/nfs/` paths locally — they will not exist. To inspect files at `/nfs/` paths, SSH into the TPU pod first.
+
+**File-ownership on shared NFS is unreliable**: `ls -l` of a `/nfs/` path can show files with a `uid:gid` of an unrelated user. This happens because uid mappings are inconsistent across workers — a file's apparent owner depends on which worker's `getpwuid` table is consulted, not on who actually wrote it. Do **not** treat the displayed owner as the real one (e.g. don't assume "another user is running here, back off" just because a file in your own job's output dir shows up owned by `kshitiz` / `gene` / etc.). Cross-check by mtime, file content, or which user's command actually wrote the file before drawing conclusions.
 
 **TPU Python environment**: The project venv on TPU workers is at `/nfs/aidm_nfs/saksham3/uv/vla/`. The system `python` (`/usr/bin/python`) does **not** have tensorflow / jax / project deps. Either activate the venv or call its python directly:
 ```bash
@@ -459,6 +482,8 @@ source /nfs/aidm_nfs/saksham3/uv/vla/bin/activate
 #### Launching jobs via `scripts/run_on_tpu.py`
 
 When launching training via `run_on_tpu.py`, the `--command` must include additional args derived from `pod_config.py`. These are **not** automatically injected by `run_on_tpu.py`:
+
+**Batch size by pod size**: use `--batch-size=128` on v5e-32 pods and `--batch-size=256` on v5e-64 pods, unless the user states otherwise.
 
 **For policy training** (`scripts/train.py`):
 ```bash
@@ -481,6 +506,11 @@ python scripts/run_on_tpu.py --tpu-type v5e-64 --tpu-name <pod-name> \
     --log-interval=100 \
     --wandb-group='Value Functions'"
 ```
+
+W&B group conventions:
+- `Policies` — policy models (π-0, π-0.5, etc.)
+- `Value Functions` — value function pre-training runs
+- `Fine-Tuned Value Functions` — value function fine-tuning runs (i.e., when `--fine-tune <name>` is set)
 
 #### TPU job logs
 Jobs launched via `run_on_tpu.py` write output to `~/tpu_job_output.log` on each worker. The exit code is written to `~/tpu_job_exit_code`. To check logs:

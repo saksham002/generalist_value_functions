@@ -20,9 +20,10 @@ from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared.normalize import NormStats
 
-# Set BESTOFN_DEBUG=1 in the environment to enable action-stat logging during
-# `BestOfNWrapper.sample_actions`. Read once at module import.
-_BESTOFN_DEBUG: bool = os.environ.get("BESTOFN_DEBUG", "0") == "1"
+# Set OPENPI_DEBUG=1 in the environment to enable observation/action-stat logging
+# during `BestOfNWrapper.sample_actions` and the policy-only path in
+# `BestOfNPolicy._run_jit_inference`. Read once at module import.
+_DEBUG: bool = os.environ.get("OPENPI_DEBUG", "0") == "1"
 from openpi.value_functions import base_value_functions as _base_vf
 
 
@@ -39,17 +40,17 @@ def _log_model_inputs(
     that are None are skipped at trace time (not added to the JIT graph).
     """
     jax.debug.print(
-        f"[BestOfN.debug] {tag} state shape={observation.state.shape} value={{v}}",
+        f"[debug] {tag} state shape={observation.state.shape} value={{v}}",
         v = observation.state[0],
     )
     if observation.action_mask is not None:
         jax.debug.print(
-            f"[BestOfN.debug] {tag} action_mask shape={observation.action_mask.shape} value={{v}}",
+            f"[debug] {tag} action_mask shape={observation.action_mask.shape} value={{v}}",
             v = observation.action_mask[0],
         )
     if observation.tokenized_prompt is not None:
         jax.debug.print(
-            f"[BestOfN.debug] {tag} tokenized_prompt shape={observation.tokenized_prompt.shape} value={{v}}",
+            f"[debug] {tag} tokenized_prompt shape={observation.tokenized_prompt.shape} value={{v}}",
             v = observation.tokenized_prompt[0],
         )
         if observation.tokenized_prompt_mask is not None:
@@ -60,7 +61,7 @@ def _log_model_inputs(
 
             def _log_detokenized(token_ids, mask):
                 print(
-                    f"[BestOfN.debug] {tag} untokenized_prompt: "
+                    f"[debug] {tag} untokenized_prompt: "
                     f"{detokenize_prompt(token_ids, mask)!r}"
                 )
 
@@ -71,24 +72,24 @@ def _log_model_inputs(
             )
     if observation.tokenized_prompt_mask is not None:
         jax.debug.print(
-            f"[BestOfN.debug] {tag} tokenized_prompt_mask shape={observation.tokenized_prompt_mask.shape} value={{v}}",
+            f"[debug] {tag} tokenized_prompt_mask shape={observation.tokenized_prompt_mask.shape} value={{v}}",
             v = observation.tokenized_prompt_mask[0],
         )
     for cam_name, img in observation.images.items():
         jax.debug.print(
-            f"[BestOfN.debug] {tag} image[{cam_name}] shape={img.shape} min={{mn:.4f}} max={{mx:.4f}}",
+            f"[debug] {tag} image[{cam_name}] shape={img.shape} min={{mn:.4f}} max={{mx:.4f}}",
             mn = jnp.min(img[0]), mx = jnp.max(img[0]),
         )
     for mask_name, mask in observation.image_masks.items():
         jax.debug.print(
-            f"[BestOfN.debug] {tag} image_mask[{mask_name}] shape={mask.shape} value={{v}}",
+            f"[debug] {tag} image_mask[{mask_name}] shape={mask.shape} value={{v}}",
             v = mask[0],
         )
     if actions is not None:
         # Print the full action chunk for the first batch element.
         chunk = actions[0]
         jax.debug.print(
-            f"[BestOfN.debug] {tag} actions[0] shape={chunk.shape} value={{v}}",
+            f"[debug] {tag} actions[0] shape={chunk.shape} value={{v}}",
             v = chunk,
         )
 
@@ -281,11 +282,22 @@ class BestOfNWrapper(_model.BaseModel):
         self.policy_use_quantile_norm = policy_use_quantile_norm
         self.critic_use_quantile_norm = critic_use_quantile_norm
         self.critic_action_dim_offset = critic_action_dim_offset
-        if critic_action_horizon is not None and 6 * critic_action_horizon != 5 * action_horizon:
+        # Three supported (action_horizon, critic_action_horizon) regimes:
+        #   - (60, 50): 60 Hz policy + 30 Hz critic. Stride-2 subsample
+        #     (60 -> 30), then zero-pad to 50.
+        #   - (30, 50): same-fps policy + critic. Skip subsample, zero-pad
+        #     30 -> 50.
+        #   - (50, 50): matched-horizon policy + critic. No subsample, no
+        #     pad — the chunk is forwarded as-is to the critic. The 30 / 20
+        #     valid / invalid split is carried entirely by `action_mask`.
+        if critic_action_horizon is not None and not (
+            critic_action_horizon == 50 and action_horizon in (30, 50, 60)
+        ):
             raise ValueError(
-                "Expected 6/5 * critic_action_horizon == action_horizon "
-                "(60 Hz policy, action_horizon=60 + 30 Hz critic, action_horizon=50). "
-                f"Got critic_action_horizon={critic_action_horizon}, action_horizon={action_horizon}."
+                "Only (action_horizon=30, critic_action_horizon=50), "
+                "(action_horizon=50, critic_action_horizon=50), "
+                "and (action_horizon=60, critic_action_horizon=50) are supported. "
+                f"Got action_horizon={action_horizon}, critic_action_horizon={critic_action_horizon}."
             )
         self.critic_action_horizon = critic_action_horizon
         if convert_to_global and absolute_actions is None:
@@ -294,16 +306,22 @@ class BestOfNWrapper(_model.BaseModel):
             )
         self.absolute_actions = absolute_actions
 
-    def _renormalize_actions(self, actions: at.Array, initial_pose: at.Array | None = None) -> at.Array:
-        """Bring actions from policy normalized space into the critic's normalized action space.
+    def _unnormalize_policy_actions(
+        self, actions: at.Array, initial_pose: at.Array | None = None,
+    ) -> at.Array:
+        """Slice action_dim, undo policy normalization, optionally convert to global.
 
-        Steps:
-        1. Optionally slice action dim to match critic (e.g. 32-d padded → 14-d EEF).
-        2. Unnormalize from policy action space.
-        3. Optionally convert delta actions to global using initial_pose.
-        4. Normalize into critic action space.
+        Returns actions in raw policy-output space (e.g. metric eef_pos / radian
+        eef_rot / [-1,1] gripper). The caller is then responsible for adapting
+        the horizon (subsample / pad) before applying `_normalize_critic_actions`.
 
-        Both policy_norm_stats and critic_norm_stats must be set (enforced by config validation).
+        Splitting this out from the original `_renormalize_actions` is required
+        when the policy and critic use different action_horizons and per-position
+        chunk-wise-delta norm-stats: critic stats have shape
+        (critic_action_horizon, action_dim), so `Normalize(critic_stats)` cannot
+        be applied to a chunk that's still at the policy's horizon. The horizon
+        adapt has to happen between Unnormalize-with-policy-stats and
+        Normalize-with-critic-stats.
         """
         action_key = "actions"
         data = {action_key: actions}
@@ -353,7 +371,16 @@ class BestOfNWrapper(_model.BaseModel):
                 actions_flat,
             )
             data[action_key] = absolute_flat.reshape(batch_size, num_samples, action_horizon, ad)
-        data = _transforms.Normalize(critic_action_stats, use_quantiles = self.critic_use_quantile_norm)(data)
+        return data[action_key]
+
+    def _normalize_critic_actions(self, actions: at.Array) -> at.Array:
+        """Apply Normalize-with-critic-stats. Caller must have already adapted
+        the horizon to `critic_action_horizon` (or skipped if horizons match)."""
+        action_key = "actions"
+        critic_action_stats = {action_key: self.critic_norm_stats[action_key]}
+        data = _transforms.Normalize(
+            critic_action_stats, use_quantiles = self.critic_use_quantile_norm,
+        )({action_key: actions})
         return data[action_key]
 
     def _renormalize_state(self, state: at.Array) -> at.Array:
@@ -411,6 +438,7 @@ class BestOfNWrapper(_model.BaseModel):
         value_function: _base_vf.BaseValueFunction | _base_vf.BaseMultiValueFunction | None = None,
         critic_tokenized_prompt: at.Array | None = None,
         critic_tokenized_prompt_mask: at.Array | None = None,
+        sample_rngs: at.KeyArrayLike | None = None,
         **kwargs,
     ) -> _model.Actions:
         """Sample N actions and select best via Q-value.
@@ -427,6 +455,13 @@ class BestOfNWrapper(_model.BaseModel):
                 critic's own tokenizer. When provided, overrides expanded_obs.tokenized_prompt
                 before the critic forward so the critic sees its in-distribution token IDs.
             critic_tokenized_prompt_mask: Matching [B, T] bool mask for critic_tokenized_prompt.
+            sample_rngs: Optional pre-split rng array of shape (N, ...). If provided, used
+                as the per-sample rngs directly (skipping the in-JIT `jax.random.split` of
+                `rng`). Intended for the multi-host serve path: the caller hands in a
+                DATA_AXIS-sharded rng array so each chip gets a unique rng (and therefore
+                unique noise) without the cross-host all-gather collapsing per-host
+                divergence into a "Frankenstein" tensor. Pass None for the legacy
+                same-rng-per-call path (used by training / single-host eval).
             **kwargs: Forwarded to base model's sample_actions (if base_model exists).
 
         Returns:
@@ -446,19 +481,75 @@ class BestOfNWrapper(_model.BaseModel):
         batch_size = observation.state.shape[0]
 
         if self.base_model is not None:
-            if _BESTOFN_DEBUG:
+            if _DEBUG:
                 _log_model_inputs("policy", observation)
-            # Sample from base model
-            n = self.num_samples
-            sample_rngs = jax.random.split(rng_sample, n)
+                # Probe a representative leaf of the underlying pi0/pi05 base model
+                # so we can verify the restored params on the server match the
+                # diagnostic's restored params bit-for-bit.
+                if hasattr(self.base_model, "action_out_proj"):
+                    aop_kernel = self.base_model.action_out_proj.kernel.value
+                    aop_bias = self.base_model.action_out_proj.bias.value
+                    jax.debug.print(
+                        "[debug] base_model.action_out_proj/kernel shape={s} dtype={d} "
+                        "mean={mn:.6e} std={st:.6e} min={mi:.6e} max={mx:.6e} sum={sm:.6e} "
+                        "first8={f}",
+                        s = aop_kernel.shape, d = aop_kernel.dtype,
+                        mn = jnp.mean(aop_kernel.astype(jnp.float32)),
+                        st = jnp.std(aop_kernel.astype(jnp.float32)),
+                        mi = jnp.min(aop_kernel.astype(jnp.float32)),
+                        mx = jnp.max(aop_kernel.astype(jnp.float32)),
+                        sm = jnp.sum(aop_kernel.astype(jnp.float32)),
+                        f = aop_kernel.reshape((-1,))[:8].astype(jnp.float32),
+                    )
+                    jax.debug.print(
+                        "[debug] base_model.action_out_proj/bias shape={s} dtype={d} "
+                        "mean={mn:.6e} std={st:.6e} sum={sm:.6e} value={v}",
+                        s = aop_bias.shape, d = aop_bias.dtype,
+                        mn = jnp.mean(aop_bias.astype(jnp.float32)),
+                        st = jnp.std(aop_bias.astype(jnp.float32)),
+                        sm = jnp.sum(aop_bias.astype(jnp.float32)),
+                        v = aop_bias.astype(jnp.float32),
+                    )
+            # Two paths for picking the per-sample rngs that get fed to the
+            # vmap'd policy.sample_actions call:
+            #   - sample_rngs is None → legacy path: split `rng_sample` into
+            #     ceil(num_samples / num_workers) keys per worker. Same rng on
+            #     every host, so every host computes the same per-worker n
+            #     candidates (no cross-worker diversity). Used by training /
+            #     single-host eval.
+            #   - sample_rngs is not None → caller hands in a sharded array of
+            #     shape (N, ...) where N is leading-axis-sharded across the
+            #     mesh's DATA_AXIS. Each chip gets a unique rng → unique noise.
+            #     Used by the multi-host serve path to fan out diverse noise
+            #     per chip without triggering the cross-host all-gather
+            #     "Frankenstein" failure mode.
+            if sample_rngs is None:
+                num_workers = jax.process_count()
+                n = max(1, -(-self.num_samples // num_workers))
+                sample_rngs = jax.random.split(rng_sample, n)
 
-            @eqx.filter_vmap(in_axes=(0, None, None, None))
+            # Match main's vmap pattern: use `eqx.filter_vmap` with explicit
+            # `in_axes=(0, None, None, None)`, passing `model`, `trans`, and
+            # `next_action` as positional args (broadcast, not vmapped). This
+            # avoids closing the NNX module / transition over `jax.vmap` —
+            # which (under the previous `jax.vmap(sample_with_rng)(sample_rngs)`
+            # closure pattern) was producing wrong outputs on the live server.
+            @eqx.filter_vmap(in_axes = (0, None, None, None))
             def sample_with_rng(rng_i, model, trans, next_action):
-                return model.sample_actions(rng_i, trans, compute_next_action=next_action, **kwargs)
+                return model.sample_actions(
+                    rng_i, trans, compute_next_action = next_action, **kwargs,
+                )
 
             all_actions = sample_with_rng(sample_rngs, self.base_model, transition, compute_next_action)
             # all_actions shape: [N, B, ah, ad]
             all_actions = jnp.moveaxis(all_actions, 0, 1)  # [B, N, ah, ad]
+            if _DEBUG:
+                # Raw policy output in policy-normalized space, before the
+                # critic-side renormalize / horizon-pad / action-dim slice.
+                jax.debug.print(
+                    f"[debug] policy raw_actions shape={all_actions.shape} sample0={{v}}",
+                    v = all_actions[0, 0],
+                )
         else:
             # Use cached counterfactual actions
             all_actions = self._get_cached_actions(
@@ -468,23 +559,38 @@ class BestOfNWrapper(_model.BaseModel):
         n = all_actions.shape[1]
         action_horizon = all_actions.shape[2]
 
-        # Renormalize actions into critic space if self.critic_norm_stats was provided.
+        # Bring actions into critic space. The order is deliberate:
+        #   (1) Unnormalize policy stats — requires actions at policy_action_horizon
+        #       since policy norm-stats are per-position, shape (policy_ah, ad).
+        #   (2) Adapt horizon (subsample / pad) to critic_action_horizon.
+        #   (3) Normalize critic stats — requires actions at critic_action_horizon
+        #       since critic norm-stats are per-position, shape (critic_ah, ad).
+        # Doing (3) before (2) was the prior bug (asserted on shape mismatch
+        # between policy-horizon actions and critic-horizon stats).
         if self.critic_norm_stats is not None:
             initial_pose = transition.action[:, :1, :] if self.convert_to_global else None
-            eval_actions = self._renormalize_actions(all_actions, initial_pose=initial_pose)
+            eval_actions = self._unnormalize_policy_actions(
+                all_actions, initial_pose = initial_pose,
+            )
         else:
             eval_actions = all_actions
 
-        # When the critic was trained at a slower frame rate than the policy
-        # (60 Hz policy, action_horizon=60; 30 Hz critic, action_horizon=50 with the
-        # last 20 slots zero-padded via fps_mask_30 at training time), subsample the
-        # policy chunk at stride 2 (60 → 30 real actions) and zero-pad up to the
-        # critic's expected horizon (30 → 50). Subsample observation.action_mask the
-        # same way and pad with False so the critic only attends to the real
-        # subsampled actions, matching the fps_mask_30 mask the critic was trained on.
+        # Adapt the policy chunk to the critic's expected horizon. Two regimes are
+        # supported (validated in __init__):
+        #   - 60 Hz policy + 30 Hz critic (action_horizon=60, critic_action_horizon=50):
+        #     stride-2 subsample (60 → 30 real actions), then zero-pad to 50,
+        #     matching the fps_mask_30 mask the critic was trained on.
+        #   - same-fps policy + critic (action_horizon=30, critic_action_horizon=50):
+        #     skip the subsample, just zero-pad 30 → 50.
+        # In both cases the action_mask is also subsampled (when applicable) and
+        # zero-padded with False so the critic only attends to the real actions.
         critic_action_mask = None
         if self.critic_action_horizon is not None and self.critic_action_horizon != action_horizon:
-            subsampled_actions = eval_actions[:, :, 1::2, :]
+            do_subsample = 6 * self.critic_action_horizon == 5 * action_horizon
+            if do_subsample:
+                subsampled_actions = eval_actions[:, :, 1::2, :]
+            else:
+                subsampled_actions = eval_actions
             subsampled_horizon = subsampled_actions.shape[2]
             pad_amount = self.critic_action_horizon - subsampled_horizon
             eval_actions = jnp.pad(
@@ -493,7 +599,9 @@ class BestOfNWrapper(_model.BaseModel):
             )
 
             if observation.action_mask is not None:
-                subsampled_mask = observation.action_mask[:, 1::2]
+                subsampled_mask = (
+                    observation.action_mask[:, 1::2] if do_subsample else observation.action_mask
+                )
             else:
                 subsampled_mask = jnp.ones((batch_size, subsampled_horizon), dtype = jnp.bool_)
             subsampled_mask_expanded = jnp.repeat(
@@ -506,6 +614,10 @@ class BestOfNWrapper(_model.BaseModel):
             )
 
             action_horizon = self.critic_action_horizon
+
+        # (3) Apply Normalize-with-critic-stats now that the horizon matches.
+        if self.critic_norm_stats is not None:
+            eval_actions = self._normalize_critic_actions(eval_actions)
 
         # Renormalize state into critic space before expanding (one renorm vs. N redundant ones).
         # Policy already sampled above using `observation` in its own normalized space.
@@ -535,14 +647,38 @@ class BestOfNWrapper(_model.BaseModel):
         # critic consumes a sliced subset of the policy's action vector.
         flat_actions = eval_actions.reshape(batch_size * n, action_horizon, eval_actions.shape[-1])
 
-        if _BESTOFN_DEBUG:
+        if _DEBUG:
             _log_model_inputs("critic", expanded_obs, actions = flat_actions)
+
+        # Critic prefix encodes images + prompt + state KVs. The critic was
+        # trained on its OWN tokenized_prompt (different buffer length / vocab
+        # than the policy's) and on critic-normalized state, so using `observation`
+        # here would silently bake the policy's tokens + policy-normalized state
+        # into the cached prefix and leave the critic off-distribution.
+        prefix_observation = critic_observation
+        if critic_tokenized_prompt is not None:
+            prefix_observation = dataclasses.replace(
+                prefix_observation,
+                tokenized_prompt = critic_tokenized_prompt,
+                tokenized_prompt_mask = critic_tokenized_prompt_mask,
+            )
 
         prefix_cache = None
         network = getattr(value_function, "q_network", getattr(value_function, "network", None))
-        if network is not None and hasattr(network, "compute_prefix_cache"):
+        # The sibling repo's value_function classes expose a top-level
+        # `compute_prefix_cache` that delegates to the underlying network. The
+        # in-repo SARSAValueFunction doesn't expose that wrapper, so checking
+        # only the network's attribute and then calling on `value_function`
+        # (which is what the sibling code does) raises AttributeError. Guard
+        # both: only enter this branch when both the network supports the
+        # KV-cache fast path AND the value_function exposes the wrapper call.
+        if (
+            network is not None
+            and hasattr(network, "compute_prefix_cache")
+            and hasattr(value_function, "compute_prefix_cache")
+        ):
             raw_kv_cache, raw_prefix_mask = value_function.compute_prefix_cache(
-                observation, use_target = self.use_target_value
+                prefix_observation, use_target = self.use_target_value
             )
             repeated_kv_cache = jax.tree.map(
                 lambda x: jnp.repeat(x, n, axis = 1), raw_kv_cache
@@ -571,15 +707,9 @@ class BestOfNWrapper(_model.BaseModel):
         q_values = result[0] if isinstance(result, tuple) else result
         q_values = q_values.reshape(batch_size, n)
 
-        if self.selection_mode == "argmax":
-            indices = jnp.argmax(q_values, axis=1)
-        elif self.selection_mode == "softmax":
-            logits = q_values / self.softmax_temperature
-            indices = jax.random.categorical(rng_select, logits, axis=1)
-        else:
-            raise ValueError(f"Unknown selection_mode: {self.selection_mode}")
-
-        return all_actions[jnp.arange(batch_size), indices], q_values
+        # Selection happens in the caller (host-side) so multi-host can
+        # process_allgather + argmax across workers.
+        return all_actions, q_values
 
     @override
     def compute_loss(

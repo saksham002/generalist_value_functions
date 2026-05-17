@@ -139,8 +139,6 @@ def main():
     mask = np.ones_like(chunked_loss)
     if observation.action_mask is not None:
         mask = mask * np.asarray(observation.action_mask)
-    if observation.loss_mask is not None:
-        mask = mask * np.asarray(observation.loss_mask)[:, None]
     masked_loss = np.sum(chunked_loss * mask) / np.maximum(np.sum(mask), 1.0)
     logging.info(f"Masked loss (same as training): {masked_loss:.6f}")
 

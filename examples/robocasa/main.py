@@ -317,11 +317,25 @@ def eval_env(
         video_logger = "pending"
 
     total_episodes, total_successes = 0, 0
+    # Flat per-replan-call variance buffers, tagged by episode outcome.
+    # (1) cross-sample q-value variance per call; (2) within-chunk per-dim
+    # action variance (pre-interpolation, averaged over dims) per call.
+    # Single mean at the end across all calls in success/failure episodes.
+    call_q_var_succ: list[float] = []
+    call_q_var_fail: list[float] = []
+    call_act_var_succ: list[float] = []
+    call_act_var_fail: list[float] = []
     for episode_idx in tqdm.tqdm(range(num_trials), desc=env_name):
-        obs, info = env.reset()
+        # Per-episode reset seed: deterministic across runs (same `seed` →
+        # same starting configuration for episode_idx), and spaced enough
+        # apart to keep adjacent episodes' RNG streams disjoint.
+        obs, info = env.reset(seed = seed + 100 * episode_idx)
         task_lang = obs["annotation.human.task_description"]
         action_plan = collections.deque()
         done = False
+        # Per-call variance buffers for this episode.
+        ep_call_q_vars: list[float] = []
+        ep_call_act_vars: list[float] = []
 
         if isinstance(video_logger, VideoLogger):
             video_logger.start_episode(episode_idx)
@@ -363,6 +377,14 @@ def eval_env(
                 infer_result = client.infer(element)
                 roundtrip_ms = (time.perf_counter() - infer_t0) * 1000.0
                 action_chunk = infer_result["actions"]
+                # Pre-interpolation chunk variance: var across time axis per
+                # dim, then mean over dims. Captures how variable the
+                # selected action sequence is across the model horizon.
+                pre_interp_chunk = np.asarray(action_chunk, dtype = np.float32)
+                if pre_interp_chunk.shape[0] >= 2:
+                    ep_call_act_vars.append(
+                        float(np.mean(np.var(pre_interp_chunk, axis = 0)))
+                    )
                 # Resample model fps -> env fps. No-op when source==target.
                 action_chunk = _interpolate_action_chunk(
                     np.asarray(action_chunk, dtype=np.float32),
@@ -370,6 +392,10 @@ def eval_env(
                     target_fps=env_action_fps,
                 )
                 q_values = infer_result.get("q_values")
+                if q_values is not None:
+                    q_arr_for_var = np.asarray(q_values, dtype = np.float32).reshape(-1)
+                    if q_arr_for_var.size >= 2:
+                        ep_call_q_vars.append(float(np.var(q_arr_for_var)))
                 # Server-reported compute time (set by BestOfNPolicy.infer / Policy.infer).
                 server_ms = infer_result.get("policy_timing", {}).get("infer_ms")
                 server_str = f"{server_ms:.1f}ms" if server_ms is not None else "n/a"
@@ -445,8 +471,40 @@ def eval_env(
         logging.info(f"Episode {total_episodes}: {'success' if done else 'failure'}")
         logging.info(f"Running: {total_successes}/{total_episodes} ({total_successes / total_episodes * 100:.1f}%)")
 
+        ep_q_var_mean = float(np.mean(ep_call_q_vars)) if ep_call_q_vars else float("nan")
+        ep_act_var_mean = float(np.mean(ep_call_act_vars)) if ep_call_act_vars else float("nan")
+        logging.info(
+            f"Episode {total_episodes} variance (per-call mean): q={ep_q_var_mean:.6f}, "
+            f"action_pre_interp={ep_act_var_mean:.6f}"
+        )
+
+        if done:
+            call_q_var_succ.extend(ep_call_q_vars)
+            call_act_var_succ.extend(ep_call_act_vars)
+        else:
+            call_q_var_fail.extend(ep_call_q_vars)
+            call_act_var_fail.extend(ep_call_act_vars)
+
     logging.info(
         f"[{env_name}] Final: {total_successes}/{total_episodes} ({total_successes / total_episodes * 100:.1f}%)"
+    )
+
+    def _mean_or_nan(xs: list[float]) -> float:
+        return float(np.mean(xs)) if xs else float("nan")
+
+    q_var_succ_mean = _mean_or_nan(call_q_var_succ)
+    q_var_fail_mean = _mean_or_nan(call_q_var_fail)
+    act_var_succ_mean = _mean_or_nan(call_act_var_succ)
+    act_var_fail_mean = _mean_or_nan(call_act_var_fail)
+    logging.info(
+        f"[{env_name}] q_value variance over n samples — success: {q_var_succ_mean:.6f} "
+        f"(n_calls={len(call_q_var_succ)}), failure: {q_var_fail_mean:.6f} "
+        f"(n_calls={len(call_q_var_fail)})"
+    )
+    logging.info(
+        f"[{env_name}] action pre-interp per-dim variance (avg over dims) — success: "
+        f"{act_var_succ_mean:.6f} (n_calls={len(call_act_var_succ)}), failure: "
+        f"{act_var_fail_mean:.6f} (n_calls={len(call_act_var_fail)})"
     )
 
     if log_path is not None:
@@ -455,6 +513,12 @@ def eval_env(
                 {
                     "num_episodes": total_episodes,
                     "success_rate": total_successes / total_episodes if total_episodes > 0 else 0.0,
+                    "q_value_variance_success_mean": q_var_succ_mean,
+                    "q_value_variance_failure_mean": q_var_fail_mean,
+                    "action_pre_interp_variance_success_mean": act_var_succ_mean,
+                    "action_pre_interp_variance_failure_mean": act_var_fail_mean,
+                    "num_success_calls": len(call_q_var_succ),
+                    "num_failure_calls": len(call_q_var_fail),
                 },
                 f,
                 indent=4,

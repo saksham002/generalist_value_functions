@@ -1,14 +1,12 @@
 # Scratch / one-off scripts
 random/
-
-# Local Gemma helper checkout (synced separately via run_on_tpu.py)
-gemma/
-
-# Recorded eval videos
-eval/xarm_scripts/obs_videos/
+flow_test/
 
 # Per-user project status snapshots (see CLAUDE.md "Project Status / Session Context")
 project_status/
+
+# Separate repo
+eval/
 
 # Data directories.
 assets/

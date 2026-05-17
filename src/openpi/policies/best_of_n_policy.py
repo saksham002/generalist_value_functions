@@ -45,7 +45,7 @@ import openpi.models.model as _model
 import openpi.shared.normalize as _normalize
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.transforms as _transforms
-from openpi.models.best_of_n import _BESTOFN_DEBUG
+from openpi.models.best_of_n import _DEBUG
 from openpi.models.best_of_n import BestOfNWrapper
 from openpi.models.best_of_n import _log_model_inputs
 from openpi.policies import policy as _policy_module
@@ -75,7 +75,6 @@ _BROADCAST_RESTORE_DTYPES: dict[str, Any] = {
     "action_mask": jnp.bool_,
     "token_ar_mask": jnp.bool_,
     "token_loss_mask": jnp.bool_,
-    "loss_mask": jnp.bool_,
     # Critic-side extras
     "critic_token_mask": jnp.bool_,
 }
@@ -255,7 +254,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # best_of_n.py). Mirrors the `_bestofn_sample` pattern: pass the model
         # as a positional argument to `@nnx.jit` rather than capture by closure
         # so the NNX state is sharded correctly.
-        if _BESTOFN_DEBUG:
+        if _DEBUG:
             @nnx.jit
             def _sample_with_debug(model, rng_in, transition_in, noise = None):
                 # ---- DIAGNOSTIC: fingerprints INSIDE the JIT graph for the
@@ -375,6 +374,13 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # for "actions" is stored at the unpadded (14) dim.
         self._action_dim_offset = policy_model_config.action_dim_offset
         self._eef_action_dim = norm_stats["actions"].mean.shape[-1]
+        # State dim for the prewarm dummy (norm_stats["state"] is the
+        # authoritative shape; fall back to the action dim if absent).
+        self._state_dim = norm_stats["state"].mean.shape[-1]
+        # Set in the critic branch below: True when the critic's data factory
+        # is the HDF5 pipeline (sim_bimanual_assembly etc.), False for the
+        # RoboCasa/RoboCoin pipeline. Drives the prewarm dummy obs schema.
+        self._critic_is_hdf5 = False
 
         # JAX rank 0 binds the websocket; every other rank runs
         # participate_loop so the JIT'd inference doesn't deadlock waiting
@@ -439,6 +445,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 step = critic_step,
             )
             critic_kwargs = _build_critic_kwargs(critic_config)
+            self._critic_is_hdf5 = isinstance(critic_config.data, _config.Hdf5RldsDataConfig)
             self._critic_model = critic_model
             self._critic_model.eval()
             self._critic_tokenizer = critic_kwargs["tokenizer"]
@@ -562,7 +569,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # ---- DIAGNOSTIC: dump fingerprints of batched + rng + extras keys
         # right before _run_jit_inference. Lets us compare against the SAME
         # path constructed manually in test scripts.
-        if _BESTOFN_DEBUG and self._process_index == 0:
+        if _DEBUG and self._process_index == 0:
             import hashlib as _hashlib
             def _fp(name, v):
                 if hasattr(v, "shape"):
@@ -660,7 +667,15 @@ class BestOfNPolicy(_base_policy.BasePolicy):
 
         initial_eef_pose = None
         if self._bestofn is not None:
-            initial_eef_pose = _bimanual_eef_pose_from_obs(obs)
+            # convert_to_global=True needs the real EEF pose, so attempt the
+            # RoboCasa-schema extraction. Non-RoboCasa clients (no
+            # obs["observation/state"]) only run with convert_to_global=False
+            # where init_pose is unused — fall back to a zeros dummy so
+            # inference proceeds. TODO (todos.md): make this schema-generic.
+            try:
+                initial_eef_pose = _bimanual_eef_pose_from_obs(obs)
+            except (KeyError, ValueError):
+                initial_eef_pose = obs["state"]
 
         transformed = self._input_transform(obs)
 
@@ -680,7 +695,21 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # must preserve that or the model will attend to a zero-image.
         action_horizon = self._model.action_horizon
         if "action_mask" not in batched:
-            batched["action_mask"] = jnp.ones(action_horizon, dtype = jnp.bool_)[None, :]
+            # action_horizon=50 with RoboCasa target_fps=30 → only the first
+            # 3*50//5 = 30 steps correspond to the 1-second model window;
+            # last 20 are zero-padding the training-time fps_mask_30 masked
+            # out (see RoboCasaRldsDataset._build_action_mask). Carry the
+            # same 30 / 20 split here so policy attention + critic
+            # observation match training. Other horizons (30, 60) default
+            # to all-True; their adapt-time mask logic in
+            # BestOfNWrapper.sample_actions handles subsample / pad.
+            if action_horizon == 50:
+                fps_mask = jnp.concatenate(
+                    [jnp.ones(30, dtype = jnp.bool_), jnp.zeros(20, dtype = jnp.bool_)]
+                )
+                batched["action_mask"] = fps_mask[None, :]
+            else:
+                batched["action_mask"] = jnp.ones(action_horizon, dtype = jnp.bool_)[None, :]
         if "image_mask" not in batched:
             batched["image_mask"] = {k: jnp.array([True]) for k in batched.get("image", {})}
 
@@ -867,7 +896,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         sample_kwargs = dict(self._sample_kwargs)
         if "noise" in extras:
             sample_kwargs["noise"] = extras["noise"]
-        if _BESTOFN_DEBUG:
+        if _DEBUG:
             _log_model_inputs("policy", observation)
         actions_out = self._sample_actions_jit(rng, transition, **sample_kwargs)
         # Note: the raw_actions debug print runs INSIDE the JIT graph (inside
@@ -942,20 +971,33 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 return
 
             logger.info("Prewarming BestOfNPolicy JIT (this may take 30-60s)...")
-            zero_image = np.zeros((224, 224, 3), dtype = np.uint8)
-            # Identity quaternion (xyzw = [0, 0, 0, 1]) at the base- and
-            # eef-rotation slots; convert_raw_state_to_model_state otherwise
-            # passes the all-zeros quaternion to scipy.Rotation which raises.
-            state = np.zeros(_robocasa_policy.ROBOCASA_RAW_STATE_DIM, dtype = np.float32)
-            state[3:7] = np.array([0.0, 0.0, 0.0, 1.0], dtype = np.float32)   # base quat
-            state[10:14] = np.array([0.0, 0.0, 0.0, 1.0], dtype = np.float32)  # eef quat
-            dummy_obs = {
-                "observation/image": zero_image,
-                "observation/image_right": zero_image,
-                "observation/wrist_image": zero_image,
-                "observation/state": state,
-                "prompt": "prewarm",
-            }
+            zero_image = np.zeros((self._image_size, self._image_size, 3), dtype = np.uint8)
+            if self._critic_is_hdf5:
+                # HDF5 pipeline (sim_bimanual_assembly etc.): the input
+                # transform expects an `image` dict + flat `state` + `prompt`,
+                # matching what the client sends. State norm is quantile so a
+                # zeros vector is fine (no quaternion conversion on this path).
+                dummy_obs = {
+                    "image": {k: zero_image for k in self._image_keys},
+                    "state": np.zeros(self._state_dim, dtype = np.float32),
+                    "prompt": "prewarm",
+                }
+            else:
+                # RoboCasa/RoboCoin pipeline: flat observation/* keys with the
+                # raw RoboCasa state. Identity quaternion (xyzw = [0,0,0,1]) at
+                # the base- and eef-rotation slots; convert_raw_state_to_model_state
+                # otherwise passes an all-zeros quaternion to scipy.Rotation
+                # which raises.
+                state = np.zeros(_robocasa_policy.ROBOCASA_RAW_STATE_DIM, dtype = np.float32)
+                state[3:7] = np.array([0.0, 0.0, 0.0, 1.0], dtype = np.float32)   # base quat
+                state[10:14] = np.array([0.0, 0.0, 0.0, 1.0], dtype = np.float32)  # eef quat
+                dummy_obs = {
+                    "observation/image": zero_image,
+                    "observation/image_right": zero_image,
+                    "observation/wrist_image": zero_image,
+                    "observation/state": state,
+                    "prompt": "prewarm",
+                }
             _ = self.infer(dummy_obs)
             logger.info("Prewarm complete.")
         except Exception as exc:  # pylint: disable=broad-except

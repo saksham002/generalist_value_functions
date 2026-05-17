@@ -220,9 +220,6 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         sq_err = jnp.square(v_t - u_t)
-        if self.action_dim_mask is not None:
-            dim_mask = jnp.array(self.action_dim_mask, dtype=jnp.float32)[None, None, :]  # (1, 1, ad)
-            return jnp.sum(sq_err * dim_mask, axis = -1) / jnp.sum(dim_mask)
         return jnp.mean(sq_err, axis = -1)
 
     def compute_prefix_cache(
@@ -336,8 +333,6 @@ class Pi0(_model.BaseModel):
         mask = jnp.ones((batch_size, action_horizon))
         if observation.action_mask is not None:
             mask = mask * observation.action_mask
-        if observation.loss_mask is not None:
-            mask = mask * observation.loss_mask[:, None]
         num_valid = jnp.maximum(jnp.sum(mask), 1.0)
 
         l1 = jnp.sum(l1_per_step * mask) / num_valid
