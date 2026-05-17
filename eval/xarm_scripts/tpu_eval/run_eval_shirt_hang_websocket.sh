@@ -8,7 +8,7 @@ set -e
 # Configuration — edit these before running
 # =============================================================================
 # IP of TPU worker 0 (read from serve_policy_shirt_hang.sh startup logs).
-POLICY_HOST="<tpu-worker-0-ip>"
+POLICY_HOST="localhost"
 POLICY_PORT=8000
 
 ROBOT_HOST="xarmpc.pc.cs.cmu.edu"

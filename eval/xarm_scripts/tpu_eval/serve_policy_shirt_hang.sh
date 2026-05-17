@@ -11,17 +11,17 @@ TPU_TYPE="v5e-32"
 TPU_NAME="v5e-tpu-32-1"
 PORT=8000
 
-POLICY_CONFIG="robocasa_pi05_finetune"
+POLICY_CONFIG="real_hang_pi05_filter_intervention_60_Hz"
 POLICY_DIR="gs://saksham-euw4/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention_60_Hz/real_hang_pi05_filter_intervention_60_Hz"
 POLICY_STEP=50000
 
 # Set CRITIC_ENABLE=false to serve the policy without BestOfN.
-CRITIC_ENABLE=false
-CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta"
-CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta/robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta/robocasa_paligemma_q_sarsa_finetune_chunk_wise_delta"
-CRITIC_STEP=235000
-CRITIC_FT_CONFIG="robocasa_paligemma_q_sarsa_finetune_chunk_wise_delta"
-NUM_SAMPLES=64
+CRITIC_ENABLE=true
+CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa"
+CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_q_sarsa/robocoin_bimanual_paligemma_q_sarsa/real_hang_finetune_q_sarsa"
+CRITIC_STEP=238000
+CRITIC_FT_CONFIG="real_hang_finetune_q_sarsa"
+NUM_SAMPLES=8
 # =============================================================================
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)" #Should resolve to batch_value_learning

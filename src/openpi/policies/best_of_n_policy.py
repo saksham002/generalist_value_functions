@@ -45,7 +45,7 @@ import openpi.models.model as _model
 import openpi.shared.normalize as _normalize
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.transforms as _transforms
-from openpi.models.best_of_n import _DEBUG
+from openpi.models.best_of_n import _BESTOFN_DEBUG
 from openpi.models.best_of_n import BestOfNWrapper
 from openpi.models.best_of_n import _log_model_inputs
 from openpi.policies import policy as _policy_module
@@ -255,7 +255,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # best_of_n.py). Mirrors the `_bestofn_sample` pattern: pass the model
         # as a positional argument to `@nnx.jit` rather than capture by closure
         # so the NNX state is sharded correctly.
-        if _DEBUG:
+        if _BESTOFN_DEBUG:
             @nnx.jit
             def _sample_with_debug(model, rng_in, transition_in, noise = None):
                 # ---- DIAGNOSTIC: fingerprints INSIDE the JIT graph for the
@@ -562,7 +562,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # ---- DIAGNOSTIC: dump fingerprints of batched + rng + extras keys
         # right before _run_jit_inference. Lets us compare against the SAME
         # path constructed manually in test scripts.
-        if _DEBUG and self._process_index == 0:
+        if _BESTOFN_DEBUG and self._process_index == 0:
             import hashlib as _hashlib
             def _fp(name, v):
                 if hasattr(v, "shape"):
@@ -867,7 +867,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         sample_kwargs = dict(self._sample_kwargs)
         if "noise" in extras:
             sample_kwargs["noise"] = extras["noise"]
-        if _DEBUG:
+        if _BESTOFN_DEBUG:
             _log_model_inputs("policy", observation)
         actions_out = self._sample_actions_jit(rng, transition, **sample_kwargs)
         # Note: the raw_actions debug print runs INSIDE the JIT graph (inside

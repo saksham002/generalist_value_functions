@@ -689,6 +689,8 @@ def run_episode(
                 action_plan = full_actions[
                     :, args.real_action_start : args.real_action_start + args.real_action_dim
                 ]
+                if t == 0:
+                    breakpoint()
                 log_line = (
                     f"Episode {episode_idx} step {t}: prompt={prompt!r}, "
                     f"action_plan shape={action_plan.shape}, inference={elapsed:.3f}s"

@@ -76,7 +76,7 @@ class JobRunner:
             "PALIGEMMA_CACHE=$HOME/.cache/openpi/vertex-model-garden-paligemma-us/paligemma/pt_224.npz && "
             'if [ ! -f "$PALIGEMMA_CACHE" ]; then '
             'mkdir -p "$(dirname "$PALIGEMMA_CACHE")" && '
-            f'cp {nfs}/{user}/gemma/2b/pt_224.npz "$PALIGEMMA_CACHE"; '
+            f'cp {nfs}/{user}/gemma/2b/pt_224.npz "$PALIGEMMA_CACHE" || true; '
             "fi && "
             "export PLATFORM=tpu"
         )
