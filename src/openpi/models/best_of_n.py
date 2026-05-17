@@ -149,6 +149,9 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
     # 30 steps), pads with zeros up to 50, and passes an action_mask of shape (B*N, 50)
     # with the first 30 entries True so the critic only attends to the real subsampled
     # actions. When None, the policy's action_horizon is forwarded to the critic unchanged.
+    # Additionally supports critic_action_horizon=60 with action_horizon=60 (HDF5 60 Hz
+    # critics): same stride-2 subsample but zero-padded to 60 → action_mask 30 True + 30
+    # False. See the regime list and gate in BestOfNWrapper for the full set.
     critic_action_horizon: int | None = None
 
     # Transform that converts chunk-wise-delta actions to absolute actions.
@@ -282,7 +285,7 @@ class BestOfNWrapper(_model.BaseModel):
         self.policy_use_quantile_norm = policy_use_quantile_norm
         self.critic_use_quantile_norm = critic_use_quantile_norm
         self.critic_action_dim_offset = critic_action_dim_offset
-        # Three supported (action_horizon, critic_action_horizon) regimes:
+        # Four supported (action_horizon, critic_action_horizon) regimes:
         #   - (60, 50): 60 Hz policy + 30 Hz critic. Stride-2 subsample
         #     (60 -> 30), then zero-pad to 50.
         #   - (30, 50): same-fps policy + critic. Skip subsample, zero-pad
@@ -290,13 +293,18 @@ class BestOfNWrapper(_model.BaseModel):
         #   - (50, 50): matched-horizon policy + critic. No subsample, no
         #     pad — the chunk is forwarded as-is to the critic. The 30 / 20
         #     valid / invalid split is carried entirely by `action_mask`.
+        #   - (60, 60): 60 Hz policy + 60-step critic (HDF5 60 Hz critics,
+        #     e.g. sim_bimanual_assembly). Stride-2 subsample (60 -> 30),
+        #     then zero-pad to 60; action_mask is 30 True + 30 False.
         if critic_action_horizon is not None and not (
-            critic_action_horizon == 50 and action_horizon in (30, 50, 60)
+            (critic_action_horizon == 50 and action_horizon in (30, 50, 60))
+            or (critic_action_horizon == 60 and action_horizon == 60)
         ):
             raise ValueError(
                 "Only (action_horizon=30, critic_action_horizon=50), "
                 "(action_horizon=50, critic_action_horizon=50), "
-                "and (action_horizon=60, critic_action_horizon=50) are supported. "
+                "(action_horizon=60, critic_action_horizon=50), "
+                "and (action_horizon=60, critic_action_horizon=60) are supported. "
                 f"Got action_horizon={action_horizon}, critic_action_horizon={critic_action_horizon}."
             )
         self.critic_action_horizon = critic_action_horizon
@@ -575,18 +583,25 @@ class BestOfNWrapper(_model.BaseModel):
         else:
             eval_actions = all_actions
 
-        # Adapt the policy chunk to the critic's expected horizon. Two regimes are
+        # Adapt the policy chunk to the critic's expected horizon. Regimes are
         # supported (validated in __init__):
         #   - 60 Hz policy + 30 Hz critic (action_horizon=60, critic_action_horizon=50):
         #     stride-2 subsample (60 → 30 real actions), then zero-pad to 50,
         #     matching the fps_mask_30 mask the critic was trained on.
         #   - same-fps policy + critic (action_horizon=30, critic_action_horizon=50):
         #     skip the subsample, just zero-pad 30 → 50.
-        # In both cases the action_mask is also subsampled (when applicable) and
+        #   - 60 Hz policy + 60-step critic (action_horizon=60, critic_action_horizon=60):
+        #     stride-2 subsample (60 → 30), then zero-pad to 60 → action_mask
+        #     30 True + 30 False. Equal horizons but still subsampled (unlike
+        #     the 50/50 forward-as-is case), so it needs the explicit gate below.
+        # In all cases the action_mask is also subsampled (when applicable) and
         # zero-padded with False so the critic only attends to the real actions.
         critic_action_mask = None
-        if self.critic_action_horizon is not None and self.critic_action_horizon != action_horizon:
-            do_subsample = 6 * self.critic_action_horizon == 5 * action_horizon
+        subsample_60_60 = action_horizon == 60 and self.critic_action_horizon == 60
+        if self.critic_action_horizon is not None and (
+            self.critic_action_horizon != action_horizon or subsample_60_60
+        ):
+            do_subsample = (6 * self.critic_action_horizon == 5 * action_horizon) or subsample_60_60
             if do_subsample:
                 subsampled_actions = eval_actions[:, :, 1::2, :]
             else:

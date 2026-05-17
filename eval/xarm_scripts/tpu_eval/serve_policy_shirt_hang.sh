@@ -9,19 +9,19 @@ set -e
 # =============================================================================
 TPU_TYPE="v5e-32"
 TPU_NAME="v5e-tpu-32-1"
-PORT=8000
+PORT=8005
 
 POLICY_CONFIG="real_hang_pi05_filter_intervention_60_Hz"
 POLICY_DIR="gs://saksham-euw4/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention_60_Hz/real_hang_pi05_filter_intervention_60_Hz"
-POLICY_STEP=50000
+POLICY_STEP=199999
 
 # Set CRITIC_ENABLE=false to serve the policy without BestOfN.
-CRITIC_ENABLE=true
+CRITIC_ENABLE=false
 CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa"
 CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_q_sarsa/robocoin_bimanual_paligemma_q_sarsa/real_hang_finetune_q_sarsa"
 CRITIC_STEP=238000
 CRITIC_FT_CONFIG="real_hang_finetune_q_sarsa"
-NUM_SAMPLES=8
+NUM_SAMPLES=4
 # =============================================================================
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)" #Should resolve to batch_value_learning

@@ -9,7 +9,7 @@ set -e
 # =============================================================================
 # IP of TPU worker 0 (read from serve_policy_shirt_hang.sh startup logs).
 POLICY_HOST="localhost"
-POLICY_PORT=8000
+POLICY_PORT=8005
 
 ROBOT_HOST="xarmpc.pc.cs.cmu.edu"
 ROBOT_PORT=8080
