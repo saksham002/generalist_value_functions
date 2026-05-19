@@ -391,14 +391,20 @@ def _to_bimanual_arm_first_action(action: np.ndarray) -> np.ndarray:
     return np.concatenate([arm, zeros], axis = -1)
 
 
-def _bimanual_eef_observation(data: dict, prefix: str) -> tuple[np.ndarray, dict, dict]:
+def _bimanual_eef_observation(
+    data: dict, prefix: str, use_all_cameras: bool = False,
+) -> tuple[np.ndarray, dict, dict]:
     """Shared shape-up for current/next observation in the bimanual-EEF layout.
 
     Returns (state_14d, image_dict, image_mask_dict). `prefix` is "" for the current
     observation and "next_" for next-state critic inputs.
+
+    When `use_all_cameras=True`, routes all three cameras into the bimanual slots
+    (left/top → base_0_rgb, right/top → left_wrist_0_rgb, wrist_camera → right_wrist_0_rgb)
+    with all three masks True. Otherwise, follows the legacy bimanual layout that
+    masks the third slot.
     """
     state_key = f"{prefix}observation/state"
-    base_image_key = f"{prefix}observation/image_right"
     wrist_image_key = f"{prefix}observation/wrist_image"
 
     state = np.asarray(data[state_key], dtype = np.float32)
@@ -406,18 +412,36 @@ def _bimanual_eef_observation(data: dict, prefix: str) -> tuple[np.ndarray, dict
         state = convert_raw_state_to_model_state(state)
     state_14d = _to_bimanual_arm_first_state(state)
 
-    base_image = _parse_image(data[base_image_key])
-    wrist_image = _parse_image(data[wrist_image_key])
-    image = {
-        "base_0_rgb": base_image,
-        "left_wrist_0_rgb": wrist_image,
-        "right_wrist_0_rgb": np.zeros_like(base_image),
-    }
-    image_mask = {
-        "base_0_rgb": np.True_,
-        "left_wrist_0_rgb": np.True_,
-        "right_wrist_0_rgb": np.False_,
-    }
+    if use_all_cameras:
+        left_top_image_key = f"{prefix}observation/image"
+        right_top_image_key = f"{prefix}observation/image_right"
+        left_top_image = _parse_image(data[left_top_image_key])
+        right_top_image = _parse_image(data[right_top_image_key])
+        wrist_image = _parse_image(data[wrist_image_key])
+        image = {
+            "base_0_rgb": left_top_image,
+            "left_wrist_0_rgb": right_top_image,
+            "right_wrist_0_rgb": wrist_image,
+        }
+        image_mask = {
+            "base_0_rgb": np.True_,
+            "left_wrist_0_rgb": np.True_,
+            "right_wrist_0_rgb": np.True_,
+        }
+    else:
+        base_image_key = f"{prefix}observation/image_right"
+        base_image = _parse_image(data[base_image_key])
+        wrist_image = _parse_image(data[wrist_image_key])
+        image = {
+            "base_0_rgb": base_image,
+            "left_wrist_0_rgb": wrist_image,
+            "right_wrist_0_rgb": np.zeros_like(base_image),
+        }
+        image_mask = {
+            "base_0_rgb": np.True_,
+            "left_wrist_0_rgb": np.True_,
+            "right_wrist_0_rgb": np.False_,
+        }
     return state_14d, image, image_mask
 
 
@@ -439,6 +463,10 @@ class RoboCasaBimanualEEFInputs(transforms.DataTransformFn):
         left_wrist_0_rgb  <- observation/wrist_image    mask=True
         right_wrist_0_rgb <- zeros_like(base_0_rgb)     mask=False
 
+    When `use_all_cameras=True`, the third slot is no longer masked and the layout
+    becomes (observation/image → base_0_rgb, observation/image_right → left_wrist_0_rgb,
+    observation/wrist_image → right_wrist_0_rgb) with all three masks True.
+
     `next_observation/*` and RL fields (reward, mc_return, termination, truncation,
     td_discount, action_mask, next_action_mask, fps) are passed through when present
     — that's the only difference between supervised and critic-mode usage.
@@ -446,9 +474,12 @@ class RoboCasaBimanualEEFInputs(transforms.DataTransformFn):
 
     action_dim: int  # Unused (kept for API parity with RoboCasaInputs).
     model_type: _model.ModelType = _model.ModelType.PI0
+    use_all_cameras: bool = False
 
     def __call__(self, data: dict) -> dict:
-        state, image, image_mask = _bimanual_eef_observation(data, prefix = "")
+        state, image, image_mask = _bimanual_eef_observation(
+            data, prefix = "", use_all_cameras = self.use_all_cameras,
+        )
         inputs: dict = {"state": state, "image": image, "image_mask": image_mask}
 
         if "actions" in data:
@@ -457,7 +488,9 @@ class RoboCasaBimanualEEFInputs(transforms.DataTransformFn):
             )
 
         if f"next_observation/state" in data:
-            next_state, next_image, next_image_mask = _bimanual_eef_observation(data, prefix = "next_")
+            next_state, next_image, next_image_mask = _bimanual_eef_observation(
+                data, prefix = "next_", use_all_cameras = self.use_all_cameras,
+            )
             inputs["next_state"] = next_state
             inputs["next_image"] = next_image
             inputs["next_image_mask"] = next_image_mask

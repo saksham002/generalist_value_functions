@@ -2146,10 +2146,10 @@ def main(config: _config.TrainConfig):
         if jax.process_count() > 1:
             jax.experimental.multihost_utils.sync_global_devices("val_cache_write")
         del val_trajectory_dataset, val_input_transform, _val_data_config, _val_rlds_kwargs
-    elif data_config.rlds_dataset_class == "robocoin":
+    elif data_config.rlds_dataset_class in ("robocoin", "hdf5"):
         action_horizon = config.action_horizon or config.model.action_horizon
         val_tokenizer = config.data._get_critic_tokenizer(config.model)
-        assert val_tokenizer is not None, "RoboCOIN validation variants require a critic tokenizer."
+        assert val_tokenizer is not None, "RoboCOIN/HDF5 validation variants require a critic tokenizer."
         # Build a val-only data_config that (a) optionally points at val_dataset_dir
         # (a smaller variant of the same dataset) and (b) leaves images compressed.
         # `decode_images=False` keeps cam_X as the raw JPEG/PNG bytes coming out
@@ -2284,7 +2284,7 @@ def main(config: _config.TrainConfig):
         step = int(critic_state.step)
         model = nnx.merge(critic_state.model_def, critic_state.params)
 
-        if data_config.rlds_dataset_class in ("robocoin", "robocasa"):
+        if data_config.rlds_dataset_class in ("robocoin", "robocasa", "hdf5"):
             generate_validation_plots_dlimp(
                 model = model,
                 val_episode_indices = val_episode_indices,
@@ -2462,7 +2462,7 @@ def main(config: _config.TrainConfig):
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
-                if data_config.rlds_dataset_class in ("robocoin", "robocasa"):
+                if data_config.rlds_dataset_class in ("robocoin", "robocasa", "hdf5"):
                     generate_validation_plots_dlimp(
                         model = model,
                         val_episode_indices = val_episode_indices,

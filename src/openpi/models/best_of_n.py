@@ -278,12 +278,20 @@ class BestOfNWrapper(_model.BaseModel):
                 "policy_norm_stats and critic_norm_stats must both be provided or both be None."
             )
         if policy_norm_stats is not None:
-            if set(policy_norm_stats) != set(critic_norm_stats):
+            # Only the core transition keys must match between policy and critic
+            # norm stats; extra keys (e.g. 'action_diff', which a chunk-wise-delta
+            # critic carries but a non-delta policy does not) are ignored for both
+            # the key-set check and the per-key value comparison.
+            _core_keys = {"state", "actions", "next_state", "next_actions"}
+            p_core = set(policy_norm_stats) & _core_keys
+            c_core = set(critic_norm_stats) & _core_keys
+            if p_core != c_core:
                 raise ValueError(
-                    "BestOfNWrapper requires identical policy/critic norm stats; key sets "
-                    f"differ: {sorted(policy_norm_stats)} vs {sorted(critic_norm_stats)}."
+                    "BestOfNWrapper requires identical policy/critic core norm-stat keys "
+                    f"(state/actions/next_state/next_actions); differ: {sorted(p_core)} "
+                    f"vs {sorted(c_core)}."
                 )
-            for stats_key in policy_norm_stats:
+            for stats_key in sorted(p_core):
                 p_stats = policy_norm_stats[stats_key]
                 c_stats = critic_norm_stats[stats_key]
                 for field_name in ("mean", "std", "q01", "q99"):

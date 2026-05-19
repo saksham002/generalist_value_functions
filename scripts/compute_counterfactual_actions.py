@@ -95,7 +95,7 @@ def _resolve_config_with_fine_tune(config_name: str, fine_tune: str | None):
 class CommonArgs:
     """Arguments shared across all subcommands."""
 
-    config_name: str = "cosmos_robocoin_bc_flow"
+    config_name: str = "robocoin_bimanual_pi05_rlds"
     """Config name to resolve RLDS data source and policy."""
 
     fine_tune: str | None = None
@@ -145,6 +145,9 @@ class LaunchArgs(CommonArgs):
 
     mem: str = "64GB"
     """SLURM memory limit."""
+
+    cpus_per_task: int | None = None
+    """SLURM --cpus-per-task for each worker (and the merge job). None = scheduler default."""
 
     gres: str = "gpu:L40S:1"
     """SLURM GPU resource spec."""
@@ -460,7 +463,7 @@ def run_worker(args: WorkerArgs) -> None:
         include_subtasks = np.zeros(max_subtasks, dtype = np.bool_)
         for idx, text in enumerate(subtask_texts[:first_null_index_val]):
             lowered = text.rstrip(". ").strip().lower()
-            include_subtasks[idx] = lowered not in {"static", "abnormal"}
+            include_subtasks[idx] = lowered not in {"dummy", "static", "abnormal"}
 
         policy_prompt = _build_policy_prompt(subtask_texts, first_null_index_val)
         if policy_prompt is None:
@@ -485,13 +488,37 @@ def run_worker(args: WorkerArgs) -> None:
     if action_dim_mask is not None:
         action_dim_mask = np.asarray(action_dim_mask, dtype = np.bool_)
         action_dim = int(np.sum(action_dim_mask))
+        # Mirrors PadStatesAndActions._resolve_offset: contiguous True block.
+        true_indices = np.where(action_dim_mask)[0]
+        assert (true_indices == np.arange(true_indices[0], true_indices[-1] + 1)).all(), (
+            f"action_dim_mask must be a contiguous True block, got {action_dim_mask.tolist()}"
+        )
+        action_dim_offset = int(true_indices[0])
     else:
         action_dim = policy_model_config.action_dim
+        action_dim_offset = getattr(policy_model_config, "action_dim_offset", 0)
     max_subtasks = 5
+    prompt_mode = data_config.rlds_kwargs.get("prompt_mode", "subtask")
+
+    def _select_task_description_prompt(
+        step: dict[str, Any], fps: int, task_description: str,
+    ) -> tuple[str | None, int, np.ndarray]:
+        """Constant-per-episode prompt; mirrors hdf5_rlds_dataset.py:569-572."""
+        if not task_description:
+            return None, 0, np.zeros(action_horizon, dtype = np.bool_)
+        if data_config.rlds_kwargs["mask_boundary_actions"]:
+            steps_value = int(np.asarray(step["steps_to_subtask_end"]).flatten()[0])
+            action_mask = np.arange(action_horizon, dtype = np.int32) <= steps_value
+        else:
+            action_mask = np.ones(action_horizon, dtype = np.bool_)
+        if fps == 30:
+            valid_30fps_actions = 3 * action_horizon // 5
+            action_mask &= np.arange(action_horizon, dtype = np.int32) < valid_30fps_actions
+        return task_description, 0, action_mask
 
     logger.info(
         f"Action horizon={action_horizon}, action_dim={action_dim}, num_samples={args.num_samples}, "
-        f"action_dim_mask={action_dim_mask}, "
+        f"action_dim_mask={action_dim_mask}, prompt_mode={prompt_mode}, "
         f"mask_boundary_actions={data_config.rlds_kwargs.get('mask_boundary_actions')}, "
         f"use_chunk_wise_delta={data_config.rlds_kwargs.get('use_chunk_wise_delta')}, "
         f"rng_seed=0 (hardcoded in Policy)"
@@ -528,7 +555,7 @@ def run_worker(args: WorkerArgs) -> None:
         return ", ".join(parts)
 
     for shard_list_pos, shard_idx in enumerate(my_shards):
-        # In reverse mode, stop early if the forward worker has caught up: if the 5th
+        # In reverse mode, stop early if the forward worker has caught up: if the 10th
         # upcoming shard (in our reversed order) already exists, both ends have converged.
         if args.reverse:
             lookahead = 10
@@ -542,12 +569,29 @@ def run_worker(args: WorkerArgs) -> None:
                     / ca_store.get_shard_filename(args.split, lookahead_shard_idx)
                 )
                 if lookahead_path.exists():
-                    logger.info(
-                        "Worker %d: reverse lookahead shard %d (position +%d) already exists, "
-                        "forward worker has caught up. Stopping early.",
-                        worker_id, lookahead_shard_idx, lookahead,
+                    # On resume, the current shard already existing means this is
+                    # our own prior reverse output (not forward convergence), so
+                    # skip it and keep going; only stop if it is missing.
+                    current_shard_path = (
+                        worker_dir
+                        / ca_store.COUNTERFACTUAL_ACTION_STORE_DATASET_NAME
+                        / ca_store.VERSION
+                        / ca_store.get_shard_filename(args.split, shard_idx)
                     )
-                    break
+                    if current_shard_path.exists():
+                        logger.info(
+                            "Worker %d: reverse lookahead shard %d (position +%d) exists but "
+                            "current shard %d also exists (prior reverse output); skipping.",
+                            worker_id, lookahead_shard_idx, lookahead, shard_idx,
+                        )
+                        continue
+                    else:
+                        logger.info(
+                            "Worker %d: reverse lookahead shard %d (position +%d) already exists, "
+                            "forward worker has caught up. Stopping early.",
+                            worker_id, lookahead_shard_idx, lookahead,
+                        )
+                        break
 
         start_pos, num_episodes = shard_info[shard_idx]
 
@@ -594,6 +638,8 @@ def run_worker(args: WorkerArgs) -> None:
                 num_episodes,
             )
 
+        
+        # Initialize the shard_writer once per shard
         shard_writer = ca_store.CounterfactualActionStoreTFDSShardWriter(
             output_dir = str(worker_dir),
             shard_idx = shard_idx,
@@ -617,6 +663,14 @@ def run_worker(args: WorkerArgs) -> None:
                 repo_id = repo_id.numpy()
             embodiment = extract_embodiment(repo_id)
             fps = int(episode["episode_metadata"]["fps"])
+            episode_task_description = ""
+            if prompt_mode == "task_description":
+                td = episode["episode_metadata"]["task_description"]
+                if hasattr(td, "numpy"):
+                    td = td.numpy()
+                if isinstance(td, bytes):
+                    td = td.decode("utf-8")
+                episode_task_description = (td or "").rstrip(". ").strip()
             episode_actions = None
             if args.debug_metrics:
                 episode_actions = []
@@ -647,8 +701,12 @@ def run_worker(args: WorkerArgs) -> None:
             episode_cov_trace_sum = 0.0
             episode_cov_trace_num_valid = 0.0
 
-            if not any(int(step["first_null_index"]) > 0 for step in episode["steps"]):
-                # No valid subtasks for this episode, leave all zeros
+            if prompt_mode == "task_description":
+                skip_whole_episode = not episode_task_description
+            else:
+                skip_whole_episode = not any(int(step["first_null_index"]) > 0 for step in episode["steps"])
+            if skip_whole_episode:
+                # No valid prompt for this episode, leave all zeros
                 pass
             else:
                 pending_requests: deque[PendingRequest] = deque()
@@ -700,7 +758,15 @@ def run_worker(args: WorkerArgs) -> None:
                             text = text.decode("utf-8")
                         subtask_texts.append(text)
 
-                    policy_prompt, sampled_idx, action_mask = _select_policy_subtask(step, subtask_texts, fps)
+
+                    if prompt_mode == "task_description":
+                        policy_prompt, sampled_idx, action_mask = _select_task_description_prompt(
+                            step, fps, episode_task_description,
+                        )
+                    else:
+                        policy_prompt, sampled_idx, action_mask = _select_policy_subtask(
+                            step, subtask_texts, fps,
+                        )
                     if policy_prompt is None:
                         continue
                     episode_valid_frames += 1
@@ -712,7 +778,16 @@ def run_worker(args: WorkerArgs) -> None:
                     if hasattr(step_state, "numpy"):
                         step_state = step_state.numpy()
                     step_state = np.array(step_state, dtype=np.float32)
-                    if data_config.rlds_kwargs["state_dim"] == 16 and step_state.shape[-1] == 14:
+                    if data_config_for_policy.robocoin_use_eef:
+                        # Mirrors RoboCoinRldsDataset._construct_eef_state: 14-D EEF layout
+                        # (left xyz/rpy + left gripper + right xyz/rpy + right gripper)
+                        # built from 12-D eef_sim_pose_state and the joint state's gripper slots.
+                        step_eef_state = step["eef_sim_pose_state"]
+                        if hasattr(step_eef_state, "numpy"):
+                            step_eef_state = step_eef_state.numpy()
+                        step_eef_state = np.asarray(step_eef_state, dtype = np.float32)
+                        step_state = _construct_eef_repr_np(step_state, step_eef_state)
+                    elif data_config.rlds_kwargs["state_dim"] == 16 and step_state.shape[-1] == 14:
                         step_state = np.concatenate([step_state[:6], [0.0], step_state[6:13], [0.0], step_state[13:]], axis = 0).astype(np.float32)
 
                     # Decode images once per step (not per subtask)
@@ -883,9 +958,15 @@ def run_worker(args: WorkerArgs) -> None:
 
                     with episode_timer.context("sample_actions_to_host"):
                         actions_np = np.asarray(actions_out)
+                    # Slice the padded model output (action_dim) down to the meaningful
+                    # contiguous block before output_transform. norm_stats["actions"] is
+                    # stored at the unpadded dim, and Unnormalize is strict on shape;
+                    # without this slice it would assert. Mirrors BestOfNPolicy.infer
+                    # (src/openpi/policies/best_of_n_policy.py:621-637).
+                    actions_np = actions_np[..., action_dim_offset : action_dim_offset + action_dim]
                     batch_states = np.concatenate(
                         [
-                            np.broadcast_to(request.state[None], (n, *request.state.shape))
+                            np.broadcast_to(request.transformed["state"][None], (n, *request.transformed["state"].shape))
                             for request, n in batch_requests
                         ],
                         axis=0,
@@ -898,19 +979,13 @@ def run_worker(args: WorkerArgs) -> None:
                                 "actions": actions_np,
                                 "next_state": batch_states,
                                 "next_actions": actions_np,
-                                "counterfactual_actions": actions_np,
-                                "counterfactual_next_actions": actions_np,
                             }
                         )
                     output_actions = transformed_outputs["actions"]
-                    if action_dim_mask is not None:
-                        output_actions = output_actions[..., action_dim_mask]
 
                     offset = 0
                     for request, n in batch_requests:
                         request_actions = actions_np[offset : offset + n]
-                        if action_dim_mask is not None:
-                            request_actions = request_actions[..., action_dim_mask]
                         if args.debug_metrics:
                             gt_actions = request.gt_actions
                             if action_dim_mask is not None:
@@ -1124,6 +1199,8 @@ def run_launch(args: LaunchArgs) -> None:
             "--wrap",
             wrap_cmd,
         ]
+        if args.cpus_per_task is not None:
+            sbatch_cmd.extend(["--cpus-per-task", str(args.cpus_per_task)])
         if args.qos is not None:
             sbatch_cmd.extend(["--qos", args.qos])
 
@@ -1168,6 +1245,8 @@ def run_launch(args: LaunchArgs) -> None:
             "--wrap",
             merge_wrap,
         ]
+        if args.cpus_per_task is not None:
+            merge_sbatch_cmd.extend(["--cpus-per-task", str(args.cpus_per_task)])
         if args.qos is not None:
             merge_sbatch_cmd.extend(["--qos", args.qos])
         merge_job_id = _submit_sbatch(merge_sbatch_cmd)

@@ -326,9 +326,9 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
 
         logger.info(
             "PaliGemmaValueNetwork: variant=%s, is_gemma3=%s, is_gemma4=%s, action_conditioned=%s, "
-            "action_horizon=%s, no_state=%s, action_block_bidirectional=%s",
+            "action_horizon=%s, no_state=%s, action_block_bidirectional=%s, use_layernorm=%s",
             config.paligemma_variant, self._is_gemma3, self._is_gemma4, self._action_conditioned,
-            self._action_horizon, self._no_state, config.action_block_bidirectional,
+            self._action_horizon, self._no_state, config.action_block_bidirectional, config.use_layernorm,
         )
 
         # Get config and module class based on variant

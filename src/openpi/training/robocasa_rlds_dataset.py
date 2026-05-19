@@ -175,7 +175,7 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
 
         base_euler = state_action_spaces.quaternion_to_euler_xyz_tf(base_quat)
         eef_euler = state_action_spaces.quaternion_to_euler_xyz_tf(eef_quat)
-        gripper = tf.reduce_mean(gripper_qpos, axis = -1, keepdims = True)
+        gripper = tf.reduce_mean(tf.abs(gripper_qpos), axis = -1, keepdims = True)
 
         converted_state = tf.concat(
             [base_position, base_euler, eef_position, eef_euler, gripper],
