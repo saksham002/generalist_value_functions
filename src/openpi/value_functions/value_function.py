@@ -632,6 +632,7 @@ class CQLValueFunctionConfig(BaseValueFunctionConfig):
 
     discount: float = 0.99
     tau: float = 0.005
+    next_token_loss_weight: float = 0.0
 
     action_bounds: ActionBounds = dataclasses.field(
         default_factory = lambda: ActionBounds.from_uniform(-1.0, 1.0, action_dim = 1, is_normalized = True)
@@ -688,6 +689,7 @@ class CQLValueFunctionConfig(BaseValueFunctionConfig):
             cql_clip_diff_max=self.cql_clip_diff_max,
             use_calql=self.use_calql,
             use_calql_on_random_actions=self.use_calql_on_random_actions,
+            next_token_loss_weight=self.next_token_loss_weight,
         )
 
     @override
@@ -719,6 +721,7 @@ class CQLValueFunction(BaseValueFunction):
     target_q_head: ValueHead
     discount: float
     tau: float
+    next_token_loss_weight: float
 
     action_bounds: ActionBounds
     cql_alpha: float
@@ -754,6 +757,7 @@ class CQLValueFunction(BaseValueFunction):
         cql_clip_diff_max: float,
         use_calql: bool,
         use_calql_on_random_actions: bool,
+        next_token_loss_weight: float = 0.0,
     ):
         super().__init__()
         self.q_network = q_network
@@ -774,6 +778,7 @@ class CQLValueFunction(BaseValueFunction):
         self.cql_clip_diff_max = cql_clip_diff_max
         self.use_calql = use_calql
         self.use_calql_on_random_actions = use_calql_on_random_actions
+        self.next_token_loss_weight = next_token_loss_weight
 
     @override
     def compute_value(
@@ -866,6 +871,7 @@ class CQLValueFunction(BaseValueFunction):
             cql_clip_diff_max=self.cql_clip_diff_max,
             use_calql=self.use_calql,
             use_calql_on_random_actions=self.use_calql_on_random_actions,
+            next_token_loss_weight=self.next_token_loss_weight,
             value_function=self,
         )
         total_loss = q_loss + self.cql_alpha * cql_loss

@@ -365,6 +365,50 @@ def test_cached_best_of_n_uses_counterfactual_next_actions():
     assert jnp.allclose(actions, expected)
 
 
+def test_cached_best_of_n_uses_counterfactual_actions():
+    rng = jax.random.key(0)
+    config = best_of_n.BestOfNWrapperConfig(
+        action_dim=2,
+        action_horizon=1,
+        num_samples=3,
+        base_model_config=None,
+        selection_mode="argmax",
+    )
+    model = config.create(rng)
+    vf = _MockValueFunction()
+
+    obs = _make_obs(batch_size=2)
+    cfa = jnp.array(
+        [
+            [[[0.0, 0.0]], [[1.0, 1.0]], [[2.0, 2.0]]],
+            [[[3.0, 0.0]], [[0.5, 0.5]], [[1.0, 4.0]]],
+        ]
+    )
+    transition = Transition(
+        observation=obs,
+        action=jnp.zeros((2, 1, 2)),
+        reward=jnp.zeros((2,)),
+        next_observation=obs,
+        next_action=jnp.zeros((2, 1, 2)),
+        mc_return=jnp.zeros((2,)),
+        termination=jnp.zeros((2,), dtype=bool),
+        truncation=jnp.zeros((2,), dtype=bool),
+        td_discount=None,
+        counterfactual_actions=cfa,
+    )
+
+    # sample_actions returns (all_actions [B, N, ah, ad], q_values [B, N]);
+    # the cached path is a pure pass-through of counterfactual_actions, scored
+    # by the critic. Selection happens in the caller, so assert the contract.
+    all_actions, q_values = model.sample_actions(
+        rng, transition, compute_next_action=False, value_function=vf
+    )
+    assert all_actions.shape == (2, 3, 1, 2)
+    assert q_values.shape == (2, 3)
+    assert jnp.allclose(all_actions, cfa)
+    assert jnp.all(jnp.isfinite(q_values))
+
+
 def test_cached_best_of_n_requires_enough_counterfactual_actions():
     rng = jax.random.key(0)
     config = best_of_n.BestOfNWrapperConfig(

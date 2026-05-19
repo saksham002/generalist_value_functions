@@ -357,7 +357,15 @@ class DeltaActions(DataTransformFn):
             mask = None
             dims = 0
 
-        for state_key, action_key in (("state", "actions"), ("next_state", "next_actions")):
+        # Cached counterfactual chunks (shape [k, ah, ad]) are delta'd against
+        # the same state as their non-counterfactual counterpart; absent keys
+        # are skipped so non-RoboCOIN / non-cache configs are unaffected.
+        for state_key, action_key in (
+            ("state", "actions"),
+            ("next_state", "next_actions"),
+            ("state", "counterfactual_actions"),
+            ("next_state", "counterfactual_next_actions"),
+        ):
             if action_key not in data or state_key not in data:
                 continue
             state = data[state_key]
@@ -727,6 +735,7 @@ def _tokenize_robocoin_subtask_prompt(
 
     image_tokenizer = isinstance(tokenizer, (_tokenizer.Gemma3Tokenizer, _tokenizer.Gemma4Tokenizer))
     if image_tokenizer and tokenizer._num_images > 0:
+        assert add_bos, "add_bos must be True with Gemma3 or Gemma4 tokenizer"
         soi_markers = [tokenizer.START_OF_IMAGE_ID] * tokenizer._num_images
         raw_tokens = [raw_tokens[0]] + soi_markers + raw_tokens[1:]
         subtask_start_index += tokenizer._num_images

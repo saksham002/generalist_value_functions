@@ -105,9 +105,13 @@ class Transition:
         - reward, mc_return: Reward signals
         - termination, truncation: Episode boundary flags
         - tokenized_prompt, tokenized_prompt_mask: Optional text prompts
-        - (optional) counterfactual_next_actions: Pre-computed counterfactual actions for TD backup
+        - (optional) counterfactual_actions / counterfactual_next_actions: Pre-computed
+          counterfactual actions for BestOfN at the current / next state
         """
         observation, next_observation = _extract_observations_from_batch(batch)
+        counterfactual_actions = batch.get("counterfactual_actions")
+        if counterfactual_actions is not None:
+            counterfactual_actions = jnp.asarray(counterfactual_actions)
         counterfactual_next_actions = batch.get("counterfactual_next_actions")
         if counterfactual_next_actions is not None:
             counterfactual_next_actions = jnp.asarray(counterfactual_next_actions)
@@ -122,6 +126,7 @@ class Transition:
             termination=jnp.asarray(batch["termination"]),
             truncation=jnp.asarray(batch["truncation"]),
             td_discount = jnp.asarray(batch["td_discount"]) if "td_discount" in batch else None,
+            counterfactual_actions=counterfactual_actions,
             counterfactual_next_actions=counterfactual_next_actions,
         )
 

@@ -649,6 +649,7 @@ def cql_objective(
     *,
     rng: at.KeyArrayLike,
     discount: float = 0.99,
+    next_token_loss_weight: float = 0.0,
     action_bounds: ActionBounds,
     cql_alpha: float,
     cql_temp: float = 1.0,
@@ -668,7 +669,14 @@ def cql_objective(
 
     # Q(s, a) prediction (may be ensemble)
     rng, q_rng = jax.random.split(rng)
-    q_features = q_network.compute_features(transition.observation, transition.action, rng = q_rng)
+    # PaliGemma returns (features, aux) when rng is set; aux carries the
+    # next-token-prediction targets. Unwrap exactly like sarsa_objective so the
+    # head sees features (not the tuple) and the aux loss can be composed.
+    network_out = q_network.compute_features(transition.observation, transition.action, rng = q_rng)
+    if isinstance(network_out, tuple) and len(network_out) == 2 and isinstance(network_out[1], dict):
+        q_features, aux = network_out
+    else:
+        q_features, aux = network_out, {}
     q_pred = q_head(q_features)
     q_pred_for_logging = jnp.mean(q_pred, axis=0) if isinstance(q_head, EnsembleHead) else q_pred
 
@@ -719,6 +727,16 @@ def cql_objective(
         f"Expected target shape {transition.reward.shape}, got {target.shape}"
     )
     q_loss = _compute_value_loss(q_head, q_features, target)
+    next_token_embeddings = aux.get("next_token_embeddings")
+    next_token_loss = None
+    if next_token_embeddings is not None:
+        next_token_loss = next_token_objective(
+            q_network,
+            next_token_embeddings,
+            aux["next_token_targets"],
+            aux["next_token_mask"],
+        )
+        q_loss = q_loss + next_token_loss_weight * next_token_loss
     td_error = q_pred_for_logging - target
 
     q_pred_mc_diff = (q_pred_for_logging - transition.mc_return) if transition.mc_return is not None else None
@@ -737,6 +755,8 @@ def cql_objective(
         if q_pred_mc_diff is not None:
             info["mc_loss"] = jnp.mean(jnp.square(q_pred_mc_diff))
             info["avg_q_minus_mc"] = jnp.mean(q_pred_mc_diff)
+        if next_token_loss is not None:
+            info["next_token_loss"] = next_token_loss
         return q_loss, cql_loss, info
 
     # CQL samples: random, next, (optional) current
@@ -887,4 +907,6 @@ def cql_objective(
     if q_pred_mc_diff is not None:
         info["mc_loss"] = jnp.mean(jnp.square(q_pred_mc_diff))
         info["avg_q_minus_mc"] = jnp.mean(q_pred_mc_diff)
+    if next_token_loss is not None:
+        info["next_token_loss"] = next_token_loss
     return q_loss, cql_loss, info

@@ -61,7 +61,10 @@ class ValueFunctionInputs(transforms.DataTransformFn):
         if "prompt" in data:
             result["prompt"] = data["prompt"]
 
-        # Pass through cached next actions for BestOfN TD backup when available.
+        # Pass through cached counterfactual actions (current + next state) for
+        # BestOfN when available.
+        if "counterfactual_actions" in data:
+            result["counterfactual_actions"] = data["counterfactual_actions"]
         if "counterfactual_next_actions" in data:
             result["counterfactual_next_actions"] = data["counterfactual_next_actions"]
 

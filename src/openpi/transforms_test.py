@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 import openpi.models.tokenizer as _tokenizer
+import openpi.shared.normalize as _normalize
 import openpi.transforms as _transforms
 
 
@@ -65,6 +66,81 @@ def test_absolute_actions_noop():
 def test_make_bool_mask():
     assert _transforms.make_bool_mask(2, -2, 2) == (True, True, False, False, True, True)
     assert _transforms.make_bool_mask(2, 0, 2) == (True, True, True, True)
+
+
+def test_delta_actions_counterfactual_keys():
+    # Cached counterfactual chunks ([k, ah, ad]) must be delta-converted exactly
+    # like their non-counterfactual counterpart (state vs next_state) with the
+    # RoboCOIN bimanual EEF mask + rpy composition.
+    rng = np.random.default_rng(86)
+    mask = _transforms.make_bool_mask(6, -1, 6, -1)
+    rpy_index_start = (3, 10)
+    state = rng.standard_normal(14).astype(np.float32)
+    next_state = rng.standard_normal(14).astype(np.float32)
+    actions = rng.standard_normal((50, 14)).astype(np.float32)
+    next_actions = rng.standard_normal((50, 14)).astype(np.float32)
+    k = 8
+    item = {
+        "state": state,
+        "next_state": next_state,
+        "actions": actions.copy(),
+        "next_actions": next_actions.copy(),
+        "counterfactual_actions": np.broadcast_to(actions, (k, 50, 14)).copy(),
+        "counterfactual_next_actions": np.broadcast_to(next_actions, (k, 50, 14)).copy(),
+    }
+    out = _transforms.DeltaActions(mask=mask, rpy_index_start=rpy_index_start)(item)
+    for i in range(k):
+        assert np.allclose(out["counterfactual_actions"][i], out["actions"], atol=1e-5)
+        assert np.allclose(out["counterfactual_next_actions"][i], out["next_actions"], atol=1e-5)
+
+
+def test_delta_actions_counterfactual_absent_noop():
+    # Without counterfactual keys behaviour is unchanged and no keys are added.
+    item = {"state": np.array([1, 2, 3]), "actions": np.array([[3, 4, 5], [5, 6, 7]])}
+    out = _transforms.DeltaActions(mask=[False, True])(item)
+    assert "counterfactual_actions" not in out
+    assert "counterfactual_next_actions" not in out
+    assert np.all(out["actions"] == np.array([[3, 2, 5], [5, 4, 7]]))
+
+
+def test_normalize_clip_counterfactual_parity():
+    # After Normalize(quantile)+Clip the counterfactual keys must be identical
+    # (per candidate) to the non-counterfactual ones (shared action stats).
+    rng = np.random.default_rng(86)
+    stats = _normalize.NormStats(
+        mean = np.zeros((50, 14), np.float32),
+        std = np.ones((50, 14), np.float32),
+        q01 = -np.ones((50, 14), np.float32),
+        q99 = np.ones((50, 14), np.float32),
+    )
+    norm_stats = {
+        "actions": stats,
+        "next_actions": stats,
+        "counterfactual_actions": stats,
+        "counterfactual_next_actions": stats,
+    }
+    actions = rng.standard_normal((50, 14)).astype(np.float32)
+    next_actions = rng.standard_normal((50, 14)).astype(np.float32)
+    k = 8
+    item = {
+        "actions": actions.copy(),
+        "next_actions": next_actions.copy(),
+        "counterfactual_actions": np.broadcast_to(actions, (k, 50, 14)).copy(),
+        "counterfactual_next_actions": np.broadcast_to(next_actions, (k, 50, 14)).copy(),
+    }
+    item = _transforms.Normalize(norm_stats, use_quantiles = True)(item)
+    bound = 1.25
+    item = _transforms.Clip(
+        {
+            "actions": (-bound, bound),
+            "next_actions": (-bound, bound),
+            "counterfactual_actions": (-bound, bound),
+            "counterfactual_next_actions": (-bound, bound),
+        }
+    )(item)
+    for i in range(k):
+        assert np.allclose(item["counterfactual_actions"][i], item["actions"], atol=1e-6)
+        assert np.allclose(item["counterfactual_next_actions"][i], item["next_actions"], atol=1e-6)
 
 
 def test_tokenize_prompt():
