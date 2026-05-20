@@ -129,6 +129,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         *,
         policy_step: int | None = None,
         policy_fine_tune_config: str | None = None,
+        policy_task_description: str | None = None,
         critic_config_name: str | None = None,
         critic_checkpoint_dir: str | None = None,
         critic_step: int | None = None,
@@ -395,6 +396,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # PaligemmaTokenizer used by RoboCasa configs writes max_token_len at
         # construction time; we just read it off the model.
         self._max_token_len = self._model.max_token_len
+        self._policy_task_description = policy_task_description
         self._image_size = 224  # RoboCasa eval transforms always emit 224x224.
         self._image_keys = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
         # Critic prompt length (only used when BestOfN + critic are active);
@@ -619,6 +621,8 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         the JIT'd inference closure consumes).
         """
         prompt_str = obs.get("prompt")
+        if self._policy_task_description is not None:
+            obs = {**obs, "prompt": self._policy_task_description}
 
         transformed = self._input_transform(obs)
 
@@ -953,6 +957,7 @@ def create_bestofn_policy(
     policy_checkpoint_dir: str,
     policy_step: int | None = None,
     policy_fine_tune_config: str | None = None,
+    policy_task_description: str | None = None,
     critic_config_name: str | None = None,
     critic_checkpoint_dir: str | None = None,
     critic_step: int | None = None,
@@ -971,6 +976,7 @@ def create_bestofn_policy(
         policy_checkpoint_dir = policy_checkpoint_dir,
         policy_step = policy_step,
         policy_fine_tune_config = policy_fine_tune_config,
+        policy_task_description = policy_task_description,
         critic_config_name = critic_config_name,
         critic_checkpoint_dir = critic_checkpoint_dir,
         critic_step = critic_step,

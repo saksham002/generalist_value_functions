@@ -14,6 +14,8 @@ PORT=8000
 POLICY_CONFIG="sim_bimanual_assembly_pi05"
 POLICY_DIR="gs://saksham-euw4/checkpoints/robocoin/pi05_finetune/sim_bimanual_assembly_pi05/sim_bimanual_assembly_pi05"
 POLICY_STEP=10000
+# Constant policy prompt (prompt_mode="task_description"); critic still uses the client's dynamic subtask.
+POLICY_TASK_DESCRIPTION="Insert the white block into the pink and blue blocks and place the combination on the platform."
 
 # Set CRITIC_ENABLE=false to serve the policy without BestOfN.
 CRITIC_ENABLE=false
@@ -28,12 +30,13 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # tyro requires each subcommand selector to be IMMEDIATELY followed by its own flags.
 POLICY_BLOCK="policy:checkpoint --policy.config ${POLICY_CONFIG} --policy.dir ${POLICY_DIR} --policy.step ${POLICY_STEP}"
+TASK_DESCRIPTION_FLAG="--task-description \"${POLICY_TASK_DESCRIPTION}\""
 if [ "${CRITIC_ENABLE}" = true ]; then
-    PRE_POLICY_FLAGS=""
+    PRE_POLICY_FLAGS="${TASK_DESCRIPTION_FLAG}"
     CRITIC_BLOCK="critic:critic-args --critic.config ${CRITIC_CONFIG} --critic.dir ${CRITIC_DIR} --critic.step ${CRITIC_STEP} --critic.fine-tune-config ${CRITIC_FT_CONFIG} --critic.num-samples ${NUM_SAMPLES}"
 else
     # --use-bestofn-loader routes through BestOfNPolicy so the action-dim slice runs before Unnormalize.
-    PRE_POLICY_FLAGS="--use-bestofn-loader"
+    PRE_POLICY_FLAGS="--use-bestofn-loader ${TASK_DESCRIPTION_FLAG}"
     CRITIC_BLOCK=""
 fi
 
