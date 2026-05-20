@@ -14,8 +14,8 @@ POLICY_PORT=8005
 ROBOT_HOST="xarmpc.pc.cs.cmu.edu"
 ROBOT_PORT=8080
 
-NUM_EPISODES=10
-START_EPISODE_IDX=0
+NUM_EPISODES=40
+START_EPISODE_IDX=3
 CONTROL_FREQ=60
 QUERY_FREQ=30
 MAX_STEPS=7200
@@ -23,10 +23,9 @@ MAX_STEPS=7200
 HAS_CRITIC=true
 NUM_SAMPLES=8
 
-LOG_VIDEOS=false
+LOG_VIDEOS=true
 DEBUG_VALUES=false
 MANUAL=true
-USE_TASK_DESCRIPTION=false
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -53,7 +52,6 @@ ARGS=""
 [ "${LOG_VIDEOS}" = true ]          && ARGS="${ARGS} --args.log-videos"
 [ "${DEBUG_VALUES}" = true ]        && ARGS="${ARGS} --args.debug-values"
 [ "${MANUAL}" = true ]              && ARGS="${ARGS} --args.manual"
-[ "${USE_TASK_DESCRIPTION}" = true ] && ARGS="${ARGS} --args.use-task-description"
 
 uv run eval/xarm_scripts/tpu_eval/eval_shirt_hang_websocket.py \
     --args.policy-host "${POLICY_HOST}" \

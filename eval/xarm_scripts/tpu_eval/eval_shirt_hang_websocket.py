@@ -39,8 +39,6 @@ import tyro
 
 from openpi_client import websocket_client_policy as _websocket_client_policy
 
-import pdb
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 logger = logging.getLogger(__name__)
 
@@ -107,9 +105,6 @@ class Args:
 
     camera_names: tuple[str, ...] = ("right/top", "left/wrist", "right/wrist")
     """Camera names as returned by the robot environment server."""
-
-    use_task_description: bool = False
-    """If set, use a fixed task description prompt instead of the subtask tracker."""
 
     debug: bool = False
     """Debug mode: skip policy connection, save camera images to disk and print state instead."""
@@ -604,9 +599,6 @@ def extract_images_rgb(obs: dict[str, Any], camera_names: tuple[str, ...]) -> di
 # =============================================================================
 
 
-_TASK_DESCRIPTION_PROMPT = "Place the shirt on the hanger and hang it from the rod."
-
-
 def run_episode(
     env: Any,
     client: _websocket_client_policy.WebsocketClientPolicy,
@@ -616,19 +608,12 @@ def run_episode(
     logger.info(f"Starting episode {episode_idx}")
     obs, _ = env.reset(seed=episode_idx)
 
-    tracker: SubtaskTracker | None = None
-    if not args.use_task_description:
-        tracker = SubtaskTracker(manual = args.manual)
-        if args.manual:
-            # Drain any Enter presses queued before this episode started.
-            while not _advance_q.empty():
-                _advance_q.get_nowait()
-            logger.info("Manual subtask switching enabled — press Enter to advance subtask.")
-    else:
-        logger.info(
-            f"Policy uses subtask_prompt_mode='task_description'; using fixed prompt "
-            f"and skipping the auto/manual subtask tracker."
-        )
+    tracker = SubtaskTracker(manual = args.manual)
+    if args.manual:
+        # Drain any Enter presses queued before this episode started.
+        while not _advance_q.empty():
+            _advance_q.get_nowait()
+        logger.info("Manual subtask switching enabled — press Enter to advance subtask.")
 
     # Per-episode video logger. With a critic, the Q-value plot panel is animated;
     # without one, that panel is left blank and the video shows only the 3 cameras.
@@ -651,18 +636,17 @@ def run_episode(
 
     try:
         while not (terminated or truncated) and t < args.max_steps:
-            if tracker is not None:
-                tracker.update(obs)
-                if args.manual:
-                    while not _advance_q.empty():
-                        _advance_q.get_nowait()
-                        tracker.force_advance()
-                        logger.info(f"Manual advance → subtask {tracker.subtask} ({tracker.prompt!r})")
-                        if video_logger is not None:
-                            video_logger.record_advance(t)
+            tracker.update(obs)
+            if args.manual:
+                while not _advance_q.empty():
+                    _advance_q.get_nowait()
+                    tracker.force_advance()
+                    logger.info(f"Manual advance → subtask {tracker.subtask} ({tracker.prompt!r})")
+                    if video_logger is not None:
+                        video_logger.record_advance(t)
 
             if t % args.query_freq == 0:
-                prompt = _TASK_DESCRIPTION_PROMPT if args.use_task_description else tracker.prompt
+                prompt = tracker.prompt
                 state, initial_eef_pose = extract_state(obs)
                 images_rgb = extract_images_rgb(obs, args.camera_names)
 
@@ -684,13 +668,11 @@ def run_episode(
                 action_plan = full_actions[
                     :, args.real_action_start : args.real_action_start + args.real_action_dim
                 ]
-                if t == 0:
-                    breakpoint()
                 log_line = (
                     f"Episode {episode_idx} step {t}: prompt={prompt!r}, "
-                    f"action_plan shape={action_plan.shape}, inference={elapsed:.3f}s"
+                    f"inference={elapsed:.3f}s"
                 )
-                if args.debug_values and q_values is not None:
+                if q_values is not None:
                     # B = 1 in the eval flow; flatten and format.
                     values_str = ", ".join(f"{v:.4f}" for v in np.asarray(q_values).reshape(-1).tolist())
                     log_line += f", q_values=[{values_str}]"
