@@ -14,11 +14,10 @@ Two modes:
   uses, so action-dim padding (32-D model output → 14-D bimanual EEF slot)
   is unwrapped consistently with the BestOfN path.
 - **Best-of-N**: `critic_*` args also provided. Builds a `BestOfNWrapper`
-  around the loaded policy, JITs the BestOfN sample closure, re-tokenizes the
-  prompt with the critic's tokenizer at infer time, and feeds the current
-  unnormalized 14-D EEF pose as `transition.action` so the wrapper can
-  convert chunk-wise-delta candidates back to global before evaluating the
-  critic.
+  around the loaded policy, JITs the BestOfN sample closure, and re-tokenizes
+  the prompt with the critic's tokenizer at infer time. The policy and critic
+  share norm stats + chunk-wise-delta format, so the policy's normalized
+  output is scored by the critic directly (no renormalization).
 
 The shape of the returned `infer(obs)` dict is `{"actions": np.ndarray,
 "policy_timing": {"infer_ms": float}, "q_values": np.ndarray | None}`. The
@@ -115,29 +114,6 @@ def _build_critic_kwargs(critic_config: Any) -> dict[str, Any]:
     }
 
 
-def _bimanual_eef_pose_from_obs(obs: dict[str, Any]) -> np.ndarray:
-    """Compute the 14-D bimanual-EEF pose from a raw RoboCasa obs dict.
-
-    RoboCasaBimanualEEFInputs ("state[..., 6:13]" arm slot + 7 zeros padding)
-    runs as the first input transform in the policy's pipeline; we recompute
-    the same projection before the input transform consumes the raw obs so we
-    can pass it as `transition.action` to BestOfNWrapper.convert_to_global.
-    Stays in the unnormalized state/action space since AbsoluteActions sees
-    raw poses.
-    """
-    state = np.asarray(obs["observation/state"], dtype=np.float32)
-    if state.shape[-1] == _robocasa_policy.ROBOCASA_RAW_STATE_DIM:
-        state = _robocasa_policy.convert_raw_state_to_model_state(state)
-    if state.shape[-1] != _robocasa_policy.ROBOCASA_STATE_DIM:
-        raise ValueError(
-            "Expected raw 16-D or converted 13-D RoboCasa state for bimanual-EEF pose, "
-            f"got shape {state.shape}."
-        )
-    arm = state[..., 6:13]  # eef_pos:3, eef_rot:3, gripper:1
-    zeros = np.zeros((*state.shape[:-1], 7), dtype=state.dtype)
-    return np.concatenate([arm, zeros], axis=-1)
-
-
 class BestOfNPolicy(_base_policy.BasePolicy):
     """Loads a policy (and optional critic), serves an `infer(obs)` API.
 
@@ -153,6 +129,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         *,
         policy_step: int | None = None,
         policy_fine_tune_config: str | None = None,
+        policy_task_description: str | None = None,
         critic_config_name: str | None = None,
         critic_checkpoint_dir: str | None = None,
         critic_step: int | None = None,
@@ -419,6 +396,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # PaligemmaTokenizer used by RoboCasa configs writes max_token_len at
         # construction time; we just read it off the model.
         self._max_token_len = self._model.max_token_len
+        self._policy_task_description = policy_task_description
         self._image_size = 224  # RoboCasa eval transforms always emit 224x224.
         self._image_keys = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
         # Critic prompt length (only used when BestOfN + critic are active);
@@ -455,26 +433,10 @@ class BestOfNPolicy(_base_policy.BasePolicy):
 
             # `use_chunk_wise_delta` lives on the data FACTORY (RLDSRoboCasaDataConfig
             # / RoboCoinRldsDataConfig), not the runtime DataConfig instance, so
-            # we read it from `config.data`. `use_quantile_norm` is on the runtime
-            # DataConfig (it gets propagated through .create()) so we read that
-            # from `data_config`.
+            # we read it from `config.data`. BestOfNWrapper asserts the policy
+            # and critic values match (and that their norm stats are identical).
             policy_use_chunk_wise_delta = config.data.use_chunk_wise_delta
             critic_use_chunk_wise_delta = critic_kwargs["use_chunk_wise_delta"]
-            policy_use_quantile_norm = data_config.use_quantile_norm
-            critic_use_quantile_norm = critic_kwargs["use_quantile_norm"]
-            convert_to_global = (not critic_use_chunk_wise_delta) and policy_use_chunk_wise_delta
-            absolute_actions = None
-            if convert_to_global:
-                absolute_actions = next(
-                    (t for t in data_config.data_transforms.outputs if isinstance(t, _transforms.AbsoluteActions)),
-                    None,
-                )
-                if absolute_actions is None:
-                    raise ValueError(
-                        "BestOfNPolicy: convert_to_global=True but no AbsoluteActions transform "
-                        "found in policy data_config.data_transforms.outputs. Check that the "
-                        "policy's data config sets use_chunk_wise_delta=True."
-                    )
 
             resolved_offset = (
                 critic_action_dim_offset if critic_action_dim_offset is not None else self._action_dim_offset
@@ -488,9 +450,8 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 f"critic_action_dim={critic_action_dim} (policy action_dim={self._model.action_dim}), "
                 f"policy_action_horizon={policy_action_horizon}, "
                 f"critic_action_horizon={critic_action_horizon}, "
-                f"convert_to_global={convert_to_global}, "
-                f"policy_use_quantile_norm={policy_use_quantile_norm}, "
-                f"critic_use_quantile_norm={critic_use_quantile_norm})"
+                f"policy_use_chunk_wise_delta={policy_use_chunk_wise_delta}, "
+                f"critic_use_chunk_wise_delta={critic_use_chunk_wise_delta})"
             )
             self._bestofn = BestOfNWrapper(
                 action_dim = self._model.action_dim,
@@ -500,16 +461,14 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 num_samples = num_samples,
                 take_min_over_ensemble = take_min_over_ensemble,
                 use_target_value = False,
-                convert_to_global = convert_to_global,
                 selection_mode = selection_mode,
                 softmax_temperature = softmax_temperature,
                 policy_norm_stats = norm_stats,
                 critic_norm_stats = critic_norm_stats,
-                policy_use_quantile_norm = policy_use_quantile_norm,
-                critic_use_quantile_norm = critic_use_quantile_norm,
+                policy_use_chunk_wise_delta = policy_use_chunk_wise_delta,
+                critic_use_chunk_wise_delta = critic_use_chunk_wise_delta,
                 critic_action_dim_offset = resolved_offset,
                 critic_action_horizon = critic_action_horizon,
-                absolute_actions = absolute_actions,
             )
 
             @nnx.jit
@@ -544,9 +503,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         """Run a single inference step on rank 0 (or single-host).
 
         Mirrors LocalPolicy.predict but is callable from WebsocketPolicyServer
-        (single-arg dict input, dict output). The 14-D bimanual EEF "initial
-        pose" needed by BestOfN's convert_to_global path is reconstructed from
-        the raw observation via _bimanual_eef_pose_from_obs.
+        (single-arg dict input, dict output).
 
         Multi-host: this method is called only on rank 0 (the websocket-bound
         host). It builds the inference inputs, broadcasts them to all other
@@ -664,18 +621,8 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         the JIT'd inference closure consumes).
         """
         prompt_str = obs.get("prompt")
-
-        initial_eef_pose = None
-        if self._bestofn is not None:
-            # convert_to_global=True needs the real EEF pose, so attempt the
-            # RoboCasa-schema extraction. Non-RoboCasa clients (no
-            # obs["observation/state"]) only run with convert_to_global=False
-            # where init_pose is unused — fall back to a zeros dummy so
-            # inference proceeds. TODO (todos.md): make this schema-generic.
-            try:
-                initial_eef_pose = _bimanual_eef_pose_from_obs(obs)
-            except (KeyError, ValueError):
-                initial_eef_pose = obs["state"]
+        if self._policy_task_description is not None:
+            obs = {**obs, "prompt": self._policy_task_description}
 
         transformed = self._input_transform(obs)
 
@@ -718,7 +665,6 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             critic_tokens, critic_token_mask = self._critic_tokenizer.tokenize(prompt_str, None)
             extras["critic_tokens"] = jnp.asarray(critic_tokens)[None, ...]
             extras["critic_token_mask"] = jnp.asarray(critic_token_mask)[None, ...]
-            extras["init_pose"] = jnp.asarray(initial_eef_pose, dtype = jnp.float32)[None, None, :]
         if noise is not None:
             noise_arr = jnp.asarray(noise)
             if noise_arr.ndim == 2:
@@ -744,8 +690,6 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         if self._bestofn is not None:
             extras["critic_tokens"] = jnp.zeros((1, self._critic_max_token_len), dtype = jnp.int32)
             extras["critic_token_mask"] = jnp.zeros((1, self._critic_max_token_len), dtype = jnp.bool_)
-            # init_pose is the 14-D bimanual-EEF pose used by convert_to_global.
-            extras["init_pose"] = jnp.zeros((1, 1, self._eef_action_dim), dtype = jnp.float32)
         return batched, extras
 
     def _broadcast_inputs(
@@ -884,9 +828,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         """
         observation = _model.Observation.from_dict(batched)
         if self._bestofn is not None:
-            transition = _base_vf.Transition(
-                observation = observation, action = extras["init_pose"],
-            )
+            transition = _base_vf.Transition(observation = observation)
             actions_out, q_values = self._bestofn_sample(
                 self._bestofn, self._critic_model, rng, sample_rngs, transition,
                 extras["critic_tokens"], extras["critic_token_mask"],
@@ -1015,6 +957,7 @@ def create_bestofn_policy(
     policy_checkpoint_dir: str,
     policy_step: int | None = None,
     policy_fine_tune_config: str | None = None,
+    policy_task_description: str | None = None,
     critic_config_name: str | None = None,
     critic_checkpoint_dir: str | None = None,
     critic_step: int | None = None,
@@ -1033,6 +976,7 @@ def create_bestofn_policy(
         policy_checkpoint_dir = policy_checkpoint_dir,
         policy_step = policy_step,
         policy_fine_tune_config = policy_fine_tune_config,
+        policy_task_description = policy_task_description,
         critic_config_name = critic_config_name,
         critic_checkpoint_dir = critic_checkpoint_dir,
         critic_step = critic_step,

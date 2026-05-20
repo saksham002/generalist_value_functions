@@ -13,7 +13,8 @@ FINE_TUNE_CONFIG=""  # Optional: FineTuneConfig name from config.py. Leave empty
 STEP=199999
 
 # Optional: enable BestOfN value-guided action selection.
-CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa"
+#CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa"
+CRITIC_CONFIG=""
 CRITIC_CHECKPOINT="/data/group_data/rl/saksham3/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_q_sarsa/real_hang_finetune_q_sarsa"
 CRITIC_FINE_TUNE_CONFIG="real_hang_finetune_q_sarsa"
 CRITIC_STEP=238000

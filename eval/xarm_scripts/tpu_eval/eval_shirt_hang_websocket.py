@@ -37,11 +37,6 @@ import requests
 from scipy.spatial.transform import Rotation
 import tyro
 
-import openpi.models.model as _model
-import openpi.transforms as _transforms
-from openpi.models.best_of_n import BestOfNWrapper
-from openpi.shared.normalize import NormStats
-from openpi.value_functions import base_value_functions as _base_vf
 from openpi_client import websocket_client_policy as _websocket_client_policy
 
 import pdb
