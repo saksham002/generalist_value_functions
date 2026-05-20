@@ -1270,7 +1270,7 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
 class Hdf5RldsDataConfig(DataConfigFactory):
     """Data config for HDF5-sourced datasets (e.g. ``real_hang``).
 
-    Standalone sibling of ``RoboCoinRldsDataConfig`` — routes to ``Hdf5RldsDataset``
+    Standalone sibling of ``RoboCoinRldsDataConfig`` — routes to the corresponding dataset
     via ``rlds_dataset_class = "hdf5"``. The real_hang assets happen to ship in the
     RoboCOIN multi-embodiment norm-stat format, so ``_load_norm_stats`` delegates
     to the RoboCOIN implementation (and the helpers it transitively reads off
@@ -1432,6 +1432,7 @@ class Hdf5RldsDataConfig(DataConfigFactory):
             if self.use_chunk_wise_delta and "action_diff" in norm_stats:
                 norm_stats["actions"] = _slice_action_diff_norm_stats(
                     norm_stats["action_diff"], model_config.action_horizon,
+                    subsample = self.subsample,
                 )
             if "state" in norm_stats and "next_state" not in norm_stats:
                 norm_stats["next_state"] = norm_stats["state"]
@@ -1496,19 +1497,48 @@ class Hdf5RldsDataConfig(DataConfigFactory):
 
 
 def _slice_action_diff_norm_stats(
-    stats: _transforms.NormStats, action_horizon: int,
+    stats: _transforms.NormStats, action_horizon: int, subsample: bool = False,
 ) -> _transforms.NormStats:
     """Slice the leading time axis of a 2-D `(H, D)` NormStats to `(action_horizon, D)`.
 
     `compute_norm_stats` writes `action_diff` stats at a fixed length covering the
     longest action_horizon any consumer uses; the runtime config slices down to its
     own action_horizon when routing `action_diff` into the `actions` key.
+
+    When `subsample=True` (matches `Hdf5RldsDataset(subsample=True)`), strides the
+    stored stats `[1::2]` so the kept slots align with the half-cadence action
+    chunks the model actually sees. If the resulting array is shorter than
+    `action_horizon`, pads the time axis with zeros to match.
     """
+    import numpy as np
+
+    # matches subsample=True in Hdf5RldsDataset processing
+    def _stride(arr):
+        return None if arr is None else arr[1::2]
+
+    if subsample:
+        stats = _transforms.NormStats(
+            mean = _stride(stats.mean),
+            std = _stride(stats.std),
+            q01 = _stride(stats.q01),
+            q99 = _stride(stats.q99),
+        )
+
+    def _slice_and_pad(arr):
+        if arr is None:
+            return None
+        sliced = arr[:action_horizon]
+        if sliced.shape[0] < action_horizon:
+            pad_len = action_horizon - sliced.shape[0]
+            pad = np.zeros((pad_len, *sliced.shape[1:]), dtype = sliced.dtype)
+            sliced = np.concatenate([sliced, pad], axis = 0)
+        return sliced
+
     return _transforms.NormStats(
-        mean = stats.mean[:action_horizon],
-        std = stats.std[:action_horizon],
-        q01 = None if stats.q01 is None else stats.q01[:action_horizon],
-        q99 = None if stats.q99 is None else stats.q99[:action_horizon],
+        mean = _slice_and_pad(stats.mean),
+        std = _slice_and_pad(stats.std),
+        q01 = _slice_and_pad(stats.q01),
+        q99 = _slice_and_pad(stats.q99),
     )
 
 
@@ -3576,189 +3606,12 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocasa/validation_cache_dir_chunk_wise_delta_turn_on_sink_faucet/",
         include_repos = (),
     ),
-    FineTuneConfig(
-        name = "real_hang_pi05_finetune",
-        data_factory = Hdf5RldsDataConfig(
-            rlds_data_dir = "gs://saksham-euw4/hdf5/",
-            datasets = (rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
-            assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/checkpoints/robocoin/pi05_finetune/robocoin_bimanual_pi05/robocoin_bimanual_pi05/real_hang_pi05_finetune/250000/assets",
-                asset_id = "norm_stats",
-            ),
-            discount = 0.999,
-            td_n = 60,
-            use_eef = True,
-            state_dim = 14,
-            critic_mode = False,
-            use_chunk_wise_delta = True,
-            use_quantile_norm = True,
-            filter_n = 8,
-            shuffle_buffer_size = 50_000,
-            mask_boundary_actions = False,
-            replace_boundary_actions = False,
-        ),
-        model_overrides = {"discrete_state_input": False, "action_horizon": 60},
-        action_horizon = 60,
-        num_train_steps = 200_000,
-        save_interval = 25_000,
-        keep_period = 25_000,
-        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
-    ),
-    FineTuneConfig(
-        name = "real_hang_finetune_75",
-        data_factory = Hdf5RldsDataConfig(
-            rlds_data_dir = "gs://saksham-euw4/hdf5/real_hang/75",
-            datasets = (rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
-            assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang/75",
-                asset_id = "norm_stats",
-            ),
-            discount = 0.999,
-            td_n = 60,
-            use_eef = True,
-            state_dim = 14,
-            critic_mode = False,
-            use_chunk_wise_delta = True,
-            use_quantile_norm = True,
-            filter_n = 8,
-            shuffle_buffer_size = 50_000,
-            mask_boundary_actions = False,
-            replace_boundary_actions = False,
-        ),
-        model_overrides = {"action_horizon": 60},
-        action_horizon = 60,
-        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang_75_tcp/",
-        num_val_trajectories = 2,
-        include_repos = (),
-        num_train_steps = 2000,
-        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
-        save_interval = 500,
-        plot_interval = 500,
-        keep_period = 500,
-    ),
-    FineTuneConfig(
-        name = "real_hang_finetune_q_sarsa",
-        data_factory = Hdf5RldsDataConfig(
-            rlds_data_dir = "gs://saksham-euw4/hdf5/real_hang_60_Hz",
-            datasets = (rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
-            assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang_60_Hz",
-                asset_id = "norm_stats",
-            ),
-            discount = 0.999,
-            td_n = 60,
-            use_eef = True,
-            state_dim = 14,
-            critic_mode = False,
-            use_chunk_wise_delta = True,
-            use_quantile_norm = True,
-            filter_n = 8,
-            shuffle_buffer_size = 50_000,
-            subsample = True,
-            mask_boundary_actions = False,
-            replace_boundary_actions = False,
-        ),
-        model_overrides = {"action_horizon": 60},
-        action_horizon = 60,
-        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_real_hang_q_sarsa/",
-        num_val_trajectories = 5,
-        include_repos = (),
-        num_train_steps = 8000,
-        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
-        save_interval = 2000,
-        plot_interval = 2000,
-        keep_period = 2000,
-    ),
-    FineTuneConfig(
-        name = "real_hang_state_ablation_finetune",
-        data_factory = Hdf5RldsDataConfig(
-            rlds_data_dir = "gs://saksham-euw4/hdf5/real_hang",
-            datasets = (rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
-            assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
-                asset_id = "norm_stats",
-            ),
-            discount = 0.999,
-            td_n = 60,
-            use_eef = False,
-            state_dim = 16,
-            critic_mode = False,
-            use_chunk_wise_delta = True,
-            use_quantile_norm = True,
-            filter_n = 8,
-            shuffle_buffer_size = 50_000,
-            mask_boundary_actions = False,
-            replace_boundary_actions = False,
-        ),
-        model_overrides = {"action_horizon": 60},
-        action_horizon = 60,
-        num_train_steps = 10_000,
-        save_interval = 10_000,
-        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-5),
-    ),
-    FineTuneConfig(
-        name = "real_hang_state_ablation_no_state_finetune",
-        data_factory = Hdf5RldsDataConfig(
-            rlds_data_dir = "gs://saksham-euw4/hdf5/real_hang",
-            datasets = (rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
-            assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
-                asset_id = "norm_stats",
-            ),
-            discount = 0.999,
-            td_n = 60,
-            use_eef = False,
-            state_dim = 16,
-            critic_mode = False,
-            use_chunk_wise_delta = True,
-            use_quantile_norm = True,
-            filter_n = 8,
-            shuffle_buffer_size = 50_000,
-            mask_boundary_actions = False,
-            replace_boundary_actions = False,
-        ),
-        model_overrides = {"discrete_state_input": False, "action_horizon": 60},
-        action_horizon = 60,
-        num_train_steps = 10_000,
-        save_interval = 10_000,
-        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-5),
-    ),
-    FineTuneConfig(
-        name = "real_hang_state_pi05_finetune",
-        data_factory = Hdf5RldsDataConfig(
-            rlds_data_dir = "gs://saksham-euw4/hdf5/real_hang/",
-            # rlds_data_dir = "/data/group_data/rl/saksham3/hdf5/",
-            datasets = (rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
-            assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang",
-                # assets_dir = "/data/group_data/rl/saksham3/hdf5/real_hang",
-                asset_id = "norm_stats",
-            ),
-            discount = 0.999,
-            td_n = 60,
-            use_eef = True,
-            state_dim = 14,
-            critic_mode = False,
-            use_chunk_wise_delta = True,
-            use_quantile_norm = True,
-            filter_n = 8,
-            shuffle_buffer_size = 50_000,
-            mask_boundary_actions = False,
-            replace_boundary_actions = False,
-        ),
-        model_overrides = {"action_horizon": 60},
-        action_horizon = 60,
-        num_train_steps = 100_000,
-        save_interval = 20_000,
-        keep_period = 20_000,
-        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-5),
-    ),
     # chunk-wise-delta + quantile-norm Q-SARSA critic fine-tune for this task. Mirrors the data-pipeline
     # knobs of robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta so the
     # restored critic sees the same action/state representation it was
     # pre-trained under.
     FineTuneConfig(
-        name = "sim_bimanual_assembly_paligemma_q_sarsa_finetune_chunk_wise_delta",
+        name = "sim_bimanual_assembly_q_sarsa_finetune_chunk_wise_delta",
         data_factory = Hdf5RldsDataConfig(
             repo_id = "sim_bimanual_assembly",
             rlds_data_dir = "gs://saksham-euw4/hdf5",
@@ -3770,8 +3623,6 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
                 asset_id = "norm_stats",
             ),
             discount = 0.999,
-            # HDF5 source is 60 Hz; td_n must be in 60 Hz units. 60 (=1 s @ 60 Hz)
-            # is the closest available analog of the 50-step pre-training horizon.
             td_n = 60,
             use_eef = True,
             state_dim = 14,
@@ -3783,10 +3634,6 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             replace_boundary_actions = False,
             subsample = True,
         ),
-        # HDF5 dataset class only supports action_chunk_size in {30, 60}; the
-        # chunk_wise_delta pre-training horizon is 50 (RoboCoin 30 Hz). 60 is the
-        # closest HDF5 analog at the source 60 Hz rate, matching existing
-        # HDF5 + chunk_wise_delta fine-tunes (real_hang_finetune_q_sarsa).
         model_overrides = {"action_horizon": 60},
         action_horizon = 60,
         num_train_steps = 10_000,
@@ -3795,8 +3642,40 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         keep_period = 5_000,
         lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
         num_val_trajectories = 2,
-        validation_cache_dir = "/nfs/aidm_nfs/saksham3/sim_bimanual_assembly/validation_cache_dir_chunk_wise_delta_bimanual_assembly/",
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/sim_bimanual_assembly/validation_cache_dir_sim_bimanual_assembly/",
         include_repos = (),
+    ),
+    FineTuneConfig(
+        name = "real_shirt_hang_q_sarsa_finetune_chunk_wise_delta",
+        data_factory = Hdf5RldsDataConfig(
+            rlds_data_dir = "gs://saksham-euw4/hdf5",
+            datasets = (rlds_dataset.RLDSDataset(name = "real_shirt_hang", version = "1.0.0", weight = 1.0),),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/real_shirt_hang",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            use_eef = True,
+            state_dim = 14,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            subsample = True,
+        ),
+        model_overrides = {"action_horizon": 60},
+        action_horizon = 60,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/validation_cache_dir_real_shirt_hang/",
+        num_val_trajectories = 2,
+        include_repos = (),
+        num_train_steps = 8000,
+        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
+        save_interval = 2000,
+        plot_interval = 2000,
+        keep_period = 2000,
     ),
 ]
 
@@ -5477,61 +5356,6 @@ _CONFIGS = [
         keep_period = 20_000,
         fsdp_devices = 16,
         action_horizon = 60,
-    ),
-    # Same as real_hang_pi05_filter_intervention_60_Hz, but uses the task description as the
-    # prompt with no subtask conditioning (subtask_prompt_mode="task_description").
-    TrainConfig(
-        name="real_hang_pi05_filter_intervention_60_Hz_task_description",
-        model=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b",
-            action_expert_variant="gemma_300m",
-            action_dim=32,
-            action_horizon=60,
-            max_token_len=96,
-            pi05=True,
-            discrete_state_input=True,
-            action_dim_offset=14,
-            action_dim_mask=(False,) * 14 + (True,) * 14 + (False,) * 4,
-            pad_state_to_action_dim=False,
-            dtype="float32",
-        ),
-        data=Hdf5RldsDataConfig(
-            rlds_data_dir="gs://saksham-euw4/hdf5/real_hang_60_Hz/",
-            # rlds_data_dir="/data/group_data/rl/saksham3/hdf5/real_hang_60_Hz/",
-            datasets=(rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),),
-            assets=AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_hang_60_Hz",
-                asset_id = "norm_stats",
-            ),
-            discount=0.999,
-            td_n=60,
-            use_eef=True,
-            critic_mode=False,
-            use_chunk_wise_delta=True,
-            use_quantile_norm=True,
-            filter_n=8,
-            filter_intervention=True,
-            shuffle_buffer_size=50_000,
-            mask_boundary_actions=False,
-            state_dim=14,
-            prompt_mode="task_description",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=200_000,
-        batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-4,
-            decay_steps=200_000,
-            decay_lr=1e-5,
-        ),
-        optimizer=_optimizer.AdamW(),
-        num_workers=0,
-        log_interval=100,
-        save_interval=25_000,
-        keep_period=25_000,
-        fsdp_devices=16,
-        action_horizon=60,
     ),
     # Same as robocoin_bimanual_pi05_no_mask but with state_dim=16 and discrete_state_input=True
     TrainConfig(
