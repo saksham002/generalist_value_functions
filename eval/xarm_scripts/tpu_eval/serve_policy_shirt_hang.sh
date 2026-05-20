@@ -8,20 +8,20 @@ set -e
 # Configuration — edit these before running
 # =============================================================================
 TPU_TYPE="v5e-32"
-TPU_NAME="v5e-tpu-32-0"
+TPU_NAME="v5e-tpu-32-1"
 PORT=8005
 
-POLICY_CONFIG="real_hang_pi05_filter_intervention_60_Hz"
-POLICY_DIR="gs://saksham-euw4/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention_60_Hz/real_hang_pi05_filter_intervention_60_Hz"
-POLICY_STEP=199999
+POLICY_CONFIG="real_shirt_hang_pi05"
+POLICY_DIR="gs://saksham-euw4/checkpoints/robocoin/pi05_finetune/real_shirt_hang_pi05/real_shirt_hang_pi05"
+POLICY_STEP=60000
 
 # Set CRITIC_ENABLE=false to serve the policy without BestOfN.
 CRITIC_ENABLE=true
-CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa"
-CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_q_sarsa/robocoin_bimanual_paligemma_q_sarsa/real_hang_finetune_q_sarsa"
+CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta"
+CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta/robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta/real_shirt_hang_q_sarsa_finetune_chunk_wise_delta"
 CRITIC_STEP=238000
-CRITIC_FT_CONFIG="real_hang_finetune_q_sarsa"
-NUM_SAMPLES=2
+CRITIC_FT_CONFIG="real_shirt_hang_q_sarsa_finetune_chunk_wise_delta"
+NUM_SAMPLES=8
 # =============================================================================
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)" #Should resolve to batch_value_learning
@@ -37,7 +37,9 @@ else
     CRITIC_BLOCK=""
 fi
 
-SERVE_INVOCATION="python scripts/serve_policy.py --port ${PORT} ${PRE_POLICY_FLAGS} ${POLICY_BLOCK} ${CRITIC_BLOCK}"
+TASK_DESCRIPTION="Place the shirt on the hanger and hang it from the rod."
+
+SERVE_INVOCATION="python scripts/serve_policy.py --port ${PORT} --task-description '${TASK_DESCRIPTION}' ${PRE_POLICY_FLAGS} ${POLICY_BLOCK} ${CRITIC_BLOCK}"
 COMMAND="${SERVE_INVOCATION}"
 
 echo "================================================"

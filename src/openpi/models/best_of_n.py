@@ -251,6 +251,7 @@ class BestOfNWrapper(_model.BaseModel):
         critic_use_chunk_wise_delta: bool = False,
         critic_action_dim_offset: int | None = None,
         critic_action_horizon: int | None = None,
+        subsample_policy_norm_stats: bool = False,
     ):
         super().__init__(action_dim, action_horizon, max_token_len)
         self.base_model = base_model
@@ -302,9 +303,19 @@ class BestOfNWrapper(_model.BaseModel):
                             "BestOfNWrapper requires identical policy/critic norm stats; "
                             f"'{stats_key}'.{field_name} presence differs."
                         )
-                    if p_val is not None and not np.array_equal(
-                        np.asarray(p_val), np.asarray(c_val)
-                    ):
+                    if p_val is None:
+                        continue
+                    p_arr = np.asarray(p_val)
+                    c_arr = np.asarray(c_val)
+                    # When the critic FT specifies `subsample=True` AND the
+                    # norm stats are per-timestep (2D: [horizon, dim]), the
+                    # policy is at 2x the critic's rate (e.g. 60Hz vs 30Hz),
+                    # so stride-2 subsample the policy stats along the horizon
+                    # axis before comparing. Otherwise compare strictly.
+                    if subsample_policy_norm_stats and p_arr.ndim >= 2:
+                        p_arr = p_arr[1::2]
+                        c_arr = c_arr[ : p_arr.shape[0]]
+                    if not np.array_equal(p_arr, c_arr):
                         raise ValueError(
                             "BestOfNWrapper requires identical policy/critic norm stats; "
                             f"'{stats_key}'.{field_name} differs."

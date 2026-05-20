@@ -7,10 +7,10 @@ set -e
 # =============================================================================
 # Configuration — edit these before running
 # =============================================================================
-CONFIG_NAME="real_hang_pi05_filter_intervention_60_Hz"
-CHECKPOINT_DIR="/data/group_data/rl/saksham3/checkpoints/robocoin/pi05_finetune/real_hang_pi05_filter_intervention_60_Hz/"
+CONFIG_NAME="real_shirt_hang_pi05"
+CHECKPOINT_DIR="gs://saksham-euw4/checkpoints/robocoin/pi05_finetune/real_shirt_hang_pi05/real_shirt_hang_pi05"
 FINE_TUNE_CONFIG=""  # Optional: FineTuneConfig name from config.py. Leave empty to skip.
-STEP=199999
+STEP=60000
 
 # Optional: enable BestOfN value-guided action selection.
 #CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa"
@@ -30,6 +30,8 @@ START_EPISODE_IDX=16  # Index of the first episode (loop runs from this for NUM_
 DEBUG=false  # Set to true to skip policy loading and just save images / print state
 DEBUG_VALUES=true  # Set to true to log critic Q-values for each BestOfN candidate during predict
 MANUAL=true  # Set to true to advance subtasks manually by pressing Enter (auto heuristic disabled)
+
+TASK_DESCRIPTION="Place the shirt on the hanger and hang it from the rod."  # Fixed prompt that overrides obs["prompt"] regardless of subtask tracker. Leave empty to use tracker / policy default.
 
 # =============================================================================
 
@@ -107,6 +109,11 @@ if [ "${MANUAL}" = true ]; then
     MANUAL_ARGS="--args.manual"
 fi
 
+TASK_DESCRIPTION_ARGS=""
+if [ -n "${TASK_DESCRIPTION}" ]; then
+    TASK_DESCRIPTION_ARGS="--args.task-description ${TASK_DESCRIPTION}"
+fi
+
 echo -e "${BLUE}Starting eval...${NC}"
 echo ""
 
@@ -118,8 +125,9 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTH
     --args.robot-port "${ROBOT_PORT}" \
     --args.num-episodes "${NUM_EPISODES}" \
     --args.start-episode-idx "${START_EPISODE_IDX}" \
+    --args.task-description "${TASK_DESCRIPTION}"\
     ${FINE_TUNE_ARGS} \
     ${CRITIC_ARGS} \
     ${VIDEO_ARGS} \
     ${DEBUG_ARGS} \
-    ${MANUAL_ARGS}
+    ${MANUAL_ARGS} 

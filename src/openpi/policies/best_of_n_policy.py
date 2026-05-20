@@ -469,6 +469,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 critic_use_chunk_wise_delta = critic_use_chunk_wise_delta,
                 critic_action_dim_offset = resolved_offset,
                 critic_action_horizon = critic_action_horizon,
+                subsample_policy_norm_stats = getattr(critic_config.data, "subsample", False),
             )
 
             @nnx.jit

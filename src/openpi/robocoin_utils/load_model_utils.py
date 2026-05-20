@@ -120,7 +120,7 @@ def load_critic(
         config = ft_config.apply_overrides(config, pretrained_step = None)
     if config_override is not None:
         config = config_override(config)
-    config = dataclasses.replace(config, fsdp_devices = jax.local_device_count())
+    # config = dataclasses.replace(config, fsdp_devices = jax.local_device_count())  # disabled: use TrainConfig's fsdp_devices for pod-wide FSDP
 
     train_module = load_train_module()
     rng = jax.random.PRNGKey(86)
@@ -186,7 +186,7 @@ def load_policy(load_config: LoadPolicyConfig):
         ft_config = _config.get_fine_tune_config(load_config.fine_tune)
         config = ft_config.apply_overrides(config, pretrained_step = None)
 
-    config = dataclasses.replace(config, fsdp_devices = jax.local_device_count())
+    # config = dataclasses.replace(config, fsdp_devices = jax.local_device_count())  # disabled: use TrainConfig's fsdp_devices for pod-wide FSDP
 
     train_module = _load_script_module("train.py")
     rng = jax.random.PRNGKey(86)

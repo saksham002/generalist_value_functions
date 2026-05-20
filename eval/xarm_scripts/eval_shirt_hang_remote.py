@@ -147,6 +147,11 @@ class Args:
     """If set AND BestOfN is in use, save a per-episode 4-panel mp4 (wrist + base + Q-value plot)
     to eval/xarm_scripts/videos/episode_<n>.mp4 at FPS = control_freq / query_freq."""
 
+    task_description: str | None = None
+    """Optional fixed task-description prompt. If set, overrides obs['prompt'] before the
+    transforms run — mirrors the server-side `policy_task_description` override that
+    serve_policy.py exposes via --task-description."""
+
 
 # =============================================================================
 # Critic loading
@@ -212,7 +217,9 @@ class LocalPolicy:
         critic_norm_stats: dict[str, NormStats] | None = None,
         critic_kwargs: dict[str, Any] | None = None,
         num_samples: int = 8,
+        policy_task_description: str | None = None,
     ) -> None:
+        self._policy_task_description = policy_task_description
         import openpi.policies.policy as _policy_module
         import openpi.shared.nnx_utils as nnx_utils
         import openpi.transforms as _transforms
@@ -397,6 +404,10 @@ class LocalPolicy:
                 or None for the policy-only path.
         """
         raw_state = np.asarray(obs_dict["state"], dtype=np.float32)
+        # Optional task-description override: forces a fixed prompt regardless of
+        # what the caller passed (mirrors the server-side `policy_task_description`).
+        if self._policy_task_description is not None:
+            obs_dict = {**obs_dict, "prompt": self._policy_task_description}
         # Capture the prompt string before _input_transform runs (TokenizePrompt pops it).
         prompt_str = obs_dict.get("prompt")
         transformed = self._input_transform(obs_dict)
@@ -1137,6 +1148,7 @@ def main(args: Args) -> None:
         critic_norm_stats = critic_norm_stats,
         critic_kwargs = critic_kwargs,
         num_samples = args.num_samples,
+        policy_task_description = args.task_description,
     )
 
     logger.info(f"Connecting to robot environment at {args.robot_host}:{args.robot_port}")

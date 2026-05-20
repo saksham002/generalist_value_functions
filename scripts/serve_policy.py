@@ -87,6 +87,11 @@ class Args:
     # prompt.
     default_prompt: str | None = None
 
+    # Override obs["prompt"] for the policy only, leaving the critic on the client-sent
+    # prompt — required when the policy was trained with prompt_mode="task_description"
+    # but the critic was trained with prompt_mode="subtask". BestOfN path only.
+    task_description: str | None = None
+
     # Port to serve the policy on.
     port: int = 8000
     # Record the policy's behavior for debugging.
@@ -158,6 +163,7 @@ def create_policy(args: Args) -> _policy.BasePolicy:
                 policy_checkpoint_dir = args.policy.dir,
                 policy_step = args.policy.step,
                 policy_fine_tune_config = args.policy.fine_tune_config,
+                policy_task_description = args.task_description,
                 critic_config_name = args.critic.config,
                 critic_checkpoint_dir = args.critic.dir,
                 critic_step = args.critic.step,
@@ -178,6 +184,7 @@ def create_policy(args: Args) -> _policy.BasePolicy:
             policy_checkpoint_dir = args.policy.dir,
             policy_step = args.policy.step,
             policy_fine_tune_config = args.policy.fine_tune_config,
+            policy_task_description = args.task_description,
             default_prompt = args.default_prompt,
         )
 
