@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 import subprocess
 
+from openpi.tpu.gcloud import _apply_ssh_user
 from openpi.tpu.gcloud import ssh_command
 
 logger = logging.getLogger(__name__)
@@ -57,7 +58,7 @@ def sync_code(
     )
 
     # Build rsync command with gcloud as SSH transport
-    ssh_cmd = f"gcloud compute tpus tpu-vm ssh {tpu_name} --zone={zone} --project={project} --worker=0 --"
+    ssh_cmd = f"gcloud compute tpus tpu-vm ssh {_apply_ssh_user(tpu_name)} --zone={zone} --project={project} --worker=0 --"
 
     rsync_args = [
         "rsync",

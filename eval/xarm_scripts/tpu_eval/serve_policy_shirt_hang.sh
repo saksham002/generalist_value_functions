@@ -19,7 +19,7 @@ POLICY_STEP=60000
 CRITIC_ENABLE=true
 CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta"
 CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta/robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta/real_shirt_hang_q_sarsa_finetune_chunk_wise_delta"
-CRITIC_STEP=238000
+CRITIC_STEP=234000
 CRITIC_FT_CONFIG="real_shirt_hang_q_sarsa_finetune_chunk_wise_delta"
 NUM_SAMPLES=8
 # =============================================================================

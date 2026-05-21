@@ -2,6 +2,9 @@
 random/
 flow_test/
 
+# Per-project gcloud credentials (when CLOUDSDK_CONFIG points here)
+.gcloud/
+
 # Per-user project status snapshots (see CLAUDE.md "Project Status / Session Context")
 project_status/
 
