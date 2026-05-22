@@ -91,6 +91,11 @@ def detokenize_prompt(token_ids: np.ndarray, mask: np.ndarray) -> str:
     return tokenizer._tokenizer.decode(ids.tolist())
 
 
+# Logged once (first prediction batch) so HBM can be read right after the first
+# JIT compile — the point of a fast measurement loop is not to wait for the full run.
+_HBM_LOGGED = False
+
+
 @nnx.jit
 def _jitted_compute_value(
     model_to_use: _value_fn.BaseValueFunction,
@@ -211,6 +216,15 @@ def get_obs_and_action(
         prompt_key = "tokenized_prompt"
         prompt_mask_key = "tokenized_prompt_mask"
 
+    # Subtask boundary indices belong to the positive (TokenizeRoboCoinSubtaskPrompt)
+    # prompt; the negative prompt is a plain tokenization with no subtask suffix.
+    if prefix == "negative_":
+        subtask_start_index_key = None
+        subtask_end_index_key = None
+    else:
+        subtask_start_index_key = "subtask_start_index"
+        subtask_end_index_key = "subtask_end_index"
+
     state = stack_frames(frame_dicts, state_key)
     if state is None:
         raise ValueError(f"Missing required key '{state_key}' in frame dicts")
@@ -219,6 +233,13 @@ def get_obs_and_action(
 
     tokenized_prompt = stack_frames(frame_dicts, prompt_key)
     tokenized_prompt_mask = stack_frames(frame_dicts, prompt_mask_key)
+
+    subtask_start_index = (
+        stack_frames(frame_dicts, subtask_start_index_key) if subtask_start_index_key is not None else None
+    )
+    subtask_end_index = (
+        stack_frames(frame_dicts, subtask_end_index_key) if subtask_end_index_key is not None else None
+    )
 
     action = None
     action_mask = None
@@ -235,6 +256,8 @@ def get_obs_and_action(
         tokenized_prompt=tokenized_prompt,
         tokenized_prompt_mask=tokenized_prompt_mask,
         action_mask=action_mask,
+        subtask_start_index=subtask_start_index,
+        subtask_end_index=subtask_end_index,
     )
 
     return obs, action
@@ -282,6 +305,7 @@ def count_subtask_segments(frames: list[dict], prefix: str = "") -> tuple[int, i
 _CACHE_KEYS = {
     "state", "image", "image_mask", "actions", "action_mask",
     "tokenized_prompt", "tokenized_prompt_mask",
+    "subtask_start_index", "subtask_end_index",
     "tokenized_negative_prompt", "tokenized_negative_prompt_mask",
     "negative_subtask_1_text", "random_actions", "counterfactual_actions",
     "mc_return", "include_subtask", "fps",
@@ -671,6 +695,17 @@ def predict_values(
                 logger.info(f"  Batch obs.tokenized_prompt: shape={obs.tokenized_prompt.shape}")
 
         pred_values_np, attn_np = jax.device_get(_jitted_compute_value(model, obs, act))
+
+        global _HBM_LOGGED
+        if not _HBM_LOGGED:
+            _HBM_LOGGED = True
+            for _dev in jax.local_devices():
+                _s = _dev.memory_stats() or {}
+                logger.info(
+                    f"[HBM] proc={jax.process_index()} dev={_dev.id}: "
+                    f"peak={_s.get('peak_bytes_in_use', 0) / 1e9:.2f} GB / "
+                    f"limit={_s.get('bytes_limit', 0) / 1e9:.2f} GB"
+                )
 
         pred_values_neg_np = None
         if "tokenized_negative_prompt" in frame_dicts[0]:
