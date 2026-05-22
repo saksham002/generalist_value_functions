@@ -36,7 +36,6 @@ _POLICY_CONFIGS: dict[str, BestOfNWrapperConfig] = {
         base_model_config=None,
         num_samples=8,
         use_target_value=False,
-        convert_to_global=True,
     ),
     "robocoin_bimanual_cql": BestOfNWrapperConfig(
         action_dim=14,
@@ -44,7 +43,6 @@ _POLICY_CONFIGS: dict[str, BestOfNWrapperConfig] = {
         base_model_config=None,
         num_samples=8,
         use_target_value=True,
-        convert_to_global=False,
     ),
 }
 
@@ -76,6 +74,13 @@ class EvalConfig:
     policy_checkpoint_path: str | None = None
     # Critic checkpoint step to load. If None, uses the latest step.
     step: int | None = None
+    override_task_prompt: str | None = None
+    batch_size: int = 32
+    # If True, populate the validation cache and exit before plotting.
+    cache_only: bool = False
+    # Optional wandb run name (used when output_dir is None → wandb logging).
+    # Defaults to f"eval_{config_name}" when unset.
+    wandb_run_name: str | None = None
 
 
 def _resolve_eval_cache_dir(eval_config: EvalConfig) -> str:
@@ -169,6 +174,7 @@ def main(eval_config: EvalConfig):
         fine_tune = eval_config.fine_tune,
         step = eval_config.step,
         config_override = _config_override,
+        fsdp_devices = jax.device_count(),
     )
     action_conditioned = model.network.action_conditioned
     logger.info(f"Loaded model from {eval_config.checkpoint_path}, action_conditioned={action_conditioned}")
@@ -184,7 +190,7 @@ def main(eval_config: EvalConfig):
         _transforms.Normalize(data_config.norm_stats, use_quantiles = data_config.use_quantile_norm),
         *([_transforms.Clip(data_config.clip_normalized_bounds)] if data_config.clip_normalized_bounds is not None else []),
         *data_config.model_transforms.inputs,
-        _config.AddRoboCoinValidationVariants(
+        _config.AddValidationVariants(
             val_tokenizer,
             use_quantile_norm = data_config.use_quantile_norm,
         ),
@@ -193,7 +199,19 @@ def main(eval_config: EvalConfig):
     cache_dir = _resolve_eval_cache_dir(eval_config)
     split = data_config.val_split if eval_config.split == "val" else eval_config.split
 
-    if jax.process_index() == 0:
+    cache_complete = False
+    if os.path.exists(cache_dir):
+        existing_pkls = {f for f in os.listdir(cache_dir) if f.endswith(".pkl")}
+        required_pkls = {f"{repo.replace('/', '__')}.pkl" for repo in config.include_repos}
+        if required_pkls.issubset(existing_pkls) and len(existing_pkls) >= eval_config.num_trajectories:
+            cache_complete = True
+            logger.info(f"Cache complete at {cache_dir} ({len(existing_pkls)} pkls); skipping create_rlds_dataset")
+
+    # cache_val_episodes is multi-worker by design: process 0 fills the
+    # full-coverage slots, workers > 0 cache the include_repos. Run it on ALL
+    # workers (matching train_value_function.py) — gating to process 0 drops
+    # the per-worker include_repos coverage.
+    if not cache_complete:
         val_trajectory_dataset = _data_loader.create_rlds_dataset(
             data_config,
             action_horizon,
@@ -211,15 +229,39 @@ def main(eval_config: EvalConfig):
             input_transform = val_input_transform,
         )
         del val_trajectory_dataset
+
     if jax.process_count() > 1:
         jax.experimental.multihost_utils.sync_global_devices("eval_cache_write")
+
+    if eval_config.cache_only:
+        logger.info("--cache-only set: validation cache populated; exiting before plotting.")
+        return
+
+    override_prompt = None
+    if eval_config.override_task_prompt is not None:
+        critic_prompt_mode = getattr(config.data, "prompt_mode", None)
+        if critic_prompt_mode == "task_description_predict_current_subtask":
+            # Match the serving/eval path's critic tokenization (best_of_n_policy.py):
+            # tokenize the task-description prefix only — empty subtask suffix, no
+            # trailing newline. The subtask indices are discarded (cached val frames
+            # carry none, so the critic forward runs with subtask_start_index=None).
+            override_tokens, override_mask, _, _ = _transforms._tokenize_robocoin_subtask_prompt(
+                val_tokenizer, eval_config.override_task_prompt, "", append_newline = False,
+            )
+            override_prompt = (override_tokens, override_mask)
+        else:
+            override_prompt = val_tokenizer.tokenize(eval_config.override_task_prompt)
+        logger.info(
+            f"Overriding tokenized_prompt with {eval_config.override_task_prompt!r} "
+            f"(prompt_mode={critic_prompt_mode!r})"
+        )
 
     if eval_config.output_dir is None and jax.process_index() == 0:
         import wandb
 
         wandb.init(
             project = eval_config.project_name,
-            name = f"eval_{eval_config.config_name}",
+            name = eval_config.wandb_run_name or f"eval_{eval_config.config_name}",
             config = dataclasses.asdict(eval_config),
         )
 
@@ -231,7 +273,8 @@ def main(eval_config: EvalConfig):
         data_config = data_config,
         cache_dir = cache_dir,
         output_dir = eval_config.output_dir,
-        batch_size = 8,
+        batch_size = eval_config.batch_size,
+        override_prompt = override_prompt,
     )
 
     if eval_config.counterfactual_best_of_n and action_conditioned:
@@ -358,9 +401,19 @@ def main(eval_config: EvalConfig):
 
                 wandb.log(best_of_n_images)
 
-    if hasattr(train_module, "_render_thread") and train_module._render_thread is not None:
+    # Keep all hosts alive until rank 0 has fully completed async rendering/logging.
+    if (
+        jax.process_index() == 0
+        and train_module._render_thread is not None
+        and train_module._render_thread.is_alive()
+    ):
+        logger.info("Waiting for render thread to finish")
         train_module._render_thread.join()
         train_module._render_thread = None
+
+    if jax.process_count() > 1:
+        logger.info("Waiting at post-render multihost barrier")
+        jax.experimental.multihost_utils.sync_global_devices("evaluate_value_function_post_render_join")
 
     if eval_config.output_dir is None and jax.process_index() == 0:
         import wandb

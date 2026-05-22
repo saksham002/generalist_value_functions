@@ -414,6 +414,10 @@ def eval_env(
     call_q_var_fail: list[float] = []
     call_act_var_succ: list[float] = []
     call_act_var_fail: list[float] = []
+    # Per-episode mean ACS (average cosine similarity across the BestOfN
+    # candidate pool), bucketed by episode outcome.
+    episode_acs_succ: list[float] = []
+    episode_acs_fail: list[float] = []
     for episode_idx in tqdm.tqdm(range(start_episode_idx, num_trials), desc = env_name, initial = start_episode_idx, total = num_trials):
         obs, info = env.reset(seed = seed + 100 * episode_idx)
         action_plan = collections.deque()
@@ -421,6 +425,7 @@ def eval_env(
         prompt_idx = 0
         ep_call_q_vars: list[float] = []
         ep_call_act_vars: list[float] = []
+        ep_call_acs: list[float] = []
 
         if isinstance(video_logger, VideoLogger):
             video_logger.start_episode(episode_idx)
@@ -458,6 +463,9 @@ def eval_env(
                     q_arr_for_var = np.asarray(q_values, dtype = np.float32).reshape(-1)
                     if q_arr_for_var.size >= 2:
                         ep_call_q_vars.append(float(np.var(q_arr_for_var)))
+                acs_value = infer_result.get("acs")
+                if acs_value is not None and np.isfinite(acs_value):
+                    ep_call_acs.append(float(acs_value))
                 server_ms = infer_result.get("policy_timing", {}).get("infer_ms")
                 server_str = f"{server_ms:.1f}ms" if server_ms is not None else "n/a"
                 q_str = ""
@@ -521,17 +529,22 @@ def eval_env(
 
         ep_q_var_mean = float(np.mean(ep_call_q_vars)) if ep_call_q_vars else float("nan")
         ep_act_var_mean = float(np.mean(ep_call_act_vars)) if ep_call_act_vars else float("nan")
+        ep_acs_mean = float(np.mean(ep_call_acs)) if ep_call_acs else float("nan")
         logging.info(
             f"Episode {total_episodes} variance (per-call mean): q={ep_q_var_mean:.6f}, "
-            f"action_pre_interp={ep_act_var_mean:.6f}"
+            f"action_pre_interp={ep_act_var_mean:.6f}, acs={ep_acs_mean:.6f}"
         )
 
         if done:
             call_q_var_succ.extend(ep_call_q_vars)
             call_act_var_succ.extend(ep_call_act_vars)
+            if ep_call_acs:
+                episode_acs_succ.append(ep_acs_mean)
         else:
             call_q_var_fail.extend(ep_call_q_vars)
             call_act_var_fail.extend(ep_call_act_vars)
+            if ep_call_acs:
+                episode_acs_fail.append(ep_acs_mean)
 
     logging.info(
         f"[{env_name}] Final: {total_successes}/{total_episodes} ({total_successes / total_episodes * 100:.1f}%)"
@@ -544,6 +557,8 @@ def eval_env(
     q_var_fail_mean = _mean_or_nan(call_q_var_fail)
     act_var_succ_mean = _mean_or_nan(call_act_var_succ)
     act_var_fail_mean = _mean_or_nan(call_act_var_fail)
+    acs_succ_mean = _mean_or_nan(episode_acs_succ)
+    acs_fail_mean = _mean_or_nan(episode_acs_fail)
     logging.info(
         f"[{env_name}] q_value variance over n samples — success: {q_var_succ_mean:.6f} "
         f"(n_calls={len(call_q_var_succ)}), failure: {q_var_fail_mean:.6f} "
@@ -553,6 +568,11 @@ def eval_env(
         f"[{env_name}] action pre-interp per-dim variance (avg over dims) — success: "
         f"{act_var_succ_mean:.6f} (n_calls={len(call_act_var_succ)}), failure: "
         f"{act_var_fail_mean:.6f} (n_calls={len(call_act_var_fail)})"
+    )
+    logging.info(
+        f"[{env_name}] ACS (avg cosine sim across BestOfN pool, per-episode mean) — success: "
+        f"{acs_succ_mean:.6f} (n_episodes={len(episode_acs_succ)}), failure: "
+        f"{acs_fail_mean:.6f} (n_episodes={len(episode_acs_fail)})"
     )
 
     if log_path is not None:
@@ -565,6 +585,10 @@ def eval_env(
                     "q_value_variance_failure_mean": q_var_fail_mean,
                     "action_pre_interp_variance_success_mean": act_var_succ_mean,
                     "action_pre_interp_variance_failure_mean": act_var_fail_mean,
+                    "acs_success_mean": acs_succ_mean,
+                    "acs_failure_mean": acs_fail_mean,
+                    "num_success_episodes_acs": len(episode_acs_succ),
+                    "num_failure_episodes_acs": len(episode_acs_fail),
                     "num_success_calls": len(call_q_var_succ),
                     "num_failure_calls": len(call_q_var_fail),
                 },

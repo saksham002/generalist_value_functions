@@ -216,6 +216,12 @@ def train_step(
     is_robocasa = isinstance(config.data, _config.RLDSRoboCasaDataConfig)
     obs_state = observation.state[..., :7] if is_robocasa else observation.state
 
+    # When subsample=True (Hdf5 with subsample) the chunk has H slots but only
+    # the first H//2 are valid (fps prefix mask zeros the rest); restrict action
+    # stats to the valid prefix so the padded slots don't pollute mean/std.
+    if getattr(config.data, "subsample", False):
+        actions = actions[:, : config.action_horizon // 2, :]
+
     # Mask action stats by config.model.action_dim_mask so the padded action dims
     # (e.g. dims 14:32 for pi-0.5 robocasa) don't pull mean/std toward 0.
     action_dim_mask_tuple = getattr(config.model, "action_dim_mask", None)

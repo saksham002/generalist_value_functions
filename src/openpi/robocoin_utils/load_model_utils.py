@@ -99,6 +99,7 @@ def load_critic(
     fine_tune: str | None = None,
     step: int | None = None,
     config_override: Callable[[Any], Any] | None = None,
+    fsdp_devices: int = 16,
 ) -> tuple[nnx.Module, dict[str, _normalize.NormStats], Any, int]:
     """Load a value-function checkpoint plus norm stats.
 
@@ -120,7 +121,7 @@ def load_critic(
         config = ft_config.apply_overrides(config, pretrained_step = None)
     if config_override is not None:
         config = config_override(config)
-    config = dataclasses.replace(config, fsdp_devices = 16)
+    config = dataclasses.replace(config, fsdp_devices = fsdp_devices)
 
     train_module = load_train_module()
     rng = jax.random.PRNGKey(86)

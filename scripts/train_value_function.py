@@ -623,6 +623,7 @@ def value_function_train_step(
     """
     # pdb.set_trace()
     model = nnx.merge(state.model_def, state.params)
+    model.train()
     policy = None if policy_state is None else nnx.merge(policy_state.model_def, policy_state.params)
 
     if isinstance(config.model, _value_fn.BaseMultiValueFunctionConfig):
@@ -690,6 +691,11 @@ def value_function_train_step(
     is_robocasa = isinstance(config.data, _config.RLDSRoboCasaDataConfig)
     obs_state = transition.observation.state[..., :7] if is_robocasa else transition.observation.state
     action = transition.action[..., :7] if is_robocasa else transition.action
+    # When subsample=True (Hdf5 with subsample) the chunk has H slots but only
+    # the first H//2 are valid (fps prefix mask zeros the rest); restrict action
+    # stats to the valid prefix so the padded slots don't pollute mean/std.
+    if getattr(config.data, "subsample", False):
+        action = action[:, : config.action_horizon // 2, :]
     batch_stats = {
         # Observation stats
         "batch/obs_mean": jnp.mean(obs_state),
@@ -1792,6 +1798,7 @@ def generate_validation_plots_dlimp(
     cache_dir: str,
     output_dir: str | None = None,
     batch_size: int = 64,
+    override_prompt: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> dict:
     """Generate validation plots for RoboCOIN.
 
@@ -1855,6 +1862,16 @@ def generate_validation_plots_dlimp(
         if not frames:
             logging.warning(f"Traj {traj_idx} cache empty, skipping")
             continue
+
+        if override_prompt is not None:
+            override_tokens, override_mask = override_prompt
+            for frame in frames:
+                frame["tokenized_prompt"] = override_tokens
+                frame["tokenized_prompt_mask"] = override_mask
+                # Override is prefix-only — drop the cached subtask indices so the
+                # critic runs with subtask_start_index=None for the overridden prompt.
+                frame.pop("subtask_start_index", None)
+                frame.pop("subtask_end_index", None)
 
         decode_episode_images(frames, image_size)
 

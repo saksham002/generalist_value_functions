@@ -38,6 +38,7 @@ import dataclasses
 import datetime
 import json
 import logging
+import os
 import shlex
 import subprocess
 import time
@@ -214,7 +215,8 @@ class MergeArgs(CommonArgs):
     """Overwrite existing merged output."""
 
     cleanup_workers: bool = False
-    """Delete worker directories after successful merge."""
+    """Delete each worker's directory as soon as its shards have been copied
+    into the merged output — reclaims disk incrementally during the merge."""
 
 
 # =============================================================================
@@ -254,7 +256,20 @@ def run_worker(args: WorkerArgs) -> None:
     if not args.checkpoint_dir:
         raise ValueError("--checkpoint-dir is required.")
 
+    # Isolate this worker's download cache. maybe_download's filelock does not
+    # serialize across NFS-mounted nodes, so workers sharing ~/.cache/openpi race
+    # on the force_download=True norm-stats fetch. A per-job cache dir removes the
+    # shared path entirely.
+    cache_tag = os.environ.get("SLURM_JOB_ID") or f"worker_{worker_id}"
+    os.environ["OPENPI_DATA_HOME"] = os.path.expanduser(f"~/.cache/openpi_ca/{cache_tag}")
+
     config, data_config, dataset_cfg, _ = _resolve_config_with_fine_tune(args.config_name, args.fine_tune)
+
+    # This worker has no subsample support: it samples on the raw (un-subsampled)
+    # steps, so a subsample=True config would misalign the cache with training.
+    assert not data_config.rlds_kwargs.get("subsample", False), (
+        "compute_counterfactual_actions.py does not support subsample=True configs."
+    )
 
     # Create builder once and reuse for metadata queries and dataset loading
     source_builder = tfds.builder(dataset_cfg.name, data_dir=data_config.rlds_data_dir, version=dataset_cfg.version)
@@ -334,6 +349,13 @@ def run_worker(args: WorkerArgs) -> None:
     model = nnx.merge(_graphdef, _state)
     data_config_for_policy = config.data.create(config.assets_dirs, policy_model_config)
     norm_stats = _checkpoints.load_norm_stats(checkpoint_dir_path / "assets", data_config_for_policy.asset_id)
+    # Keep only the norm-stat keys the Normalize / Unnormalize transforms reference at
+    # inference. Checkpoints also store "action_diff" (chunk-wise-delta stats); leaving
+    # it in trips Unnormalize's strict key check since the output dict has no such key.
+    # Mirrors best_of_n_policy._INFERENCE_NORM_KEYS.
+    if norm_stats is not None:
+        inference_norm_keys = {"state", "actions", "next_state", "next_actions"}
+        norm_stats = {k: v for k, v in norm_stats.items() if k in inference_norm_keys}
 
     import openpi.policies.policy as _policy
     import openpi.transforms as _transforms
@@ -431,12 +453,18 @@ def run_worker(args: WorkerArgs) -> None:
         return jax.tree.map(pad_array, tree)
 
     def _construct_eef_repr_np(action: np.ndarray, eef_action: np.ndarray) -> np.ndarray:
+        # Gripper slots within `action` depend on its dim: left at dim//2 - 1, right at
+        # dim - 1, matching the 14D (6, 13) and 16D (7, 15) raw layouts. Mirrors
+        # Hdf5RldsDataset._construct_eef_repr so 16D joint states map grippers correctly.
+        total_dim = action.shape[-1]
+        left_gripper_index = total_dim // 2 - 1
+        right_gripper_index = total_dim - 1
         return np.concatenate(
             [
                 eef_action[..., :6],
-                action[..., 6:7],
+                action[..., left_gripper_index : left_gripper_index + 1],
                 eef_action[..., 6:12],
-                action[..., 13:14],
+                action[..., right_gripper_index : right_gripper_index + 1],
             ],
             axis = -1,
         ).astype(np.float32)
@@ -670,7 +698,11 @@ def run_worker(args: WorkerArgs) -> None:
                     td = td.numpy()
                 if isinstance(td, bytes):
                     td = td.decode("utf-8")
-                episode_task_description = (td or "").rstrip(". ").strip()
+                # Pass the raw task_description verbatim; training feeds it unmodified
+                # (hdf5_rlds_dataset.py: frame["prompt"] = frame["task_description"]) and
+                # the tokenizer only strips whitespace. Stripping a trailing period here
+                # would diverge the tokenized prompt from training.
+                episode_task_description = td or ""
             episode_actions = None
             if args.debug_metrics:
                 episode_actions = []
@@ -790,7 +822,8 @@ def run_worker(args: WorkerArgs) -> None:
                     elif data_config.rlds_kwargs["state_dim"] == 16 and step_state.shape[-1] == 14:
                         step_state = np.concatenate([step_state[:6], [0.0], step_state[6:13], [0.0], step_state[13:]], axis = 0).astype(np.float32)
 
-                    # Decode images once per step (not per subtask)
+                    # Decode images once per step (not per subtask). Resize to the model's
+                    # 224x224 input happens later in the ResizeImages model transform.
                     decoded_images = {}
                     with episode_timer.context("image_decode"):
                         for cam_key in (
@@ -1304,6 +1337,7 @@ def run_merge(args: MergeArgs) -> None:
 
     # Collect shard metadata from all workers
     shard_data: dict[int, dict] = {}
+    worker_shards: dict[int, list[int]] = {}
     reference_manifest: ca_store.CounterfactualActionStoreManifest | None = None
 
     for worker_id in range(args.num_workers):
@@ -1337,6 +1371,7 @@ def run_merge(args: MergeArgs) -> None:
                 "num_bytes": info["num_bytes"],
                 "source_path": shard_path,
             }
+            worker_shards.setdefault(worker_id, []).append(shard_idx)
 
         logger.info(f"Worker {worker_id}: {len(worker_metadata)} shards")
 
@@ -1367,13 +1402,23 @@ def run_merge(args: MergeArgs) -> None:
         logger.info(f"Copying shard {shard_idx}: {source_path} -> {dest_path}")
         source_path.copy(dest_path)
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [
-            executor.submit(_copy_shard, shard_idx, shard_data[shard_idx]["source_path"])
-            for shard_idx in sorted_shard_indices
-        ]
-        for future in concurrent.futures.as_completed(futures):
-            future.result()
+    # Copy + (optionally) delete one worker at a time so disk is reclaimed
+    # incrementally instead of holding every worker's shards through merge end.
+    for worker_id in range(args.num_workers):
+        these_shards = worker_shards.get(worker_id, [])
+        if not these_shards:
+            continue
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(_copy_shard, sid, shard_data[sid]["source_path"])
+                for sid in these_shards
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+        if args.cleanup_workers:
+            worker_root = source_dir / "_workers" / f"worker_{worker_id}"
+            logger.info(f"Cleaning up worker {worker_id}: {worker_root}")
+            worker_root.rmtree()
 
     features = ca_store.get_counterfactual_action_store_tfds_feature_spec(reference_manifest)
 
@@ -1420,15 +1465,9 @@ def run_merge(args: MergeArgs) -> None:
     logger.info(f"Merge complete: {verify_count} episodes in {num_shards} shards written to {merged_dataset_dir}")
 
     if args.cleanup_workers:
-        for worker_id in range(args.num_workers):
-            worker_root = source_dir / "_workers" / f"worker_{worker_id}"
-            if worker_root.exists():
-                logger.info(f"Cleaning up worker {worker_id}: {worker_root}")
-                worker_root.rmtree()
         workers_dir = source_dir / "_workers"
         try:
-            remaining = list(workers_dir.iterdir())
-            if not remaining:
+            if not list(workers_dir.iterdir()):
                 workers_dir.rmtree()
         except Exception:
             pass

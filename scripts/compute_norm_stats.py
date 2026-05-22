@@ -202,10 +202,11 @@ def main(
 
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    # Always pull 50-step chunks for action_diff stats so the produced (H=50, D) array
-    # covers the longest action_horizon any consumer might use. Runtime configs slice
-    # this down to their own action_horizon at data_config.create() time.
-    action_horizon = ACTION_DIFF_HORIZON
+    # Pull chunks at the config's effective action_horizon (after FineTune overrides)
+    # so the (H, D) action_diff_stats array covers the consumer's horizon. Falls back
+    # to ACTION_DIFF_HORIZON for configs without an explicit action_horizon. Shorter
+    # consumers slice down at data_config.create() time.
+    action_horizon = config.action_horizon if config.action_horizon is not None else ACTION_DIFF_HORIZON
 
     # Determine what type of data loader to use
     if data_config.minari_dataset_id is not None:
@@ -225,22 +226,29 @@ def main(
         )
         output_id = data_config.repo_id
 
-    # DeltaActions for the action_diff stats. Hardcoded for the RoboCasa policy
-    # arm-first bimanual layout (14-D = [arm_pos(3), arm_rpy(3), arm_grip(1), zeros(7)]).
-    # Position dims get linear delta, rpy block at index 3 gets relative-rotation delta,
-    # the gripper and the trailing zero placeholder slots stay absolute.
+    # Hard-coded for the 14D bimanual EEF-layout chunk-wise-delta action space
+    # (left xyz, left rpy, left gripper, right xyz, right rpy, right gripper).
+    # rpy_index_start covers both arms' rotation slots so they use relative-
+    # rotation composition; the mask keeps grippers absolute.
     action_diff_transform = transforms.DeltaActions(
-        mask = transforms.make_bool_mask(6, -1, -7),
-        rpy_index_start = (3,),
+        mask = transforms.make_bool_mask(6, -1, 6, -1),
+        rpy_index_start = (3, 10),
     )
 
     state_stats = normalize.RunningStats()
     action_stats = normalize.RunningStats()  # populated only with action[0] -> (D,)
     action_diff_stats: list[normalize.RunningStats] = []  # one RunningStats per timestep -> (H, D)
 
+    # When the underlying dataset emits chunks at the source 60 Hz cadence but the
+    # runtime uses subsample=True (30 Hz), restrict to the [1::2] slice so the
+    # action_diff stats reflect the half-cadence chunks the model actually sees.
+    subsample = bool(getattr(data_config, "subsample", False))
+
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
         state = np.asarray(batch["state"])      # (B, D_state)
         actions = np.asarray(batch["actions"])  # (B, H, D_act)
+        if subsample:
+            actions = actions[:, 1::2, :]
         state_stats.update(state)
         # Use only the first action of the chunk for the absolute-action stats.
         action_stats.update(actions[:, 0, :])
