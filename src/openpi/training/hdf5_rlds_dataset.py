@@ -21,7 +21,7 @@ from typing import Any, Literal
 import openpi.training.rlds_dataset as rlds_dataset
 
 
-PromptMode = Literal["subtask", "task_description"]
+PromptMode = Literal["subtask", "task_description", "task_description_predict_current_subtask"]
 
 
 class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
@@ -231,8 +231,10 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         }
         if self._filter_intervention:
             result["is_intervention"] = traj["is_intervention"]
-        if self._prompt_mode == "subtask":
+        if self._prompt_mode != "task_description":
             # Per-frame episode flag so the filters can drop subtask-prompt frames lacking subtask annotations.
+            # task_description_predict_current_subtask still needs the per-frame subtask annotation
+            # (it predicts it), so the flag is kept for that mode too — mirrors RoboCOIN.
             result["has_subtask_annotations"] = tf.fill(
                 [traj_len],
                 tf.cast(traj["traj_metadata"]["episode_metadata"]["has_subtask_annotations"][0], tf.bool),
@@ -569,6 +571,9 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
 
         if self._prompt_mode == "task_description":
             frame["prompt"] = frame["task_description"]
+        elif self._prompt_mode == "task_description_predict_current_subtask":
+            frame["prompt"] = frame["task_description"]
+            frame["subtask_text"] = frame["subtask_1"]
         else:
             frame["prompt"] = frame["subtask_1"]
 
@@ -649,7 +654,7 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
             mask = tf.logical_and(mask, tf.logical_not(tf.logical_and(tail, traj["is_partial"])))
         if self._filter_intervention:
             mask = tf.logical_and(mask, tf.cast(traj["is_intervention"], tf.bool))
-        if self._prompt_mode == "subtask":
+        if self._prompt_mode != "task_description":
             # Mirror frame_filter.
             mask = tf.logical_and(mask, tf.cast(traj["has_subtask_annotations"], tf.bool))
         return tf.nest.map_structure(lambda x: tf.boolean_mask(x, mask), traj)
@@ -674,7 +679,7 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         if self._filter_intervention:
             keep = tf.logical_and(keep, tf.cast(frame["is_intervention"], tf.bool))
 
-        if self._prompt_mode == "subtask":
+        if self._prompt_mode != "task_description":
             keep = tf.logical_and(keep, tf.cast(frame["has_subtask_annotations"], tf.bool))
 
         return keep

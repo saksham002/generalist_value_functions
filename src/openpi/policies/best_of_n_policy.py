@@ -13,7 +13,7 @@ Two modes:
   the same RoboCasa-style explicit slice + output-transform path the sibling
   uses, so action-dim padding (32-D model output → 14-D bimanual EEF slot)
   is unwrapped consistently with the BestOfN path.
-- **Best-of-N**: `critic_*` args also provided. Builds a `BestOfNWrapper`
+- **Best-of-N**: `critic_*` args also provided. Builds a Wrapper around BestOfN
   around the loaded policy, JITs the BestOfN sample closure, and re-tokenizes
   the prompt with the critic's tokenizer at infer time. The policy and critic
   share norm stats + chunk-wise-delta format, so the policy's normalized
@@ -95,6 +95,26 @@ def _restore_inference_dtypes(d: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _compute_acs(actions: np.ndarray) -> float:
+    """Average cosine similarity across a BestOfN candidate action pool.
+
+    `actions` is the (n, ah, ad) pool of candidate action chunks. For every
+    unordered pair of the n candidates, the per-timestep cosine similarity
+    between the two chunks is averaged across the ah horizon; those C(n, 2)
+    pair scalars are then averaged into a single value. Returns NaN when n < 2.
+    """
+    n = actions.shape[0]
+    if n < 2:
+        return float("nan")
+    norms = np.linalg.norm(actions, axis = -1, keepdims = True)
+    unit = actions / np.clip(norms, 1e-8, None)
+    # per_timestep_cos[i, j, t] = <unit[i, t], unit[j, t]>
+    per_timestep_cos = np.einsum("itd,jtd->ijt", unit, unit)
+    cos_per_pair = per_timestep_cos.mean(axis = -1)  # (n, n): mean over horizon
+    upper = np.triu_indices(n, k = 1)  # unique unordered pairs
+    return float(cos_per_pair[upper].mean())
+
+
 def _build_critic_kwargs(critic_config: Any) -> dict[str, Any]:
     """Pack the critic-side attributes BestOfNWrapper needs from the TrainConfig.
 
@@ -109,6 +129,7 @@ def _build_critic_kwargs(critic_config: Any) -> dict[str, Any]:
         # to the model's action_horizon when the TrainConfig field is unset.
         "action_horizon": critic_config.action_horizon or critic_config.model.action_horizon,
         "use_chunk_wise_delta": critic_config.data.use_chunk_wise_delta,
+        "subsample": getattr(critic_config.data, "subsample", False),
         "use_quantile_norm": getattr(critic_config.data, "use_quantile_norm", False),
         "tokenizer": critic_config.model.network_config.get_tokenizer(),
     }
@@ -397,6 +418,11 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # construction time; we just read it off the model.
         self._max_token_len = self._model.max_token_len
         self._policy_task_description = policy_task_description
+        # Critic-side prompt override; set below after critic load when the
+        # critic's data factory uses prompt_mode="task_description_predict_current_subtask"
+        # (training prompt = constant task description; the subtask text is only
+        # used for the auxiliary next-token loss, not for the input prompt).
+        self._critic_task_description: str | None = None
         self._image_size = 224  # RoboCasa eval transforms always emit 224x224.
         self._image_keys = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
         # Critic prompt length (only used when BestOfN + critic are active);
@@ -431,12 +457,27 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             # broadcast on participating workers).
             self._critic_max_token_len = critic_config.model.network_config.max_token_len
 
+            # Auto-route the constant task description into critic tokenization
+            # when the critic was trained with prompt_mode="task_description_predict_current_subtask".
+            # In that training mode the input prompt was the task description (the
+            # subtask text only appears in the next-token auxiliary loss labels),
+            # so at eval time we must feed the same task description rather than
+            # the client's dynamic subtask.
+            critic_prompt_mode = getattr(critic_config.data, "prompt_mode", None)
+            if critic_prompt_mode == "task_description_predict_current_subtask" and policy_task_description is not None:
+                self._critic_task_description = policy_task_description
+                logger.info(
+                    f"Critic prompt_mode={critic_prompt_mode!r}: routing constant "
+                    f"task_description into critic tokenization."
+                )
+
             # `use_chunk_wise_delta` lives on the data FACTORY (RLDSRoboCasaDataConfig
             # / RoboCoinRldsDataConfig), not the runtime DataConfig instance, so
             # we read it from `config.data`. BestOfNWrapper asserts the policy
             # and critic values match (and that their norm stats are identical).
             policy_use_chunk_wise_delta = config.data.use_chunk_wise_delta
             critic_use_chunk_wise_delta = critic_kwargs["use_chunk_wise_delta"]
+            critic_subsample = critic_kwargs["subsample"]
 
             resolved_offset = (
                 critic_action_dim_offset if critic_action_dim_offset is not None else self._action_dim_offset
@@ -467,6 +508,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 critic_norm_stats = critic_norm_stats,
                 policy_use_chunk_wise_delta = policy_use_chunk_wise_delta,
                 critic_use_chunk_wise_delta = critic_use_chunk_wise_delta,
+                critic_subsample = critic_subsample,
                 critic_action_dim_offset = resolved_offset,
                 critic_action_horizon = critic_action_horizon,
             )
@@ -556,10 +598,11 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         actions_out, q_values = self._run_jit_inference(batched, extras, sample_rng, sample_rngs)
         actions_out = jax.block_until_ready(actions_out)
         q_values_np: np.ndarray | None = None
+        acs_value: float | None = None
         if q_values is not None:
             q_values = jax.block_until_ready(q_values)
             # actions_pool: (total, ah, ad), q_pool: (total,) — B=1 dropped.
-            # `total == self._bestofn.num_samples` because the BestOfNWrapper
+            # `total == num_samples` because the BestOfNWrapper
             # trims its candidate pool to `num_samples` before the critic runs;
             # the padding to `num_samples_padded` happens only at the per-chip
             # rng layer to align with DATA_AXIS sharding, and the extra
@@ -571,7 +614,14 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             best_idx = int(np.argmax(q_pool))
             actions_out = actions_pool[best_idx]
             q_values_np = q_pool
-            logger.info(f"BestOfN q_values (n={n}): {q_values_np.tolist()}")
+            # Average cosine similarity across the candidate pool, computed on
+            # the 14-D EEF action slice (the non-EEF padded dims carry other
+            # robot DOFs and would skew the similarity).
+            eef_pool = actions_pool[
+                ..., self._action_dim_offset : self._action_dim_offset + self._eef_action_dim
+            ]
+            acs_value = _compute_acs(np.asarray(eef_pool))
+            logger.info(f"BestOfN q_values (n={n}): {q_values_np.tolist()}  acs={acs_value:.4f}")
         else:
             # Policy-only path: drop the always-1 leading batch dim so the
             # downstream slice + output_transform see (ah, ad) like the
@@ -607,6 +657,8 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         }
         if self._return_q_values and q_values_np is not None:
             result["q_values"] = q_values_np
+            if acs_value is not None:
+                result["acs"] = acs_value
         return result
 
     # ---------------------------------------------------------------------
@@ -662,7 +714,13 @@ class BestOfNPolicy(_base_policy.BasePolicy):
 
         extras: dict[str, Any] = {}
         if self._bestofn is not None:
-            critic_tokens, critic_token_mask = self._critic_tokenizer.tokenize(prompt_str, None)
+            if self._critic_task_description is not None:
+                # Eval drops the subtask suffix: tokenize the prefix only (no trailing "\n").
+                critic_tokens, critic_token_mask, _, _ = _transforms._tokenize_robocoin_subtask_prompt(
+                    self._critic_tokenizer, self._critic_task_description, "", append_newline = False,
+                )
+            else:
+                critic_tokens, critic_token_mask = self._critic_tokenizer.tokenize(prompt_str, None)
             extras["critic_tokens"] = jnp.asarray(critic_tokens)[None, ...]
             extras["critic_token_mask"] = jnp.asarray(critic_token_mask)[None, ...]
         if noise is not None:

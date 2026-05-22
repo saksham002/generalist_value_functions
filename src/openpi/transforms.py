@@ -714,6 +714,7 @@ def _tokenize_robocoin_subtask_prompt(
     suffix: str,
     *,
     state: np.ndarray | None = None,
+    append_newline: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
     if state is not None:
         raise NotImplementedError("TokenizeRoboCoinSubtaskPrompt does not support discrete state input.")
@@ -728,7 +729,7 @@ def _tokenize_robocoin_subtask_prompt(
     add_bos = getattr(tokenizer, "_use_bos", True)
     prefix_tokens = tokenizer._tokenizer.encode(prefix_with_separator, add_bos = add_bos)
     suffix_tokens = tokenizer._tokenizer.encode(cleaned_suffix, add_bos = False)
-    newline_tokens = tokenizer._tokenizer.encode("\n")
+    newline_tokens = tokenizer._tokenizer.encode("\n") if append_newline else []
     raw_tokens = prefix_tokens + suffix_tokens + newline_tokens
     subtask_start_index = len(prefix_tokens)
     subtask_end_index = subtask_start_index + len(suffix_tokens) - 1
