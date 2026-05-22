@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from openpi.models import best_of_n as _best_of_n
 from openpi.models import model as _model
 from openpi.policy_extraction.temperature import Temperature
 from openpi.shared import array_typing as at
@@ -697,6 +698,24 @@ def cql_objective(
         if isinstance(target_q_head, EnsembleHead):
             target_q_values = jnp.min(target_q_values, axis=0)
         target_q_values = jnp.max(target_q_values, axis=-1)
+    elif (
+        isinstance(policy, _best_of_n.BestOfNWrapper)
+        and policy.base_model is None
+        and policy.use_target_value
+        and not isinstance(target_q_head, EnsembleHead)
+    ):
+        # BestOfN already ran the target network over all N cached candidates inside
+        # sample_actions; reuse its argmax q-value as the Bellman target instead of
+        # re-forwarding target_q_network on the winning action. Ensemble heads are
+        # excluded because select_best_action_and_q returns the scalar best_q from
+        # whatever reduction sample_actions used (take_min_over_ensemble), which is
+        # not always the same reduction the non-fast path applies (compute_min).
+        next_actions, target_q_values = policy.select_best_action_and_q(
+            target_rng,
+            transition,
+            compute_next_action=True,
+            value_function=value_function,
+        )
     else:
         next_actions, _ = _sample_policy_actions(
             policy,
