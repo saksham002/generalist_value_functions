@@ -127,6 +127,10 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
     policy_use_chunk_wise_delta: bool = False
     critic_use_chunk_wise_delta: bool = False
 
+    # Whether the critic was trained with quantile normalization. Selects the
+    # range the policy's sampled candidates are clipped to before scoring.
+    critic_use_quantile_norm: bool = False
+
     # If the critic was trained with subsample=True (Hdf5RldsDataConfig), its
     # per-position 2-D norm stats correspond to the stride-2 slice of the
     # policy's, so the equality check compares `policy[1::2]` to `critic` for
@@ -197,6 +201,7 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
             critic_norm_stats=self.critic_norm_stats,
             policy_use_chunk_wise_delta=self.policy_use_chunk_wise_delta,
             critic_use_chunk_wise_delta=self.critic_use_chunk_wise_delta,
+            critic_use_quantile_norm=self.critic_use_quantile_norm,
             critic_subsample=self.critic_subsample,
             critic_action_dim_offset=self.critic_action_dim_offset,
             critic_action_horizon=self.critic_action_horizon,
@@ -237,6 +242,7 @@ class BestOfNWrapper(_model.BaseModel):
     critic_norm_stats: dict[str, NormStats] | None
     policy_use_chunk_wise_delta: bool
     critic_use_chunk_wise_delta: bool
+    critic_use_quantile_norm: bool
     critic_subsample: bool
     critic_action_dim_offset: int | None
     critic_action_horizon: int | None
@@ -257,6 +263,7 @@ class BestOfNWrapper(_model.BaseModel):
         critic_norm_stats: dict[str, NormStats] | None = None,
         policy_use_chunk_wise_delta: bool = False,
         critic_use_chunk_wise_delta: bool = False,
+        critic_use_quantile_norm: bool = False,
         critic_subsample: bool = False,
         critic_action_dim_offset: int | None = None,
         critic_action_horizon: int | None = None,
@@ -272,6 +279,7 @@ class BestOfNWrapper(_model.BaseModel):
         self.critic_norm_stats = critic_norm_stats
         self.policy_use_chunk_wise_delta = policy_use_chunk_wise_delta
         self.critic_use_chunk_wise_delta = critic_use_chunk_wise_delta
+        self.critic_use_quantile_norm = critic_use_quantile_norm
         self.critic_subsample = critic_subsample
         self.critic_action_dim_offset = critic_action_dim_offset
         # This path scores the policy's normalized output with the critic
@@ -507,6 +515,11 @@ class BestOfNWrapper(_model.BaseModel):
                     f"[debug] policy raw_actions shape={all_actions.shape} sample0={{v}}",
                     v = all_actions[0, 0],
                 )
+            # Clip the policy's sampled candidates to the critic's training
+            # range. The cached-counterfactual branch needs no clip — those
+            # actions were anyway clipped while batching.
+            clip_bound = 5.0 if self.critic_use_quantile_norm else 1.25
+            all_actions = jnp.clip(all_actions, -clip_bound, clip_bound)
         else:
             # Use cached counterfactual actions
             all_actions = self._get_cached_actions(

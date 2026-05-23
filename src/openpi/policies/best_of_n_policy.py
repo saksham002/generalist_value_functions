@@ -508,6 +508,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 critic_norm_stats = critic_norm_stats,
                 policy_use_chunk_wise_delta = policy_use_chunk_wise_delta,
                 critic_use_chunk_wise_delta = critic_use_chunk_wise_delta,
+                critic_use_quantile_norm = critic_kwargs["use_quantile_norm"],
                 critic_subsample = critic_subsample,
                 critic_action_dim_offset = resolved_offset,
                 critic_action_horizon = critic_action_horizon,
