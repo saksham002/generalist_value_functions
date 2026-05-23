@@ -128,6 +128,10 @@ class Args:
     """If set, save a per-episode 4-panel mp4 (wrist + base + Q-value plot)
     to eval/xarm_scripts/tpu_eval/videos/episode_<n>.mp4 at FPS = control_freq / query_freq."""
 
+    video_subdir: str = ""
+    """Optional subdirectory under eval/xarm_scripts/tpu_eval/videos/ in which to store
+    this run's mp4s. Empty string saves directly into videos/."""
+
 # =============================================================================
 # Subtask tracker
 # =============================================================================
@@ -620,6 +624,8 @@ def run_episode(
     video_logger: VideoLogger | None = None
     if args.log_videos:
         video_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "videos")
+        if args.video_subdir:
+            video_dir = os.path.join(video_dir, args.video_subdir)
         video_fps = args.control_freq / args.query_freq
         video_logger = VideoLogger(
             output_dir = video_dir,
@@ -758,13 +764,25 @@ def main(args: Args) -> None:
         env.close()
         return
 
-    client = _websocket_client_policy.WebsocketClientPolicy(args.policy_host, args.policy_port)
-
     logger.info(f"Connecting to robot environment at {args.robot_host}:{args.robot_port}")
     env = RemoteEnvironmentAdapter(host=args.robot_host, port=args.robot_port, control_freq=args.control_freq)
     logger.info("Connected to robot environment.")
 
+    client = None
     for episode_idx in range(args.start_episode_idx, args.start_episode_idx + args.num_episodes):
+        # Reconnect per episode so a response left buffered by a Ctrl-C'd inference in the
+        # previous episode can't carry over. A stale buffered response would be returned by
+        # the next episode's first infer() call, desyncing every request/response by one.
+        if client is not None:
+            logger.info(f"Reconnecting policy client to {args.policy_host}:{args.policy_port} for episode {episode_idx}")
+            try:
+                client._ws.close()
+            except Exception:
+                pass
+        else:
+            logger.info(f"Connecting policy client to {args.policy_host}:{args.policy_port} for episode {episode_idx}")
+        client = _websocket_client_policy.WebsocketClientPolicy(args.policy_host, args.policy_port)
+
         try:
             run_episode(env, client, args, episode_idx)
         except KeyboardInterrupt:

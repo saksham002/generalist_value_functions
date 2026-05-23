@@ -127,6 +127,16 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
     policy_use_chunk_wise_delta: bool = False
     critic_use_chunk_wise_delta: bool = False
 
+    # Whether the critic was trained with quantile normalization. Selects the
+    # range the policy's sampled candidates are clipped to before scoring.
+    critic_use_quantile_norm: bool = False
+
+    # If the critic was trained with subsample=True (Hdf5RldsDataConfig), its
+    # per-position 2-D norm stats correspond to the stride-2 slice of the
+    # policy's, so the equality check compares `policy[1::2]` to `critic` for
+    # any 2-D field.
+    critic_subsample: bool = False
+
     # When the policy and critic have different action dimensions, slice the policy
     # action down to the critic's action dim before applying critic norm stats. The
     # slice covers indices [critic_action_dim_offset : critic_action_dim_offset + critic_action_dim],
@@ -191,6 +201,8 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
             critic_norm_stats=self.critic_norm_stats,
             policy_use_chunk_wise_delta=self.policy_use_chunk_wise_delta,
             critic_use_chunk_wise_delta=self.critic_use_chunk_wise_delta,
+            critic_use_quantile_norm=self.critic_use_quantile_norm,
+            critic_subsample=self.critic_subsample,
             critic_action_dim_offset=self.critic_action_dim_offset,
             critic_action_horizon=self.critic_action_horizon,
         )
@@ -230,6 +242,8 @@ class BestOfNWrapper(_model.BaseModel):
     critic_norm_stats: dict[str, NormStats] | None
     policy_use_chunk_wise_delta: bool
     critic_use_chunk_wise_delta: bool
+    critic_use_quantile_norm: bool
+    critic_subsample: bool
     critic_action_dim_offset: int | None
     critic_action_horizon: int | None
 
@@ -249,9 +263,10 @@ class BestOfNWrapper(_model.BaseModel):
         critic_norm_stats: dict[str, NormStats] | None = None,
         policy_use_chunk_wise_delta: bool = False,
         critic_use_chunk_wise_delta: bool = False,
+        critic_use_quantile_norm: bool = False,
+        critic_subsample: bool = False,
         critic_action_dim_offset: int | None = None,
         critic_action_horizon: int | None = None,
-        subsample_policy_norm_stats: bool = False,
     ):
         super().__init__(action_dim, action_horizon, max_token_len)
         self.base_model = base_model
@@ -264,6 +279,8 @@ class BestOfNWrapper(_model.BaseModel):
         self.critic_norm_stats = critic_norm_stats
         self.policy_use_chunk_wise_delta = policy_use_chunk_wise_delta
         self.critic_use_chunk_wise_delta = critic_use_chunk_wise_delta
+        self.critic_use_quantile_norm = critic_use_quantile_norm
+        self.critic_subsample = critic_subsample
         self.critic_action_dim_offset = critic_action_dim_offset
         # This path scores the policy's normalized output with the critic
         # directly (no renorm), so it requires both ends to share the
@@ -303,23 +320,20 @@ class BestOfNWrapper(_model.BaseModel):
                             "BestOfNWrapper requires identical policy/critic norm stats; "
                             f"'{stats_key}'.{field_name} presence differs."
                         )
-                    if p_val is None:
-                        continue
-                    p_arr = np.asarray(p_val)
-                    c_arr = np.asarray(c_val)
-                    # When the critic FT specifies `subsample=True` AND the
-                    # norm stats are per-timestep (2D: [horizon, dim]), the
-                    # policy is at 2x the critic's rate (e.g. 60Hz vs 30Hz),
-                    # so stride-2 subsample the policy stats along the horizon
-                    # axis before comparing. Otherwise compare strictly.
-                    if subsample_policy_norm_stats and p_arr.ndim >= 2:
-                        p_arr = p_arr[1::2]
-                        c_arr = c_arr[ : p_arr.shape[0]]
-                    if not np.array_equal(p_arr, c_arr):
-                        raise ValueError(
-                            "BestOfNWrapper requires identical policy/critic norm stats; "
-                            f"'{stats_key}'.{field_name} differs."
-                        )
+                    if p_val is not None:
+                        p_arr = np.asarray(p_val)
+                        c_arr = np.asarray(c_val)
+                        # If the critic was trained with subsample=True, its
+                        # per-position 2-D stats correspond to the stride-2 slice
+                        # of the policy's, so compare that slice to match positions.
+                        if critic_subsample and p_arr.ndim == 2:
+                            p_arr = p_arr[1::2]
+                            c_arr = c_arr[: p_arr.shape[0]]
+                        if not np.array_equal(p_arr, c_arr):
+                            raise ValueError(
+                                "BestOfNWrapper requires identical policy/critic norm stats; "
+                                f"'{stats_key}'.{field_name} differs."
+                            )
         # Four supported (action_horizon, critic_action_horizon) regimes:
         #   - (60, 50): 60 Hz policy + 30 Hz critic. Stride-2 subsample
         #     (60 -> 30), then zero-pad to 50.
@@ -501,6 +515,11 @@ class BestOfNWrapper(_model.BaseModel):
                     f"[debug] policy raw_actions shape={all_actions.shape} sample0={{v}}",
                     v = all_actions[0, 0],
                 )
+            # Clip the policy's sampled candidates to the critic's training
+            # range. The cached-counterfactual branch needs no clip — those
+            # actions were anyway clipped while batching.
+            clip_bound = 5.0 if self.critic_use_quantile_norm else 1.25
+            all_actions = jnp.clip(all_actions, -clip_bound, clip_bound)
         else:
             # Use cached counterfactual actions
             all_actions = self._get_cached_actions(
@@ -701,11 +720,50 @@ class BestOfNWrapper(_model.BaseModel):
         # No base model: return deterministic distribution at best cached action
         import distrax
 
-        best_action, _ = self.sample_actions(
-            rng, transition, compute_next_action=compute_next_action, value_function=value_function, **kwargs
+        best_action, _ = self.select_best_action_and_q(
+            rng, transition,
+            compute_next_action=compute_next_action,
+            value_function=value_function,
+            **kwargs,
         )
-        batch_size = best_action.shape[0]
-        return distrax.Deterministic(loc=best_action.reshape(batch_size, -1))
+        return distrax.Deterministic(loc=best_action)
+
+    def select_best_action_and_q(
+        self,
+        rng: at.KeyArrayLike,
+        transition: _base_vf.Transition,
+        *,
+        compute_next_action: bool,
+        value_function: _base_vf.BaseValueFunction | _base_vf.BaseMultiValueFunction | None,
+        **kwargs,
+    ) -> tuple[at.Array, at.Array]:
+        """Select the argmax-Q candidate from cached counterfactual actions.
+
+        Returns (best_action[B, ah, ad], best_q[B]). The Q value is whichever
+        flavor sample_actions used: target Q when use_target_value=True,
+        online Q otherwise. Callers that need a *target*-Q value (e.g. the CQL
+        Bellman backup) MUST check self.use_target_value before consuming
+        best_q. Only supports base_model=None: with a base_model present,
+        sample_actions samples fresh candidates per call and the q values
+        returned here are not reusable in the same way.
+        """
+        if self.base_model is not None:
+            raise ValueError(
+                "select_best_action_and_q is only defined when base_model is None "
+                "(used by the BestOfN-over-cached-counterfactual-actions training path)."
+            )
+        all_actions, q_values = self.sample_actions(
+            rng, transition,
+            compute_next_action=compute_next_action,
+            value_function=value_function,
+            **kwargs,
+        )
+        best_idx = jnp.argmax(q_values, axis = -1)
+        best_action = jnp.take_along_axis(
+            all_actions, best_idx[:, None, None, None], axis = 1,
+        ).squeeze(1)
+        best_q = jnp.take_along_axis(q_values, best_idx[:, None], axis = -1).squeeze(-1)
+        return best_action, best_q
 
 
 def expand_observation(observation: _model.Observation, num_samples: int) -> _model.Observation:
