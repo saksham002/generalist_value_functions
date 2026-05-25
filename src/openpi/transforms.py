@@ -708,6 +708,52 @@ def _clean_prompt_text(prompt: str) -> str:
     return prompt.strip().replace("_", " ").replace("\n", " ")
 
 
+def _tokenize_robocoin_subtask_prompt_gemma4(
+    tokenizer: _tokenizer.Gemma4Tokenizer,
+    prefix: str,
+    suffix: str,
+    *,
+    state: np.ndarray | None = None,
+    append_newline: bool = True,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Gemma-4 subtask tokenization: a text-only prompt with no BOS / <SOI> markers.
+
+    BOS and the per-camera <SOI> markers are supplied by the network
+    (`_embed_sequence_gemma4`: BOS from the special embeddings, <SOI> inside each
+    image block), so the tokenized prompt carries only the text stream and
+    `subtask_start_index` / `subtask_end_index` index it directly.
+    """
+    if state is not None:
+        raise NotImplementedError("TokenizeRoboCoinSubtaskPrompt does not support discrete state input.")
+
+    cleaned_prefix = _clean_prompt_text(prefix)
+    cleaned_suffix = _clean_prompt_text(suffix)
+    prefix_with_separator = f"{cleaned_prefix} " if cleaned_prefix else cleaned_prefix
+
+    # Tokenize prefix and suffix separately so the split index is correct by construction.
+    # add_bos=False: BOS is supplied separately by the network's special embeddings.
+    prefix_tokens = tokenizer._tokenizer.encode(prefix_with_separator, add_bos = False)
+    suffix_tokens = tokenizer._tokenizer.encode(cleaned_suffix, add_bos = False)
+    newline_tokens = tokenizer._tokenizer.encode("\n") if append_newline else []
+    raw_tokens = prefix_tokens + suffix_tokens + newline_tokens
+    subtask_start_index = len(prefix_tokens)
+    subtask_end_index = subtask_start_index + len(suffix_tokens) - 1
+
+    max_len = tokenizer._max_len
+    tokens_len = len(raw_tokens)
+    if tokens_len < max_len:
+        padding = [False] * (max_len - tokens_len)
+        token_mask = [True] * tokens_len + padding
+        raw_tokens = raw_tokens + padding
+    else:
+        raw_tokens = raw_tokens[:max_len]
+        token_mask = [True] * max_len
+        subtask_start_index = min(subtask_start_index, max_len)
+        subtask_end_index = min(subtask_end_index, max_len - 1)
+
+    return np.asarray(raw_tokens), np.asarray(token_mask), subtask_start_index, subtask_end_index
+
+
 def _tokenize_robocoin_subtask_prompt(
     tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer,
     prefix: str,
@@ -716,6 +762,12 @@ def _tokenize_robocoin_subtask_prompt(
     state: np.ndarray | None = None,
     append_newline: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
+    # Gemma-4 uses a dedicated text-only tokenization (no BOS / <SOI> in the prompt —
+    # the network supplies them). PaliGemma and Gemma-3 fall through unchanged.
+    if isinstance(tokenizer, _tokenizer.Gemma4Tokenizer):
+        return _tokenize_robocoin_subtask_prompt_gemma4(
+            tokenizer, prefix, suffix, state = state, append_newline = append_newline
+        )
     if state is not None:
         raise NotImplementedError("TokenizeRoboCoinSubtaskPrompt does not support discrete state input.")
 

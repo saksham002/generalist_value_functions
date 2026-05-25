@@ -45,6 +45,8 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.hdf5_rlds_dataset as hdf5_rlds_dataset
 import openpi.training.robocoin_rlds_dataset as robocoin_rlds_dataset
 import openpi.training.rlds_dataset as rlds_dataset
+import openpi.training.robocasa_datasets as robocasa_datasets
+import openpi.training.robocasa_rlds_dataset as robocasa_rlds_dataset
 import openpi.training.state_action_spaces as state_action_spaces
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
@@ -1617,6 +1619,11 @@ class RLDSRoboCasaDataConfig(DataConfigFactory):
     # at 30fps the dataset uses 3*td_n/5 native steps.
     td_n: int = 50
 
+    # "subtask" (default) runs the composite subtask tracker for composite datasets;
+    # "task_description" bypasses the tracker so the raw per-step language_instruction
+    # is the prompt for every dataset (atomic and composite alike).
+    prompt_mode: robocasa_rlds_dataset.PromptMode = "subtask"
+
     def __post_init__(self) -> None:
         if self.mask_boundary_actions and self.replace_boundary_actions:
             raise ValueError(
@@ -1703,6 +1710,7 @@ class RLDSRoboCasaDataConfig(DataConfigFactory):
             "image_size": (self.image_size, self.image_size),
             "shuffle_buffer_size": self.shuffle_buffer_size,
             "mask_boundary_actions": self.mask_boundary_actions or self.replace_boundary_actions,
+            "prompt_mode": self.prompt_mode,
         }
         if self.interpolation_config is not None:
             # Interpolation runs INSIDE trajectory_transforms, before any bimanual-EEF
@@ -3834,7 +3842,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
     # 480x480 images via the gemma4_e2b backbone and the lower-shuffle / lower-parallelism
     # data pipeline gemma4 needs for its memory budget.
     FineTuneConfig(
-        name = "sim_bimanual_assembly_q_sarsa_finetune_task_description_state_gemma4",
+        name = "sim_bimanual_assembly_gemma4_q_sarsa_finetune_task_description_state",
         data_factory = Hdf5RldsDataConfig(
             repo_id = "sim_bimanual_assembly",
             rlds_data_dir = "gs://saksham-euw4/hdf5",
@@ -3885,7 +3893,71 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         keep_period = 5_000,
         lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
         num_val_trajectories = 2,
-        validation_cache_dir = "/nfs/aidm_nfs/saksham3/sim_bimanual_assembly/validation_cache_dir_sim_bimanual_assembly_task_description_state_gemma4/",
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/sim_bimanual_assembly/validation_cache_dir_sim_bimanual_assembly_gemma4_task_description_state/",
+        include_repos = (),
+    ),
+    # Fine-tune the gemma4 CQL+Best-of-N base (robocoin_bimanual_gemma4_cql_rlds)
+    # on sim_bimanual_assembly. Every cql_rlds-specific knob (td_n=50,
+    # action_horizon=50, max_token_len=96, image_size=(480,480), discount=0.999,
+    # use_chunk_wise_delta, use_quantile_norm, prompt_mode) is mirrored from the
+    # base so the pretrained checkpoint slots in without an inference-time shift;
+    # only the dataset (Hdf5RldsDataConfig swap for sim_bimanual_assembly) and
+    # counterfactual store change. subsample=True follows the gemma4 q_sarsa
+    # sim_bimanual_assembly fine-tune above (sim runs at 30 Hz vs the source
+    # 60 Hz chunks).
+    FineTuneConfig(
+        name = "sim_bimanual_assembly_gemma4_cql_rlds_finetune_task_description",
+        data_factory = Hdf5RldsDataConfig(
+            repo_id = "sim_bimanual_assembly",
+            rlds_data_dir = "gs://saksham-euw4/hdf5",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "sim_bimanual_assembly", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/sim_bimanual_assembly",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.999,
+            td_n = 50,
+            use_eef = True,
+            state_dim = 14,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            image_size = (480, 480),
+            shuffle_buffer_size = 7_500,
+            num_parallel_reads = 4,
+            num_parallel_calls = 4,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/sim_bimanual_assembly_pi05/counterfactual_action_store",
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        # q_network_config is byte-identical to the gemma4_cql_rlds base's
+        # q_network_config — restated here so the pretrained checkpoint loads
+        # without any shift in backbone variant, image size, max_token_len, or
+        # layernorm placement.
+        model_overrides = {
+            "q_network_config": _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (480, 480),
+                max_token_len = 96,
+                action_dim = 14,
+                dtype = "float32",
+                paligemma_variant = "gemma4_e2b",
+                use_layernorm = True,
+            ),
+        },
+        action_horizon = 50,
+        num_train_steps = 10_000,
+        save_interval = 5_000,
+        plot_interval = 5_000,
+        keep_period = 5_000,
+        lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
+        num_val_trajectories = 2,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/sim_bimanual_assembly/validation_cache_dir_sim_bimanual_assembly_gemma4_cql_rlds_finetune/",
         include_repos = (),
     ),
     FineTuneConfig(
@@ -3970,9 +4042,9 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         },
         action_horizon = 60,
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/validation_cache_dir_real_shirt_hang_task_description_state/",
-        num_val_trajectories = 2,
+        num_val_trajectories = 3,
         include_repos = (),
-        num_train_steps = 8000,
+        num_train_steps = 10_000,
         lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
         save_interval = 2000,
         plot_interval = 2000,
@@ -3983,7 +4055,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
     # 480x480 images via the gemma4_e2b backbone and the lower-shuffle / lower-parallelism
     # data pipeline gemma4 needs for its memory budget.
     FineTuneConfig(
-        name = "real_shirt_hang_q_sarsa_finetune_task_description_state_gemma4",
+        name = "real_shirt_hang_gemma4_q_sarsa_finetune_task_description_state",
         data_factory = Hdf5RldsDataConfig(
             rlds_data_dir = "gs://saksham-euw4/hdf5",
             datasets = (rlds_dataset.RLDSDataset(name = "real_shirt_hang", version = "1.0.0", weight = 1.0),),
@@ -4025,10 +4097,10 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             ),
         },
         action_horizon = 60,
-        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/validation_cache_dir_real_shirt_hang_task_description_state_gemma4/",
-        num_val_trajectories = 2,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/validation_cache_dir_real_shirt_hang_gemma4_task_description_state/",
+        num_val_trajectories = 3,
         include_repos = (),
-        num_train_steps = 8000,
+        num_train_steps = 10_000,
         lr_schedule = _optimizer.ConstantSchedule(lr = 1e-6),
         save_interval = 2000,
         plot_interval = 2000,
@@ -4597,6 +4669,135 @@ _CONFIGS = [
         num_val_trajectories=10,
         include_repos=("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir="/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_50/",
+    ),
+    # From-scratch joint Q pretraining over the 49 RoboCasa zero-base-motion atomic
+    # datasets (see robocasa_datasets.PRETRAIN_ZERO_BASE_MOTION_ATOMIC; weights ∝ step
+    # counts so per-step draws are uniform across the union). Mirrors the network +
+    # training recipe of robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta (SARSA +
+    # PaliGemma Q net, chunk-wise-delta + quantile norm, PaliGemma weights). Native
+    # 20 Hz (no FPS interpolation); action_horizon = td_n = 20 (= 1 sec at 20 Hz);
+    # discount = 0.99 interpreted per native step. The joint asset_id below must be
+    # produced by running compute_norm_stats.py over these 49 datasets first.
+    TrainConfig(
+        name = "robocasa_paligemma_q_sarsa_chunk_wise_delta_pretrain_atomic",
+        model = _value_function.SARSAValueFunctionConfig(
+            network_config = _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                max_token_len = 48,
+                action_dim = 14,
+                dtype = "float32",
+            ),
+            head_config = _heads.RegressionHeadConfig(),
+            action_horizon = 20,
+        ),
+        data = RLDSRoboCasaDataConfig(
+            rlds_data_dir = "gs://saksham-euw4/robocasa",
+            datasets = robocasa_datasets.PRETRAIN_ZERO_BASE_MOTION_ATOMIC,
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/robocasa/norm_stats",
+                asset_id = "pretrain__atomic__zero_base_motion_joint",
+            ),
+            critic_mode = True,
+            bimanual_eef_layout = True,
+            use_all_cameras = True,
+            image_size = 224,
+            discount = 0.99,
+            td_n = 20,
+            native_fps = 20.0,
+            interpolation_config = None,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+        ),
+        weight_loader = weight_loaders.PaliGemmaWeightLoader(),
+        num_train_steps = 10_000,
+        batch_size = 256,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 1e-5,
+            decay_steps = 10_000,
+            decay_lr = 1e-6,
+        ),
+        optimizer = _optimizer.AdamW(weight_decay = 1e-6),
+        num_workers = 0,
+        log_interval = 100,
+        plot_interval = 4_000,
+        save_interval = 2_000,
+        fsdp_devices = 16,
+        action_horizon = 20,
+        num_val_trajectories = 5,
+        include_repos = (
+            "pretrain__atomic__turn_on_sink_faucet",
+            "pretrain__atomic__turn_sink_spout",
+            "pretrain__atomic__pick_place_counter_to_sink",
+            "pretrain__atomic__pick_place_cabinet_to_counter",
+            "pretrain__atomic__close_cabinet",
+        ),
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocasa/validation_cache_dir_chunk_wise_delta_pretrain_atomic/",
+    ),
+    # Pi-0.5 fine-tune from pi05_base on 3 RoboCasa composite tasks (target__composite__
+    # prepare_coffee, weigh_ingredients, arrange_tea), step-weighted. Uses
+    # prompt_mode="task_description" so the composite subtask tracker is bypassed and
+    # the raw per-step language_instruction drives the prompt. Native 20 Hz, no FPS
+    # interpolation; action_horizon = 20 (= 1 sec at 20 Hz). max_token_len = 48 chosen
+    # to comfortably cover the composite language_instructions via PaligemmaTokenizer.
+    # The joint asset_id below must be produced by running compute_norm_stats.py first.
+    TrainConfig(
+        name = "robocasa_pi05_target_composite",
+        model = pi0_config.Pi0Config(
+            paligemma_variant = "gemma_2b",
+            action_expert_variant = "gemma_300m",
+            action_dim = 32,
+            action_horizon = 20,
+            max_token_len = 48,
+            pi05 = True,
+            discrete_state_input = False,
+            action_dim_offset = 0,
+            action_dim_mask = (True,) * 7 + (False,) * 25,
+            pad_state_to_action_dim = False,
+            dtype = "float32",
+        ),
+        data = RLDSRoboCasaDataConfig(
+            rlds_data_dir = "gs://saksham-euw4/robocasa",
+            datasets = robocasa_datasets.TARGET_COMPOSITE_JOINT,
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/robocasa/norm_stats",
+                asset_id = "target__composite__joint",
+            ),
+            critic_mode = False,
+            bimanual_eef_layout = True,
+            use_all_cameras = True,
+            image_size = 224,
+            discount = 0.99,
+            td_n = 20,
+            native_fps = 20.0,
+            interpolation_config = None,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            prompt_mode = "task_description",
+        ),
+        weight_loader = weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps = 70_000,
+        batch_size = 128,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 5e-5,
+            decay_steps = 70_000,
+            decay_lr = 5e-6,
+        ),
+        optimizer = _optimizer.AdamW(),
+        num_workers = 0,
+        log_interval = 100,
+        save_interval = 10_000,
+        fsdp_devices = 16,
+        action_horizon = 20,
     ),
     # Per-task from-scratch TrainConfigs. Same effective settings as applying the
     # robocasa FineTuneConfig on top of robocoin, except the training

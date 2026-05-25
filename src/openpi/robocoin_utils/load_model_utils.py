@@ -173,6 +173,12 @@ class LoadPolicyConfig:
     checkpoint_path: str
     fine_tune: str | None = None
     step: int | None = None
+    # Optional override of TrainConfig.fsdp_devices for the inference mesh. None
+    # keeps the previous default (16) and the same-topology restore_state path
+    # for v5e-32. Setting a different value (e.g. device_count // num_samples
+    # for the BestOfN sample-parallel path) forces re-sharding via
+    # restore_params_with_shardings.
+    fsdp_devices: int | None = None
 
 
 def load_policy(load_config: LoadPolicyConfig):
@@ -187,7 +193,12 @@ def load_policy(load_config: LoadPolicyConfig):
         ft_config = _config.get_fine_tune_config(load_config.fine_tune)
         config = ft_config.apply_overrides(config, pretrained_step = None)
 
-    config = dataclasses.replace(config, fsdp_devices = 16)
+    # Default fsdp_devices=16 reproduces the saved (2, 16) sharding on v5e-32.
+    # Override (e.g. BestOfN sample-parallel) forces re-sharding because the
+    # mesh shape no longer matches the checkpoint's metadata.
+    fsdp_override = load_config.fsdp_devices
+    fsdp_devices = fsdp_override if fsdp_override is not None else 16
+    config = dataclasses.replace(config, fsdp_devices = fsdp_devices)
 
     train_module = _load_script_module("train.py")
     rng = jax.random.PRNGKey(86)
@@ -200,17 +211,33 @@ def load_policy(load_config: LoadPolicyConfig):
         overwrite = False,
         resume = True,
     )
-    # restore_params_with_shardings re-shards even when saved sharding matches
-    # the load-time mesh, silently producing wrong weights on (2,16) mesh.
-    # restore_state uses the saved sharding metadata directly.
-    class _DummyLoader:
-        def state_dict(self): return {}
-        def load_state_dict(self, *_args, **_kw): pass
+    # Same-topology path (v5e-32, fsdp_devices=16, mesh (2, 16) = 32 chips):
+    # restore_state uses the saved sharding metadata directly. Different-topology
+    # path (override-set, or device_count != 32): the saved sharding may not cover
+    # the current mesh, so force a re-shard via restore_params_with_shardings.
+    saved_chip_count = 32
+    if fsdp_override is None and jax.device_count() == saved_chip_count:
+        class _DummyLoader:
+            def state_dict(self): return {}
+            def load_state_dict(self, *_args, **_kw): pass
 
-    restored_state = _checkpoints.restore_state(
-        checkpoint_manager, train_state_shape, _DummyLoader(), step = load_config.step,
-    )
-    model = nnx.merge(restored_state.model_def, restored_state.params)
+        restored_state = _checkpoints.restore_state(
+            checkpoint_manager, train_state_shape, _DummyLoader(), step = load_config.step,
+        )
+        params = restored_state.params
+        model_def = restored_state.model_def
+    else:
+        logger.info(
+            "load_policy: fsdp_devices=%d device_count=%d mesh=%s; using restore_params_with_shardings to re-shard.",
+            fsdp_devices, jax.device_count(), mesh.devices.shape,
+        )
+        restored = restore_params_with_shardings(
+            checkpoint_manager, train_state_shape, state_sharding, step = load_config.step,
+        )
+        params = restored["params"]
+        model_def = train_state_shape.model_def
+
+    model = nnx.merge(model_def, params)
     logger.info(f"Loaded policy from {load_config.checkpoint_path}")
 
     return model, config

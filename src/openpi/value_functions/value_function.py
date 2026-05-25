@@ -393,13 +393,16 @@ class SARSAValueFunction(ValueFunction):
         self,
         observation: _model.Observation,
         use_target: bool = False,
-    ) -> tuple[at.Array, at.Array]:
+    ) -> tuple[at.Array, at.Array, at.Array | None]:
         """Wrapper that exposes the underlying network's prefix-cache fast path.
 
         Used by `BestOfNWrapper.sample_actions` to compute the critic's
         per-prefix KV cache once and reuse it across the N candidate-action
         evaluations (instead of re-encoding images + prompt N times). Mirrors
-        the sibling repo's wrapper at value_function.py:393.
+        the sibling repo's wrapper at value_function.py:393. Returns
+        ``(kv_cache, prefix_mask, subtask_mask)``; ``subtask_mask`` is the
+        ``[B, prefix_len]`` boolean over prefix columns marking subtask-text
+        positions (or None when subtask boundaries weren't supplied).
         """
         network = self.target_network if use_target else self.network
         if not hasattr(network, "compute_prefix_cache"):
@@ -824,7 +827,7 @@ class CQLValueFunction(BaseValueFunction):
         self,
         observation: _model.Observation,
         use_target: bool = False,
-    ) -> tuple[at.Array, at.Array]:
+    ) -> tuple[at.Array, at.Array, at.Array | None]:
         network = self.target_q_network if use_target else self.q_network
         if not hasattr(network, "compute_prefix_cache"):
             raise AttributeError(

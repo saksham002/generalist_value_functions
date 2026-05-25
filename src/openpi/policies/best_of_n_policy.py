@@ -76,6 +76,7 @@ _BROADCAST_RESTORE_DTYPES: dict[str, Any] = {
     "token_loss_mask": jnp.bool_,
     # Critic-side extras
     "critic_token_mask": jnp.bool_,
+    "critic_images": jnp.float32,
 }
 
 
@@ -160,9 +161,14 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         selection_mode: Literal["argmax", "softmax"] = "argmax",
         softmax_temperature: float = 1.0,
         critic_action_dim_offset: int | None = None,
+        expect_critic_images: bool = False,
         default_prompt: str | None = None,
         return_q_values: bool = True,
         prewarm: bool = True,
+        sample_parallel: bool = False,
+        fsdp_devices: int | None = None,
+        inject_noise: bool = False,
+        noise_level: float = 0.0,
     ) -> None:
         # Both critic-config and critic-checkpoint must be provided together.
         critic_args_set = (critic_config_name is not None) or (critic_checkpoint_dir is not None)
@@ -172,6 +178,68 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 "provided together (both or neither)."
             )
         self._return_q_values = return_q_values
+        self._expect_critic_images = expect_critic_images
+        self._inject_noise = bool(inject_noise)
+        self._noise_level = float(noise_level)
+
+        # sample_parallel mode (opt-in): shard the per-sample rngs (and JIT
+        # outputs) along BATCH_AXIS so num_samples unique candidates are
+        # produced (1 per batch position when num_samples == BATCH_AXIS, or
+        # num_samples/BATCH_AXIS per position batched via vmap when num_samples
+        # > BATCH_AXIS). JIT outputs are with_sharding_constraint'd to fully
+        # replicated so host gather is a one-shard read.
+        #
+        # Default fsdp_devices selection — caller can override via the
+        # `fsdp_devices` kwarg. The override is useful when the auto-computed
+        # value (device_count // num_samples) is too small to fit the
+        # restored params (e.g. v5e-32 with N=8 → auto fsdp=4 puts the policy +
+        # critic params on each chip at 4× the per-chip footprint of the
+        # saved fsdp=16 sharding, which exceeds 16 GB HBM and OOMs).
+        device_count = jax.device_count()
+        if num_samples <= 0:
+            raise ValueError(f"num_samples must be >= 1, got {num_samples}")
+        self._sample_parallel = bool(sample_parallel)
+        if self._sample_parallel:
+            if fsdp_devices is None:
+                # Auto: when num_samples >= device_count, FSDP=1 (each chip a
+                # batch position); when num_samples < device_count, FSDP =
+                # device_count/num_samples (one chip per FSDP shard per sample).
+                if num_samples >= device_count:
+                    fsdp_override = 1
+                else:
+                    if device_count % num_samples != 0:
+                        raise ValueError(
+                            f"sample_parallel=True auto fsdp requires device_count "
+                            f"({device_count}) divisible by num_samples ({num_samples}); "
+                            f"pass fsdp_devices explicitly to use a different mesh."
+                        )
+                    fsdp_override = device_count // num_samples
+            else:
+                if fsdp_devices <= 0 or device_count % fsdp_devices != 0:
+                    raise ValueError(
+                        f"sample_parallel fsdp_devices override ({fsdp_devices}) must be a "
+                        f"positive divisor of device_count ({device_count})."
+                    )
+                fsdp_override = fsdp_devices
+            batch_axis_size = device_count // fsdp_override
+            if num_samples % batch_axis_size != 0:
+                raise ValueError(
+                    f"sample_parallel=True requires num_samples ({num_samples}) divisible "
+                    f"by BATCH_AXIS size ({batch_axis_size} = device_count/fsdp_devices). "
+                    f"With device_count={device_count} and fsdp_devices={fsdp_override}, "
+                    f"valid num_samples values are multiples of {batch_axis_size}."
+                )
+            self._fsdp_devices_override: int | None = fsdp_override
+            self._sample_parallel_batch_axis = batch_axis_size
+            logger.info(
+                "BestOfNPolicy sample_parallel=True: num_samples=%d, mesh=(%d batch, %d fsdp), "
+                "device_count=%d, fsdp_devices_override=%s",
+                num_samples, batch_axis_size, fsdp_override, device_count,
+                "auto" if fsdp_devices is None else str(fsdp_devices),
+            )
+        else:
+            self._fsdp_devices_override = None
+            self._sample_parallel_batch_axis = None
 
         # ---- Load policy + build the per-RoboCasa Policy with full transforms.
         logger.info(f"Loading policy '{policy_config_name}' from {policy_checkpoint_dir} (step={policy_step})...")
@@ -180,6 +248,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             checkpoint_path = policy_checkpoint_dir,
             fine_tune = policy_fine_tune_config,
             step = policy_step,
+            fsdp_devices = self._fsdp_devices_override,
         )
         model, config = _load_policy(load_config)
         logger.info("Policy checkpoint restored.")
@@ -234,7 +303,10 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         self._output_transform = policy._output_transform  # noqa: SLF001
         self._sample_kwargs = dict(policy._sample_kwargs)  # noqa: SLF001
         self._rng = policy._rng  # noqa: SLF001
-        self._metadata = policy.metadata
+        # Surface image sizes + critic-image flag to client metadata for EvalImageHelper.
+        self._metadata = dict(policy.metadata)
+        self._metadata["policy_image_size"] = list(getattr(config.data, "image_size", (224, 224)))
+        self._metadata["expect_critic_images"] = bool(expect_critic_images)
 
         # Policy.__init__ skips this on the JAX path; force eval-mode here.
         self._model.eval()
@@ -390,27 +462,31 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         self._inference_iter = 0  # bumped in lockstep on every host
 
         # Mesh used for the FSDP-sharded JIT call. Re-built from `config.fsdp_devices`
-        # which load_policy pins to 16 — same mesh the policy params were restored
-        # onto. Used below to declare the per-sample rngs as DATA_AXIS-sharded so
-        # each chip gets a unique noise tensor.
+        # — defaults to 16 (saved checkpoint topology). With sample_parallel=True
+        # config.fsdp_devices was set to device_count // num_samples so the
+        # BATCH_AXIS exactly matches num_samples and the rng/leading axis maps
+        # 1:1 onto batch positions with no padding.
         from openpi.training import sharding as _sharding_mod
         self._sharding_mod = _sharding_mod
         self._mesh = _sharding_mod.make_mesh(config.fsdp_devices)
-        # Pad num_samples to a multiple of jax.device_count() so a single
-        # PartitionSpec(DATA_AXIS, None) cleanly splits the leading axis across
-        # all chips (1 unique sample per chip). User's num_samples is the lower
-        # bound; the critic ends up scoring `num_samples_padded` candidates and
-        # we argmax over all of them downstream.
-        device_count = jax.device_count()
-        if num_samples <= 0:
-            raise ValueError(f"num_samples must be >= 1, got {num_samples}")
-        self._num_samples_padded = ((num_samples + device_count - 1) // device_count) * device_count
-        if self._num_samples_padded != num_samples:
-            logger.info(
-                "BestOfNPolicy: padding num_samples %d -> %d (next multiple of device_count=%d) "
-                "so the per-sample rngs cleanly shard along DATA_AXIS.",
-                num_samples, self._num_samples_padded, device_count,
-            )
+        if self._sample_parallel:
+            # No padding: sample_rngs.shape[0] == num_samples; the BATCH_AXIS
+            # either matches num_samples (1 per batch position, parallel) or
+            # divides num_samples (multiple per batch position, sequential vmap).
+            self._num_samples_padded = num_samples
+        else:
+            # Pad num_samples to a multiple of jax.device_count() so a single
+            # PartitionSpec(DATA_AXIS, None) cleanly splits the leading axis across
+            # all chips (1 unique sample per chip). User's num_samples is the lower
+            # bound; the critic ends up scoring `num_samples_padded` candidates and
+            # we argmax over all of them downstream.
+            self._num_samples_padded = ((num_samples + device_count - 1) // device_count) * device_count
+            if self._num_samples_padded != num_samples:
+                logger.info(
+                    "BestOfNPolicy: padding num_samples %d -> %d (next multiple of device_count=%d) "
+                    "so the per-sample rngs cleanly shard along DATA_AXIS.",
+                    num_samples, self._num_samples_padded, device_count,
+                )
 
         # Cache the obs schema (shapes / dtypes) so participating ranks can
         # construct dummies of the exact structure broadcast_one_to_all expects.
@@ -436,6 +512,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         self._bestofn_sample = None
         self._bestofn = None
         self._policy_data_config = data_config
+        self._policy_subsample = getattr(config.data, "subsample", False)
 
         if critic_args_set:
             logger.info(
@@ -447,9 +524,17 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 critic_checkpoint_dir,
                 fine_tune = critic_fine_tune_config,
                 step = critic_step,
+                fsdp_devices = self._fsdp_devices_override if self._fsdp_devices_override is not None else 16,
             )
             critic_kwargs = _build_critic_kwargs(critic_config)
             self._critic_is_hdf5 = isinstance(critic_config.data, _config.Hdf5RldsDataConfig)
+            # Critic-side image_size: surfaced to clients + used to shape dummies
+            # (HLO must match across hosts).
+            critic_network_config = getattr(critic_config.model, "network_config", None)
+            critic_image_size = getattr(critic_network_config, "image_size", None) if critic_network_config is not None else None
+            if critic_image_size is not None:
+                self._metadata["critic_image_size"] = list(critic_image_size)
+            self._critic_image_size = tuple(critic_image_size) if critic_image_size is not None else None
             self._critic_model = critic_model
             self._critic_model.eval()
             self._critic_tokenizer = critic_kwargs["tokenizer"]
@@ -494,6 +579,13 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 f"policy_use_chunk_wise_delta={policy_use_chunk_wise_delta}, "
                 f"critic_use_chunk_wise_delta={critic_use_chunk_wise_delta})"
             )
+            wrapper_critic_kwargs = {
+                "use_quantile_norm": critic_kwargs["use_quantile_norm"],
+                "subsample": critic_subsample,
+                "policy_subsample": self._policy_subsample,
+                "action_dim_offset": resolved_offset,
+                "action_horizon": critic_action_horizon,
+            }
             self._bestofn = BestOfNWrapper(
                 action_dim = self._model.action_dim,
                 action_horizon = self._model.action_horizon,
@@ -508,26 +600,50 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 critic_norm_stats = critic_norm_stats,
                 policy_use_chunk_wise_delta = policy_use_chunk_wise_delta,
                 critic_use_chunk_wise_delta = critic_use_chunk_wise_delta,
-                critic_use_quantile_norm = critic_kwargs["use_quantile_norm"],
-                critic_subsample = critic_subsample,
-                critic_action_dim_offset = resolved_offset,
-                critic_action_horizon = critic_action_horizon,
+                critic_kwargs = wrapper_critic_kwargs,
+                inject_noise = self._inject_noise,
+                noise_level = self._noise_level,
             )
+            if self._inject_noise:
+                logger.info(
+                    f"BestOfNWrapper inject_noise=True (noise_level={self._noise_level}): "
+                    f"sampling 1 policy action + N={num_samples} Gaussian perturbations."
+                )
+
+            # Capture for closure (avoids referencing `self` inside JIT body):
+            _mesh = self._mesh
+            _sample_parallel = self._sample_parallel
 
             @nnx.jit
-            def _bestofn_sample(bon, vf, rng, sample_rngs, transition, critic_prompt, critic_prompt_mask):
-                # BestOfNWrapper.sample_actions returns (selected_action, q_values).
+            def _bestofn_sample(bon, vf, rng, sample_rngs, transition, critic_prompt, critic_prompt_mask, critic_images):
+                # BestOfNWrapper.sample_actions returns (all_actions, q_values).
                 # `rng` is replicated (used only for the softmax-selection rng);
-                # `sample_rngs` is DATA_AXIS-sharded so each chip generates unique
-                # initial noise. Forwarded as the optional `sample_rngs=` kwarg
-                # so the wrapper skips its in-JIT split and uses these directly.
-                return bon.sample_actions(
+                # `sample_rngs` is leading-axis-sharded so each parallel sample
+                # group gets unique initial noise. Forwarded as the optional
+                # `sample_rngs=` kwarg so the wrapper skips its in-JIT split and
+                # uses these directly.
+                # Critic view: critic-tokenized prompt, optional critic_images, shared image_masks.
+                critic_obs = dataclasses.replace(
+                    transition.observation,
+                    tokenized_prompt = critic_prompt,
+                    tokenized_prompt_mask = critic_prompt_mask,
+                )
+                if critic_images is not None:
+                    critic_obs = dataclasses.replace(critic_obs, images = critic_images)
+                all_actions, q_values = bon.sample_actions(
                     rng, transition, compute_next_action = False,
                     value_function = vf,
-                    critic_tokenized_prompt = critic_prompt,
-                    critic_tokenized_prompt_mask = critic_prompt_mask,
+                    critic_observation = critic_obs,
                     sample_rngs = sample_rngs,
                 )
+                if _sample_parallel:
+                    # Replicate outputs across all chips so host gather just reads
+                    # one addressable shard — no cross-host process_allgather on
+                    # the candidate axis.
+                    replicated = jax.sharding.NamedSharding(_mesh, jax.sharding.PartitionSpec())
+                    all_actions = jax.lax.with_sharding_constraint(all_actions, replicated)
+                    q_values = jax.lax.with_sharding_constraint(q_values, replicated)
+                return all_actions, q_values
 
             self._bestofn_sample = _bestofn_sample
             logger.info("Critic loaded; BestOfN sample closure JIT-registered.")
@@ -677,6 +793,11 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         if self._policy_task_description is not None:
             obs = {**obs, "prompt": self._policy_task_description}
 
+        # Pull critic_image out before _input_transform (which only knows about `image`).
+        critic_image_dict = obs.get("critic_image") if isinstance(obs, dict) else None
+        if critic_image_dict is not None:
+            obs = {k: v for k, v in obs.items() if k != "critic_image"}
+
         transformed = self._input_transform(obs)
 
         batched: dict[str, Any] = {}
@@ -708,6 +829,12 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                     [jnp.ones(30, dtype = jnp.bool_), jnp.zeros(20, dtype = jnp.bool_)]
                 )
                 batched["action_mask"] = fps_mask[None, :]
+            elif self._policy_subsample and action_horizon == 60:
+                # Stride-2 policy emits 30 real actions zero-padded to 60.
+                fps_mask = jnp.concatenate(
+                    [jnp.ones(30, dtype = jnp.bool_), jnp.zeros(30, dtype = jnp.bool_)]
+                )
+                batched["action_mask"] = fps_mask[None, :]
             else:
                 batched["action_mask"] = jnp.ones(action_horizon, dtype = jnp.bool_)[None, :]
         if "image_mask" not in batched:
@@ -724,6 +851,17 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 critic_tokens, critic_token_mask = self._critic_tokenizer.tokenize(prompt_str, None)
             extras["critic_tokens"] = jnp.asarray(critic_tokens)[None, ...]
             extras["critic_token_mask"] = jnp.asarray(critic_token_mask)[None, ...]
+            if self._expect_critic_images:
+                if critic_image_dict is None:
+                    raise ValueError(
+                        "expect_critic_images=True but obs has no 'critic_image' dict. "
+                        "The eval client must populate critic_image with the critic-pipeline images."
+                    )
+                # Mirror Observation.from_dict's uint8 → float32 [-1, 1] (critic_images bypass it).
+                extras["critic_images"] = {
+                    k: jnp.asarray(v)[None, ...].astype(jnp.float32) / 127.5 - 1.0
+                    for k, v in critic_image_dict.items()
+                }
         if noise is not None:
             noise_arr = jnp.asarray(noise)
             if noise_arr.ndim == 2:
@@ -749,6 +887,17 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         if self._bestofn is not None:
             extras["critic_tokens"] = jnp.zeros((1, self._critic_max_token_len), dtype = jnp.int32)
             extras["critic_token_mask"] = jnp.zeros((1, self._critic_max_token_len), dtype = jnp.bool_)
+            if self._expect_critic_images:
+                # float32 + critic_image_size to match rank-0; mismatched dummy halts TPU.
+                critic_h, critic_w = (
+                    self._critic_image_size
+                    if getattr(self, "_critic_image_size", None) is not None
+                    else (self._image_size, self._image_size)
+                )
+                extras["critic_images"] = {
+                    k: jnp.zeros((1, critic_h, critic_w, 3), dtype = jnp.float32)
+                    for k in self._image_keys
+                }
         return batched, extras
 
     def _broadcast_inputs(
@@ -797,14 +946,22 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         base_rng = jax.random.fold_in(self._rng, fold_value)
 
         total_rngs = jax.random.split(base_rng, self._num_samples_padded)
+        # In sample_parallel mode shard rngs along BATCH_AXIS only (size =
+        # num_samples) so each batch position owns one unique rng, replicated
+        # across the per-sample FSDP group. Otherwise use the original
+        # DATA_AXIS (combined batch+fsdp = device_count) sharding.
+        leading_spec = (
+            self._sharding_mod.BATCH_AXIS if self._sample_parallel
+            else self._sharding_mod.DATA_AXIS
+        )
         # Determine PartitionSpec based on key array layout: typed PRNG keys
         # have ndim=1, untyped uint32 keys have ndim=2 (trailing key-data axis).
         if total_rngs.ndim == 1:
-            spec = jax.sharding.PartitionSpec(self._sharding_mod.DATA_AXIS)
+            spec = jax.sharding.PartitionSpec(leading_spec)
         else:
             # ndim >= 2: shard leading axis only, replicate the trailing axes.
             spec = jax.sharding.PartitionSpec(
-                self._sharding_mod.DATA_AXIS, *([None] * (total_rngs.ndim - 1))
+                leading_spec, *([None] * (total_rngs.ndim - 1))
             )
         sharding_spec = jax.sharding.NamedSharding(self._mesh, spec)
         # `jax.device_put` won't accept a multi-host sharding because each host
@@ -856,6 +1013,14 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         (= n_per_host after dropping B=1) is multiplied by num_processes, giving
         (num_samples_padded, ah, ad) on every host.
         """
+        if self._sample_parallel:
+            # JIT outputs are with_sharding_constraint'd to fully replicated, so
+            # every chip on every host holds the complete (B, N, ...) array.
+            # Read the first addressable shard — all shards are identical replicas,
+            # and no cross-host gather is needed.
+            actions = np.asarray(local_actions.addressable_shards[0].data)
+            q_values = np.asarray(local_q_values.addressable_shards[0].data, dtype = np.float32)
+            return actions[0], q_values[0]
         a_shards = [np.asarray(s.data) for s in local_actions.addressable_shards]
         q_shards = [np.asarray(s.data) for s in local_q_values.addressable_shards]
         # Each shard is one chip's slice along the sharded axis (axis 1). Concat axis=1
@@ -891,6 +1056,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             actions_out, q_values = self._bestofn_sample(
                 self._bestofn, self._critic_model, rng, sample_rngs, transition,
                 extras["critic_tokens"], extras["critic_token_mask"],
+                extras.get("critic_images"),
             )
             return actions_out, q_values
         transition = _model.wrap_observation_as_transition(observation)
@@ -902,6 +1068,13 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         actions_out = self._sample_actions_jit(rng, transition, **sample_kwargs)
         # Note: the raw_actions debug print runs INSIDE the JIT graph (inside
         # `_sample_with_debug` wrapped by `_sample_actions_jit`), not here.
+        if self._inject_noise:
+            # Zero-mean Gaussian perturbation in policy-normalized space.
+            # `rng` is replicated, so noise is identical across hosts (consistent
+            # with the policy's replicated output on this BC path).
+            noise_rng = jax.random.fold_in(rng, 1)
+            eps = jax.random.normal(noise_rng, actions_out.shape, dtype = actions_out.dtype)
+            actions_out = actions_out + jnp.asarray(self._noise_level, dtype = actions_out.dtype) * eps
         return actions_out, None
 
     def participate_loop(self) -> None:
@@ -983,6 +1156,15 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                     "state": np.zeros(self._state_dim, dtype = np.float32),
                     "prompt": "prewarm",
                 }
+                # Include critic_image so prewarm compiles the actual inference path.
+                if self._expect_critic_images:
+                    critic_h, critic_w = (
+                        self._critic_image_size
+                        if getattr(self, "_critic_image_size", None) is not None
+                        else (self._image_size, self._image_size)
+                    )
+                    critic_zero = np.zeros((critic_h, critic_w, 3), dtype = np.uint8)
+                    dummy_obs["critic_image"] = {k: critic_zero for k in self._image_keys}
             else:
                 # RoboCasa/RoboCoin pipeline: flat observation/* keys with the
                 # raw RoboCasa state. Identity quaternion (xyzw = [0,0,0,1]) at
@@ -1026,8 +1208,13 @@ def create_bestofn_policy(
     selection_mode: Literal["argmax", "softmax"] = "argmax",
     softmax_temperature: float = 1.0,
     critic_action_dim_offset: int | None = None,
+    expect_critic_images: bool = False,
     default_prompt: str | None = None,
     prewarm: bool = True,
+    sample_parallel: bool = False,
+    fsdp_devices: int | None = None,
+    inject_noise: bool = False,
+    noise_level: float = 0.0,
 ) -> BestOfNPolicy:
     """Convenience factory; matches the kwargs the serve_policy CLI exposes."""
     return BestOfNPolicy(
@@ -1045,6 +1232,11 @@ def create_bestofn_policy(
         selection_mode = selection_mode,
         softmax_temperature = softmax_temperature,
         critic_action_dim_offset = critic_action_dim_offset,
+        expect_critic_images = expect_critic_images,
         default_prompt = default_prompt,
         prewarm = prewarm,
+        sample_parallel = sample_parallel,
+        fsdp_devices = fsdp_devices,
+        inject_noise = inject_noise,
+        noise_level = noise_level,
     )

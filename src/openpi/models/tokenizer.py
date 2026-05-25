@@ -128,23 +128,18 @@ class Gemma4Tokenizer:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto = f.read())
 
     def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        # Text-only token stream: BOS and per-camera <SOI> markers are supplied by the
+        # network (Gemma-4 special embeddings + image blocks), not the tokenized prompt.
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
         if state is not None:
             discretized_state = np.digitize(state, bins = np.linspace(-1, 1, 256 + 1)[:-1]) - 1
             state_str = " ".join(map(str, discretized_state))
             full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
-            tokens = self._tokenizer.encode(full_prompt, add_bos = self._use_bos)
+            tokens = self._tokenizer.encode(full_prompt, add_bos = False)
         else:
-            tokens = self._tokenizer.encode(cleaned_text, add_bos = self._use_bos) + self._tokenizer.encode("\n")
+            tokens = self._tokenizer.encode(cleaned_text, add_bos = False) + self._tokenizer.encode("\n")
 
-        if self._num_images > 0:
-            soi_markers = [self.START_OF_IMAGE_ID] * self._num_images
-            if self._use_bos:
-                tokens = [tokens[0]] + soi_markers + tokens[1:]
-            else:
-                tokens = soi_markers + tokens
-
-        total_len = self._max_len + self._num_images
+        total_len = self._max_len
         tokens_len = len(tokens)
         if tokens_len < total_len:
             padding = [False] * (total_len - tokens_len)
