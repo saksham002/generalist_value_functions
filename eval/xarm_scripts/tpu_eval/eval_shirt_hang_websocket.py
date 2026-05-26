@@ -38,6 +38,7 @@ from scipy.spatial.transform import Rotation
 import tyro
 
 from openpi_client import websocket_client_policy as _websocket_client_policy
+from openpi_client import eval_image_helper as _eval_image_helper
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 logger = logging.getLogger(__name__)
@@ -131,6 +132,17 @@ class Args:
     video_subdir: str = ""
     """Optional subdirectory under eval/xarm_scripts/tpu_eval/videos/ in which to store
     this run's mp4s. Empty string saves directly into videos/."""
+
+    use_critic_subtasks: bool = True
+    """If True, send the per-step subtask prompt to the critic via obs["prompt"]. If False,
+    send task_description instead, so the critic is conditioned on the same prompt the policy
+    receives. Only affects the critic — the policy prompt is pinned server-side by the
+    serve_policy --task-description override. Requires a critic whose prompt_mode reads the
+    client prompt (not task_description_predict_current_subtask, which ignores obs["prompt"])."""
+
+    task_description: str = ""
+    """Prompt sent to the critic when use_critic_subtasks is False; should match the server's
+    --task-description (the prompt the policy is conditioned on)."""
 
 # =============================================================================
 # Subtask tracker
@@ -606,6 +618,7 @@ def extract_images_rgb(obs: dict[str, Any], camera_names: tuple[str, ...]) -> di
 def run_episode(
     env: Any,
     client: _websocket_client_policy.WebsocketClientPolicy,
+    image_helper: _eval_image_helper.EvalImageHelper,
     args: Args,
     episode_idx: int,
 ) -> None:
@@ -652,14 +665,20 @@ def run_episode(
                         video_logger.record_advance(t)
 
             if t % args.query_freq == 0:
-                prompt = tracker.prompt
+                # obs["prompt"] is consumed by the critic; the policy prompt is pinned
+                # server-side by serve_policy's --task-description override.
+                critic_prompt = tracker.prompt if args.use_critic_subtasks else args.task_description
                 state, initial_eef_pose = extract_state(obs)
                 images_rgb = extract_images_rgb(obs, args.camera_names)
-
+                element_images = image_helper.process_images({
+                    "base_0_rgb": images_rgb.get("base_0_rgb"),
+                    "left_wrist_0_rgb": images_rgb.get("left_wrist_0_rgb"),
+                    "right_wrist_0_rgb": images_rgb.get("right_wrist_0_rgb"),
+                })
                 obs_dict = {
-                    "image": images_rgb,
+                    **element_images,
                     "state": state,
-                    "prompt": prompt,
+                    "prompt": critic_prompt,
                 }
 
                 t0 = time.perf_counter()
@@ -675,8 +694,8 @@ def run_episode(
                     :, args.real_action_start : args.real_action_start + args.real_action_dim
                 ]
                 log_line = (
-                    f"Episode {episode_idx} step {t}: prompt={prompt!r}, "
-                    f"inference={elapsed:.3f}s"
+                    f"Episode {episode_idx} step {t}: subtask={tracker.subtask} "
+                    f"critic_prompt={critic_prompt!r}, inference={elapsed:.3f}s"
                 )
                 if q_values is not None:
                     # B = 1 in the eval flow; flatten and format.
@@ -782,9 +801,14 @@ def main(args: Args) -> None:
         else:
             logger.info(f"Connecting policy client to {args.policy_host}:{args.policy_port} for episode {episode_idx}")
         client = _websocket_client_policy.WebsocketClientPolicy(args.policy_host, args.policy_port)
-
+        image_helper = _eval_image_helper.EvalImageHelper.from_client(client)
+        logger.info(
+            f"EvalImageHelper: policy={image_helper.policy_image_size}, "
+            f"critic={image_helper.critic_image_size}, "
+            f"expect_critic_images={image_helper.expect_critic_images}"
+        )
         try:
-            run_episode(env, client, args, episode_idx)
+            run_episode(env, client, image_helper, args, episode_idx)
         except KeyboardInterrupt:
             logger.info(f"Episode {episode_idx} interrupted by Ctrl+C")
         try:

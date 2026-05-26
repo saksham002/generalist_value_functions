@@ -69,6 +69,31 @@ class CriticArgs:
     # policy action that the critic consumes. None → use the policy config's
     # action_dim_offset.
     critic_action_dim_offset: int | None = None
+    # If True, expect the client to populate `obs["critic_image"]` with a
+    # critic-pipeline image dict on every infer call. They are routed into the
+    # critic's `Observation.images` (the policy still uses `obs["image"]`).
+    expect_critic_images: bool = False
+    # If True, switch BestOfNPolicy to sample-parallel mode: build a
+    # (num_samples, device_count // num_samples) mesh so each candidate runs on
+    # its own batch position with a small per-sample FSDP group, instead of
+    # sampling device_count candidates and discarding the surplus. Requires
+    # device_count divisible by num_samples.
+    sample_parallel: bool = False
+    # Override the inference mesh's fsdp axis size when sample_parallel=True.
+    # None → auto-pick (device_count // num_samples). Use this when the
+    # auto-picked value would make per-chip param storage too large
+    # (e.g. on v5e-32 keep fsdp=16 to match the saved sharding).
+    fsdp_devices: int | None = None
+    # If True, BestOfN samples ONE base action from the policy and N different
+    # zero-mean Gaussian noise vectors (each with its own rng); the candidates
+    # are `action + noise_level * eps_i`. The critic then scores and argmax-
+    # selects, same as the standard BestOfN path. Default False reproduces the
+    # original "sample N actions from the policy" behavior bit-for-bit.
+    inject_noise: bool = False
+    # Stddev multiplier on the Gaussian eps when inject_noise=True. Applied in
+    # policy-normalized space; for quantile-norm critics the action range is
+    # roughly [-1.25, 1.25], so 0.01 is a ~1%-of-range perturbation.
+    noise_level: float = 0.0
 
 
 @dataclasses.dataclass
@@ -110,6 +135,13 @@ class Args:
     # action-dim slice before Unnormalize, which the default Policy.infer
     # path does not. Implied (no need to set) when --critic.* is set.
     use_bestofn_loader: bool = False
+    # Add zero-mean Gaussian noise to the policy's sampled action in the
+    # no-critic (BC) path: action_out = policy_action + noise_level * eps.
+    # Applied in policy-normalized space. Default False reproduces the
+    # plain BC path bit-for-bit. (For the BoN path, set the equivalent
+    # --critic.inject-noise / --critic.noise-level instead.)
+    inject_noise: bool = False
+    noise_level: float = 0.0
 
 
 # Default checkpoints that should be used for each environment.
@@ -173,7 +205,12 @@ def create_policy(args: Args) -> _policy.BasePolicy:
                 selection_mode = args.critic.selection_mode,
                 softmax_temperature = args.critic.softmax_temperature,
                 critic_action_dim_offset = args.critic.critic_action_dim_offset,
+                expect_critic_images = args.critic.expect_critic_images,
                 default_prompt = args.default_prompt,
+                sample_parallel = args.critic.sample_parallel,
+                fsdp_devices = args.critic.fsdp_devices,
+                inject_noise = args.critic.inject_noise,
+                noise_level = args.critic.noise_level,
             )
         # use_bestofn_loader=True without critic: load policy through
         # BestOfNPolicy (which applies the bimanual-EEF action-dim slice)
@@ -186,6 +223,8 @@ def create_policy(args: Args) -> _policy.BasePolicy:
             policy_fine_tune_config = args.policy.fine_tune_config,
             policy_task_description = args.task_description,
             default_prompt = args.default_prompt,
+            inject_noise = args.inject_noise,
+            noise_level = args.noise_level,
         )
 
     match args.policy:

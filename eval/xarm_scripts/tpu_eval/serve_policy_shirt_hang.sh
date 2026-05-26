@@ -17,11 +17,15 @@ POLICY_STEP=60000
 
 # Set CRITIC_ENABLE=false to serve the policy without BestOfN.
 CRITIC_ENABLE=true
-CRITIC_CONFIG="robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta"
-CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta/robocoin_bimanual_paligemma_q_sarsa_chunk_wise_delta/real_shirt_hang_q_sarsa_finetune_chunk_wise_delta"
-CRITIC_STEP=234000
-CRITIC_FT_CONFIG="real_shirt_hang_q_sarsa_finetune_chunk_wise_delta"
+CRITIC_CONFIG="robocoin_bimanual_gemma4_q_sarsa_task_description"
+CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q_gemma4/robocoin_bimanual_gemma4_q_sarsa_task_description/robocoin_bimanual_gemma4_q_sarsa_task_description/real_shirt_hang_gemma4_q_sarsa_finetune_task_description_state_last_subtask_fix"
+CRITIC_STEP=238000
+CRITIC_FT_CONFIG="real_shirt_hang_gemma4_q_sarsa_finetune_task_description_state_last_subtask_fix"
 NUM_SAMPLES=8
+# When true, pass --critic.expect-critic-images: the critic consumes a separate obs["critic_image"]
+# stream (the eval client must send it; needed when the critic's image size/pipeline differs from the
+# policy, e.g. a gemma4 critic). When false, the critic reuses the policy's obs["image"].
+EXPECT_CRITIC_IMAGES=true
 # =============================================================================
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)" #Should resolve to batch_value_learning
@@ -30,7 +34,12 @@ REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)" #Should resolve to batch_val
 POLICY_BLOCK="policy:checkpoint --policy.config ${POLICY_CONFIG} --policy.dir ${POLICY_DIR} --policy.step ${POLICY_STEP}"
 if [ "${CRITIC_ENABLE}" = true ]; then
     PRE_POLICY_FLAGS=""
-    CRITIC_BLOCK="critic:critic-args --critic.config ${CRITIC_CONFIG} --critic.dir ${CRITIC_DIR} --critic.step ${CRITIC_STEP} --critic.fine-tune-config ${CRITIC_FT_CONFIG} --critic.num-samples ${NUM_SAMPLES}"
+    if [ "${EXPECT_CRITIC_IMAGES}" = true ]; then
+        CRITIC_IMAGES_FLAG="--critic.expect-critic-images"
+    else
+        CRITIC_IMAGES_FLAG=""
+    fi
+    CRITIC_BLOCK="critic:critic-args --critic.config ${CRITIC_CONFIG} --critic.dir ${CRITIC_DIR} --critic.step ${CRITIC_STEP} --critic.fine-tune-config ${CRITIC_FT_CONFIG} --critic.num-samples ${NUM_SAMPLES} --critic.sample-parallel --critic.fsdp-devices 16 ${CRITIC_IMAGES_FLAG}"
 else
     # --use-bestofn-loader routes through BestOfNPolicy so the action-dim slice runs before Unnormalize.
     PRE_POLICY_FLAGS="--use-bestofn-loader"

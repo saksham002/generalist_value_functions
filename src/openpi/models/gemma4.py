@@ -400,6 +400,44 @@ class Module(nn.Module):
         """Compute per-layer input embeddings of shape [B, T, num_layers, per_layer_input_dim]."""
         return self.embedder.encode_per_layer_input(embeddings, tokens)
 
+    def init_kv_cache(self, batch_size: int, cache_size: int) -> KVCache:
+        """Allocate an empty per-layer KV cache sized for ``cache_size`` total positions.
+
+        The upstream attention module uses a fixed-size left-aligned cache: each
+        forward pass scatters new K/V into positions ``[end_index, end_index +
+        seq_len)`` and advances ``end_index``. This helper produces a cache with
+        per-layer shapes that match the layer's attention type (local vs global —
+        different ``num_kv_heads`` / ``head_dim`` in some variants).
+        """
+        config = self.configs[0]
+        pattern = _repeat_pattern(config.attn_pattern, num_layers = config.num_layers)
+        dtype = jnp.dtype(self.embed_dtype)
+        cache: KVCache = {}
+        for layer_idx in range(config.num_layers):
+            is_global = _ATTN_TYPE_MAP[int(pattern[layer_idx])] == _fork_mod.AttentionType.GLOBAL
+            if is_global:
+                num_kv = (
+                    config.num_global_kv_heads
+                    if config.num_global_kv_heads is not None
+                    else config.num_kv_heads
+                )
+                kv_head_dim = (
+                    config.global_key_size
+                    if config.global_key_size is not None
+                    else config.head_dim
+                )
+            else:
+                num_kv = config.num_kv_heads
+                kv_head_dim = config.head_dim
+            cache[f"layer_{layer_idx}"] = _fork_mod.Attention.init_cache(
+                cache_size = cache_size,
+                num_heads = num_kv,
+                head_dim = kv_head_dim,
+                batch_size = batch_size,
+                dtype = dtype,
+            )
+        return cache
+
     # ---- Main forward ----
 
     def __call__(

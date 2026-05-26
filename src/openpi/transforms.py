@@ -123,6 +123,7 @@ class Normalize(DataTransformFn):
     def __post_init__(self):
         if self.norm_stats is not None and self.use_quantiles:
             _assert_quantile_stats(self.norm_stats)
+            object.__setattr__(self, "norm_stats", _sanitize_quantile_norm_stats(self.norm_stats))
 
     def __call__(self, data: DataDict) -> DataDict:
         if self.norm_stats is None:
@@ -160,11 +161,13 @@ class Normalize(DataTransformFn):
         return self.norm_stats[embodiment]
 
     def _normalize(self, x, stats: NormStats):
+        _assert_norm_shape_match(x, stats.mean)
         return (x - stats.mean) / (stats.std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
+        _assert_norm_shape_match(x, stats.q01)
         return (x - stats.q01) / (stats.q99 - stats.q01 + 1e-6) * 2.0 - 1.0
 
 
@@ -246,6 +249,7 @@ class Unnormalize(DataTransformFn):
     def __post_init__(self):
         if self.norm_stats is not None and self.use_quantiles:
             _assert_quantile_stats(self.norm_stats)
+            object.__setattr__(self, "norm_stats", _sanitize_quantile_norm_stats(self.norm_stats))
 
     def __call__(self, data: DataDict) -> DataDict:
         if self.norm_stats is None:
@@ -284,17 +288,14 @@ class Unnormalize(DataTransformFn):
         return self.norm_stats[embodiment]
 
     def _unnormalize(self, x, stats: NormStats):
-        mean = pad_to_dim(stats.mean, x.shape[-1], axis=-1, value=0.0)
-        std = pad_to_dim(stats.std, x.shape[-1], axis=-1, value=1.0)
-        return x * (std + 1e-6) + mean
+        _assert_norm_shape_match(x, stats.mean)
+        return x * (stats.std + 1e-6) + stats.mean
 
     def _unnormalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
-        q01, q99 = stats.q01, stats.q99
-        if (dim := q01.shape[-1]) < x.shape[-1]:
-            return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
-        return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+        _assert_norm_shape_match(x, stats.q01)
+        return (x + 1.0) / 2.0 * (stats.q99 - stats.q01 + 1e-6) + stats.q01
 
 
 @dataclasses.dataclass(frozen=True)
@@ -303,10 +304,10 @@ class ResizeImages(DataTransformFn):
     width: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        # Direct stretch matches dexterous_hang_config.py:_decode_and_reencode_jpeg, which
-        # writes 224x224 training frames via tf.image.resize without aspect preservation.
-        # Using resize_with_pad here would letterbox the eval frames and the model has
-        # never seen black bars on top/bottom.
+        # Direct stretch matches the tf.image.resize call in the RLDS dataset
+        # builder (src/openpi/training/rlds_dataset.py:805), which discards
+        # aspect ratio. Using resize_with_pad here would letterbox eval frames
+        # and the model has never seen black bars on top/bottom.
         data["image"] = {k: image_tools.resize_stretch(v, self.height, self.width) for k, v in data["image"].items()}
         if "next_image" in data:
             data["next_image"] = {
@@ -356,7 +357,15 @@ class DeltaActions(DataTransformFn):
             mask = None
             dims = 0
 
-        for state_key, action_key in (("state", "actions"), ("next_state", "next_actions")):
+        # Cached counterfactual chunks (shape [k, ah, ad]) are delta'd against
+        # the same state as their non-counterfactual counterpart; absent keys
+        # are skipped so non-RoboCOIN / non-cache configs are unaffected.
+        for state_key, action_key in (
+            ("state", "actions"),
+            ("next_state", "next_actions"),
+            ("state", "counterfactual_actions"),
+            ("next_state", "counterfactual_next_actions"),
+        ):
             if action_key not in data or state_key not in data:
                 continue
             state = data[state_key]
@@ -561,10 +570,9 @@ class PromptFromLeRobotTask(DataTransformFn):
 class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to the model action dimension.
 
-    When ``action_dim_mask`` is provided, source values are scattered into the
-    True positions of the mask in order (i.e. source[..., i] lands at the
-    i-th True index in mask). Number of source dims must equal the number of
-    True entries.
+    When ``action_dim_mask`` is provided, the True positions must form a
+    contiguous block; the offset is taken from the first True index and source
+    values are placed at ``[offset : offset + d]``.
 
     Otherwise, when ``action_dim_offset > 0``, values are placed at
     [offset : offset + d].
@@ -576,23 +584,29 @@ class PadStatesAndActions(DataTransformFn):
     action_dim_mask: tuple[bool, ...] | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
-        if self.action_dim_mask is not None:
-            true_indices = tuple(i for i, m in enumerate(self.action_dim_mask) if m)
+        offset = self._resolve_offset()
+        if offset > 0:
             if self.pad_state:
-                data["state"] = _scatter_to_mask(data["state"], self.model_action_dim, true_indices)
+                data["state"] = _insert_at_offset(data["state"], self.model_action_dim, offset)
             if "actions" in data:
-                data["actions"] = _scatter_to_mask(data["actions"], self.model_action_dim, true_indices)
-        elif self.action_dim_offset > 0:
-            if self.pad_state:
-                data["state"] = _insert_at_offset(data["state"], self.model_action_dim, self.action_dim_offset)
-            if "actions" in data:
-                data["actions"] = _insert_at_offset(data["actions"], self.model_action_dim, self.action_dim_offset)
+                data["actions"] = _insert_at_offset(data["actions"], self.model_action_dim, offset)
         else:
             if self.pad_state:
                 data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis = -1)
             if "actions" in data:
                 data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis = -1)
         return data
+
+    def _resolve_offset(self) -> int:
+        if self.action_dim_mask is None:
+            return self.action_dim_offset
+        true_indices = [i for i, m in enumerate(self.action_dim_mask) if m]
+        if not true_indices:
+            return self.action_dim_offset
+        assert true_indices == list(range(true_indices[0], true_indices[-1] + 1)), (
+            f"action_dim_mask must be a contiguous True block, got {self.action_dim_mask}"
+        )
+        return true_indices[0]
 
 
 def flatten_dict(tree: at.PyTree) -> dict:
@@ -688,27 +702,56 @@ def _insert_at_offset(x: np.ndarray, target_dim: int, offset: int) -> np.ndarray
     return out
 
 
-def _scatter_to_mask(x: np.ndarray, target_dim: int, true_indices: tuple[int, ...]) -> np.ndarray:
-    """Scatter x's last-axis values into true_indices of a zero array of size target_dim.
-
-    Source dim i lands at target index true_indices[i]. Asserts source dim count
-    equals len(true_indices).
-    """
-    real_dim = x.shape[-1]
-    assert real_dim == len(true_indices), (
-        f"source dim ({real_dim}) != number of True positions in mask ({len(true_indices)})"
-    )
-    assert all(0 <= idx < target_dim for idx in true_indices), (
-        f"true_indices out of range for target_dim={target_dim}: {true_indices}"
-    )
-    out_shape = x.shape[:-1] + (target_dim,)
-    out = np.zeros(out_shape, dtype = x.dtype)
-    out[..., list(true_indices)] = x
-    return out
 
 
 def _clean_prompt_text(prompt: str) -> str:
     return prompt.strip().replace("_", " ").replace("\n", " ")
+
+
+def _tokenize_robocoin_subtask_prompt_gemma4(
+    tokenizer: _tokenizer.Gemma4Tokenizer,
+    prefix: str,
+    suffix: str,
+    *,
+    state: np.ndarray | None = None,
+    append_newline: bool = True,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Gemma-4 subtask tokenization: a text-only prompt with no BOS / <SOI> markers.
+
+    BOS and the per-camera <SOI> markers are supplied by the network
+    (`_embed_sequence_gemma4`: BOS from the special embeddings, <SOI> inside each
+    image block), so the tokenized prompt carries only the text stream and
+    `subtask_start_index` / `subtask_end_index` index it directly.
+    """
+    if state is not None:
+        raise NotImplementedError("TokenizeRoboCoinSubtaskPrompt does not support discrete state input.")
+
+    cleaned_prefix = _clean_prompt_text(prefix)
+    cleaned_suffix = _clean_prompt_text(suffix)
+    prefix_with_separator = f"{cleaned_prefix} " if cleaned_prefix else cleaned_prefix
+
+    # Tokenize prefix and suffix separately so the split index is correct by construction.
+    # add_bos=False: BOS is supplied separately by the network's special embeddings.
+    prefix_tokens = tokenizer._tokenizer.encode(prefix_with_separator, add_bos = False)
+    suffix_tokens = tokenizer._tokenizer.encode(cleaned_suffix, add_bos = False)
+    newline_tokens = tokenizer._tokenizer.encode("\n") if append_newline else []
+    raw_tokens = prefix_tokens + suffix_tokens + newline_tokens
+    subtask_start_index = len(prefix_tokens)
+    subtask_end_index = subtask_start_index + len(suffix_tokens) - 1
+
+    max_len = tokenizer._max_len
+    tokens_len = len(raw_tokens)
+    if tokens_len < max_len:
+        padding = [False] * (max_len - tokens_len)
+        token_mask = [True] * tokens_len + padding
+        raw_tokens = raw_tokens + padding
+    else:
+        raw_tokens = raw_tokens[:max_len]
+        token_mask = [True] * max_len
+        subtask_start_index = min(subtask_start_index, max_len)
+        subtask_end_index = min(subtask_end_index, max_len - 1)
+
+    return np.asarray(raw_tokens), np.asarray(token_mask), subtask_start_index, subtask_end_index
 
 
 def _tokenize_robocoin_subtask_prompt(
@@ -717,7 +760,14 @@ def _tokenize_robocoin_subtask_prompt(
     suffix: str,
     *,
     state: np.ndarray | None = None,
+    append_newline: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
+    # Gemma-4 uses a dedicated text-only tokenization (no BOS / <SOI> in the prompt —
+    # the network supplies them). PaliGemma and Gemma-3 fall through unchanged.
+    if isinstance(tokenizer, _tokenizer.Gemma4Tokenizer):
+        return _tokenize_robocoin_subtask_prompt_gemma4(
+            tokenizer, prefix, suffix, state = state, append_newline = append_newline
+        )
     if state is not None:
         raise NotImplementedError("TokenizeRoboCoinSubtaskPrompt does not support discrete state input.")
 
@@ -731,13 +781,14 @@ def _tokenize_robocoin_subtask_prompt(
     add_bos = getattr(tokenizer, "_use_bos", True)
     prefix_tokens = tokenizer._tokenizer.encode(prefix_with_separator, add_bos = add_bos)
     suffix_tokens = tokenizer._tokenizer.encode(cleaned_suffix, add_bos = False)
-    newline_tokens = tokenizer._tokenizer.encode("\n")
+    newline_tokens = tokenizer._tokenizer.encode("\n") if append_newline else []
     raw_tokens = prefix_tokens + suffix_tokens + newline_tokens
     subtask_start_index = len(prefix_tokens)
     subtask_end_index = subtask_start_index + len(suffix_tokens) - 1
 
     image_tokenizer = isinstance(tokenizer, (_tokenizer.Gemma3Tokenizer, _tokenizer.Gemma4Tokenizer))
     if image_tokenizer and tokenizer._num_images > 0:
+        assert add_bos, "add_bos must be True with Gemma3 or Gemma4 tokenizer"
         soi_markers = [tokenizer.START_OF_IMAGE_ID] * tokenizer._num_images
         raw_tokens = [raw_tokens[0]] + soi_markers + raw_tokens[1:]
         subtask_start_index += tokenizer._num_images
@@ -796,3 +847,62 @@ def _assert_quantile_stats(norm_stats: at.PyTree[NormStats]) -> None:
             raise ValueError(
                 f"quantile stats must be provided if use_quantile_norm is True. Key {k} is missing q01 or q99."
             )
+
+
+def _sanitize_quantile_norm_stats(
+    norm_stats: at.PyTree[NormStats] | None,
+) -> at.PyTree[NormStats] | None:
+    """Expand degenerate quantile bounds so 0-valued constants normalize to 0.
+
+    Where q01[i] == q99[i], assert the common value is 0 and replace with
+    q01[i] = -1, q99[i] = +1. The formula `(x - q01) / (q99 - q01 + eps) * 2 - 1`
+    then maps x = 0 to 0 (without this fix, a degenerate (q01 = q99 = 0)
+    collapses x = 0 to -1).
+
+    Used for padded/masked dims (e.g. the bimanual-EEF left-arm slot, which
+    is constant 0 in the dataset and so has q01 = q99 = 0 in norm_stats).
+    The mean/std path is naturally well-behaved at x = 0, mean = 0, std = 0
+    because (0 - 0) / (0 + eps) = 0, so no analogous fix is needed there.
+    """
+    if norm_stats is None or not norm_stats:
+        return norm_stats
+
+    def _fix_one(stats: NormStats) -> NormStats:
+        if stats.q01 is None or stats.q99 is None:
+            return stats
+        q01 = np.asarray(stats.q01)
+        q99 = np.asarray(stats.q99)
+        degenerate = q01 == q99
+        if not degenerate.any():
+            return stats
+        assert np.all(q01[degenerate] == 0), (
+            f"Quantile-norm sanitize: q01 == q99 at some indices but value is not 0: "
+            f"{q01[degenerate]}"
+        )
+        new_q01 = np.where(degenerate, -1.0, q01)
+        new_q99 = np.where(degenerate, 1.0, q99)
+        return _normalize.NormStats(mean = stats.mean, std = stats.std, q01 = new_q01, q99 = new_q99)
+
+    first_value = next(iter(norm_stats.values()))
+    if isinstance(first_value, NormStats):
+        return {k: _fix_one(v) for k, v in norm_stats.items()}
+    return {emb: {k: _fix_one(v) for k, v in inner.items()} for emb, inner in norm_stats.items()}
+
+
+def _assert_norm_shape_match(x: np.ndarray, stats_arr: np.ndarray) -> None:
+    """Assert that x's last K dims match stats_arr.shape, where K = stats_arr.ndim.
+
+    Catches mismatches between 1-D stats (D,) applied to (B, ..., D) data, or
+    2-D stats (H, D) applied to (B, ..., H, D) data, before silent broadcasting
+    produces the wrong result.
+    """
+    stats_shape = np.shape(stats_arr)
+    K = len(stats_shape)
+    if K == 0:
+        return
+    actual = np.shape(x)[-K:]
+    if actual != stats_shape:
+        raise AssertionError(
+            f"Norm-stats shape mismatch: array shape {np.shape(x)} "
+            f"vs stats shape {stats_shape}; last {K} dim(s) must match."
+        )

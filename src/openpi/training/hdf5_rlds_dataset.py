@@ -21,7 +21,7 @@ from typing import Any, Literal
 import openpi.training.rlds_dataset as rlds_dataset
 
 
-PromptMode = Literal["subtask", "task_description"]
+PromptMode = Literal["subtask", "task_description", "task_description_predict_current_subtask"]
 
 
 class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
@@ -76,10 +76,10 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
                 "Hdf5RldsDataset requires (state_dim=16, use_eef=False) or "
                 f"(state_dim=14, use_eef=True); got state_dim={state_dim}, use_eef={use_eef}"
             )
-        if td_n is not None and td_n % 5 != 0:
-            raise ValueError(f"td_n must be a multiple of 5, got {td_n}")
-        if filter_n is not None and filter_n % 5 != 0:
-            raise ValueError(f"filter_n must be a multiple of 5, got {filter_n}")
+        if td_n is not None and td_n % 2 != 0:
+            raise ValueError(f"td_n must be a multiple of 2, got {td_n}")
+        if filter_n is not None and filter_n % 2 != 0:
+            raise ValueError(f"filter_n must be a multiple of 2, got {filter_n}")
         if variable_horizon and mask_boundary_actions:
             raise ValueError("variable_horizon=True requires mask_boundary_actions=False")
         if variable_horizon and td_n != action_chunk_size:
@@ -146,6 +146,21 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         """Extract trajectory fields used by ``_apply_rl_fields`` and ``frame_transforms``."""
         import tensorflow as tf
 
+
+        if "reward" in traj:
+            terminal_reward = tf.cast(traj["reward"][-1], tf.float32)
+            is_partial_scalar = tf.logical_not(terminal_reward > tf.constant(0.99, dtype = tf.float32))
+        else:
+            # Heuristic guess for is_partial. When reward is absent, fall back to per-episode subtask annotations: a
+            # trajectory is complete iff has_subtask_annotations is True AND the terminal
+            # subtask_1 frame matches the task's final subtask.
+            has_subtask_annotations = tf.cast(
+                traj["traj_metadata"]["episode_metadata"]["has_subtask_annotations"][0], tf.bool,
+            )
+            terminal_subtask = traj["subtask_1"][-1]
+            matches_terminal = tf.equal(terminal_subtask, "Place the hanger on the rod")
+            is_partial_scalar = tf.logical_not(tf.logical_and(has_subtask_annotations, matches_terminal))
+
         if self._subsample:
             traj = self._subsample_trajectory(traj)
 
@@ -202,14 +217,28 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
             "actions": actions,
             "observation": observation,
             "subtask_1": traj["subtask_1"],
-            "steps_to_subtask_end": traj["steps_to_subtask_end"],
+            # task_description has no subtasks: count down to episode end instead.
+            "steps_to_subtask_end": (
+                tf.cast(traj["_len"] - 1 - traj["_frame_index"], tf.int32)
+                if self._prompt_mode == "task_description"
+                else traj["steps_to_subtask_end"]
+            ),
             "fps": fps,
             "repo_id": repo_id,
             "task_description": task_description,
             "embodiment": embodiment,
+            "is_partial": tf.fill([traj_len], is_partial_scalar),
         }
         if self._filter_intervention:
             result["is_intervention"] = traj["is_intervention"]
+        if self._prompt_mode != "task_description":
+            # Per-frame episode flag so the filters can drop subtask-prompt frames lacking subtask annotations.
+            # task_description_predict_current_subtask still needs the per-frame subtask annotation
+            # (it predicts it), so the flag is kept for that mode too — mirrors RoboCOIN.
+            result["has_subtask_annotations"] = tf.fill(
+                [traj_len],
+                tf.cast(traj["traj_metadata"]["episode_metadata"]["has_subtask_annotations"][0], tf.bool),
+            )
         del dataset_cfg
 
         # `frame_index` is the original per-episode frame index baked into the raw HDF5
@@ -217,7 +246,7 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         # [0::2] slice and does NOT divide it by 2, so the same physical step retains
         # the same `frame_index` whether or not subsample=True — handy for matching the
         # same sample across subsampled and un-subsampled views.
-        for key in ("index", "episode_index", "_frame_index", "_traj_index", "repo_index", "frame_index"):
+        for key in ("index", "episode_index", "_frame_index", "_traj_index", "repo_index", "frame_index", "_len"):
             if key in traj:
                 result[key] = traj[key]
 
@@ -261,7 +290,7 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
 
         out = {k: _walk(v, k) for k, v in traj.items()}
 
-        for halve_key in ("_frame_index", "index", "steps_to_subtask_end"):
+        for halve_key in ("_frame_index", "index", "steps_to_subtask_end", "_len"):
             if halve_key in out:
                 out[halve_key] = out[halve_key] // 2
 
@@ -542,6 +571,9 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
 
         if self._prompt_mode == "task_description":
             frame["prompt"] = frame["task_description"]
+        elif self._prompt_mode == "task_description_predict_current_subtask":
+            frame["prompt"] = frame["task_description"]
+            frame["subtask_text"] = frame["subtask_1"]
         else:
             frame["prompt"] = frame["subtask_1"]
 
@@ -606,14 +638,25 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
 
         traj = super()._apply_frame_transforms_to_trajectory(traj)
 
-        mask = tf.ones(tf.shape(traj["actions"])[0:1], dtype = tf.bool)
+        traj_len = tf.shape(traj["actions"])[0]
+        mask = tf.ones([traj_len], dtype = tf.bool)
         if self._filter_n is not None:
             fps = tf.cast(traj["fps"], tf.int32)
-            # filter_n is in 60 Hz units (same convention as td_n).
             filter_n_native = tf.where(tf.equal(fps, 30), self._filter_n // 2, self._filter_n)
             mask = tf.logical_and(mask, traj["steps_to_subtask_end"] >= filter_n_native)
+        # Drop last td_n frames only when the trajectory is partial (no terminal
+        # reward to anchor the bootstrap target). `_len` and `_frame_index` are
+        # in raw 60 Hz units regardless of subsample, matching td_n's units.
+        if self._td_n is not None:
+            fps0 = tf.cast(traj["fps"][0], tf.int32)
+            td_n_native = tf.where(tf.equal(fps0, 30), self._td_n // 2, self._td_n)
+            tail = (traj["_len"] - int(self._critic_mode == True) - traj["_frame_index"]) < td_n_native
+            mask = tf.logical_and(mask, tf.logical_not(tf.logical_and(tail, traj["is_partial"])))
         if self._filter_intervention:
             mask = tf.logical_and(mask, tf.cast(traj["is_intervention"], tf.bool))
+        if self._prompt_mode != "task_description":
+            # Mirror frame_filter.
+            mask = tf.logical_and(mask, tf.cast(traj["has_subtask_annotations"], tf.bool))
         return tf.nest.map_structure(lambda x: tf.boolean_mask(x, mask), traj)
 
     def frame_filter(self, frame: dict) -> bool:
@@ -624,11 +667,19 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
 
         if self._filter_n is not None:
             fps = tf.cast(frame["fps"], tf.int32)
-            # filter_n is in 60 Hz units (same convention as td_n).
             filter_n_native = tf.where(tf.equal(fps, 30), self._filter_n // 2, self._filter_n)
             keep = tf.logical_and(keep, frame["steps_to_subtask_end"] >= filter_n_native)
 
+        if self._td_n is not None:
+            fps = tf.cast(frame["fps"], tf.int32)
+            td_n_native = tf.where(tf.equal(fps, 30), self._td_n // 2, self._td_n)
+            tail = (frame["_len"] - int(self._critic_mode == True) - frame["_frame_index"]) < td_n_native
+            keep = tf.logical_and(keep, tf.logical_not(tf.logical_and(tail, frame["is_partial"])))
+
         if self._filter_intervention:
             keep = tf.logical_and(keep, tf.cast(frame["is_intervention"], tf.bool))
+
+        if self._prompt_mode != "task_description":
+            keep = tf.logical_and(keep, tf.cast(frame["has_subtask_annotations"], tf.bool))
 
         return keep

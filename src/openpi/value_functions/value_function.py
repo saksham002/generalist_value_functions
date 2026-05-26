@@ -293,8 +293,7 @@ class ValueFunction(BaseValueFunction):
     ) -> at.Float[at.Array, "*b"]:
         """For value functions without target network, return the same as compute_value."""
         result = self.compute_value(
-            observation,
-            action,
+            observation, action,
             take_min_over_ensemble = take_min_over_ensemble,
             prefix_cache = prefix_cache,
         )
@@ -394,7 +393,17 @@ class SARSAValueFunction(ValueFunction):
         self,
         observation: _model.Observation,
         use_target: bool = False,
-    ) -> tuple[at.Array, at.Array]:
+    ) -> tuple[at.Array, at.Array, at.Array | None]:
+        """Wrapper that exposes the underlying network's prefix-cache fast path.
+
+        Used by `BestOfNWrapper.sample_actions` to compute the critic's
+        per-prefix KV cache once and reuse it across the N candidate-action
+        evaluations (instead of re-encoding images + prompt N times). Mirrors
+        the sibling repo's wrapper at value_function.py:393. Returns
+        ``(kv_cache, prefix_mask, subtask_mask)``; ``subtask_mask`` is the
+        ``[B, prefix_len]`` boolean over prefix columns marking subtask-text
+        positions (or None when subtask boundaries weren't supplied).
+        """
         network = self.target_network if use_target else self.network
         if not hasattr(network, "compute_prefix_cache"):
             raise AttributeError(
@@ -626,6 +635,7 @@ class CQLValueFunctionConfig(BaseValueFunctionConfig):
 
     discount: float = 0.99
     tau: float = 0.005
+    next_token_loss_weight: float = 0.0
 
     action_bounds: ActionBounds = dataclasses.field(
         default_factory = lambda: ActionBounds.from_uniform(-1.0, 1.0, action_dim = 1, is_normalized = True)
@@ -682,6 +692,7 @@ class CQLValueFunctionConfig(BaseValueFunctionConfig):
             cql_clip_diff_max=self.cql_clip_diff_max,
             use_calql=self.use_calql,
             use_calql_on_random_actions=self.use_calql_on_random_actions,
+            next_token_loss_weight=self.next_token_loss_weight,
         )
 
     @override
@@ -713,6 +724,7 @@ class CQLValueFunction(BaseValueFunction):
     target_q_head: ValueHead
     discount: float
     tau: float
+    next_token_loss_weight: float
 
     action_bounds: ActionBounds
     cql_alpha: float
@@ -748,6 +760,7 @@ class CQLValueFunction(BaseValueFunction):
         cql_clip_diff_max: float,
         use_calql: bool,
         use_calql_on_random_actions: bool,
+        next_token_loss_weight: float = 0.0,
     ):
         super().__init__()
         self.q_network = q_network
@@ -768,6 +781,7 @@ class CQLValueFunction(BaseValueFunction):
         self.cql_clip_diff_max = cql_clip_diff_max
         self.use_calql = use_calql
         self.use_calql_on_random_actions = use_calql_on_random_actions
+        self.next_token_loss_weight = next_token_loss_weight
 
     @override
     def compute_value(
@@ -813,7 +827,7 @@ class CQLValueFunction(BaseValueFunction):
         self,
         observation: _model.Observation,
         use_target: bool = False,
-    ) -> tuple[at.Array, at.Array]:
+    ) -> tuple[at.Array, at.Array, at.Array | None]:
         network = self.target_q_network if use_target else self.q_network
         if not hasattr(network, "compute_prefix_cache"):
             raise AttributeError(
@@ -860,6 +874,7 @@ class CQLValueFunction(BaseValueFunction):
             cql_clip_diff_max=self.cql_clip_diff_max,
             use_calql=self.use_calql,
             use_calql_on_random_actions=self.use_calql_on_random_actions,
+            next_token_loss_weight=self.next_token_loss_weight,
             value_function=self,
         )
         total_loss = q_loss + self.cql_alpha * cql_loss
