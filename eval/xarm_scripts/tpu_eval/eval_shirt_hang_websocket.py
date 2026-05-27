@@ -796,7 +796,8 @@ def main(args: Args) -> None:
             logger.info(f"Reconnecting policy client to {args.policy_host}:{args.policy_port} for episode {episode_idx}")
             try:
                 client._ws.close()
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Error closing previous client websocket (ignored, reconnecting anyway): {e}")
                 pass
         else:
             logger.info(f"Connecting policy client to {args.policy_host}:{args.policy_port} for episode {episode_idx}")

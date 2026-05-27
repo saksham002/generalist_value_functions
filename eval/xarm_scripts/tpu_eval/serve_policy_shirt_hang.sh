@@ -8,7 +8,7 @@ set -e
 # Configuration — edit these before running
 # =============================================================================
 TPU_TYPE="v5e-32"
-TPU_NAME="v5e-tpu-32-1"
+TPU_NAME="v5e-tpu-32-0"
 PORT=8005
 
 POLICY_CONFIG="real_shirt_hang_pi05"
@@ -17,15 +17,15 @@ POLICY_STEP=60000
 
 # Set CRITIC_ENABLE=false to serve the policy without BestOfN.
 CRITIC_ENABLE=true
-CRITIC_CONFIG="robocoin_bimanual_gemma4_q_sarsa_task_description"
-CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q_gemma4/robocoin_bimanual_gemma4_q_sarsa_task_description/robocoin_bimanual_gemma4_q_sarsa_task_description/real_shirt_hang_gemma4_q_sarsa_finetune_task_description_state_last_subtask_fix"
-CRITIC_STEP=238000
-CRITIC_FT_CONFIG="real_shirt_hang_gemma4_q_sarsa_finetune_task_description_state_last_subtask_fix"
+CRITIC_CONFIG="robocoin_bimanual_paligemma_cql_rlds"
+CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_cql_rlds/robocoin_bimanual_paligemma_cql_rlds/real_shirt_hang_paligemma_cql_rlds_finetune_task_description"
+CRITIC_STEP=160000
+CRITIC_FT_CONFIG="real_shirt_hang_paligemma_cql_rlds_finetune_task_description"
 NUM_SAMPLES=8
 # When true, pass --critic.expect-critic-images: the critic consumes a separate obs["critic_image"]
 # stream (the eval client must send it; needed when the critic's image size/pipeline differs from the
 # policy, e.g. a gemma4 critic). When false, the critic reuses the policy's obs["image"].
-EXPECT_CRITIC_IMAGES=true
+EXPECT_CRITIC_IMAGES=false
 # =============================================================================
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)" #Should resolve to batch_value_learning
