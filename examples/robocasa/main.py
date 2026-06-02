@@ -37,6 +37,7 @@ import imageio
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
+from openpi.training.robocasa_online_subtask_tracker import get_online_tracker
 from robocasa.utils.dataset_registry import TASK_SET_REGISTRY
 from robocasa.utils.dataset_registry_utils import get_task_horizon
 from robocasa.utils.env_utils import convert_action
@@ -76,6 +77,10 @@ import tyro
 
 # 256 -> 512x512 final, satisfies libx264's "divisible by 16".
 _VIDEO_PANEL_SIZE = 256
+# Header band above the 2x2 mosaic for the current subtask prompt (matches
+# sim_bimanual_assembly/main.py). Keep combined height (2 * panel + header)
+# divisible by 16 so libx264 doesn't auto-resize.
+_VIDEO_HEADER_HEIGHT = 32
 
 
 class VideoLogger:
@@ -117,19 +122,27 @@ class VideoLogger:
         self._images: list[dict[str, np.ndarray]] = []
         self._q_values: list[np.ndarray] = []
         self._steps: list[int] = []
+        self._subtasks: list[str] = []
         self._episode_idx: int | None = None
 
     def start_episode(self, episode_idx: int) -> None:
         self._reset()
         self._episode_idx = episode_idx
 
-    def record_predict(self, images: dict[str, np.ndarray], q_values: np.ndarray | None, t: int) -> None:
+    def record_predict(
+        self,
+        images: dict[str, np.ndarray],
+        q_values: np.ndarray | None,
+        t: int,
+        subtask: str = "",
+    ) -> None:
         self._images.append({k: np.asarray(v).copy() for k, v in images.items()})
         if q_values is None:
             self._q_values.append(np.zeros((0,), dtype = np.float32))
         else:
             self._q_values.append(np.asarray(q_values, dtype = np.float32).reshape(-1))
         self._steps.append(t)
+        self._subtasks.append(subtask)
 
     def finish_episode(self, success: bool = False) -> None:
         if self._episode_idx is None or not self._images:
@@ -173,7 +186,27 @@ class VideoLogger:
 
         top = np.concatenate([agentview_left, value_panel], axis = 1)
         bottom = np.concatenate([agentview_right, eye_in_hand], axis = 1)
-        return np.concatenate([top, bottom], axis = 0)
+        mosaic = np.concatenate([top, bottom], axis = 0)
+        subtask = self._subtasks[frame_idx] if frame_idx < len(self._subtasks) else ""
+        header = self._render_subtask_header(mosaic.shape[1], subtask)
+        return np.concatenate([header, mosaic], axis = 0)
+
+    def _render_subtask_header(self, width: int, subtask: str) -> np.ndarray:
+        header = np.zeros((_VIDEO_HEADER_HEIGHT, width, 3), dtype = np.uint8)
+        if not subtask:
+            return header
+        font = self._cv2.FONT_HERSHEY_SIMPLEX
+        thickness = 1
+        scale = 0.55
+        while scale > 0.3:
+            (text_w, text_h), _baseline = self._cv2.getTextSize(subtask, font, scale, thickness)
+            if text_w <= width - 8:
+                break
+            scale -= 0.05
+        x = max(4, (width - text_w) // 2)
+        y = (_VIDEO_HEADER_HEIGHT + text_h) // 2
+        self._cv2.putText(header, subtask, (x, y), font, scale, (255, 255, 255), thickness, self._cv2.LINE_AA)
+        return header
 
     def _render_value_plot(self, size: int, q_matrix: np.ndarray, steps: np.ndarray, current_step: int) -> np.ndarray:
         plt = self._plt
@@ -205,6 +238,8 @@ class Args:
     # Model-emit fps -> env-step fps. Equal => pass-through. Required (no
     # defaults). Listed first so the dataclass ordering rule
     # (non-default fields must precede default fields) is satisfied.
+    # When the server reports interpolation_config_present=False these are
+    # ignored (no client-side resampling).
     model_action_fps: float
     env_action_fps: float
 
@@ -221,13 +256,13 @@ class Args:
 
     # Logging
     log_dir: str | None = None
-    # Sub-directory under <log_dir>/<env> selecting the eval method
-    # ("bc" | "bestofn8" | "bestofn64"); set by the launching bash script to
-    # match the served critic config. Empty => no method subdir.
+    # Multi-segment path under <log_dir>/<env> selecting the eval method,
+    # mirroring examples/sim_bimanual_assembly/main.py. Layouts built by the
+    # launching bash script:
+    #   policy-only:  "<policy_config>/bc[_noise<level>]/<date-tag>"
+    #   best-of-N:    "<policy_config>/<critic_ft_config>_<critic_step>/best_of_n_<N>[_noise<level>]/<date-tag>"
+    # Empty => no method subdir.
     method: str = ""
-    # Leaf run-tag sub-dir under <log_dir>/<env>/<method> (a date-time stamp);
-    # set by the launching bash script. Empty => no run-tag subdir.
-    run_tag: str = ""
     seed: int = 7
     # Save per-episode 2x2 mosaic mp4 (cameras + Q-value plot if available).
     log_videos: bool = False
@@ -249,6 +284,9 @@ class Args:
     # tally + final stats.json success_rate cover all completed episodes.
     start_episode_idx: int = 0
     resume_from_dir: str | None = None
+    # When True, save the last frame's agentview_left + agentview_right side-by-side
+    # PNG to <log_path>/last_frames/{successes,failures}/episode_<env_idx>.png.
+    save_last_frames: bool = False
 
 
 def eval_main(args: Args) -> None:
@@ -270,7 +308,6 @@ def eval_main(args: Args) -> None:
             split=args.split,
             log_dir=args.log_dir,
             method=args.method,
-            run_tag=args.run_tag,
             num_trials=args.num_trials,
             resize_size=args.resize_size,
             replan_steps=args.replan_steps,
@@ -283,6 +320,7 @@ def eval_main(args: Args) -> None:
             max_steps=args.max_steps,
             start_episode_idx=args.start_episode_idx,
             resume_from_dir=args.resume_from_dir,
+            save_last_frames=args.save_last_frames,
         )
 
 
@@ -291,7 +329,6 @@ def eval_env(
     split: str,
     log_dir: str | None,
     method: str,
-    run_tag: str,
     num_trials: int,
     resize_size: int,
     replan_steps: int,
@@ -304,11 +341,12 @@ def eval_env(
     max_steps: int = 1200,
     start_episode_idx: int = 0,
     resume_from_dir: str | None = None,
+    save_last_frames: bool = False,
 ) -> None:
-    task_horizon = get_task_horizon(env_name)
-    # Cap the per-episode horizon at `max_steps` so tasks with long horizons
-    # don't run unbounded; default 1200 ≈ 1 min at 20 Hz.
-    horizon = min(int(task_horizon * 1.5), max_steps)
+    horizon = get_task_horizon(env_name)
+    # ArrangeTea override.
+    if env_name == "ArrangeTea":
+        horizon = int(75 * 20)
 
     # Set up logging directory
     log_path = None
@@ -331,19 +369,23 @@ def eval_env(
             f"Resuming eval in {log_path} from start_episode_idx={start_episode_idx}"
         )
     elif log_dir is not None:
-        # log_dir is a pure base (no task — the gym env names the task).
-        # Final tree: <log_dir>/<env>/<method>/<run_tag>/ , where method and
-        # run_tag (a date-time stamp) are passed by the launching bash script.
+        # log_dir is a pure base (no task — the gym env names the task). Final
+        # tree: <log_dir>/<env>/<method>/ , where <method> is a multi-segment
+        # path encoding policy + critic + N + noise (built by the launching
+        # bash script). Matches examples/sim_bimanual_assembly/main.py.
         log_path = pathlib.Path(log_dir) / env_name
         if method:
             log_path = log_path / method
-        if run_tag:
-            log_path = log_path / run_tag
 
-        # Skip if this exact run dir was already evaluated.
-        if (log_path / "stats.json").exists():
-            logging.info(f"stats.json exists at {log_path}, skipping.")
-            return
+        # Refuse to overwrite a prior run's outputs. To resume an interrupted
+        # eval, set --resume-from-dir + --start-episode-idx instead.
+        if log_path.exists():
+            for marker in ("stats.json", "eval.log", "videos"):
+                if (log_path / marker).exists():
+                    raise FileExistsError(
+                        f"Eval output already exists at {log_path} ({marker} present). "
+                        "Delete it or use --resume-from-dir to continue."
+                    )
 
         log_path.mkdir(parents=True, exist_ok=True)
 
@@ -355,6 +397,19 @@ def eval_env(
         logging.getLogger().addHandler(file_handler)
 
     client = _websocket_client_policy.WebsocketClientPolicy(host, port)
+    # Query server metadata for cadence info. When the policy was trained with
+    # interpolation_config=None, the model already emits actions at the env's
+    # native fps, so client-side resampling would double-shift them. Default
+    # to True (interpolate) for backward compat with older servers that don't
+    # set this key.
+    server_meta = client.get_server_metadata() or {}
+    interpolation_config_present = bool(server_meta.get("interpolation_config_present", True))
+    model_action_fps_server = server_meta.get("model_action_fps")
+    if not interpolation_config_present:
+        logging.info(
+            "Server metadata: interpolation_config_present=False → skipping client-side "
+            "action-chunk resampling (model_action_fps=%s).", model_action_fps_server,
+        )
 
     env = gym.make(f"robocasa/{env_name}", split=split, seed=seed)
 
@@ -385,17 +440,76 @@ def eval_env(
     call_q_var_fail: list[float] = []
     call_act_var_succ: list[float] = []
     call_act_var_fail: list[float] = []
-    for episode_idx in tqdm.tqdm(range(start_episode_idx, num_trials), desc=env_name, initial=start_episode_idx, total=num_trials):
-        # Per-episode reset seed: deterministic across runs (same `seed` →
+    # Per-episode mean ACS (avg cosine sim across the BestOfN candidate pool,
+    # returned by the server when available). Bucketed by episode outcome,
+    # mirroring examples/sim_bimanual_assembly/main.py.
+    episode_acs_succ: list[float] = []
+    episode_acs_fail: list[float] = []
+    # Outer loop counts COUNTED episodes (total_episodes), not env-iterations:
+    # skipped episodes (side_bottom_right_group_3 pre-filter, mid-episode
+    # all-cameras-black) keep advancing episode_idx (fresh seed) without ticking
+    # toward num_trials. Cap at 2 * num_trials env iterations as a safety bound.
+    pbar = tqdm.tqdm(initial=start_episode_idx, total=num_trials, desc=env_name)
+    episode_idx = start_episode_idx - 1
+    max_env_idx = start_episode_idx + 2 * num_trials
+    while total_episodes < num_trials:
+        episode_idx += 1
+        if episode_idx >= max_env_idx:
+            logging.warning(
+                f"[{env_name}] hit safety bound env_idx={episode_idx}; stopping with "
+                f"total_episodes={total_episodes}/{num_trials}."
+            )
+            break
+        # Per-episode seed: deterministic across runs (same `seed` →
         # same starting configuration for episode_idx), and spaced enough
         # apart to keep adjacent episodes' RNG streams disjoint.
         obs, info = env.reset(seed = seed + 100 * episode_idx)
+        # ArrangeTea + side_bottom_right_group_3: the offscreen renderer fades
+        # to all-black mid-episode on this side-mounted cabinet. Pre-filter at
+        # reset to avoid wasting the infer round-trips.
+        if env_name == "ArrangeTea":
+            _cab_pre = getattr(env.unwrapped.env, "cab", None)
+            if _cab_pre is not None and getattr(_cab_pre, "name", "") == "side_bottom_right_group_3":
+                logging.warning(
+                    f"[{env_name}] episode {episode_idx + 1}: cabinet=side_bottom_right_group_3 → skipping (excluded from stats)."
+                )
+                continue
         task_lang = obs["annotation.human.task_description"]
+        # Optional online subtask tracker — when a tracker is registered for this
+        # env, the per-step prompt advances with the trajectory (mirroring
+        # examples/sim_bimanual_assembly/main.py's prompt_idx latch). When no
+        # tracker is registered, the prompt stays at the full task description.
+        #
+        # Door/doors lookup for trackers that need it: robocasa's Kitchen subclasses
+        # expose ``self.cab`` (the cabinet fixture) — SingleCabinet has 1 door,
+        # HingeCabinet has 2. RoboCasaGymEnv wraps the robosuite env in
+        # ``self.env``, so reach through ``env.unwrapped.env.cab``. Any env that
+        # doesn't have a ``.cab`` (or whose cabinet class isn't recognised) falls
+        # back to the tracker's running-y-excursion heuristic.
+        num_doors: int | None = None
+        try:
+            from robocasa.models.fixtures.cabinets import SingleCabinet, HingeCabinet
+            cab = getattr(env.unwrapped.env, "cab", None)
+            if isinstance(cab, SingleCabinet):
+                num_doors = 1
+            elif isinstance(cab, HingeCabinet):
+                num_doors = 2
+        except Exception as exc:
+            logging.debug(f"num_doors lookup failed for {env_name}: {exc}")
+        try:
+            online_tracker = get_online_tracker(env_name, task_lang, num_doors = num_doors)
+        except ValueError as exc:
+            logging.warning(f"Online tracker init failed for {env_name}: {exc}")
+            online_tracker = None
         action_plan = collections.deque()
         done = False
+        # Set if at any t all 3 cameras come back uniformly <10 → renderer fade
+        # bug; episode is dropped from stats and the partial video is not saved.
+        skip_for_black = False
         # Per-call variance buffers for this episode.
         ep_call_q_vars: list[float] = []
         ep_call_act_vars: list[float] = []
+        ep_call_acs: list[float] = []
 
         if isinstance(video_logger, VideoLogger):
             video_logger.start_episode(episode_idx)
@@ -404,6 +518,12 @@ def eval_env(
             img = np.ascontiguousarray(obs["video.robot0_agentview_left"])
             img_right = np.ascontiguousarray(obs["video.robot0_agentview_right"])
             wrist_img = np.ascontiguousarray(obs["video.robot0_eye_in_hand"])
+            if int(img.max()) < 10 and int(img_right.max()) < 10 and int(wrist_img.max()) < 10:
+                logging.warning(
+                    f"[{env_name}] episode {episode_idx + 1}: all 3 cameras black at t={t} → skipping (excluded from stats)."
+                )
+                skip_for_black = True
+                break
             # Stretch resize matches tf.image.resize used by the RLDS dataset
             # builder during training (src/openpi/training/rlds_dataset.py:805).
             # resize_with_pad would letterbox these frames and the model has
@@ -412,25 +532,49 @@ def eval_env(
             img_right = image_tools.convert_to_uint8(image_tools.resize_stretch(img_right, resize_size, resize_size))
             wrist_img = image_tools.convert_to_uint8(image_tools.resize_stretch(wrist_img, resize_size, resize_size))
 
-            if not action_plan:
-                # Construct state in modality.json order
-                state = np.concatenate(
-                    (
-                        obs["state.base_position"],
-                        obs["state.base_rotation"],
-                        obs["state.end_effector_position_relative"],
-                        obs["state.end_effector_rotation_relative"],
-                        obs["state.gripper_qpos"],
-                    ),
-                    axis=0,
+            # Construct state in modality.json order. Build it every step (cheap)
+            # so the online subtask tracker (advanced below) always sees a fresh
+            # state at the current env step, even on inner-step iterations that
+            # don't trigger a fresh policy infer call.
+            state = np.concatenate(
+                (
+                    obs["state.base_position"],
+                    obs["state.base_rotation"],
+                    obs["state.end_effector_position_relative"],
+                    obs["state.end_effector_rotation_relative"],
+                    obs["state.gripper_qpos"],
+                ),
+                axis=0,
+            )
+            if online_tracker is not None:
+                online_tracker.update(state, t)
+            if (
+                env_name == "ArrangeTea"
+                and online_tracker is not None
+                and getattr(online_tracker, "_order", None) is not None
+                and "mug" in online_tracker._order[0]
+            ):
+                logging.warning(
+                    f"[{env_name}] episode {episode_idx + 1}: first detected subtask is mug → skipping (excluded from stats)."
                 )
+                skip_for_black = True
+                break
+            current_prompt = (
+                online_tracker.current_subtask if online_tracker is not None else task_lang
+            )
 
+            if not action_plan:
                 element = {
                     "observation/image": img,
                     "observation/image_right": img_right,
                     "observation/wrist_image": wrist_img,
                     "observation/state": state,
-                    "prompt": task_lang,
+                    # Server overrides the policy's prompt with task_description
+                    # when its prompt_mode == "task_description"; the critic uses
+                    # it analogously when its prompt_mode ==
+                    # "task_description_predict_current_subtask".
+                    "task_description": task_lang,
+                    "prompt": current_prompt,
                 }
 
                 infer_t0 = time.perf_counter()
@@ -445,17 +589,26 @@ def eval_env(
                     ep_call_act_vars.append(
                         float(np.mean(np.var(pre_interp_chunk, axis = 0)))
                     )
-                # Resample model fps -> env fps. No-op when source==target.
-                action_chunk = _interpolate_action_chunk(
-                    np.asarray(action_chunk, dtype=np.float32),
-                    source_fps=model_action_fps,
-                    target_fps=env_action_fps,
-                )
+                # Resample model fps -> env fps. Skipped entirely when the
+                # server reports interpolation_config_present=False (the policy
+                # already emits at the env's native cadence); also no-op when
+                # source==target.
+                if interpolation_config_present:
+                    action_chunk = _interpolate_action_chunk(
+                        np.asarray(action_chunk, dtype=np.float32),
+                        source_fps=model_action_fps,
+                        target_fps=env_action_fps,
+                    )
+                else:
+                    action_chunk = np.asarray(action_chunk, dtype=np.float32)
                 q_values = infer_result.get("q_values")
                 if q_values is not None:
                     q_arr_for_var = np.asarray(q_values, dtype = np.float32).reshape(-1)
                     if q_arr_for_var.size >= 2:
                         ep_call_q_vars.append(float(np.var(q_arr_for_var)))
+                acs_value = infer_result.get("acs")
+                if acs_value is not None and np.isfinite(acs_value):
+                    ep_call_acs.append(float(acs_value))
                 # Server-reported compute time (set by BestOfNPolicy.infer / Policy.infer).
                 server_ms = infer_result.get("policy_timing", {}).get("infer_ms")
                 server_str = f"{server_ms:.1f}ms" if server_ms is not None else "n/a"
@@ -488,6 +641,7 @@ def eval_env(
                         },
                         q_values = (np.asarray(q_values).reshape(-1) if q_values is not None else None),
                         t = t,
+                        subtask = current_prompt,
                     )
 
             abs_action = action_plan.popleft()
@@ -520,31 +674,65 @@ def eval_env(
             # Sparse robocasa reward: 1.0 iff _check_success. Terminate on first hit.
             if float(reward) >= 1.0:
                 done = True
-                total_successes += 1
                 break
+            # ArrangeTea early-success: both kettle + mug on the tray AND the
+            # online tracker has advanced past the second pick (idx >= 2 means
+            # next subtask is "Close the cabinet door(s)"). Skips the
+            # cabinet-close subtask from the success criterion.
+            if env_name == "ArrangeTea" and online_tracker is not None and online_tracker._idx >= 2:
+                from robocasa.utils.object_utils import check_obj_in_receptacle
+                _base = env.unwrapped.env
+                if check_obj_in_receptacle(_base, "obj", "container") and check_obj_in_receptacle(_base, "obj2", "container"):
+                    done = True
+                    break
+
+        if skip_for_black:
+            # Don't call finish_episode: partial video is discarded (next
+            # start_episode resets the buffers). Episode doesn't count toward stats.
+            continue
 
         total_episodes += 1
+        if done:
+            total_successes += 1
+        pbar.update(1)
 
         if isinstance(video_logger, VideoLogger):
             video_logger.finish_episode(success = bool(done))
 
+        if save_last_frames and log_path is not None:
+            _sub = "successes" if done else "failures"
+            _out = log_path / "last_frames" / _sub / f"episode_{episode_idx}.png"
+            _out.parent.mkdir(parents = True, exist_ok = True)
+            imageio.imwrite(str(_out), np.concatenate([img, img_right], axis = 1))
+
         logging.info(f"Episode {total_episodes}: {'success' if done else 'failure'}")
+        if env_name == "ArrangeTea" and online_tracker is not None and getattr(online_tracker, "_order", None) is not None:
+            _first = "mug" if "mug" in online_tracker._order[0] else "kettle"
+            logging.info(
+                f"Episode {total_episodes} subtask_order: first={_first} (env_idx={episode_idx})"
+            )
         logging.info(f"Running: {total_successes}/{total_episodes} ({total_successes / total_episodes * 100:.1f}%)")
 
         ep_q_var_mean = float(np.mean(ep_call_q_vars)) if ep_call_q_vars else float("nan")
         ep_act_var_mean = float(np.mean(ep_call_act_vars)) if ep_call_act_vars else float("nan")
+        ep_acs_mean = float(np.mean(ep_call_acs)) if ep_call_acs else float("nan")
         logging.info(
             f"Episode {total_episodes} variance (per-call mean): q={ep_q_var_mean:.6f}, "
-            f"action_pre_interp={ep_act_var_mean:.6f}"
+            f"action_pre_interp={ep_act_var_mean:.6f}, acs={ep_acs_mean:.6f}"
         )
 
         if done:
             call_q_var_succ.extend(ep_call_q_vars)
             call_act_var_succ.extend(ep_call_act_vars)
+            if ep_call_acs:
+                episode_acs_succ.append(ep_acs_mean)
         else:
             call_q_var_fail.extend(ep_call_q_vars)
             call_act_var_fail.extend(ep_call_act_vars)
+            if ep_call_acs:
+                episode_acs_fail.append(ep_acs_mean)
 
+    pbar.close()
     logging.info(
         f"[{env_name}] Final: {total_successes}/{total_episodes} ({total_successes / total_episodes * 100:.1f}%)"
     )
@@ -556,6 +744,8 @@ def eval_env(
     q_var_fail_mean = _mean_or_nan(call_q_var_fail)
     act_var_succ_mean = _mean_or_nan(call_act_var_succ)
     act_var_fail_mean = _mean_or_nan(call_act_var_fail)
+    acs_succ_mean = _mean_or_nan(episode_acs_succ)
+    acs_fail_mean = _mean_or_nan(episode_acs_fail)
     logging.info(
         f"[{env_name}] q_value variance over n samples — success: {q_var_succ_mean:.6f} "
         f"(n_calls={len(call_q_var_succ)}), failure: {q_var_fail_mean:.6f} "
@@ -565,6 +755,11 @@ def eval_env(
         f"[{env_name}] action pre-interp per-dim variance (avg over dims) — success: "
         f"{act_var_succ_mean:.6f} (n_calls={len(call_act_var_succ)}), failure: "
         f"{act_var_fail_mean:.6f} (n_calls={len(call_act_var_fail)})"
+    )
+    logging.info(
+        f"[{env_name}] ACS (avg cosine sim across BestOfN pool, per-episode mean) — success: "
+        f"{acs_succ_mean:.6f} (n_episodes={len(episode_acs_succ)}), failure: "
+        f"{acs_fail_mean:.6f} (n_episodes={len(episode_acs_fail)})"
     )
 
     if log_path is not None:
@@ -577,6 +772,10 @@ def eval_env(
                     "q_value_variance_failure_mean": q_var_fail_mean,
                     "action_pre_interp_variance_success_mean": act_var_succ_mean,
                     "action_pre_interp_variance_failure_mean": act_var_fail_mean,
+                    "acs_success_mean": acs_succ_mean,
+                    "acs_failure_mean": acs_fail_mean,
+                    "num_success_episodes_acs": len(episode_acs_succ),
+                    "num_failure_episodes_acs": len(episode_acs_fail),
                     "num_success_calls": len(call_q_var_succ),
                     "num_failure_calls": len(call_q_var_fail),
                 },

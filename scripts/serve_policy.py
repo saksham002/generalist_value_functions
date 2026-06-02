@@ -135,6 +135,15 @@ class Args:
     # action-dim slice before Unnormalize, which the default Policy.infer
     # path does not. Implied (no need to set) when --critic.* is set.
     use_bestofn_loader: bool = False
+    # Build a (num_samples, device_count // num_samples) mesh for the BC +
+    # use_bestofn_loader path (the critic path has its own --critic.sample-parallel).
+    # Default True — matches the critic path's typical setting.
+    sample_parallel: bool = True
+    # Override the inference mesh's fsdp axis size for the BC + use_bestofn_loader
+    # path (the critic path has its own --critic.fsdp-devices). Match the value
+    # the policy was trained with when the saved sharding doesn't load on the
+    # auto-picked mesh (e.g. fsdp=16 for a v5e-32 / target-composite policy).
+    fsdp_devices: int | None = None
     # Add zero-mean Gaussian noise to the policy's sampled action in the
     # no-critic (BC) path: action_out = policy_action + noise_level * eps.
     # Applied in policy-normalized space. Default False reproduces the
@@ -223,6 +232,8 @@ def create_policy(args: Args) -> _policy.BasePolicy:
             policy_fine_tune_config = args.policy.fine_tune_config,
             policy_task_description = args.task_description,
             default_prompt = args.default_prompt,
+            sample_parallel = args.sample_parallel,
+            fsdp_devices = args.fsdp_devices,
             inject_noise = args.inject_noise,
             noise_level = args.noise_level,
         )

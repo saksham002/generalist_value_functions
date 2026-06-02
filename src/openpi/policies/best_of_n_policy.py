@@ -247,7 +247,11 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 "auto" if fsdp_devices is None else str(fsdp_devices),
             )
         else:
-            self._fsdp_devices_override = None
+            # Honor the caller's fsdp_devices even when sample_parallel=False —
+            # it's still consumed by LoadPolicyConfig below to pick the load
+            # mesh (and to skip the same-topology fast path in load_policy when
+            # the saved sharding metadata can't be re-used as-is).
+            self._fsdp_devices_override = fsdp_devices
             self._sample_parallel_batch_axis = None
 
         # ---- Load policy + build the per-RoboCasa Policy with full transforms.
@@ -314,8 +318,17 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         self._rng = policy._rng  # noqa: SLF001
         # Surface image sizes + critic-image flag to client metadata for EvalImageHelper.
         self._metadata = dict(policy.metadata)
-        self._metadata["policy_image_size"] = list(getattr(config.data, "image_size", (224, 224)))
+        # image_size on RoboCasa configs is a scalar int (224); Hdf5 / RoboCOIN
+        # configs use a (H, W) tuple. Normalize to a [H, W] list either way.
+        _img_size = getattr(config.data, "image_size", 224)
+        if isinstance(_img_size, int):
+            _img_size = (_img_size, _img_size)
+        self._metadata["policy_image_size"] = list(_img_size)
         self._metadata["expect_critic_images"] = bool(expect_critic_images)
+        # Surface the policy's training-time subsample flag so eval clients can
+        # set env_control_freq / replan_steps to match without keying off the
+        # config name (subsample policy → 30 Hz env + 15-step replan).
+        self._metadata["policy_subsample"] = bool(getattr(config.data, "subsample", False))
 
         # Policy.__init__ skips this on the JAX path; force eval-mode here.
         self._model.eval()
@@ -456,10 +469,11 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # State dim for the prewarm dummy (norm_stats["state"] is the
         # authoritative shape; fall back to the action dim if absent).
         self._state_dim = norm_stats["state"].mean.shape[-1]
-        # Set in the critic branch below: True when the critic's data factory
-        # is the HDF5 pipeline (sim_bimanual_assembly etc.), False for the
-        # RoboCasa/RoboCoin pipeline. Drives the prewarm dummy obs schema.
-        self._critic_is_hdf5 = False
+        # True when the POLICY's data factory is the HDF5 pipeline
+        # (sim_bimanual_assembly etc.), False for the RoboCasa/RoboCoin
+        # pipeline. Drives the prewarm dummy obs schema regardless of
+        # whether a critic is loaded.
+        self._uses_hdf5_pipeline = isinstance(config.data, _config.Hdf5RldsDataConfig)
 
         # JAX rank 0 binds the websocket; every other rank runs
         # participate_loop so the JIT'd inference doesn't deadlock waiting
@@ -522,6 +536,12 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         self._bestofn = None
         self._policy_data_config = data_config
         self._policy_subsample = getattr(config.data, "subsample", False)
+        # Prompt modes gate the per-call task_description override below.
+        self._policy_prompt_mode = (
+            getattr(config.data, "prompt_mode", None)
+            or getattr(config.data, "subtask_prompt_mode", None)
+        )
+        self._critic_prompt_mode: str | None = None
 
         if critic_args_set:
             logger.info(
@@ -536,7 +556,6 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 fsdp_devices = self._fsdp_devices_override if self._fsdp_devices_override is not None else 16,
             )
             critic_kwargs = _build_critic_kwargs(critic_config)
-            self._critic_is_hdf5 = isinstance(critic_config.data, _config.Hdf5RldsDataConfig)
             # Critic-side image_size: surfaced to clients + used to shape dummies
             # (HLO must match across hosts). SARSAValueFunctionConfig exposes the
             # PaliGemma config as `network_config`; CQLValueFunctionConfig exposes
@@ -552,6 +571,12 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             self._critic_model = critic_model
             self._critic_model.eval()
             self._critic_tokenizer = critic_kwargs["tokenizer"]
+            # Encode the "null" sentinel the same way the dynamic-prompt critic
+            # path tokenizes a live prompt (see _prepare_inputs_rank0), so the
+            # BestOfNWrapper can recognize a null-prompt step and skip value-based
+            # selection.
+            _null_tokens, _ = self._critic_tokenizer.tokenize("null", None)
+            self._critic_null_prompt_tokens = np.asarray(_null_tokens)
             # Critic prompt token length (determines the dummy shape we
             # broadcast on participating workers).
             self._critic_max_token_len = critic_network_config.max_token_len
@@ -563,6 +588,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             # so at eval time we must feed the same task description rather than
             # the client's dynamic subtask.
             critic_prompt_mode = getattr(critic_config.data, "prompt_mode", None)
+            self._critic_prompt_mode = critic_prompt_mode
             if critic_prompt_mode == "task_description_predict_current_subtask" and policy_task_description is not None:
                 self._critic_task_description = policy_task_description
                 logger.info(
@@ -629,7 +655,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             _sample_parallel = self._sample_parallel
 
             @nnx.jit
-            def _bestofn_sample(bon, vf, rng, sample_rngs, transition, critic_prompt, critic_prompt_mask, critic_images):
+            def _bestofn_sample(bon, vf, rng, sample_rngs, transition, critic_prompt, critic_prompt_mask, critic_images, critic_is_null_prompt):
                 # BestOfNWrapper.sample_actions returns (all_actions, q_values).
                 # `rng` is replicated (used only for the softmax-selection rng);
                 # `sample_rngs` is leading-axis-sharded so each parallel sample
@@ -650,6 +676,8 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                     critic_observation = critic_obs,
                     sample_rngs = sample_rngs,
                 )
+                # Detected host-side to keep the raw token array off the JIT'd module.
+                q_values = jnp.where(critic_is_null_prompt, jnp.zeros_like(q_values), q_values)
                 if _sample_parallel:
                     # Replicate outputs across all chips so host gather just reads
                     # one addressable shard — no cross-host process_allgather on
@@ -804,8 +832,22 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         the JIT'd inference closure consumes).
         """
         prompt_str = obs.get("prompt")
-        if self._policy_task_description is not None:
-            obs = {**obs, "prompt": self._policy_task_description}
+        # Per-call task_description override. Policy + critic each gated on
+        # their own prompt_mode; the override is popped before _input_transform
+        # so the transform pipeline doesn't see an unexpected field.
+        per_call_task_desc = (
+            obs.get("task_description") if isinstance(obs, dict) else None
+        )
+        if isinstance(obs, dict) and "task_description" in obs:
+            obs = {k: v for k, v in obs.items() if k != "task_description"}
+        policy_task_desc = None
+        if self._policy_prompt_mode == "task_description":
+            policy_task_desc = per_call_task_desc or self._policy_task_description
+        critic_task_desc = None
+        if self._critic_prompt_mode == "task_description_predict_current_subtask":
+            critic_task_desc = per_call_task_desc or self._critic_task_description
+        if policy_task_desc is not None:
+            obs = {**obs, "prompt": policy_task_desc}
 
         # Pull critic_image out before _input_transform (which only knows about `image`).
         critic_image_dict = obs.get("critic_image") if isinstance(obs, dict) else None
@@ -856,15 +898,24 @@ class BestOfNPolicy(_base_policy.BasePolicy):
 
         extras: dict[str, Any] = {}
         if self._bestofn is not None:
-            if self._critic_task_description is not None:
+            if critic_task_desc is not None:
                 # Eval drops the subtask suffix: tokenize the prefix only (no trailing "\n").
                 critic_tokens, critic_token_mask, _, _ = _transforms._tokenize_robocoin_subtask_prompt(
-                    self._critic_tokenizer, self._critic_task_description, "", append_newline = False,
+                    self._critic_tokenizer, critic_task_desc, "", append_newline = False,
                 )
             else:
                 critic_tokens, critic_token_mask = self._critic_tokenizer.tokenize(prompt_str, None)
             extras["critic_tokens"] = jnp.asarray(critic_tokens)[None, ...]
             extras["critic_token_mask"] = jnp.asarray(critic_token_mask)[None, ...]
+            # Host-side null-prompt detection: keeps the raw token array off
+            # the JIT'd BestOfNWrapper (nnx.split rejects bare np.ndarray leaves).
+            critic_tokens_np = np.asarray(critic_tokens)
+            null_ref = self._critic_null_prompt_tokens
+            is_null = (
+                critic_tokens_np.shape == null_ref.shape
+                and bool(np.array_equal(critic_tokens_np, null_ref))
+            )
+            extras["critic_is_null_prompt"] = jnp.asarray(is_null, dtype = jnp.bool_)
             if self._expect_critic_images:
                 if critic_image_dict is None:
                     raise ValueError(
@@ -901,6 +952,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         if self._bestofn is not None:
             extras["critic_tokens"] = jnp.zeros((1, self._critic_max_token_len), dtype = jnp.int32)
             extras["critic_token_mask"] = jnp.zeros((1, self._critic_max_token_len), dtype = jnp.bool_)
+            extras["critic_is_null_prompt"] = jnp.asarray(False, dtype = jnp.bool_)
             if self._expect_critic_images:
                 # float32 + critic_image_size to match rank-0; mismatched dummy halts TPU.
                 critic_h, critic_w = (
@@ -1071,6 +1123,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 self._bestofn, self._critic_model, rng, sample_rngs, transition,
                 extras["critic_tokens"], extras["critic_token_mask"],
                 extras.get("critic_images"),
+                extras["critic_is_null_prompt"],
             )
             return actions_out, q_values
         transition = _model.wrap_observation_as_transition(observation)
@@ -1160,7 +1213,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
 
             logger.info("Prewarming BestOfNPolicy JIT (this may take 30-60s)...")
             zero_image = np.zeros((self._image_size, self._image_size, 3), dtype = np.uint8)
-            if self._critic_is_hdf5:
+            if self._uses_hdf5_pipeline:
                 # HDF5 pipeline (sim_bimanual_assembly etc.): the input
                 # transform expects an `image` dict + flat `state` + `prompt`,
                 # matching what the client sends. State norm is quantile so a

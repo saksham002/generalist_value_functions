@@ -323,7 +323,7 @@ class BestOfNWrapper(_model.BaseModel):
                                 "BestOfNWrapper requires identical policy/critic norm stats; "
                                 f"'{stats_key}'.{field_name} differs."
                             )
-        # Four supported (action_horizon, critic_action_horizon) regimes:
+        # Five supported (action_horizon, critic_action_horizon) regimes:
         #   - (60, 50): 60 Hz policy + 30 Hz critic. Stride-2 subsample
         #     (60 -> 30), then zero-pad to 50.
         #   - (30, 50): same-fps policy + critic. Skip subsample, zero-pad
@@ -334,15 +334,19 @@ class BestOfNWrapper(_model.BaseModel):
         #   - (60, 60): 60 Hz policy + 60-step critic (HDF5 60 Hz critics,
         #     e.g. sim_bimanual_assembly). Stride-2 subsample (60 -> 30),
         #     then zero-pad to 60; action_mask is 30 True + 30 False.
+        #   - (20, 20): matched-horizon, no subsample, no pad; action_mask
+        #     is all-True (every slot is a real action).
         if critic_action_horizon is not None and not (
             (critic_action_horizon == 50 and action_horizon in (30, 50, 60))
             or (critic_action_horizon == 60 and action_horizon == 60)
+            or (critic_action_horizon == 20 and action_horizon == 20)
         ):
             raise ValueError(
                 "Only (action_horizon=30, critic_action_horizon=50), "
                 "(action_horizon=50, critic_action_horizon=50), "
                 "(action_horizon=60, critic_action_horizon=50), "
-                "and (action_horizon=60, critic_action_horizon=60) are supported. "
+                "(action_horizon=60, critic_action_horizon=60), "
+                "and (action_horizon=20, critic_action_horizon=20) are supported. "
                 f"Got action_horizon={action_horizon}, critic_action_horizon={critic_action_horizon}."
             )
         self.critic_action_horizon = critic_action_horizon
@@ -444,6 +448,14 @@ class BestOfNWrapper(_model.BaseModel):
                 axis = 1,
             )
             observation = dataclasses.replace(observation, action_mask = mask_30_30)
+            transition = dataclasses.replace(
+                transition,
+                **({"next_observation": observation} if compute_next_action else {"observation": observation}),
+            )
+        elif self.action_horizon == 20 and self.critic_action_horizon == 20:
+            # Matched-horizon, no subsample, no pad → every slot is a real action.
+            mask_all_true = jnp.ones((batch_size, 20), dtype = jnp.bool_)
+            observation = dataclasses.replace(observation, action_mask = mask_all_true)
             transition = dataclasses.replace(
                 transition,
                 **({"next_observation": observation} if compute_next_action else {"observation": observation}),

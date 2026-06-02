@@ -33,7 +33,7 @@ import time
 
 import imageio
 import numpy as np
-from openpi_client import image_tools
+from openpi_client import eval_image_helper as _eval_image_helper
 from openpi_client import websocket_client_policy as _websocket_client_policy
 from scipy.spatial.transform import Rotation
 import tqdm
@@ -47,8 +47,8 @@ _VIDEO_PANEL_SIZE = 256
 # combined frame height (2 * _VIDEO_PANEL_SIZE + _VIDEO_HEADER_HEIGHT) divisible
 # by 16 so libx264 doesn't auto-resize.
 _VIDEO_HEADER_HEIGHT = 32
-_RESIZE_SIZE = 224
-_ENV_ACTION_FPS = 60.0
+
+# No logger import
 
 
 # Per user-supplied annotations file (subtask_definitions). Index in this list
@@ -205,7 +205,6 @@ class Args:
     # Model server parameters
     host: str = "0.0.0.0"
     port: int = 8000
-    replan_steps: int = 30
 
     # Eval parameters
     split: str = "target"
@@ -215,19 +214,14 @@ class Args:
 
     # Logging
     log_dir: str | None = None
-    # Sub-directory under <log_dir>/<env> selecting the eval method
-    # ("bc" | "bestofn8" | "bestofn64"); set by the launching bash script to
-    # match the served critic config. Empty => no method subdir.
+    # Multi-segment path under <log_dir>/<env> selecting the eval method.
+    # Layouts derived by the launching bash script:
+    #   policy-only: "<policy_config>/bc[_noise<level>]"
+    #   best-of-N:   "<policy_config>/<critic_ft_config>_<critic_step>/best_of_n_<N>[_noise<level>]"
+    # Empty => no method subdir (results go straight under <log_dir>/<env>).
     method: str = ""
-    # Leaf run-tag sub-dir under <log_dir>/<env>/<method> (a date-time stamp);
-    # set by the launching bash script. Empty => no run-tag subdir.
-    run_tag: str = ""
     seed: int = 86
     log_videos: bool = False
-
-    # Hard cap on env steps per episode. Default matches the env's internal
-    # MAX_STEPS = control_freq(60) * time_limit(120 s) = 7200.
-    max_steps: int = 7200
 
     # Resume support. Skip the first `start_episode_idx` indices in the
     # per-episode loop, preserving the deterministic per-index reset seed
@@ -235,6 +229,8 @@ class Args:
     # writes into that existing run-date subdir instead of generating a new
     # timestamp; prior successes/failures are recovered by counting
     # `videos/successes/*.mp4` and `videos/failures/*.mp4`.
+    # Env cadence (env_control_freq / replan_steps / max_steps) is derived
+    # from the server's policy.metadata after connect — no CLI override.
     start_episode_idx: int = 0
     resume_from_dir: str | None = None
 
@@ -320,14 +316,11 @@ def eval_main(args: Args) -> None:
             split = args.split,
             log_dir = args.log_dir,
             method = args.method,
-            run_tag = args.run_tag,
             num_trials = args.num_trials,
-            replan_steps = args.replan_steps,
             host = args.host,
             port = args.port,
             seed = args.seed,
             log_videos = args.log_videos,
-            max_steps = args.max_steps,
             start_episode_idx = args.start_episode_idx,
             resume_from_dir = args.resume_from_dir,
         )
@@ -338,19 +331,14 @@ def eval_env(
     split: str,
     log_dir: str | None,
     method: str,
-    run_tag: str,
     num_trials: int,
-    replan_steps: int,
     host: str,
     port: int,
     seed: int,
     log_videos: bool = False,
-    max_steps: int = 7200,
     start_episode_idx: int = 0,
     resume_from_dir: str | None = None,
 ) -> None:
-    horizon = max_steps
-
     log_path = None
     file_handler: logging.FileHandler | None = None
     resuming = resume_from_dir is not None
@@ -370,17 +358,22 @@ def eval_env(
         )
     elif log_dir is not None:
         # log_dir is a pure base (no task — the gym env names the task).
-        # Final tree: <log_dir>/<env>/<method>/<run_tag>/ , where method and
-        # run_tag (a date-time stamp) are passed by the launching bash script.
+        # Final tree: <log_dir>/<env>/<method>/ , where <method> is a multi-
+        # segment path encoding the policy + critic + N + noise (built by the
+        # launching bash script).
         log_path = pathlib.Path(log_dir) / env_name
         if method:
             log_path = log_path / method
-        if run_tag:
-            log_path = log_path / run_tag
 
-        if (log_path / "stats.json").exists():
-            logging.info(f"stats.json exists at {log_path}, skipping.")
-            return
+        # Refuse to overwrite a prior run's outputs. To resume an interrupted
+        # eval, set --resume-from-dir + --start-episode-idx instead.
+        if log_path.exists():
+            for marker in ("stats.json", "eval.log", "videos"):
+                if (log_path / marker).exists():
+                    raise FileExistsError(
+                        f"Eval output already exists at {log_path} ({marker} present). "
+                        "Delete it or use --resume-from-dir to continue."
+                    )
 
         log_path.mkdir(parents = True, exist_ok = True)
 
@@ -390,9 +383,36 @@ def eval_env(
         logging.getLogger().addHandler(file_handler)
 
     client = _websocket_client_policy.WebsocketClientPolicy(host, port)
+    image_helper = _eval_image_helper.EvalImageHelper.from_client(client)
+    logging.info(
+        f"EvalImageHelper: policy={image_helper.policy_image_size}, "
+        f"critic={image_helper.critic_image_size}, "
+        f"expect_critic_images={image_helper.expect_critic_images}"
+    )
+
+    # Single source of truth for env cadence: the server's policy.metadata
+    # exposes `policy_subsample` (True iff the policy was trained at half
+    # cadence). Subsample → 30 Hz / replan 15, else 60 Hz / replan 30.
+    # max_steps follows control_freq * 120 s (env time limit). Never key off
+    # the config name string.
+    server_meta = client.get_server_metadata() or {}
+    policy_subsample = bool(server_meta.get("policy_subsample", False))
+    if policy_subsample:
+        env_control_freq = 30
+        replan_steps = 15
+    else:
+        env_control_freq = 60
+        replan_steps = 30
+    max_steps = env_control_freq * 120
+    horizon = max_steps
+    logging.info(
+        f"Eval cadence (from server policy_subsample={policy_subsample}): "
+        f"env_control_freq={env_control_freq} Hz, replan_steps={replan_steps}, "
+        f"max_steps={max_steps}"
+    )
 
     env = DoubleInsertDualXarmsGymEnv(
-        control_freq = 60, time_limit = 120, render_mode = "rgb_array", image_obs = True,
+        control_freq = env_control_freq, time_limit = 120, render_mode = "rgb_array", image_obs = True,
     )
 
     video_logger = None
@@ -434,18 +454,16 @@ def eval_env(
             right_top = np.ascontiguousarray(obs["images"]["right/top"])
             left_wrist = np.ascontiguousarray(obs["images"]["left/wrist"])
             right_wrist = np.ascontiguousarray(obs["images"]["right/wrist"])
-            base_img = image_tools.convert_to_uint8(image_tools.resize_stretch(right_top, _RESIZE_SIZE, _RESIZE_SIZE))
-            left_wrist_img = image_tools.convert_to_uint8(image_tools.resize_stretch(left_wrist, _RESIZE_SIZE, _RESIZE_SIZE))
-            right_wrist_img = image_tools.convert_to_uint8(image_tools.resize_stretch(right_wrist, _RESIZE_SIZE, _RESIZE_SIZE))
+            element_images = image_helper.process_images({
+                "base_0_rgb": right_top,
+                "left_wrist_0_rgb": left_wrist,
+                "right_wrist_0_rgb": right_wrist,
+            })
 
             if not action_plan:
                 state14 = _build_state14(obs)
                 element = {
-                    "image": {
-                        "base_0_rgb": base_img,
-                        "left_wrist_0_rgb": left_wrist_img,
-                        "right_wrist_0_rgb": right_wrist_img,
-                    },
+                    **element_images,
                     "state": state14,
                     "prompt": SUBTASKS[prompt_idx],
                 }
@@ -484,7 +502,7 @@ def eval_env(
                     q_arr = np.asarray(q_values).reshape(-1) if q_values is not None else None
                     video_logger = VideoLogger(
                         output_dir = str(log_path / "videos"),
-                        fps = max(1.0, _ENV_ACTION_FPS / replan_steps),
+                        fps = max(1.0, float(env_control_freq) / replan_steps),
                         num_samples = int(q_arr.shape[0]) if q_arr is not None else 0,
                     )
                     video_logger.start_episode(episode_idx)

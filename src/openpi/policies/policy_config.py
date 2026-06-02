@@ -72,6 +72,20 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    # Expose action-cadence info to the eval client so it knows whether to
+    # client-side resample. When ``interpolation_config`` is None on the data
+    # config, the model emits actions at its native fps and the client does
+    # not need to resample (see examples/robocasa/main.py for the consumer).
+    # We merge into a copy so we don't mutate the TrainConfig's own metadata.
+    policy_metadata: dict[str, Any] = dict(train_config.policy_metadata or {})
+    interpolation_config = getattr(train_config.data, "interpolation_config", None)
+    native_fps = getattr(train_config.data, "native_fps", None)
+    policy_metadata["interpolation_config_present"] = interpolation_config is not None
+    if interpolation_config is not None:
+        policy_metadata["model_action_fps"] = float(interpolation_config.target_fps)
+    elif native_fps is not None:
+        policy_metadata["model_action_fps"] = float(native_fps)
+
     return _policy.Policy(
         model,
         transforms=[
@@ -88,7 +102,7 @@ def create_trained_policy(
             *repack_transforms.outputs,
         ],
         sample_kwargs=sample_kwargs,
-        metadata=train_config.policy_metadata,
+        metadata=policy_metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )
