@@ -50,8 +50,10 @@ from openpi.robocoin_utils.utils import (
     cache_val_episodes,
     count_subtask_segments,
     decode_episode_images,
+    decode_text,
     get_obs_and_action,
     predict_values,
+    SnapshotConfig,
     stack_frames,
     stack_images,
 )
@@ -1788,6 +1790,122 @@ def _render_and_log_plots(
     del images, ep_frame_images, all_predictions, all_predictions_neg, all_predictions_random, all_predictions_shuffled, all_predictions_counterfactual, all_attn_scores
 
 
+def _render_snapshot_plots(
+    frames: list[dict],
+    predicted_values: list[float],
+    snapshot: SnapshotConfig,
+    episode_name: str,
+    output_dir: str | None = None,
+) -> dict:
+    """Render the extra per-interval value snapshots for one validation episode.
+
+    Reuses the already-decoded ``frames`` and the already-computed
+    ``predicted_values`` (one per frame, in order) — no re-loading or
+    re-prediction. For each interval ``[a, b]`` (inclusive) in
+    ``snapshot.shade_intervals`` the interval's subtask is read from
+    ``frames[i]["subtask_1_text"]`` and asserted constant across the interval
+    (no subtask-boundary crossing). Intervals are grouped by subtask:
+
+    - one value plot per subtask ``snapshot/<episode_name>_<subtask>``: the
+      predicted-value blue line over that subtask's frame span, each interval
+      shaded light red/green;
+    - one camera image per interval
+      ``snapshot/<episode_name>_<subtask>_<camera>_f<midpoint>``.
+
+    Returns a dict of plot_key -> wandb object (output_dir None) or saved path.
+    """
+    import re
+
+    # Low-alpha fills keep the blue value line clearly visible while red vs green
+    # stay easily distinguishable.
+    shade_style = {"r": ((1.0, 0.0, 0.0), 0.18), "g": ((0.0, 0.7, 0.0), 0.18)}
+
+    def _sanitize(text: str) -> str:
+        return re.sub(r"[^0-9A-Za-z]+", "_", text).strip("_")
+
+    per_frame_subtask = [decode_text(f["subtask_1_text"]) for f in frames]
+
+    # Resolve each interval's subtask, asserting it does not cross a boundary.
+    subtask_of_interval: list[str] = []
+    for interval_start, interval_end in snapshot.shade_intervals:
+        interval_subtasks = set(per_frame_subtask[interval_start : interval_end + 1])
+        if len(interval_subtasks) != 1:
+            raise ValueError(
+                f"Snapshot interval [{interval_start}, {interval_end}] crosses a subtask "
+                f"boundary: {sorted(interval_subtasks)}."
+            )
+        subtask_of_interval.append(next(iter(interval_subtasks)))
+
+    images: dict = {}
+
+    # Persist (timestep → predicted_value) for offline plot-style iteration.
+    # Rank-0 gated to avoid NFS write races (this function may run on every host).
+    if jax.process_index() == 0:
+        debug_dir = "/nfs/aidm_nfs/saksham3/robocoin/snapshot_debug"
+        os.makedirs(debug_dir, exist_ok = True)
+        debug_path = os.path.join(debug_dir, f"{episode_name}.npz")
+        np.savez(
+            debug_path,
+            timestep = np.arange(len(predicted_values), dtype = np.int32),
+            predicted_values = np.asarray(predicted_values, dtype = np.float64),
+            num_frames = np.int32(len(predicted_values)),
+        )
+        logging.info(f"Saved snapshot value-debug npz to {debug_path}")
+
+    # One value plot per distinct subtask that has intervals.
+    for subtask_text in dict.fromkeys(subtask_of_interval):
+        member_indices = [i for i, st in enumerate(subtask_of_interval) if st == subtask_text]
+        frame_indices = [i for i, st in enumerate(per_frame_subtask) if st == subtask_text]
+        frame_start = min(frame_indices)
+        frame_end = max(frame_indices)
+        timesteps = np.arange(frame_start, frame_end + 1)
+        values = predicted_values[frame_start : frame_end + 1]
+
+        fig, ax = plt.subplots(figsize = (10, 6))
+        ax.plot(timesteps, values, label = "Predicted Value", color = "blue", linewidth = 2)
+        for i in member_indices:
+            interval_start, interval_end = snapshot.shade_intervals[i]
+            facecolor, alpha = shade_style[snapshot.shade_colours[i]]
+            ax.axvspan(interval_start, interval_end, facecolor = facecolor, alpha = alpha)
+        ax.set_xlabel("Timestep", fontsize = 12)
+        ax.set_ylabel("Value", fontsize = 12)
+        ax.set_title(subtask_text, fontsize = 13)
+        ax.legend(fontsize = 11)
+        ax.grid(visible = True, alpha = 0.3)
+        plt.tight_layout()
+
+        plot_key = f"snapshot/{episode_name}_{_sanitize(subtask_text)}"
+        if output_dir is not None:
+            os.makedirs(output_dir, exist_ok = True)
+            out_path = os.path.join(output_dir, f"{plot_key.replace('/', '_')}.png")
+            fig.savefig(out_path, dpi = 150, bbox_inches = "tight")
+            plt.close(fig)
+            logging.info(f"Saved snapshot plot to {out_path}")
+            images[plot_key] = out_path
+        else:
+            images[plot_key] = wandb.Image(fig)
+            plt.close(fig)
+
+    # One camera image per interval, captured at the interval midpoint.
+    for i, (interval_start, interval_end) in enumerate(snapshot.shade_intervals):
+        midpoint = (interval_start + interval_end) // 2
+        camera = snapshot.snapshot_camera[i]
+        image = np.asarray(frames[midpoint]["image"][camera])
+        img_key = f"snapshot/{episode_name}_{_sanitize(subtask_of_interval[i])}_{camera}_f{midpoint}"
+        if output_dir is not None:
+            import imageio
+
+            os.makedirs(output_dir, exist_ok = True)
+            out_path = os.path.join(output_dir, f"{img_key.replace('/', '_')}.png")
+            imageio.imwrite(out_path, image)
+            logging.info(f"Saved snapshot image to {out_path}")
+            images[img_key] = out_path
+        else:
+            images[img_key] = wandb.Image(image)
+
+    return images
+
+
 def generate_validation_plots_dlimp(
     model: _value_fn.BaseValueFunction,
     val_episode_indices: list[int],
@@ -1799,6 +1917,7 @@ def generate_validation_plots_dlimp(
     output_dir: str | None = None,
     batch_size: int = 64,
     override_prompt: tuple[np.ndarray, np.ndarray] | None = None,
+    snapshot: SnapshotConfig | None = None,
 ) -> dict:
     """Generate validation plots for RoboCOIN.
 
@@ -1957,6 +2076,26 @@ def generate_validation_plots_dlimp(
             all_attn_scores[seg_key] = attn[seg_key]
 
             del seg_all_frames
+
+        # Extra snapshot plots reuse this episode's already-decoded frames and
+        # already-computed predictions (no re-load / re-predict). Rank-0 only:
+        # pure host-side matplotlib over replicated arrays, no SPMD collectives.
+        if (
+            snapshot is not None
+            and jax.process_index() == 0
+            and traj_idx == snapshot.episode_file.removesuffix(".pkl")
+        ):
+            # segment_specs partitions `frames` in order, so concatenating the
+            # per-segment predictions realigns them to absolute frame indices.
+            full_predictions: list[float] = []
+            for snapshot_seg_key, _, _, _ in segment_specs:
+                full_predictions.extend(all_predictions[snapshot_seg_key])
+            snapshot_images = _render_snapshot_plots(
+                frames, full_predictions, snapshot, episode_name = traj_idx, output_dir = output_dir,
+            )
+            if output_dir is None and snapshot_images:
+                wandb.log(snapshot_images)
+            logging.info(f"Rendered {len(snapshot_images)} snapshot plots for episode {traj_idx}")
 
         # Drop the decoded frames for this trajectory before loading the next.
         del frames

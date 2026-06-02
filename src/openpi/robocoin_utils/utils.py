@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import pickle
@@ -19,6 +20,35 @@ RLDS_TO_STANDARD_CAMERA_MAP = {
     "cam_1": "left_wrist_0_rgb",
     "cam_2": "right_wrist_0_rgb",
 }
+
+
+@dataclasses.dataclass(frozen = True)
+class SnapshotConfig:
+    """Extra per-interval value snapshots for one validation episode.
+
+    When set on the eval config, the non-subtask validation path renders, for
+    each shade interval (inclusive ``[a, b]``), the critic's predicted values
+    over the interval's subtask (blue line, no MC returns) with a light
+    red/green shaded span, plus the snapshot camera frame at the interval
+    midpoint. All outputs are keyed under the ``snapshot/`` section. The three
+    parallel tuples are indexed together (one entry per interval).
+    """
+
+    episode_file: str
+    shade_intervals: tuple[tuple[int, int], ...]
+    shade_colours: tuple[str, ...]
+    snapshot_camera: tuple[str, ...]
+
+    def __post_init__(self):
+        num_intervals = len(self.shade_intervals)
+        if not (len(self.shade_colours) == num_intervals and len(self.snapshot_camera) == num_intervals):
+            raise ValueError(
+                "snapshot shade_intervals, shade_colours and snapshot_camera must be equal length; got "
+                f"{num_intervals}, {len(self.shade_colours)}, {len(self.snapshot_camera)}."
+            )
+        for colour in self.shade_colours:
+            if colour not in ("r", "g"):
+                raise ValueError(f"snapshot shade_colours entries must be 'r' or 'g', got {colour!r}.")
 
 
 def extract_embodiment(repo_id: str | bytes) -> str:
@@ -449,7 +479,14 @@ def cache_val_episodes(
     # (tableware_cleaning, 2930 frames → 1.3 GB pickle).
     if save_only and cache_dir is not None and os.path.exists(cache_dir):
         existing_pkls = {f for f in os.listdir(cache_dir) if f.endswith(".pkl")}
-        required_pkls = {f"{_sanitize(repo)}.pkl" for repo in include_repos}
+        # When allow_duplicate_repos=True, files are written as `<repo>_<idx>.pkl`
+        # (counter starts at 0 for each new repo), so the first occurrence of each
+        # required repo always lands as `<repo>_0.pkl`. Otherwise files are bare
+        # `<repo>.pkl`.
+        if allow_duplicate_repos:
+            required_pkls = {f"{_sanitize(repo)}_0.pkl" for repo in include_repos}
+        else:
+            required_pkls = {f"{_sanitize(repo)}.pkl" for repo in include_repos}
         all_required = required_pkls.issubset(existing_pkls)
         # Worker 0 is the only worker that fills the non-required slots.
         if process_index == 0:
