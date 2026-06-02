@@ -5715,7 +5715,6 @@ _CONFIGS = [
                 paligemma_variant = "gemma_300m",
             ),
             q_head_config = _heads.RegressionHeadConfig(),
-            next_token_loss_weight = 0.0,
             action_horizon = 60,
             discount = 0.999,
             tau = 0.005,
