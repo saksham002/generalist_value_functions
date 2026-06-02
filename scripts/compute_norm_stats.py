@@ -152,6 +152,7 @@ def main(
     max_frames: int | None = 200_000,
     dataset_name: str | None = None,
     output_dir: str | None = None,
+    data_dir: str | None = None,
 ):
     """Compute normalization statistics for a config.
 
@@ -171,12 +172,21 @@ def main(
             registering a new TrainConfig per task.
         output_dir: optional explicit directory to write `norm_stats.json` to.
             Overrides the default `config.assets_dirs / repo_id` path.
+        data_dir: optional override for the RLDS root (``config.data.rlds_data_dir``).
+            Useful for computing stats against a local mirror of the GCS dataset
+            without modifying the registered config.
     """
     config = _config.get_config(config_name)
     if fine_tune is not None:
         ft_config = _config.get_fine_tune_config(fine_tune)
         config = ft_config.apply_overrides(config)
         print(f"Applied FineTuneConfig overrides from '{fine_tune}'")
+
+    if data_dir is not None:
+        config = dataclasses.replace(
+            config, data = dataclasses.replace(config.data, rlds_data_dir = data_dir)
+        )
+        print(f"Overrode rlds_data_dir to {data_dir}")
 
     if dataset_name is not None:
         if ":" in dataset_name:

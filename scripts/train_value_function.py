@@ -733,12 +733,18 @@ def value_function_train_step(
         "batch/truncation_max": jnp.max(transition.truncation.astype(jnp.float32)),
     }
     if transition.counterfactual_next_actions is not None:
-        batch_stats["batch/counterfactual_next_actions_mean"] = jnp.mean(transition.counterfactual_next_actions)
-        batch_stats["batch/counterfactual_next_actions_std"] = jnp.std(transition.counterfactual_next_actions)
-        batch_stats["batch/counterfactual_next_actions_min"] = jnp.min(transition.counterfactual_next_actions)
-        batch_stats["batch/counterfactual_next_actions_max"] = jnp.max(transition.counterfactual_next_actions)
+        # Same subsample slice as `action` above: chunk has H slots but only the first
+        # H//2 are real actions when subsample=True; the trailing slots are zero-pad
+        # from _subsample_trajectory and are masked off at the critic forward.
+        cf_next = transition.counterfactual_next_actions[..., :7] if is_robocasa else transition.counterfactual_next_actions
+        if getattr(config.data, "subsample", False):
+            cf_next = cf_next[:, :, : config.action_horizon // 2, :]
+        batch_stats["batch/counterfactual_next_actions_mean"] = jnp.mean(cf_next)
+        batch_stats["batch/counterfactual_next_actions_std"] = jnp.std(cf_next)
+        batch_stats["batch/counterfactual_next_actions_min"] = jnp.min(cf_next)
+        batch_stats["batch/counterfactual_next_actions_max"] = jnp.max(cf_next)
         batch_stats["batch/counterfactual_next_actions_out_of_range_frac"] = jnp.mean(
-            (jnp.abs(transition.counterfactual_next_actions) >= 1.001).astype(jnp.float32)
+            (jnp.abs(cf_next) >= 1.001).astype(jnp.float32)
         )
 
     batch_size = transition.reward.shape[0]
@@ -2204,13 +2210,12 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
-    wandb_resuming = resuming and ft_config is None
     init_wandb(
         config,
-        resuming = wandb_resuming,
-        enabled = config.wandb_enabled,
-        ft_config = ft_config,
-        start_new = config.wandb_new,
+        resuming=resuming,
+        enabled=config.wandb_enabled,
+        ft_config=ft_config,
+        start_new=config.wandb_new,
     )
     logging.info(f"Initialized checkpoint manager with resuming={resuming}, config.resume={config.resume}")
 
@@ -2228,7 +2233,7 @@ def main(config: _config.TrainConfig):
     else:
         batch = raw_batch
 
-    logging.info(f"Initialized data loader. Batch keys: {list(batch.keys()) if isinstance(batch, dict) else 'tuple'}")
+    logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(raw_batch)}")
 
     # Create validation data_config (same overridden config.data)
     data_config = config.data.create(config.assets_dirs, config.model)
@@ -2428,6 +2433,10 @@ def main(config: _config.TrainConfig):
     policy_state = train_state.policy
     critic_sharding = train_state_sharding.critic
     policy_sharding = train_state_sharding.policy
+    # Release the outer wrapper: it aliases critic_state's param/optimizer
+    # buffers. Holding it resident leaks the pre-fine-tune optimizer state
+    # and blocks ptrain_step's buffer donation.
+    del train_state, train_state_sharding
     logging.info(f"Initialized combined state:\nCritic: {training_utils.array_tree_to_info(critic_state.params)}")
     if policy_state:
         logging.info(f"Policy: {training_utils.array_tree_to_info(policy_state.params)}")
@@ -2479,9 +2488,21 @@ def main(config: _config.TrainConfig):
     is_fine_tuning = ft_config is not None and not ft_config.val_only
 
     if is_fine_tuning:
-        config, critic_state, critic_sharding, checkpoint_manager = ft_config.initialize(
+        config, critic_state, critic_sharding, checkpoint_manager, ft_resuming = ft_config.initialize(
             config, pretrained_step, critic_state, mesh,
         )
+        if ft_resuming:
+            # The FT save (the ActorCriticTrainState(...) call inside the training loop) wraps
+            # critic + policy as AC. Mirror that wrapping for the restore so the tree
+            # structures match.
+            ac_state = training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
+            ac_sharding = training_utils.ActorCriticTrainState(critic=critic_sharding, policy=policy_sharding)
+            ac_state = _load_model_utils.restore_state_with_shardings(
+                checkpoint_manager, ac_state, ac_sharding,
+            )
+            critic_state = ac_state.critic
+            policy_state = ac_state.policy
+            logging.info("Resuming fine-tuning from FT checkpoint")
 
     lr_schedule = config.lr_schedule.create()
 

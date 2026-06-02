@@ -89,6 +89,67 @@ class PaliGemmaWeightLoader(WeightLoader):
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
+@dataclasses.dataclass(frozen=True)
+class PaliGemmaSiglipOnlyWeightLoader(WeightLoader):
+    """Loads ONLY the SigLIP vision tower from the official PaliGemma checkpoint.
+
+    Used for value-function configs that want a pretrained vision encoder but a
+    from-scratch LLM (e.g. a smaller gemma variant). Only the `img` subtree of
+    pt_224.npz is taken; the LLM and all value-head / projection params keep their
+    random init. The SigLIP `head` (num_classes = LLM width) is dropped when its
+    shape does not match the reference, since the checkpoint head projects to the
+    gemma_2b width (2048) and a smaller backbone uses a different width.
+    """
+
+    def load(self, params: at.Params) -> at.Params:
+        path = download.maybe_download(
+            "gs://vertex-model-garden-paligemma-us/paligemma/pt_224.npz", gs={"token": "anon"}
+        )
+        with path.open("rb") as f:
+            flat_params = dict(np.load(f, allow_pickle=False))
+        paligemma_params = flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]
+        img_params = {"img": paligemma_params["img"]}
+
+        # Value function models nest PaliGemma under network/ or q_network/ (and
+        # target variants for SARSA/CQL). Mirror PaliGemmaWeightLoader's nesting.
+        if "q_network" in params and "PaliGemma" not in params:
+            loaded_params = {"q_network": {"PaliGemma": img_params}}
+            if "target_q_network" in params:
+                loaded_params["target_q_network"] = {"PaliGemma": copy.deepcopy(img_params)}
+        elif "network" in params and "PaliGemma" not in params:
+            loaded_params = {"network": {"PaliGemma": img_params}}
+            if "target_network" in params:
+                loaded_params["target_network"] = {"PaliGemma": copy.deepcopy(img_params)}
+        else:
+            loaded_params = {"PaliGemma": img_params}
+
+        # Drop any leaf whose shape does not match the reference (e.g. the SigLIP
+        # head, which projects to the LLM width). _merge_params does not shape-check,
+        # so filtering here is what keeps a width-mismatched head as random init.
+        flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+        flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+        kept = {}
+        dropped = []
+        for k, v in flat_loaded.items():
+            ref = flat_ref.get(k)
+            if ref is not None and tuple(ref.shape) == tuple(v.shape):
+                kept[k] = v
+            else:
+                dropped.append(k)
+        if not kept:
+            raise ValueError(
+                "PaliGemmaSiglipOnlyWeightLoader matched zero img params against the model. "
+                f"Sample reference keys: {sorted(flat_ref)[:5]}"
+            )
+        logger.info(
+            f"PaliGemmaSiglipOnlyWeightLoader: loading {len(kept)} SigLIP leaves, "
+            f"dropping {len(dropped)} (shape mismatch / absent): {sorted(dropped)}"
+        )
+        loaded_params = flax.traverse_util.unflatten_dict(kept, sep="/")
+
+        return _merge_params(loaded_params, params, missing_regex=".*")
+
+
 @dataclasses.dataclass(frozen = True)
 class Gemma3WeightLoader(WeightLoader):
     """Loads transformer + SigLIP weights from a Gemma 3 checkpoint.

@@ -354,9 +354,15 @@ def main(config: _config.TrainConfig):
     is_fine_tuning = ft_config is not None and not ft_config.val_only
 
     if is_fine_tuning:
-        config, train_state, train_state_sharding, checkpoint_manager = ft_config.initialize(
+        config, train_state, train_state_sharding, checkpoint_manager, ft_resuming = ft_config.initialize(
             config, pretrained_step, train_state, mesh,
         )
+        if ft_resuming:
+            import openpi.robocoin_utils.load_model_utils as _load_model_utils
+            train_state = _load_model_utils.restore_state_with_shardings(
+                checkpoint_manager, train_state, train_state_sharding,
+            )
+            logging.info("Resuming fine-tuning from FT checkpoint")
 
     lr_schedule = config.lr_schedule.create()
 
