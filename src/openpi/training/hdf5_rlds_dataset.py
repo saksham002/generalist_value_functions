@@ -48,6 +48,7 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         td_n: int | None = None,
         filter_n: int | None = None,
         filter_intervention: bool = False,
+        filter_repo_index: tuple[int, ...] | None = None,
         mask_boundary_actions: bool = True,
         variable_horizon: bool = False,
         use_chunk_wise_delta: bool = False,
@@ -96,6 +97,7 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         self._td_n = td_n
         self._filter_n = filter_n
         self._filter_intervention = filter_intervention
+        self._filter_repo_index = filter_repo_index
         self._mask_boundary_actions = mask_boundary_actions
         self._variable_horizon = variable_horizon
         self._state_dim = state_dim
@@ -107,6 +109,7 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
             f"Hdf5RldsDataset: critic_mode={critic_mode}, discount={discount}, "
             f"reward_scale={reward_scale}, reward_bias={reward_bias}, use_eef={use_eef}, "
             f"td_n={td_n}, filter_n={filter_n}, filter_intervention={filter_intervention}, "
+            f"filter_repo_index={filter_repo_index}, "
             f"mask_boundary_actions={mask_boundary_actions}, "
             f"variable_horizon={variable_horizon}, "
             f"state_dim={state_dim}, "
@@ -152,14 +155,48 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
             is_partial_scalar = tf.logical_not(terminal_reward > tf.constant(0.99, dtype = tf.float32))
         else:
             # Heuristic guess for is_partial. When reward is absent, fall back to per-episode subtask annotations: a
-            # trajectory is complete iff has_subtask_annotations is True AND the terminal
-            # subtask_1 frame matches the task's final subtask.
+            # trajectory is complete iff has_subtask_annotations is True, the terminal
+            # subtask_1 frame matches the task's final subtask, AND the right TCP z
+            # (eef_sim_pose_state[:, 8]) clears 0.4 somewhere inside the terminal subtask.
+            # The terminal-subtask span is the last subtask_len[-1] frames; subtask_is_first
+            # at that start index must be True as a sanity check.
             has_subtask_annotations = tf.cast(
                 traj["traj_metadata"]["episode_metadata"]["has_subtask_annotations"][0], tf.bool,
             )
             terminal_subtask = traj["subtask_1"][-1]
             matches_terminal = tf.equal(terminal_subtask, "Place the hanger on the rod")
-            is_partial_scalar = tf.logical_not(tf.logical_and(has_subtask_annotations, matches_terminal))
+
+            # Short-circuit on has_subtask_annotations: subtask_len / subtask_is_first can
+            # be garbage on episodes without annotations, and the whole AND collapses to
+            # False there anyway — so skip the assertion + reduce_max in that branch.
+            def _right_tcp_z_clears():
+                # subtask_len / subtask_is_first are per-step shape (5,); slot 0 tracks
+                # the active subtask (matching the existing steps_to_subtask_end[:, 0]
+                # convention in _apply_rl_fields).
+                terminal_subtask_len = tf.cast(traj["subtask_len"][-1, 0], tf.int32)
+                traj_len_local = tf.shape(traj["eef_sim_pose_state"])[0]
+                terminal_start_idx = traj_len_local - terminal_subtask_len
+                with tf.control_dependencies([
+                    tf.debugging.assert_equal(
+                        tf.cast(traj["subtask_is_first"][terminal_start_idx, 0], tf.bool),
+                        tf.constant(True, dtype = tf.bool),
+                        message = "Expected subtask_is_first=True at the start of the terminal subtask.",
+                    )
+                ]):
+                    right_tcp_z = tf.cast(traj["eef_sim_pose_state"], tf.float32)[terminal_start_idx:, 8]
+                    return tf.identity(tf.reduce_max(right_tcp_z) > tf.constant(0.4, dtype = tf.float32))
+
+            right_tcp_z_clears = tf.cond(
+                has_subtask_annotations,
+                _right_tcp_z_clears,
+                lambda: tf.constant(False, dtype = tf.bool),
+            )
+            is_partial_scalar = tf.logical_not(
+                tf.logical_and(
+                    has_subtask_annotations,
+                    tf.logical_and(matches_terminal, right_tcp_z_clears),
+                )
+            )
 
         if self._subsample:
             traj = self._subsample_trajectory(traj)
@@ -255,6 +292,17 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         if "video_latents" in traj:
             result["video_latents"] = tf.cast(traj["video_latents"], tf.bfloat16)
 
+        # Subsample case only: _subsample_trajectory has produced subsampled
+        # counterfactual_actions and _ca_episode_index whose leading dims match
+        # the subsampled main fields (T//2). Forward them so _prepare_trajectory
+        # doesn't need to re-read the un-subsampled raw versions (which would
+        # cause a from_tensor_slices leading-dim mismatch).
+        if self._subsample:
+            if "counterfactual_actions" in traj:
+                result["counterfactual_actions"] = traj["counterfactual_actions"]
+            if "_ca_episode_index" in traj:
+                result["_ca_episode_index"] = traj["_ca_episode_index"]
+
         return result
 
     def _subsample_trajectory(self, traj: dict) -> dict:
@@ -263,12 +311,27 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         - Leaves whose key contains ``"action"`` are sliced ``[1::2]`` so each kept
           action sits at the half-step between the two surrounding 30 Hz states.
         - All other leaves are sliced ``[0::2]``.
+        - ``counterfactual_actions`` is treated separately (see below).
         - All leaves are truncated to the same length ``M = traj_len // 2`` so
           downstream ``from_tensor_slices`` sees consistent first-axis sizes for
           odd-length trajectories.
         - ``_frame_index``, ``index`` and ``steps_to_subtask_end`` are then divided
           by 2 to convert from 60 Hz to 30 Hz units.
         - ``traj_metadata.episode_metadata.fps`` is overwritten with 30.
+
+        ``counterfactual_actions`` special case (shape ``(N, k, ah, ad)``):
+        each per-step chunk is itself a 60 Hz action rollout, so subsample BOTH
+        the trajectory axis and the chunk's action_horizon axis.
+        - Axis 0 (trajectory): ``[0::2]`` — the CF chunk at index t corresponds
+          to state t, not the half-step action, so it tracks state's offset (not
+          regular action's ``[1::2]``).
+        - Axis 2 (action_horizon): ``[1::2]`` — same half-step rule the per-step
+          ``actions`` field follows, applied within each chunk.
+        - Axis 2 right-padded with zeros back to the original action_horizon so
+          downstream shape contracts hold. The data-time ``next_action_mask`` at
+          fps=30 is ``[True]*(ah//2) + [False]*(ah - ah//2)``, which precisely
+          covers the kept-vs-padded boundary; the zero pad is inert at the
+          target network forward.
         """
         import tensorflow as tf
 
@@ -285,6 +348,13 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         def _walk(value, key: str):
             if isinstance(value, dict):
                 return {k: _walk(v, k) for k, v in value.items()}
+            if key == "counterfactual_actions":
+                trajectory_sliced = value[0:end:2]
+                horizon_sliced = trajectory_sliced[:, :, 1::2, :]
+                pad_amount = tf.shape(trajectory_sliced)[2] - tf.shape(horizon_sliced)[2]
+                return tf.pad(
+                    horizon_sliced, [[0, 0], [0, 0], [0, pad_amount], [0, 0]],
+                )
             start = 1 if "action" in key else 0
             return value[start:end:2]
 
@@ -370,7 +440,11 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
             if key.startswith(("latents/", "_latent")):
                 mapped_traj[key] = value
 
-        if "counterfactual_actions" in raw_traj:
+        # When self._subsample is True, counterfactual_actions and _ca_episode_index
+        # are already subsampled by _subsample_trajectory and passed through
+        # trajectory_transforms' result. In the non-subsample case we still need to
+        # read them from raw_traj here.
+        if "counterfactual_actions" in raw_traj and not self._subsample:
             counterfactual_actions = raw_traj["counterfactual_actions"]
             if self._counterfactual_action_dim_offset > 0:
                 action_dim = mapped_traj["actions"].shape[-1]
@@ -382,7 +456,7 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
                 ]
             mapped_traj["counterfactual_actions"] = counterfactual_actions
         for key in ("_ca_episode_index",):
-            if key in raw_traj:
+            if key in raw_traj and not self._subsample:
                 mapped_traj[key] = raw_traj[key]
 
         mapped_traj = self._apply_latent_views(mapped_traj)
@@ -654,6 +728,11 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
             mask = tf.logical_and(mask, tf.logical_not(tf.logical_and(tail, traj["is_partial"])))
         if self._filter_intervention:
             mask = tf.logical_and(mask, tf.cast(traj["is_intervention"], tf.bool))
+        if self._filter_repo_index is not None:
+            allowed = tf.constant(self._filter_repo_index, dtype = tf.int32)
+            repo_index = tf.cast(traj["repo_index"], tf.int32)
+            in_allowed = tf.reduce_any(tf.equal(repo_index[:, None], allowed[None, :]), axis = -1)
+            mask = tf.logical_and(mask, in_allowed)
         if self._prompt_mode != "task_description":
             # Mirror frame_filter.
             mask = tf.logical_and(mask, tf.cast(traj["has_subtask_annotations"], tf.bool))
@@ -678,6 +757,12 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
 
         if self._filter_intervention:
             keep = tf.logical_and(keep, tf.cast(frame["is_intervention"], tf.bool))
+
+        if self._filter_repo_index is not None:
+            allowed = tf.constant(self._filter_repo_index, dtype = tf.int32)
+            keep = tf.logical_and(
+                keep, tf.reduce_any(tf.equal(tf.cast(frame["repo_index"], tf.int32), allowed))
+            )
 
         if self._prompt_mode != "task_description":
             keep = tf.logical_and(keep, tf.cast(frame["has_subtask_annotations"], tf.bool))

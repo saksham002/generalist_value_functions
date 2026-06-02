@@ -39,9 +39,19 @@ Data dir points to the root: robocasa_rlds/ (e.g., /data/group_data/rl/datasets/
 from collections.abc import Sequence
 import dataclasses
 import logging
+from typing import Literal
 
 import openpi.training.rlds_dataset as rlds_dataset
+import openpi.training.robocasa_subtask_tracker as robocasa_subtask_tracker
 import openpi.training.state_action_spaces as state_action_spaces
+
+
+# Prompt source: "subtask" runs the composite subtask tracker (per-subtask
+# prompts for composite datasets, whole-episode for atomic), matching the
+# original behaviour. "task_description" bypasses the tracker entirely and
+# leaves the raw per-step language_instruction as the prompt for every
+# dataset — composite included.
+PromptMode = Literal["subtask", "task_description"]
 
 
 class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
@@ -84,6 +94,7 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
         native_fps: float | None = None,
         mask_boundary_actions: bool = True,
         td_n: int = 50,
+        prompt_mode: PromptMode = "subtask",
         **kwargs,
     ):
         # Validation-only kwargs (val_split, val_latent_store_dir) are consumed by the
@@ -110,8 +121,11 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
                 f"{interpolation_config.action_horizon_seconds})"
             )
 
-        if interpolation_config is None or interpolation_config.target_fps != 30.0:
-            raise ValueError("RoboCasaRldsDataset only supports target_fps = 30.0")
+        if interpolation_config is not None and interpolation_config.target_fps != 30.0:
+            raise ValueError(
+                "RoboCasaRldsDataset only supports target_fps=30.0 when interpolation_config is set; "
+                "for native-rate training pass interpolation_config=None."
+            )
 
         # BaseRldsDataset asserts sum(weights) == 1.0 with strict equality.
         # Floating-point accumulation breaks this for many equal-weight datasets
@@ -136,6 +150,7 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
         self._native_fps = native_fps
         self._mask_boundary_actions = mask_boundary_actions
         self._td_n = td_n
+        self._prompt_mode = prompt_mode
 
         super().__init__(
             data_dir = data_dir,
@@ -225,6 +240,41 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
             if metadata_key in traj:
                 mapped_traj[metadata_key] = traj[metadata_key]
 
+        # Composite tasks decompose into K ordered subtasks. Compute a per-step subtask
+        # index and the per-trajectory subtask order from the raw 16D state via a
+        # per-dataset heuristic (atomic tasks skip this and keep the single-segment
+        # behaviour). Done before interpolation so the heuristic sees the native-FPS
+        # raw state.
+        import numpy as np
+
+        # Skip the composite subtask tracker entirely under prompt_mode="task_description"
+        # so the raw per-step `language_instruction` survives as the prompt for both
+        # atomic and composite datasets.
+        subtask_spec = None
+        annotation_success_scalar = None
+        if self._prompt_mode == "subtask" and robocasa_subtask_tracker.is_composite_dataset(dataset_cfg.name):
+            subtask_spec = robocasa_subtask_tracker.get_subtask_spec(dataset_cfg.name)
+
+            def _compute(state, instr_per_step):
+                # `instr_per_step` is a [T]-shaped bytes array; the language
+                # instruction is constant within an episode, so take step 0.
+                instr = instr_per_step[0].decode("utf-8") if instr_per_step.size > 0 else ""
+                idx, order, ann_succ = robocasa_subtask_tracker.compute_subtasks(
+                    state, instr, subtask_spec,
+                )
+                return idx, np.array([s.encode("utf-8") for s in order]), np.bool_(ann_succ)
+
+            subtask_index, subtask_order, annotation_success_scalar = tf.numpy_function(
+                func = _compute,
+                inp = [traj["observation"]["state"], traj["language_instruction"]],
+                Tout = [tf.int32, tf.string, tf.bool],
+            )
+            subtask_index.set_shape([None])
+            subtask_order.set_shape([subtask_spec.num_subtasks])
+            annotation_success_scalar.set_shape([])
+            mapped_traj["subtask_index"] = subtask_index
+            mapped_traj["subtask_order"] = subtask_order
+
         if self._interpolation_config is not None:
             self._interpolate_trajectory(traj, mapped_traj)
 
@@ -234,6 +284,27 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
         # Built AFTER interpolation so the length matches the (possibly resampled) actions.
         post_traj_len = tf.shape(mapped_traj["actions"])[0]
         mapped_traj["repo_id"] = tf.fill([post_traj_len], dataset_cfg.name)
+
+        # Composite tasks: derive the per-step subtask prompt and steps_to_subtask_end
+        # from the (interpolation-resampled) subtask index plus the per-trajectory
+        # subtask order. steps_to_subtask_end is in step units so it must be computed
+        # on the final grid; _apply_rl_fields reads it from mapped_traj instead of
+        # recomputing the episode-end countdown.
+        if subtask_spec is not None:
+            subtask_index = mapped_traj.pop("subtask_index")
+            subtask_order = mapped_traj.pop("subtask_order")
+            step_range = tf.range(post_traj_len)
+            subtask_end_step = tf.math.segment_max(step_range, subtask_index)
+            mapped_traj["prompt"] = tf.gather(subtask_order, subtask_index)
+            mapped_traj["steps_to_subtask_end"] = tf.gather(subtask_end_step, subtask_index) - step_range
+
+        # Per-step annotation_success: False only for composite-subtask trajectories
+        # where the heuristic decomposition failed. True everywhere else (atomic,
+        # task_description prompt mode, or composite + tracker OK). Downstream
+        # frame_filter drops frames with annotation_success=False.
+        if annotation_success_scalar is None:
+            annotation_success_scalar = tf.constant(True)
+        mapped_traj["annotation_success"] = tf.fill([post_traj_len], annotation_success_scalar)
 
         mapped_traj["action_mask"] = self._build_action_mask(post_traj_len)
 
@@ -302,6 +373,10 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
             if len(prompt.shape) > 0:
                 mapped_traj["prompt"] = tf.gather(prompt, nearest_indices)
 
+        # Resample the composite-task subtask index (categorical: nearest-neighbour).
+        if "subtask_index" in mapped_traj:
+            mapped_traj["subtask_index"] = tf.gather(mapped_traj["subtask_index"], nearest_indices)
+
         if "_frame_index" in mapped_traj:
             mapped_traj["_frame_index"] = tf.range(target_len, dtype = mapped_traj["_frame_index"].dtype)
         if "_traj_index" in mapped_traj:
@@ -344,17 +419,28 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
 
         traj_len = tf.shape(mapped_traj["actions"])[0]
         i = tf.range(traj_len)
-        steps_to_subtask_end = traj_len - 1 - i  # [T] int32
+        # Composite tasks pre-compute steps_to_subtask_end (steps to the end of the
+        # current SUBTASK) in trajectory_transforms. Atomic tasks fall back to the
+        # single-segment countdown (steps to the end of the EPISODE).
+        if "steps_to_subtask_end" in mapped_traj:
+            steps_to_subtask_end = tf.cast(mapped_traj["steps_to_subtask_end"], tf.int32)
+        else:
+            steps_to_subtask_end = traj_len - 1 - i  # [T] int32
         selected_steps_f = tf.cast(steps_to_subtask_end, tf.float32)
 
-        exp_per_step = tf.constant(5.0, dtype = tf.float32)
+        # Interpolated path: calibrated to 30 fps native + 150 Hz underlying MDP
+        # (exp_per_step = 150/30 = 5) with td_n in 50 Hz canonical units. Native path
+        # (interpolation_config=None): discount is per-native-step and td_n is in
+        # native steps directly — no scaling, configured values used as-is.
+        if self._interpolation_config is not None:
+            exp_per_step = tf.constant(5.0, dtype = tf.float32)
+            td_n_native = 3 * self._td_n // 5
+        else:
+            exp_per_step = tf.constant(1.0, dtype = tf.float32)
+            td_n_native = self._td_n
         discount = tf.constant(self._discount, dtype = tf.float32)
 
         mc_return = tf.pow(discount, exp_per_step * selected_steps_f)
-
-        # Mirror robocoin's 30fps branch: td_n is in canonical 50Hz units, so the
-        # 30fps-native step count is 3*td_n/5 (robocoin_rlds_dataset.py:637-641).
-        td_n_native = 3 * self._td_n // 5
         termination = steps_to_subtask_end < td_n_native
         td_reward = tf.pow(discount, exp_per_step * selected_steps_f)
         reward = tf.where(termination, td_reward, tf.zeros_like(td_reward))
@@ -416,11 +502,14 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
         # Call base class for image decoding
         frame = super().frame_transforms(frame)
 
-        # Filter out frames with invalid prompts ('null', empty, etc.)
+        # Build a per-frame keep-mask combining:
+        #  - prompt validity (drop null/empty prompts), and
+        #  - annotation_success (drop frames whose composite-subtask heuristic failed).
+        is_valid = tf.constant(True)
         if "prompt" in frame:
             prompt = frame["prompt"]
             if isinstance(prompt, tf.Tensor):
-                is_valid = tf.logical_not(
+                prompt_ok = tf.logical_not(
                     tf.reduce_any(
                         [
                             tf.equal(tf.strings.lower(prompt), "null"),
@@ -428,7 +517,10 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
                         ]
                     )
                 )
-                frame["_filter_mask"] = is_valid
+                is_valid = tf.logical_and(is_valid, prompt_ok)
+        if "annotation_success" in frame:
+            is_valid = tf.logical_and(is_valid, tf.cast(frame["annotation_success"], tf.bool))
+        frame["_filter_mask"] = is_valid
 
         # Remap latent keys from original RoboCasa names to unified cam_0/1/2 names.
         latent_key_mapping = {
@@ -445,3 +537,26 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
                     break
 
         return frame
+
+    def frame_filter(self, frame: dict) -> bool:
+        """Drop frames whose ``_filter_mask`` was set False by frame_transforms."""
+        import tensorflow as tf
+
+        if "_filter_mask" in frame:
+            return tf.cast(frame["_filter_mask"], tf.bool)
+        return tf.constant(True)
+
+    def _apply_frame_transforms_to_trajectory(self, traj: dict) -> dict:
+        """Apply frame transforms, then mirror frame_filter on the trajectory.
+
+        Slices every leaf by ``_filter_mask`` so soft-failed composite-subtask trajectories
+        (whose per-frame _filter_mask collapses to all-False) get reduced to an empty
+        trajectory and skipped downstream by cache_val_episodes' zero-length guard.
+        """
+        import tensorflow as tf
+
+        traj = super()._apply_frame_transforms_to_trajectory(traj)
+        if "_filter_mask" in traj:
+            mask = tf.cast(traj["_filter_mask"], tf.bool)
+            traj = tf.nest.map_structure(lambda x: tf.boolean_mask(x, mask), traj)
+        return traj
