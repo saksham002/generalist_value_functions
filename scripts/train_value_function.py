@@ -415,8 +415,22 @@ def init_wandb(
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming and not start_new:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+    # Fine-tune runs own a separate wandb run + wandb_id.txt under the FT subdir
+    # (config.checkpoint_dir / ft_config.name), decoupled from the base run so a
+    # fine-tune launched with --resume (needed to load the pretrained critic) does
+    # not reattach to the base run's wandb. The subdir may not exist yet for a fresh
+    # FT (ft_config.initialize creates it later), so create it here before writing
+    # the run id; whether to resume the FT run is keyed off that subdir's
+    # wandb_id.txt rather than the base checkpoint's `resuming` flag.
+    if ft_config is not None:
+        wandb_id_dir = ckpt_dir / ft_config.name
+        wandb_id_dir.mkdir(parents = True, exist_ok = True)
+        resume_run = (wandb_id_dir / "wandb_id.txt").exists()
+    else:
+        wandb_id_dir = ckpt_dir
+        resume_run = resuming
+    if resume_run and not start_new:
+        run_id = (wandb_id_dir / "wandb_id.txt").read_text().strip()
         wandb.init(id=run_id, resume="must", project=config.project_name)
     else:
         base_name = config.exp_name if config.exp_name else config.name
@@ -427,7 +441,7 @@ def init_wandb(
             project=config.project_name,
             group=config.wandb_group,
         )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+        (wandb_id_dir / "wandb_id.txt").write_text(wandb.run.id)
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
@@ -2634,7 +2648,7 @@ def main(config: _config.TrainConfig):
         if (
             (step + 1) % config.plot_interval == 0
             or step + 1 == config.num_train_steps
-            # or (step % config.plot_interval == 0 and step == start_step and start_step > 0)
+            or (step % config.plot_interval == 0 and step == start_step and start_step > 0)
         ):
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
