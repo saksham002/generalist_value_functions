@@ -4209,7 +4209,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             "action_horizon": 60,
         },
         action_horizon = 60,
-        num_train_steps = 50_000,
+        num_train_steps = 20_000,
         save_interval = 10_000,
         plot_interval = 10_000,
         keep_period = 10_000,
@@ -4217,7 +4217,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         # this in an OffsetSchedule with offset=pretrained_step, so step 0 of the
         # cosine corresponds to the FT-start absolute step.
         lr_schedule = _optimizer.CosineDecaySchedule(
-            warmup_steps = 1, peak_lr = 5e-6, decay_steps = 50_000, decay_lr = 5e-7,
+            warmup_steps = 1000, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
         ),
         num_val_trajectories = 3,
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/real_shirt_hang/validation_cache_dir_real_shirt_hang_paligemma_cql_rlds_finetune_final/",
@@ -5620,6 +5620,77 @@ _CONFIGS = [
         include_repos = ("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_cql_rlds/",
     ),
+    # Copy of robocoin_bimanual_paligemma_cql_rlds with the next-token-prediction
+    # auxiliary loss disabled (next_token_loss_weight=0.0). Only the name,
+    # validation_cache_dir, and the ntp weight differ from the base config.
+    TrainConfig(
+        name = "robocoin_bimanual_paligemma_cql_rlds_no_ntp",
+        model = _value_function.CQLValueFunctionConfig(
+            q_network_config = _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                max_token_len = 96,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+            ),
+            q_head_config = _heads.RegressionHeadConfig(),
+            next_token_loss_weight = 0.0,
+            action_horizon = 50,
+            discount = 0.999,
+            tau = 0.005,
+            action_bounds = ActionBounds.from_uniform(-1.25, 1.25, action_dim = 14, is_normalized = True),
+            cql_alpha = 0.0,
+        ),
+        policy = _best_of_n.BestOfNWrapperConfig(
+            action_dim = 14,
+            action_horizon = 50,
+            base_model_config = None,
+            num_samples = 8,
+            use_target_value = True,
+        ),
+        policy_extraction = _policy_extraction.NoopPolicyConfig(),
+        weight_loader = weight_loaders.PaliGemmaWeightLoader(),
+        data = RoboCoinRldsDataConfig(
+            rlds_data_dir = "gs://saksham-euw4/robocoin_bimanual",
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/robocoin_bimanual/norm_stats",
+                asset_id = "embodiment_wise",
+            ),
+            datasets = (rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
+            discount = 0.999,
+            td_n = 50,
+            use_eef = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/robocoin_bimanual_pi05_rlds",
+            state_dim = 14,
+            max_token_len = 96,
+            subtask_prompt_mode = "task_description_predict_current_subtask",
+        ),
+        num_train_steps = 230_000,
+        batch_size = 256,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 1e-5,
+            decay_steps = 230_000,
+            decay_lr = 1e-6,
+        ),
+        optimizer = _optimizer.AdamW(weight_decay = 1e-6),
+        num_workers = 0,
+        log_interval = 100,
+        plot_interval = 50_000,
+        save_interval = 50_000,
+        fsdp_devices = 16,
+        action_horizon = 50,
+        num_val_trajectories = 10,
+        include_repos = ("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_cql_rlds/",
+    ),
     # From-scratch baseline on the real_shirt_hang HDF5 dataset: gemma_300m
     # backbone, random weights (NoOpWeightLoader, both Gemma LLM and SigLIP tower
     # randomly initialized). Data + counterfactual-action store taken from
@@ -5807,8 +5878,8 @@ _CONFIGS = [
         policy_extraction = _policy_extraction.NoopPolicyConfig(),
         weight_loader = weight_loaders.PaliGemmaWeightLoader(),
         data = RoboCoinRldsDataConfig(
-            rlds_data_dir = "/data/group_data/rl/datasets/",
-            # rlds_data_dir="gs://saksham-euw4/robocoin_bimanual",
+            rlds_data_dir = "gs://saksham-euw4/robocoin_bimanual",
+            # rlds_data_dir="/data/group_data/rl/datasets/",
             assets = AssetsConfig(
                 assets_dir = "gs://saksham-euw4/robocoin_bimanual/norm_stats",
                 # assets_dir="/data/group_data/rl/saksham3/robocoin/norm_stats",
@@ -5820,10 +5891,10 @@ _CONFIGS = [
             use_eef = True,
             use_chunk_wise_delta = True,
             use_quantile_norm = True,
-            shuffle_buffer_size = 100_000,
+            shuffle_buffer_size = 50_000,
             mask_boundary_actions = False,
             replace_boundary_actions = False,
-            counterfactual_action_store_dir = "/data/group_data/rl/saksham3/robocoin/cached_actions",
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/robocoin_bimanual_pi05_rlds",
             # counterfactual_action_store_dir="/data/group_data/rl/saksham3/robocoin/cached_actions/pi05_finetune_8",
             state_dim = 14,
             max_token_len = 96,
@@ -5846,7 +5917,7 @@ _CONFIGS = [
         action_horizon = 50,
         num_val_trajectories = 10,
         include_repos = ("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir = "/data/user_data/saksham3/robocoin/validation_cache/subtask_no_ntp/",
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_cql_rlds_subtask/",
     ),
     # Gemma4 mirror of robocoin_bimanual_paligemma_cql_rlds: same CQL + Best-of-N
     # setup, swapped to the gemma4_e2b backbone (480x480 unresized images, Gemma4
