@@ -125,6 +125,15 @@ def _build_critic_kwargs(critic_config: Any) -> dict[str, Any]:
     factory doesn't expose that field (it's hardcoded to False, matching the
     default), whereas RoboCoinRldsDataConfig used by the pretrain config does.
     """
+    # SARSAValueFunctionConfig names the backbone `network_config`; CQLValueFunctionConfig
+    # uses `q_network_config`. Resolve either so BestOfN works with both critic flavors.
+    network_config = getattr(critic_config.model, "network_config", None)
+    if network_config is None:
+        network_config = getattr(critic_config.model, "q_network_config", None)
+    assert network_config is not None, (
+        f"Critic model {type(critic_config.model).__name__} has neither "
+        "`network_config` (SARSA) nor `q_network_config` (CQL)."
+    )
     return {
         # FineTuneConfig overrides land on TrainConfig.action_horizon; fall back
         # to the model's action_horizon when the TrainConfig field is unset.
@@ -132,7 +141,7 @@ def _build_critic_kwargs(critic_config: Any) -> dict[str, Any]:
         "use_chunk_wise_delta": critic_config.data.use_chunk_wise_delta,
         "subsample": getattr(critic_config.data, "subsample", False),
         "use_quantile_norm": getattr(critic_config.data, "use_quantile_norm", False),
-        "tokenizer": critic_config.model.network_config.get_tokenizer(),
+        "tokenizer": network_config.get_tokenizer(),
     }
 
 
@@ -529,9 +538,14 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             critic_kwargs = _build_critic_kwargs(critic_config)
             self._critic_is_hdf5 = isinstance(critic_config.data, _config.Hdf5RldsDataConfig)
             # Critic-side image_size: surfaced to clients + used to shape dummies
-            # (HLO must match across hosts).
+            # (HLO must match across hosts). SARSAValueFunctionConfig exposes the
+            # PaliGemma config as `network_config`; CQLValueFunctionConfig exposes
+            # it as `q_network_config` — accept either.
+            # _build_critic_kwargs above has already asserted one of these exists.
             critic_network_config = getattr(critic_config.model, "network_config", None)
-            critic_image_size = getattr(critic_network_config, "image_size", None) if critic_network_config is not None else None
+            if critic_network_config is None:
+                critic_network_config = critic_config.model.q_network_config
+            critic_image_size = getattr(critic_network_config, "image_size", None)
             if critic_image_size is not None:
                 self._metadata["critic_image_size"] = list(critic_image_size)
             self._critic_image_size = tuple(critic_image_size) if critic_image_size is not None else None
@@ -540,7 +554,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             self._critic_tokenizer = critic_kwargs["tokenizer"]
             # Critic prompt token length (determines the dummy shape we
             # broadcast on participating workers).
-            self._critic_max_token_len = critic_config.model.network_config.max_token_len
+            self._critic_max_token_len = critic_network_config.max_token_len
 
             # Auto-route the constant task description into critic tokenization
             # when the critic was trained with prompt_mode="task_description_predict_current_subtask".

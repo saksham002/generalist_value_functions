@@ -7,8 +7,8 @@ set -e
 # =============================================================================
 # Configuration — edit these before running
 # =============================================================================
-TPU_TYPE="v5e-32"
-TPU_NAME="v5e-tpu-32-0"
+TPU_TYPE="v5e-64"
+TPU_NAME="v5e-tpu-64-1"
 PORT=8005
 
 POLICY_CONFIG="real_shirt_hang_pi05"
@@ -17,10 +17,10 @@ POLICY_STEP=60000
 
 # Set CRITIC_ENABLE=false to serve the policy without BestOfN.
 CRITIC_ENABLE=true
-CRITIC_CONFIG="robocoin_bimanual_paligemma_cql_rlds"
-CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_cql_rlds/robocoin_bimanual_paligemma_cql_rlds/real_shirt_hang_paligemma_cql_rlds_finetune_task_description"
-CRITIC_STEP=160000
-CRITIC_FT_CONFIG="real_shirt_hang_paligemma_cql_rlds_finetune_task_description"
+CRITIC_CONFIG="robocoin_bimanual_paligemma_cql_rlds_no_ntp"
+CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_cql_rlds_no_ntp/robocoin_bimanual_paligemma_cql_rlds_no_ntp/real_shirt_hang_paligemma_cql_rlds_finetune_task_description_final"
+CRITIC_STEP=240000
+CRITIC_FT_CONFIG="real_shirt_hang_paligemma_cql_rlds_finetune_task_description_final"
 NUM_SAMPLES=8
 # When true, pass --critic.expect-critic-images: the critic consumes a separate obs["critic_image"]
 # stream (the eval client must send it; needed when the critic's image size/pipeline differs from the

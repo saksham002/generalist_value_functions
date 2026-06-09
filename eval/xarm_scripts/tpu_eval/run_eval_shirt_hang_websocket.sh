@@ -9,13 +9,13 @@ set -e
 # =============================================================================
 # External IP of the rank-0 TPU worker (from the "Creating server" line in the
 # server startup logs). Re-check per launch — rank-0 placement can change.
-POLICY_HOST="34.34.103.169"
+POLICY_HOST="34.12.73.186"
 POLICY_PORT=8005
 ROBOT_HOST="xarmpc.pc.cs.cmu.edu"
 ROBOT_PORT=8080
 
 NUM_EPISODES=50
-START_EPISODE_IDX=20
+START_EPISODE_IDX=1
 CONTROL_FREQ=60
 QUERY_FREQ=30
 MAX_STEPS=7200
@@ -29,7 +29,7 @@ USE_CRITIC_SUBTASKS=false
 TASK_DESCRIPTION="Place the shirt on the hanger and hang it from the rod."
 
 LOG_VIDEOS=true
-VIDEO_SUBDIR="pi05_60k, Paligemma TD Learning, N=8"   # optional subdir under eval/xarm_scripts/tpu_eval/videos/ (empty = save directly there)
+VIDEO_SUBDIR="robocoin_bimanual_paligemma_cql_rlds_no_ntp, real_shirt_hang_paligemma_cql_rlds_finetune_task_description_final, 240k N=8"   # optional subdir under eval/xarm_scripts/tpu_eval/videos/ (empty = save directly there)
 DEBUG_VALUES=false
 MANUAL=true
 # =============================================================================

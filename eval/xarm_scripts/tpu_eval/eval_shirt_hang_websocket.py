@@ -653,6 +653,11 @@ def run_episode(
     terminated = False
     truncated = False
 
+    # Per-episode q-value npz logging disabled.
+    # q_log_steps: list[int] = []
+    # q_log_values: list[np.ndarray] = []
+    # qval_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qvalues")
+
     try:
         while not (terminated or truncated) and t < args.max_steps:
             tracker.update(obs)
@@ -688,6 +693,17 @@ def run_episode(
                 q_values = infer_result.get("q_values")
                 server_ms = infer_result.get("server_timing", {}).get("infer_ms")
 
+                # Per-episode .npz q-value persistence disabled.
+                # if q_values is not None:
+                #     q_log_steps.append(t)
+                #     q_log_values.append(np.asarray(q_values, dtype = np.float32).reshape(-1))
+                #     os.makedirs(qval_dir, exist_ok = True)
+                #     np.savez(
+                #         os.path.join(qval_dir, f"episode_{episode_idx}.npz"),
+                #         steps = np.asarray(q_log_steps, dtype = np.int64),
+                #         q_values = np.stack(q_log_values, axis = 0),
+                #     )
+
                 elapsed = time.perf_counter() - t0
 
                 action_plan = full_actions[
@@ -702,6 +718,30 @@ def run_episode(
                     values_str = ", ".join(f"{v:.4f}" for v in np.asarray(q_values).reshape(-1).tolist())
                     log_line += f", q_values=[{values_str}]"
                 logger.info(log_line)
+
+                # When the server decodes the current subtask (returns
+                # 'predicted_subtask'), dump the right/top camera frame so the
+                # decode can be eyeballed against what the critic actually saw.
+                predicted_subtask = infer_result.get("predicted_subtask")
+                if predicted_subtask is not None:
+                    decode_dir = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)), "decoded_subtask_images"
+                    )
+                    os.makedirs(decode_dir, exist_ok = True)
+                    right_top_rgb = images_rgb.get("base_0_rgb")  # "right/top" → base_0_rgb
+                    if right_top_rgb is not None:
+                        safe_subtask = "".join(
+                            c if c.isalnum() else "_" for c in str(predicted_subtask)
+                        )[:60]
+                        out_path = os.path.join(
+                            decode_dir, f"ep{episode_idx}_step{t}_{safe_subtask}.png"
+                        )
+                        imageio.imwrite(out_path, right_top_rgb)
+                        logger.info(
+                            f"[subtask decode] predicted={predicted_subtask!r} → "
+                            f"saved right/top image to {out_path}"
+                        )
+
                 if video_logger is not None:
                     video_logger.record_predict(images_rgb, q_values, t)
 
