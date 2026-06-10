@@ -227,11 +227,13 @@ def compute_rope_positions(
     """
     positions = jnp.cumsum(input_mask.astype(jnp.int32), axis = 1) - 1
     if subtask_start_index is not None and subtask_end_index is not None:
-        # subtask_end_index is inclusive → subtask length = end - start + 1; the extra
-        # +1 accounts for the trailing "\n" _tokenize_robocoin_subtask_prompt appends
-        # after the subtask at train time, which the inference critic prompt omits
-        # (best_of_n_policy.py tokenizes the critic prompt with append_newline=False).
-        shift_by = (subtask_end_index - subtask_start_index + 2).astype(jnp.int32)
+        # subtask_end_index points at the trailing "\n" _tokenize_robocoin_subtask_prompt
+        # appends after the subtask at train time (now included in the next-token objective),
+        # so the inclusive span length = end - start + 1 covers the subtask tokens plus that
+        # newline. The inference critic prompt omits the newline (best_of_n_policy.py uses
+        # append_newline=False), where subtask_end_index lands one past the last suffix token,
+        # yielding the same shift.
+        shift_by = (subtask_end_index - subtask_start_index + 1).astype(jnp.int32)
         positions = positions.at[:, shift_start_index:].add(-shift_by[:, None])
     return positions
 
@@ -253,11 +255,13 @@ def compute_suffix_positions(
         + jnp.cumsum(suffix_mask.astype(jnp.int32), axis = -1) - 1
     )
     if subtask_start_index is not None and subtask_end_index is not None:
-        # subtask_end_index is inclusive → subtask length = end - start + 1; the extra
-        # +1 accounts for the trailing "\n" _tokenize_robocoin_subtask_prompt appends
-        # after the subtask at train time, which the inference critic prompt omits
-        # (best_of_n_policy.py tokenizes the critic prompt with append_newline=False).
-        shift_by = (subtask_end_index - subtask_start_index + 2).astype(jnp.int32)
+        # subtask_end_index points at the trailing "\n" _tokenize_robocoin_subtask_prompt
+        # appends after the subtask at train time (now included in the next-token objective),
+        # so the inclusive span length = end - start + 1 covers the subtask tokens plus that
+        # newline. The inference critic prompt omits the newline (best_of_n_policy.py uses
+        # append_newline=False), where subtask_end_index lands one past the last suffix token,
+        # yielding the same shift.
+        shift_by = (subtask_end_index - subtask_start_index + 1).astype(jnp.int32)
         positions = positions - shift_by[:, None]
     return positions
 
@@ -320,6 +324,14 @@ class PaliGemmaNetworkConfig:
     # Tokens outside the action block remain causal.
     action_block_bidirectional: bool = False
 
+    # When True (and subtask_start/end_index are present in the data), the subtask
+    # suffix stays visible to state/action/CLS queries and keeps its natural RoPE
+    # positions: the suffix-blocking attention constraint and the position shift
+    # are both skipped, while the suffix remains causal so the next-token
+    # objective still applies. When False, value features are attention- and
+    # position-invariant to the subtask (current behavior).
+    predict_subtask_ar: bool = False
+
     def get_tokenizer(self, max_len: int | None = None):
         """Return the appropriate text tokenizer for this variant."""
         from openpi.models.tokenizer import Gemma3Tokenizer, Gemma4Tokenizer, PaligemmaTokenizer
@@ -376,12 +388,15 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         self._no_state = config.no_state
         self._image_keys = config.image_keys
         self._image_size = config.image_size
+        self._predict_subtask_ar = config.predict_subtask_ar
 
         logger.info(
             "PaliGemmaValueNetwork: variant=%s, is_gemma3=%s, is_gemma4=%s, action_conditioned=%s, "
-            "action_horizon=%s, no_state=%s, action_block_bidirectional=%s, use_layernorm=%s",
+            "action_horizon=%s, no_state=%s, action_block_bidirectional=%s, use_layernorm=%s, "
+            "predict_subtask_ar=%s",
             config.paligemma_variant, self._is_gemma3, self._is_gemma4, self._action_conditioned,
             self._action_horizon, self._no_state, config.action_block_bidirectional, config.use_layernorm,
+            config.predict_subtask_ar,
         )
 
         # Get config and module class based on variant
@@ -509,6 +524,26 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
     def feature_dim(self) -> int:
         """Return the output feature dimension (Gemma embed_dim)."""
         return self._feature_dim
+
+    def _suffix_blocking_mask(self, suffix_mask: jax.Array | None) -> jax.Array | None:
+        """Suffix mask used to hide subtask keys from non-suffix queries.
+
+        With predict_subtask_ar the subtask stays visible to state/action/CLS,
+        so no blocking mask is applied.
+        """
+        return None if self._predict_subtask_ar else suffix_mask
+
+    def _position_shift_indices(
+        self, observation: _model.Observation,
+    ) -> tuple[jax.Array | None, jax.Array | None]:
+        """Subtask indices passed to the RoPE position helpers.
+
+        With predict_subtask_ar the subtask keeps its natural positions, so the
+        shift is disabled by passing None.
+        """
+        if self._predict_subtask_ar:
+            return None, None
+        return observation.subtask_start_index, observation.subtask_end_index
 
     def _embed_sequence(
         self,
@@ -870,7 +905,7 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
 
         attn_mask = make_gemma4_attn_mask(
             input_mask,
-            suffix_mask = suffix_mask,
+            suffix_mask = self._suffix_blocking_mask(suffix_mask),
             action_start = action_block_start if self._gemma4_action_block_bidir else None,
             action_length = action_block_length if self._gemma4_action_block_bidir else None,
         )
@@ -906,18 +941,19 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
 
         attn_mask_unpadded = make_gemma4_attn_mask(
             prefix_mask,
-            suffix_mask = prefix_subtask_mask,
+            suffix_mask = self._suffix_blocking_mask(prefix_subtask_mask),
             action_start = None,
             action_length = None,
         )
         suffix_pad = jnp.zeros((batch_size, prefix_len, suffix_len), dtype = jnp.bool_)
         attn_mask = jnp.concatenate([attn_mask_unpadded, suffix_pad], axis = -1)
 
+        shift_subtask_start, shift_subtask_end = self._position_shift_indices(observation)
         positions = compute_rope_positions(
             prefix_mask,
             shift_start_index = text_end,
-            subtask_start_index = observation.subtask_start_index,
-            subtask_end_index = observation.subtask_end_index,
+            subtask_start_index = shift_subtask_start,
+            subtask_end_index = shift_subtask_end,
         )
         per_layer_input = None
         if self._gemma4_per_layer_input_dim > 0:
@@ -982,8 +1018,9 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
                 & (prefix_positions[None, :] < text_end_local)
             )
 
-        if prefix_subtask_mask is not None:
-            allowed_prefix_keys = prefix_mask & ~prefix_subtask_mask
+        blocked_subtask_keys = self._suffix_blocking_mask(prefix_subtask_mask)
+        if blocked_subtask_keys is not None:
+            allowed_prefix_keys = prefix_mask & ~blocked_subtask_keys
         else:
             allowed_prefix_keys = prefix_mask
         # AND with input_mask so padded action-query rows attend to nothing,
@@ -1000,10 +1037,11 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
         )
         attn_mask = jnp.concatenate([suffix_to_prefix, suffix_to_suffix], axis = -1)
 
+        shift_subtask_start, shift_subtask_end = self._position_shift_indices(observation)
         positions = compute_suffix_positions(
             prefix_mask, input_mask,
-            subtask_start_index = observation.subtask_start_index,
-            subtask_end_index = observation.subtask_end_index,
+            subtask_start_index = shift_subtask_start,
+            subtask_end_index = shift_subtask_end,
         )
 
         per_layer_input = None
@@ -1173,13 +1211,15 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             # Block actions / CLS from attending to subtask-text positions in the
             # cached prefix, matching the suffix_mask blocking on the full-forward
             # path. `subtask_mask` was computed once in compute_prefix_cache.
-            if subtask_mask is not None:
-                suffix_to_prefix = suffix_to_prefix & ~subtask_mask[:, None, :]
+            blocked_subtask_keys = self._suffix_blocking_mask(subtask_mask)
+            if blocked_subtask_keys is not None:
+                suffix_to_prefix = suffix_to_prefix & ~blocked_subtask_keys[:, None, :]
             attn_mask = jnp.concatenate([suffix_to_prefix, suffix_to_suffix], axis = -1)
+            shift_subtask_start, shift_subtask_end = self._position_shift_indices(observation)
             positions = compute_suffix_positions(
                 prefix_mask, suffix_mask,
-                subtask_start_index = observation.subtask_start_index,
-                subtask_end_index = observation.subtask_end_index,
+                subtask_start_index = shift_subtask_start,
+                subtask_end_index = shift_subtask_end,
             )
 
             (output,), _ = self.PaliGemma.llm(
@@ -1215,13 +1255,14 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
             tokens, input_mask, ar_mask, suffix_mask, shift_start_index = self._embed_sequence(
                 observation, action = action_array, action_mask = action_mask_array
             )
-            attn_mask = make_attn_mask(input_mask, ar_mask, suffix_mask = suffix_mask)
+            attn_mask = make_attn_mask(input_mask, ar_mask, suffix_mask = self._suffix_blocking_mask(suffix_mask))
 
+        shift_subtask_start, shift_subtask_end = self._position_shift_indices(observation)
         positions = compute_rope_positions(
             input_mask,
             shift_start_index = shift_start_index,
-            subtask_start_index = observation.subtask_start_index,
-            subtask_end_index = observation.subtask_end_index,
+            subtask_start_index = shift_subtask_start,
+            subtask_end_index = shift_subtask_end,
         )
 
         # Gemma 4 per-layer-input (computed once from embeddings + token ids).
@@ -1325,16 +1366,17 @@ class PaliGemmaValueNetwork(BaseValueNetwork):
                 seq_positions[None, :] < text_start + text_len
             )
             prefix_ar_mask = prefix_ar_mask[None, :] | suffix_mask  # [B, N]
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask, suffix_mask = suffix_mask)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask, suffix_mask = self._suffix_blocking_mask(suffix_mask))
         # Same shift_start_index as _embed_sequence's original-PaliGemma branch.
         shift_start_index = self._num_cameras * NUM_PATCHES_PER_IMAGE
         if observation.tokenized_prompt is not None:
             shift_start_index += observation.tokenized_prompt.shape[1]
+        shift_subtask_start, shift_subtask_end = self._position_shift_indices(observation)
         positions = compute_rope_positions(
             prefix_mask,
             shift_start_index = shift_start_index,
-            subtask_start_index = observation.subtask_start_index,
-            subtask_end_index = observation.subtask_end_index,
+            subtask_start_index = shift_subtask_start,
+            subtask_end_index = shift_subtask_end,
         )
         _, kv_cache = self.PaliGemma.llm([prefix_tokens], mask = prefix_attn_mask, positions = positions)
         return kv_cache, prefix_mask, suffix_mask

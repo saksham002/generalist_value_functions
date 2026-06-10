@@ -183,6 +183,10 @@ def test_tokenize_robocoin_subtask_prompt():
     assert "Lift the hanger off the rod." in decoded_prefix
     assert "Hook one side of the shirt onto the hanger." in decoded_suffix
     assert "rod. Hook" in decoded_prompt
+    # subtask_end_index points at the trailing newline appended after the subtask, so the
+    # next-token objective is supervised through the subtask's terminating newline.
+    newline_id = int(tokenizer._tokenizer.encode("\n")[0])
+    assert int(data["tokenized_prompt"][subtask_end_index]) == newline_id
 
 
 def test_resize_images_resizes_next_image():

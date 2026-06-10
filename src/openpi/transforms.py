@@ -737,7 +737,7 @@ def _tokenize_robocoin_subtask_prompt_gemma4(
     newline_tokens = tokenizer._tokenizer.encode("\n") if append_newline else []
     raw_tokens = prefix_tokens + suffix_tokens + newline_tokens
     subtask_start_index = len(prefix_tokens)
-    subtask_end_index = subtask_start_index + len(suffix_tokens) - 1
+    subtask_end_index = subtask_start_index + len(suffix_tokens)
 
     max_len = tokenizer._max_len
     tokens_len = len(raw_tokens)
@@ -784,7 +784,7 @@ def _tokenize_robocoin_subtask_prompt(
     newline_tokens = tokenizer._tokenizer.encode("\n") if append_newline else []
     raw_tokens = prefix_tokens + suffix_tokens + newline_tokens
     subtask_start_index = len(prefix_tokens)
-    subtask_end_index = subtask_start_index + len(suffix_tokens) - 1
+    subtask_end_index = subtask_start_index + len(suffix_tokens)
 
     image_tokenizer = isinstance(tokenizer, (_tokenizer.Gemma3Tokenizer, _tokenizer.Gemma4Tokenizer))
     if image_tokenizer and tokenizer._num_images > 0:
