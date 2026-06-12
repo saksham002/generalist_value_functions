@@ -15,7 +15,7 @@ ROBOT_HOST="xarmpc.pc.cs.cmu.edu"
 ROBOT_PORT=8080
 
 NUM_EPISODES=50
-START_EPISODE_IDX=1
+START_EPISODE_IDX=20
 CONTROL_FREQ=60
 QUERY_FREQ=30
 MAX_STEPS=7200
@@ -24,12 +24,12 @@ HAS_CRITIC=true
 NUM_SAMPLES=8
 # true: critic conditioned on per-step subtask prompts; false: critic gets TASK_DESCRIPTION (same prompt as the policy).
 # Requires a critic served with a prompt_mode that reads the client prompt (NOT task_description_predict_current_subtask).
-USE_CRITIC_SUBTASKS=false
+USE_CRITIC_SUBTASKS=true
 # Sent to the critic when USE_CRITIC_SUBTASKS=false; must match serve_policy_shirt_hang.sh --task-description.
 TASK_DESCRIPTION="Place the shirt on the hanger and hang it from the rod."
 
 LOG_VIDEOS=true
-VIDEO_SUBDIR="robocoin_bimanual_paligemma_cql_rlds_no_ntp, real_shirt_hang_paligemma_cql_rlds_finetune_task_description_final, 240k N=8"   # optional subdir under eval/xarm_scripts/tpu_eval/videos/ (empty = save directly there)
+VIDEO_SUBDIR="robocoin_bimanual_paligemma_cql_rlds_subtask_no_ntp, real_shirt_hang_paligemma_cql_rlds_finetune_subtask_final, 250k N=8, redo"   # optional subdir under eval/xarm_scripts/tpu_eval/videos/ (empty = save directly there)
 DEBUG_VALUES=false
 MANUAL=true
 # =============================================================================

@@ -17,10 +17,10 @@ POLICY_STEP=60000
 
 # Set CRITIC_ENABLE=false to serve the policy without BestOfN.
 CRITIC_ENABLE=true
-CRITIC_CONFIG="robocoin_bimanual_paligemma_cql_rlds_no_ntp"
-CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_cql_rlds_no_ntp/robocoin_bimanual_paligemma_cql_rlds_no_ntp/real_shirt_hang_paligemma_cql_rlds_finetune_task_description_final"
-CRITIC_STEP=240000
-CRITIC_FT_CONFIG="real_shirt_hang_paligemma_cql_rlds_finetune_task_description_final"
+CRITIC_CONFIG="robocoin_bimanual_paligemma_cql_rlds_subtask_no_ntp"
+CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_cql_rlds_subtask_no_ntp/robocoin_bimanual_paligemma_cql_rlds_subtask_no_ntp/real_shirt_hang_paligemma_cql_rlds_finetune_subtask_final"
+CRITIC_STEP=250000
+CRITIC_FT_CONFIG="real_shirt_hang_paligemma_cql_rlds_finetune_subtask_final"
 NUM_SAMPLES=8
 # When true, pass --critic.expect-critic-images: the critic consumes a separate obs["critic_image"]
 # stream (the eval client must send it; needed when the critic's image size/pipeline differs from the
@@ -39,7 +39,14 @@ if [ "${CRITIC_ENABLE}" = true ]; then
     else
         CRITIC_IMAGES_FLAG=""
     fi
-    CRITIC_BLOCK="critic:critic-args --critic.config ${CRITIC_CONFIG} --critic.dir ${CRITIC_DIR} --critic.step ${CRITIC_STEP} --critic.fine-tune-config ${CRITIC_FT_CONFIG} --critic.num-samples ${NUM_SAMPLES} --critic.sample-parallel --critic.fsdp-devices 16 ${CRITIC_IMAGES_FLAG}"
+    # Omit --critic.fine-tune-config when empty (CriticArgs.fine_tune_config defaults
+    # to None); passing the flag with no value is a tyro parse error.
+    if [ -n "${CRITIC_FT_CONFIG}" ]; then
+        CRITIC_FT_FLAG="--critic.fine-tune-config ${CRITIC_FT_CONFIG}"
+    else
+        CRITIC_FT_FLAG=""
+    fi
+    CRITIC_BLOCK="critic:critic-args --critic.config ${CRITIC_CONFIG} --critic.dir ${CRITIC_DIR} --critic.step ${CRITIC_STEP} ${CRITIC_FT_FLAG} --critic.num-samples ${NUM_SAMPLES} --critic.sample-parallel --critic.fsdp-devices 16 ${CRITIC_IMAGES_FLAG}"
 else
     # --use-bestofn-loader routes through BestOfNPolicy so the action-dim slice runs before Unnormalize.
     PRE_POLICY_FLAGS="--use-bestofn-loader"
