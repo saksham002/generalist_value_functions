@@ -57,12 +57,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 
-def _resolve_config_with_fine_tune(config_name: str, fine_tune: str | None):
+def _resolve_config_with_fine_tune(config_name: str, fine_tune: str | None, rlds_data_dir: str | None = None):
     """Resolve openpi config and optionally apply a FineTuneConfig's overrides.
 
     Mirrors the fine-tune handling in `scripts/train_value_function.py` (with
     `pretrained_step = None`, since we are not training): only data/model/interval
     overrides are applied, no schedule offsetting.
+
+    ``rlds_data_dir`` optionally overrides the config's data dir (e.g. to point at a
+    local mirror / a mini dataset instead of the GCS default baked into the config).
 
     Returns (config, data_config, dataset_cfg, model_config).
     """
@@ -72,6 +75,8 @@ def _resolve_config_with_fine_tune(config_name: str, fine_tune: str | None):
     if fine_tune is not None:
         ft_config = _config.get_fine_tune_config(fine_tune)
         config = ft_config.apply_overrides(config)
+    if rlds_data_dir is not None:
+        config = dataclasses.replace(config, data = dataclasses.replace(config.data, rlds_data_dir = rlds_data_dir))
 
     data_config = config.data.create(config.assets_dirs, config.model)
 
@@ -126,6 +131,9 @@ class CommonArgs:
     reverse: bool = False
     """If True, reverse shard processing order and skip metadata writes. Intended for running
     a second set of workers that converge from the opposite end."""
+
+    rlds_data_dir: str | None = None
+    """Optional override of the config's data dir (e.g. a local mini dataset). Forwarded to workers."""
 
 
 @dataclasses.dataclass
@@ -263,7 +271,9 @@ def run_worker(args: WorkerArgs) -> None:
     cache_tag = os.environ.get("SLURM_JOB_ID") or f"worker_{worker_id}"
     os.environ["OPENPI_DATA_HOME"] = os.path.expanduser(f"~/.cache/openpi_ca/{cache_tag}")
 
-    config, data_config, dataset_cfg, _ = _resolve_config_with_fine_tune(args.config_name, args.fine_tune)
+    config, data_config, dataset_cfg, _ = _resolve_config_with_fine_tune(
+        args.config_name, args.fine_tune, args.rlds_data_dir,
+    )
 
     # This worker has no subsample support: it samples on the raw (un-subsampled)
     # steps, so a subsample=True config would misalign the cache with training.
@@ -1142,7 +1152,9 @@ def run_launch(args: LaunchArgs) -> None:
         import tensorflow as tf
 
         tf.config.set_visible_devices([], "GPU")
-        _, data_config, dataset_cfg, _ = _resolve_config_with_fine_tune(args.config_name, args.fine_tune)
+        _, data_config, dataset_cfg, _ = _resolve_config_with_fine_tune(
+            args.config_name, args.fine_tune, args.rlds_data_dir,
+        )
         total_episodes = get_total_episodes(data_config.rlds_data_dir, dataset_cfg, args.split)
 
     logger.info(f"Total source episodes: {total_episodes}")
@@ -1194,6 +1206,8 @@ def run_launch(args: LaunchArgs) -> None:
         extra_worker_args += ["--reverse"]
     if args.fine_tune is not None:
         extra_worker_args += ["--fine-tune", args.fine_tune]
+    if args.rlds_data_dir is not None:
+        extra_worker_args += ["--rlds-data-dir", args.rlds_data_dir]
 
     extra_args_str = " ".join(extra_worker_args)
 
