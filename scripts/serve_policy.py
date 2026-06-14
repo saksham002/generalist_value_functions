@@ -94,6 +94,10 @@ class CriticArgs:
     # policy-normalized space; for quantile-norm critics the action range is
     # roughly [-1.25, 1.25], so 0.01 is a ~1%-of-range perturbation.
     noise_level: float = 0.0
+    # For a predict_subtask_ar critic only: re-decode the current subtask once
+    # every N infer calls and reuse the cached subtask string in between (the
+    # subtask is a slow-changing phase label). Ignored for non-subtask_ar critics.
+    subtask_decode_every: int = 20
 
 
 @dataclasses.dataclass
@@ -220,6 +224,7 @@ def create_policy(args: Args) -> _policy.BasePolicy:
                 fsdp_devices = args.critic.fsdp_devices,
                 inject_noise = args.critic.inject_noise,
                 noise_level = args.critic.noise_level,
+                subtask_decode_every = args.critic.subtask_decode_every,
             )
         # use_bestofn_loader=True without critic: load policy through
         # BestOfNPolicy (which applies the bimanual-EEF action-dim slice)

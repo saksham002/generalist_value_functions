@@ -31,13 +31,6 @@ import openpi.models.model as _model
 
 logger = logging.getLogger(__name__)
 
-# The env's known subtask strings, used as early-exit targets during decoding.
-DEFAULT_SUBTASK_TARGETS = (
-    "Insert the white block into the pink one",
-    "Insert the right end of this combination into the blue block",
-    "Place the combination on the wooden platform",
-)
-
 
 def critic_value_network(critic_model: Any) -> Any:
     """Resolve the PaliGemma value network used for subtask decoding.
@@ -62,9 +55,9 @@ class SubtaskDecoder:
         decode_every: Run the decode only once every N `should_decode()` calls.
             Use a large value to keep per-infer latency low; `force=True`
             overrides it for on-demand decodes.
-        max_tokens: Max subtask tokens to decode per call.
-        subtask_targets: Known subtask strings; decoding stops early once the
-            emitted prefix exactly matches one of them.
+        max_tokens: Max subtask tokens to decode per call. Decoding stops at the
+            trailing "\n" (the model's learned terminator, emitted after the
+            subtask) or once `max_tokens` is reached, whichever comes first.
     """
 
     def __init__(
@@ -74,7 +67,6 @@ class SubtaskDecoder:
         *,
         decode_every: int = 20,
         max_tokens: int = 16,
-        subtask_targets: tuple[str, ...] = DEFAULT_SUBTASK_TARGETS,
     ) -> None:
         self._critic_model = critic_model
         self._critic_tokenizer = critic_tokenizer
@@ -82,8 +74,8 @@ class SubtaskDecoder:
         self.max_tokens = int(max_tokens)
         self._call_count = 0
         self._eos_id = self._resolve_eos_id()
+        self._newline_id = self._resolve_newline_id()
         self._build_closures()
-        self._build_targets(subtask_targets)
 
     # ------------------------------------------------------------------ API
     def should_decode(self, *, force: bool = False) -> bool:
@@ -123,6 +115,15 @@ class SubtaskDecoder:
             inner = getattr(self._critic_tokenizer, "tokenizer", None)
             eos = inner.eos_id() if inner is not None and hasattr(inner, "eos_id") else None
         return eos
+
+    def _resolve_newline_id(self) -> int | None:
+        # The critic is trained to emit the trailing "\n" appended after the
+        # subtask (NTP through the newline), so "\n" is the decode terminator.
+        inner = getattr(self._critic_tokenizer, "_tokenizer", None)
+        if inner is None:
+            return None
+        ids = inner.encode("\n")
+        return int(ids[-1]) if ids else None
 
     def _build_closures(self) -> None:
         from openpi.value_functions.networks.paligemma import NUM_PATCHES_PER_IMAGE
@@ -168,20 +169,43 @@ class SubtaskDecoder:
                 )
                 return last_hidden, kv_cache, prefix_mask, last_text_pos
 
-            def _decode_step(critic_model, token_id, kv_cache, prefix_mask, last_text_pos, suffix_pos_so_far):
-                # gemma_2b path. NOT JIT'd: kv_cache extends by 1 every call,
-                # so a JIT'd version would recompile 16 times.
+            @nnx.jit
+            def _decode_suffix(critic_model, suffix_token_ids, num_emitted, kv_cache, prefix_mask, last_text_pos):
+                # gemma_2b JIT'd decode. Re-forwards the FIXED-length [1, max_tokens]
+                # padded suffix against the cached prefix on every step: feeding a
+                # constant number of suffix tokens keeps the concatenated cache
+                # (prefix_len + max_tokens) at a constant shape, so this compiles
+                # ONCE and is reused for all steps. The old one-token path grew the
+                # cache by 1 each call, so a JIT'd version would recompile per step —
+                # which is why it ran eagerly (~1.85 s/token of op-by-op dispatch).
+                # `num_emitted` is traced (it only drives the key-validity mask), so
+                # it never triggers a recompile. The short suffix k/v are recomputed
+                # each step (cheap for <=16 tokens); the expensive prefix stays cached.
                 n = critic_value_network(critic_model)
-                tok_arr = jnp.asarray(token_id, dtype = jnp.int32).reshape(1, 1)
-                tok_embed = n.PaliGemma.llm(tok_arr, method = "embed")
-                to_prefix = prefix_mask[:, None, :]
-                to_suffix = jnp.ones((1, 1, suffix_pos_so_far + 1), dtype = jnp.bool_)
-                mask = jnp.concatenate([to_prefix, to_suffix], axis = -1)
-                position = (last_text_pos + suffix_pos_so_far + 1).reshape(1, 1)
-                (hidden,), kv_cache = n.PaliGemma.llm(
-                    [tok_embed], mask = mask, positions = position, kv_cache = kv_cache,
+                max_tokens = suffix_token_ids.shape[1]
+                prefix_len = prefix_mask.shape[1]
+                suffix_embeds = n.PaliGemma.llm(suffix_token_ids, method = "embed")
+                to_prefix = jnp.broadcast_to(prefix_mask[:, None, :], (1, max_tokens, prefix_len))
+                causal = jnp.tril(jnp.ones((max_tokens, max_tokens), dtype = jnp.bool_))
+                valid_keys = (jnp.arange(max_tokens) < num_emitted)[None, :]
+                to_suffix = (causal & valid_keys)[None, :, :]
+                attn_mask = jnp.concatenate([to_prefix, to_suffix], axis = -1)
+                positions = last_text_pos[:, None] + 1 + jnp.arange(max_tokens)[None, :]
+                (hidden,), _ = n.PaliGemma.llm(
+                    [suffix_embeds], mask = attn_mask, positions = positions, kv_cache = kv_cache,
                 )
-                return hidden, kv_cache
+                # Decode ONLY the last emitted position (num_emitted-1) and pick the
+                # next token + its log-prob inside the JIT, so the per-step host
+                # transfer is two scalars (no eager argmax / log_softmax over the
+                # full vocab and no full-logits materialisation).
+                last_hidden = jax.lax.dynamic_index_in_dim(
+                    hidden[0], num_emitted - 1, axis = 0, keepdims = True,
+                )  # [1, embed_dim]
+                logits_row = n.decode(last_hidden[None])[0, 0]  # [vocab]
+                next_id = jnp.argmax(logits_row).astype(jnp.int32)
+                chosen_logp = jax.nn.log_softmax(logits_row)[next_id]
+                return next_id, chosen_logp
+            _decode_step = None
         else:
             # gemma4 path: leverages `_build_gemma4_prefix_cache_inputs` from
             # the value-network for the prefix forward (fixed-size cache,
@@ -257,6 +281,7 @@ class SubtaskDecoder:
                     per_layer_input = per_layer_input,
                 )
                 return hidden, kv_cache
+            _decode_suffix = None
 
         @nnx.jit
         def _logits_from_hidden(critic_model, hidden):
@@ -264,35 +289,8 @@ class SubtaskDecoder:
 
         self._prefix_forward = _prefix_forward
         self._decode_step = _decode_step
+        self._decode_suffix = _decode_suffix
         self._logits = _logits_from_hidden
-
-    def _build_targets(self, subtask_targets: tuple[str, ...]) -> None:
-        # Pre-tokenize the known subtask strings the SAME way the autoregressive
-        # decoder emits — bypass the public `tokenize()` (which adds a leading
-        # BOS for paligemma and always appends "\n") and call the underlying
-        # SentencePieceProcessor with add_bos=False directly so the resulting ids
-        # align with the model's own token stream.
-        inner_spp = getattr(self._critic_tokenizer, "_tokenizer", None)
-        target_seqs: list[list[int]] = []
-        for s in subtask_targets:
-            if inner_spp is not None:
-                tok_ids = [int(t) for t in inner_spp.encode(s, add_bos = False)]
-            else:
-                # Fallback: tokenize via public API, then strip BOS prefix and
-                # trailing "\n" token (id 108 in gemma sentencepiece).
-                toks, mask = self._critic_tokenizer.tokenize(s, None)
-                n_valid = int(np.asarray(mask).sum())
-                tok_ids = [int(t) for t in np.asarray(toks)[:n_valid].tolist()]
-                if tok_ids and tok_ids[0] == 2:    # BOS
-                    tok_ids = tok_ids[1:]
-                if tok_ids and tok_ids[-1] == 108:  # "\n"
-                    tok_ids = tok_ids[:-1]
-            target_seqs.append(tok_ids)
-        self._target_seqs = target_seqs
-        logger.info(
-            f"[subtask_predict] target token sequences (len each): "
-            f"{[len(s) for s in target_seqs]}"
-        )
 
     def _predict_tokens(self, critic_obs: _model.Observation) -> tuple[list[int], str, float]:
         out = self._prefix_forward(self._critic_model, critic_obs)
@@ -314,25 +312,35 @@ class SubtaskDecoder:
         chosen_logp = float(np.asarray(log_probs[next_tok]))
         predicted: list[int] = [next_tok]
         total_neg_logp: float = -chosen_logp
+        # gemma_2b host-side suffix buffer (filled as tokens are emitted, fed to
+        # the fixed-shape jitted `_decode_suffix`); unused on the gemma4 path.
+        suffix_ids = np.zeros((1, self.max_tokens), dtype = np.int32)
         for k in range(1, self.max_tokens):
-            if self._eos_id is not None and next_tok == self._eos_id:
-                break
-            # Early-exit once the emitted prefix exactly matches a known subtask.
-            if any(predicted == seq for seq in self._target_seqs):
+            # Stop only at the trailing "\n" (the model's learned terminator) or
+            # once max_tokens is reached. The "\n" is kept in `predicted` (so the
+            # per-token cost counts it) and stripped from the decoded text below.
+            if next_tok == self._newline_id or (self._eos_id is not None and next_tok == self._eos_id):
                 break
             if self._is_gemma4:
                 hidden, kv_cache = self._decode_step(
                     self._critic_model, next_tok, kv_cache, prefix_mask, last_text_pos,
                     prefix_len, cache_size, k - 1,
                 )
+                logits_row = self._logits(self._critic_model, hidden)[0, 0]
+                log_probs = jax.nn.log_softmax(logits_row)
+                next_tok = int(np.asarray(jnp.argmax(logits_row)))
+                chosen_logp = float(np.asarray(log_probs[next_tok]))
             else:
-                hidden, kv_cache = self._decode_step(
-                    self._critic_model, next_tok, kv_cache, prefix_mask, last_text_pos, k - 1,
+                # Feed the k emitted tokens (slots 0..k-1); the jitted step reads
+                # the hidden at the last emitted position (k-1) and returns the
+                # next token + its log-prob (both scalars).
+                suffix_ids[0, k - 1] = predicted[k - 1]
+                next_id, logp = self._decode_suffix(
+                    self._critic_model, jnp.asarray(suffix_ids), jnp.asarray(k, dtype = jnp.int32),
+                    kv_cache, prefix_mask, last_text_pos,
                 )
-            logits = self._logits(self._critic_model, hidden)
-            log_probs = jax.nn.log_softmax(logits[0, 0])
-            next_tok = int(np.asarray(jnp.argmax(logits[0, 0])))
-            chosen_logp = float(np.asarray(log_probs[next_tok]))
+                next_tok = int(np.asarray(next_id))
+                chosen_logp = float(np.asarray(logp))
             total_neg_logp += -chosen_logp
             predicted.append(next_tok)
         if hasattr(self._critic_tokenizer, "decode"):
@@ -340,9 +348,13 @@ class SubtaskDecoder:
         else:
             inner = getattr(self._critic_tokenizer, "tokenizer", None)
             decoded = inner.decode(predicted) if inner is not None else " ".join(map(str, predicted))
+        # Strip the trailing "\n" (and any surrounding whitespace) the model
+        # emits as its terminator — the value prompt re-adds a clean "\n" via
+        # `append_newline=True`, so keeping it here would double the newline.
+        decoded = str(decoded).strip()
         # PP = exp(-(1/T) * sum_t log p(x_t | x_<t)); using the argmax token at
         # each step (greedy decode), so this is the perplexity of the model's
         # own most-confident path conditioned on the current observation.
         n_tokens = max(1, len(predicted))
         perplexity = float(np.exp(total_neg_logp / n_tokens))
-        return predicted, str(decoded), perplexity
+        return predicted, decoded, perplexity
