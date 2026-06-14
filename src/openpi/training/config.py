@@ -4288,6 +4288,76 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/real_shirt_hang/validation_cache_dir_real_shirt_hang_paligemma_cql_rlds_finetune_subtask_final/",
         include_repos = (),
     ),
+    # Same as real_shirt_hang_paligemma_cql_rlds_finetune_task_description_final but
+    # with predict_subtask_ar=True in the restated q_network_config, for fine-tuning the
+    # robocoin_bimanual_paligemma_cql_rlds_subtask_ar base. Prompt mode stays
+    # "task_description_predict_current_subtask" (same as that base); only the AR flag
+    # differs from the plain _task_description_final config.
+    FineTuneConfig(
+        name = "real_shirt_hang_paligemma_cql_rlds_finetune_subtask_ar_final",
+        data_factory = Hdf5RldsDataConfig(
+            repo_id = "real_shirt_hang",
+            rlds_data_dir = "gs://saksham-euw4/hdf5",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "real_shirt_hang", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/real_shirt_hang",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            use_eef = True,
+            state_dim = 14,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/real_shirt_hang_pi05/",
+            max_token_len = 96,
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        # q_network_config is byte-identical to the subtask_ar base's
+        # q_network_config (224x224 images, no_state=True, predict_subtask_ar=True,
+        # default paligemma backbone, no layernorm) — restated so the pretrained
+        # checkpoint loads without any shape mismatch and the AR behavior is preserved.
+        model_overrides = {
+            "action_horizon": 60,
+            "q_network_config": _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                max_token_len = 96,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = True,
+            ),
+        },
+        # Bump the Best-of-N policy's action_horizon to match the 60-frame
+        # data chunks. Without this the policy stays at the pretrain 50 and
+        # value_function_objectives.py reshape (~lines 339, 507, 521) blows up
+        # on the 60-frame CF candidates.
+        policy_overrides = {
+            "action_horizon": 60,
+        },
+        action_horizon = 60,
+        num_train_steps = 20_000,
+        save_interval = 10_000,
+        plot_interval = 10_000,
+        keep_period = 10_000,
+        # Cosine decay 5e-6 -> 5e-7 over the 20k FT steps. FineTuneConfig wraps
+        # this in an OffsetSchedule with offset=pretrained_step, so step 0 of the
+        # cosine corresponds to the FT-start absolute step.
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
+        ),
+        num_val_trajectories = 3,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/real_shirt_hang/validation_cache_dir_real_shirt_hang_paligemma_cql_rlds_finetune_subtask_ar_final/",
+        include_repos = (),
+    ),
     FineTuneConfig(
         name = "real_shirt_hang_q_sarsa_finetune_task_description",
         data_factory = Hdf5RldsDataConfig(
