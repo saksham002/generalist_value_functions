@@ -97,8 +97,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             raise ValueError("state_dim=16 requires use_eef=False (zero-padding only applies to raw 14D state).")
         if filter_n is not None and filter_n % 5 != 0:
             raise ValueError(f"filter_n must be a multiple of 5, got {filter_n}")
-        if variable_horizon and mask_boundary_actions:
-            raise ValueError("variable_horizon=True requires mask_boundary_actions=False")
         if variable_horizon and td_n != action_chunk_size:
             raise ValueError(
                 "variable_horizon=True requires td_n == action_chunk_size, "
@@ -344,11 +342,23 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
                 )
             else:
                 sampled_k_native = tf.broadcast_to(sampled_k_cap, tf.shape(steps))
-            k_native = tf.minimum(sampled_k_native, tf.reduce_sum(tf.cast(base_action_mask, tf.int32), axis = -1))
+            # With boundary masking, cap the sampled horizon at the number of valid
+            # actions until subtask end; otherwise let it cross the subtask boundary.
+            if self._mask_boundary_actions:
+                k_native = tf.minimum(
+                    sampled_k_native, tf.reduce_sum(tf.cast(base_action_mask, tf.int32), axis = -1)
+                )
+            else:
+                k_native = sampled_k_native
             next_indices = tf.minimum(tf.range(traj_len, dtype = tf.int32)[:, None] + k_native, traj_len - 1)
             mapped_traj["variable_k_native"] = k_native
             mapped_traj["action_mask"] = offsets[None, None, :] < k_native[:, :, None]
-            mapped_traj["next_action_mask"] = mapped_traj["action_mask"] & (offsets[None, None, :] <= (steps - k_native)[:, :, None])
+            if self._mask_boundary_actions:
+                mapped_traj["next_action_mask"] = mapped_traj["action_mask"] & (
+                    offsets[None, None, :] <= (steps - k_native)[:, :, None]
+                )
+            else:
+                mapped_traj["next_action_mask"] = mapped_traj["action_mask"]
         else:
             next_indices = self._compute_next_indices(traj_len, fps)
             td_n_native = tf.where(
