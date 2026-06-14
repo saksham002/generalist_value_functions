@@ -24,6 +24,7 @@ from openpi.robocoin_utils.utils import SnapshotConfig
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.sharding as _sharding
 import openpi.transforms as _transforms
 import openpi.value_functions.base_value_functions as _base_vf
 from openpi.value_functions.networks.paligemma import NUM_PATCHES_PER_IMAGE
@@ -120,6 +121,56 @@ class EvalConfig:
     batch_size: int = 32
     # If True, populate the validation cache and exit before plotting.
     cache_only: bool = False
+    # Action-gradient-norm mode (action-conditioned Q critics only). When set,
+    # write one ``<demo>.npz`` per evaluated validation demo into this dir — each
+    # holding the per-frame squared L2 norm of the action gradient,
+    # ``||grad_a Q(s, a)||^2`` (summed over the whole 60x14 action chunk), the
+    # predicted Q, and the MC return — then exit before the normal plotting /
+    # subtask / BestOfN paths. Demos are drawn from the validation split,
+    # filtered to is_partial=False and has_subtask_annotations=True.
+    action_gradient_norm_dir: str | None = None
+    # Number of validation demos to evaluate in action-gradient-norm mode.
+    num_grad_demos: int = 5
+    # Shared cache dir for action-gradient-norm mode. When set, demos are cached
+    # here (and reused if already populated) instead of under
+    # ``<action_gradient_norm_dir>/val_cache``. Point multiple runs (e.g. two
+    # critics) at the same dir so they evaluate the identical cached demos; the
+    # first run populates it and later runs reuse it. npz outputs still go to each
+    # run's own ``action_gradient_norm_dir``.
+    grad_cache_dir: str | None = None
+    # Which action to evaluate Q(s, a) / grad_a Q at in action-gradient-norm mode:
+    # "dataset" -> the behaviour action from the dataset (prefix="");
+    # "cached"  -> the first cached counterfactual action, cached_action[0]
+    #              (prefix="counterfactual_", i.e. counterfactual_actions[:, 0]).
+    # "cached" requires the counterfactual action store to be joined, which only
+    # happens on the train split (see rlds_dataset.py), so use --split train and
+    # set --counterfactual-action-store-dir (or a config that already sets it).
+    grad_action_source: str = "dataset"
+    # Optional override of the data config's rlds_data_dir (e.g. point at a local
+    # mirror of the TFDS data instead of the GCS default baked into the config).
+    rlds_data_dir: str | None = None
+    # Directory for the per-episode subtask-snapshot debug .npz (sparse
+    # perplexity samples, subtask boundaries, per-frame value predictions).
+    # Defaults to the legacy /nfs path so TPU runs are unchanged; override to a
+    # local dir on GPU (the /nfs mount is TPU-only). If set empty/None it falls
+    # back to output_dir, and is skipped when that is also unset.
+    snapshot_debug_dir: str | None = "/nfs/aidm_nfs/saksham3/robocoin/snapshot_debug"
+    # Subtask-npz mode (subtask critics only). When set, write one
+    # ``<traj>.npz`` per evaluated trajectory into this dir — holding every
+    # per-frame value prediction, the ground-truth subtask boundaries, and the
+    # autoregressively-decoded subtask predictions sampled at
+    # ``subtask_decode_stride`` frame intervals — and skip the per-trajectory
+    # video + snapshot rendering. None → normal (video) path.
+    subtask_npz_dir: str | None = None
+    # Frame stride between autoregressive subtask decodes when subtask_npz_dir
+    # is set. Ignored on the normal path (which decodes once per second).
+    subtask_decode_stride: int = 30
+    # Number of FSDP devices for the inference mesh. None → jax.device_count()
+    # (prior default: pure FSDP, params sharded across devices, inputs
+    # replicated). Set to 1 on a GPU node for pure data parallelism: params
+    # replicated and each batched value forward split along the batch axis
+    # across all devices (mesh = (device_count, 1)).
+    fsdp_devices: int | None = None
     # Optional wandb run name (used when output_dir is None → wandb logging).
     # Defaults to f"eval_{config_name}" when unset.
     wandb_run_name: str | None = None
@@ -152,12 +203,15 @@ def _load_cached_trajectories(cache_dir: str) -> dict[str, list[dict]]:
     # bare filename (sans .pkl) as the trajectory key. The older `traj_<int>`
     # naming is no longer produced by cache_val_episodes, which writes
     # `<sanitized_repo_key>.pkl` (e.g. RoboCOIN__Split_aloha_pour_tea.pkl).
+    # epath so a gs:// cache dir works (reads pickle bytes straight from GCS),
+    # in addition to local/NFS paths.
+    from etils import epath
+
     traj_frames: dict[str, list[dict]] = {}
-    for filename in sorted(os.listdir(cache_dir)):
-        if filename.endswith(".pkl"):
-            key = filename[: -len(".pkl")]
-            with open(os.path.join(cache_dir, filename), "rb") as f:
-                traj_frames[key] = pickle.load(f)
+    for path in sorted(epath.Path(cache_dir).iterdir()):
+        if path.name.endswith(".pkl"):
+            key = path.name[: -len(".pkl")]
+            traj_frames[key] = pickle.loads(path.read_bytes())
     return traj_frames
 
 
@@ -223,13 +277,13 @@ def _build_subtask_decoder(critic_model) -> dict:
     inert (predictions stayed identical) and the real bug was the image dtype
     in `_build_critic_obs_for_frame`. Keep this aligned with production.
     """
-    net = critic_model.network
+    net = _get_critic_network(critic_model)
     is_gemma4 = "gemma4" in getattr(getattr(net, "config", None), "paligemma_variant", "")
 
     if not is_gemma4:
         @nnx.jit
         def _prefix_forward(model, observation):
-            n = model.network
+            n = _get_critic_network(model)
             obs = _model.preprocess_observation(
                 None, observation, train = False, image_resolution = n._image_size,
             )
@@ -257,7 +311,7 @@ def _build_subtask_decoder(critic_model) -> dict:
 
         def _decode_step(model, token_id, kv_cache, prefix_mask, last_text_pos, suffix_pos_so_far):
             # Not JIT'd: each step appends 1 to kv_cache, so shapes change every call.
-            n = model.network
+            n = _get_critic_network(model)
             tok_arr = jnp.asarray(token_id, dtype = jnp.int32).reshape(1, 1)
             tok_embed = n.PaliGemma.llm(tok_arr, method = "embed")
             to_prefix = prefix_mask[:, None, :]
@@ -271,7 +325,7 @@ def _build_subtask_decoder(critic_model) -> dict:
     else:
         @nnx.jit
         def _prefix_forward(model, observation):
-            n = model.network
+            n = _get_critic_network(model)
             obs = _model.preprocess_observation(
                 None, observation, train = False, image_resolution = n._image_size,
             )
@@ -303,7 +357,7 @@ def _build_subtask_decoder(critic_model) -> dict:
             model, token_id, kv_cache, prefix_mask, last_text_pos,
             prefix_len, cache_size, suffix_pos_so_far,
         ):
-            n = model.network
+            n = _get_critic_network(model)
             tok_arr = jnp.asarray(token_id, dtype = jnp.int32).reshape(1, 1)
             tok_embed = n.PaliGemma.llm(tok_arr, method = "embed")
             per_layer_input = None
@@ -329,7 +383,7 @@ def _build_subtask_decoder(critic_model) -> dict:
 
     @nnx.jit
     def _logits_from_hidden(model, hidden):
-        return model.network.decode(hidden)
+        return _get_critic_network(model).decode(hidden)
 
     return {
         "prefix_forward": _prefix_forward,
@@ -789,6 +843,7 @@ def _run_subtask_prediction(
     eval_config: "EvalConfig",
     batch_size: int,
     action_conditioned: bool,
+    mesh = None,
 ) -> None:
     """Render per-trajectory subtask-prediction videos.
 
@@ -816,7 +871,7 @@ def _run_subtask_prediction(
         logger.info("Building subtask decoder closures (gemma_2b/gemma4 KV-cache path).")
     closures = _build_subtask_decoder(model)
     eos_id = _resolve_eos_id(val_tokenizer)
-    image_keys = tuple(model.network.config.image_keys)
+    image_keys = tuple(_get_critic_network(model).config.image_keys)
 
     rendered: dict[str, object] = {}
 
@@ -826,6 +881,7 @@ def _run_subtask_prediction(
     )
     snapshot_matched = False
     fast_path = snapshot_cfg is not None and snapshot_cfg.fast_path
+    npz_mode = eval_config.subtask_npz_dir is not None
 
     for traj_idx, frames in split_traj_frames.items():
         if fast_path and traj_idx != snapshot_episode:
@@ -840,7 +896,7 @@ def _run_subtask_prediction(
         seg_all_frames = [(traj_idx, i, f) for i, f in enumerate(frames)]
         seg_mc = {traj_idx: [f["mc_return"] for f in frames]}
         preds, _, _, _, _, _ = predict_values(
-            model, seg_all_frames, seg_mc, action_conditioned, batch_size = batch_size,
+            model, seg_all_frames, seg_mc, action_conditioned, batch_size = batch_size, mesh = mesh,
         )
         predicted_values = preds[traj_idx]
         if not fast_path:
@@ -862,10 +918,11 @@ def _run_subtask_prediction(
         )
 
         fps = int(frames[0]["fps"])
-        step = max(1, fps)
+        # npz mode decodes at a fixed frame stride; the normal (video) path
+        # decodes once per second (fps stride) and force-includes the last frame.
+        step = eval_config.subtask_decode_stride if npz_mode else max(1, fps)
         sample_indices = list(range(0, len(frames), step))
-        # Always include the last frame so the perplexity curve reaches the end.
-        if sample_indices and sample_indices[-1] != len(frames) - 1:
+        if not npz_mode and sample_indices and sample_indices[-1] != len(frames) - 1:
             sample_indices.append(len(frames) - 1)
 
         perplexities: list[float | None] = [None] * len(frames)
@@ -890,7 +947,7 @@ def _run_subtask_prediction(
             gt_tokens = _extract_gt_subtask_tokens(frames[t])
             gt_perp = (
                 _score_gt_perplexity(closures, model, critic_obs, gt_tokens)
-                if gt_tokens else float("nan")
+                if (gt_tokens and not npz_mode) else float("nan")
             )
             if not is_rank0:
                 continue
@@ -908,6 +965,38 @@ def _run_subtask_prediction(
             gt_texts[t] = gt_text
 
         if not is_rank0:
+            continue
+
+        # npz mode: persist all per-frame value predictions, GT subtask
+        # boundaries, and the subtask predictions decoded at `step`-frame
+        # intervals; skip the video + snapshot rendering entirely.
+        if npz_mode:
+            import io as _io
+            from etils import epath
+
+            sample_t = np.asarray(sample_indices, dtype = np.int32)
+            predicted_subtasks = np.asarray([predicted_texts[t] or "" for t in sample_indices])
+            gt_subtasks = np.asarray([gt_texts[t] or "" for t in sample_indices])
+            npz_path = f"{eval_config.subtask_npz_dir.rstrip('/')}/{traj_idx}.npz"
+            # Serialize to bytes, then write via epath so a gs:// subtask_npz_dir
+            # works as well as local/NFS (np.savez can't write to gs:// directly).
+            _buf = _io.BytesIO()
+            np.savez(
+                _buf,
+                predicted_values = np.asarray(predicted_values, dtype = np.float64),
+                subtask_boundaries = np.asarray(_subtask_boundary_indices(frames), dtype = np.int32),
+                subtask_pred_t = sample_t,
+                predicted_subtasks = predicted_subtasks,
+                gt_subtasks = gt_subtasks,
+                num_frames = np.int32(len(frames)),
+            )
+            _out = epath.Path(npz_path)
+            _out.parent.mkdir(parents = True, exist_ok = True)
+            _out.write_bytes(_buf.getvalue())
+            logger.info(
+                f"Saved subtask npz to {npz_path}: {len(predicted_values)} value preds, "
+                f"{len(sample_t)} subtask decodes @ stride {step}."
+            )
             continue
 
         # Forward-fill the per-frame display state so the video shows the most
@@ -960,25 +1049,29 @@ def _run_subtask_prediction(
         if snapshot_episode is not None and traj_idx == snapshot_episode:
             snapshot_matched = True
             # Persist sparse (t, perp) samples + boundaries + per-frame value
-            # predictions to NFS so we can iterate on chart style offline without
-            # re-running the eval.
-            debug_dir = "/nfs/aidm_nfs/saksham3/robocoin/snapshot_debug"
-            os.makedirs(debug_dir, exist_ok = True)
-            sparse_t = np.asarray(sample_indices, dtype = np.int32)
-            sparse_perp = np.asarray(
-                [perplexities[t] if perplexities[t] is not None else np.nan for t in sample_indices],
-                dtype = np.float64,
-            )
-            debug_path = os.path.join(debug_dir, f"{traj_idx}.npz")
-            np.savez(
-                debug_path,
-                t = sparse_t,
-                perplexity = sparse_perp,
-                boundaries = np.asarray(_subtask_boundary_indices(frames), dtype = np.int32),
-                predicted_values = np.asarray(predicted_values, dtype = np.float64),
-                num_frames = np.int32(len(frames)),
-            )
-            logger.info(f"Saved snapshot debug npz to {debug_path}")
+            # predictions so we can iterate on chart style offline without
+            # re-running the eval. Target dir is configurable; falls back to
+            # output_dir, and is skipped entirely if neither is set.
+            debug_dir = eval_config.snapshot_debug_dir or eval_config.output_dir
+            if debug_dir is not None:
+                os.makedirs(debug_dir, exist_ok = True)
+                sparse_t = np.asarray(sample_indices, dtype = np.int32)
+                sparse_perp = np.asarray(
+                    [perplexities[t] if perplexities[t] is not None else np.nan for t in sample_indices],
+                    dtype = np.float64,
+                )
+                debug_path = os.path.join(debug_dir, f"{traj_idx}.npz")
+                np.savez(
+                    debug_path,
+                    t = sparse_t,
+                    perplexity = sparse_perp,
+                    boundaries = np.asarray(_subtask_boundary_indices(frames), dtype = np.int32),
+                    predicted_values = np.asarray(predicted_values, dtype = np.float64),
+                    num_frames = np.int32(len(frames)),
+                )
+                logger.info(f"Saved snapshot debug npz to {debug_path}")
+            else:
+                logger.info("No snapshot_debug_dir / output_dir set; skipping snapshot debug npz.")
             snapshot_images = _render_subtask_snapshots(
                 frames = frames,
                 perplexities = perplexities,
@@ -992,7 +1085,7 @@ def _run_subtask_prediction(
             rendered.update(snapshot_images)
             logger.info(f"Rendered {len(snapshot_images)} subtask snapshot outputs for {traj_idx}.")
 
-    if is_rank0 and snapshot_cfg is not None and not snapshot_matched:
+    if is_rank0 and snapshot_cfg is not None and not snapshot_matched and not npz_mode:
         logger.warning(
             f"Subtask snapshot episode {snapshot_cfg.episode_name!r} did not match any cached "
             f"trajectory key; no snapshots rendered. (Long episodes are split into "
@@ -1003,6 +1096,169 @@ def _run_subtask_prediction(
         import wandb
 
         wandb.log(rendered)
+
+
+def _get_critic_network(model):
+    """Return the value network, tolerating CQL critics that expose ``q_network``.
+
+    SARSA/MC value functions store the encoder as ``model.network``; CQL stores it
+    as ``model.q_network``. The rest of this script assumes ``model.network``.
+    """
+    net = getattr(model, "network", None)
+    if net is None:
+        net = getattr(model, "q_network", None)
+    if net is None:
+        raise ValueError("Critic model exposes neither .network nor .q_network.")
+    return net
+
+
+@nnx.jit
+def _jitted_action_grad_sq_norm(model, obs, act):
+    """Per-sample ``||grad_a Q(s, a)||^2`` and Q for an action-conditioned critic.
+
+    Summing Q over the batch and differentiating w.r.t. the batched action is a
+    standard trick: each sample's Q depends only on its own action, so the grad
+    of the sum w.r.t. ``act`` yields per-sample gradients ``[B, action_horizon,
+    action_dim]``. The squared L2 norm is taken over the full action chunk.
+    """
+    def _q_sum(a):
+        out = model.compute_value(obs, a, take_min_over_ensemble = True)
+        q = out[0] if isinstance(out, tuple) else out
+        return jnp.sum(q), q
+
+    grads, q = jax.grad(_q_sum, has_aux = True)(act)
+    grad_sq_norm = jnp.sum(grads ** 2, axis = tuple(range(1, grads.ndim)))
+    return grad_sq_norm, q
+
+
+def _run_action_gradient_norm(
+    model,
+    data_config,
+    action_horizon: int,
+    config,
+    val_input_transform,
+    split: str,
+    eval_config: EvalConfig,
+    action_conditioned: bool,
+) -> None:
+    """Compute and save per-frame ``||grad_a Q(s, a)||^2`` over validation demos.
+
+    Caches validation demos (allow_duplicate_repos so single-task datasets like
+    real_shirt_hang yield multiple trajectories), filters to the first
+    ``num_grad_demos`` demos with is_partial=False and has_subtask_annotations=True,
+    and writes one ``<demo>.npz`` per selected demo into ``action_gradient_norm_dir``.
+    """
+    if not action_conditioned:
+        raise ValueError("action_gradient_norm requires an action-conditioned (Q) critic.")
+
+    if eval_config.grad_action_source not in {"dataset", "cached"}:
+        raise ValueError(
+            f"--grad-action-source must be 'dataset' or 'cached', got {eval_config.grad_action_source!r}."
+        )
+    # "cached" evaluates Q / grad at cached_action[0] = counterfactual_actions[:, 0]
+    # (get_obs_and_action with prefix="counterfactual_" already takes [:, 0]).
+    action_prefix = "counterfactual_" if eval_config.grad_action_source == "cached" else ""
+
+    critic_network = _get_critic_network(model)
+    image_size = tuple(critic_network.config.image_size)
+
+    out_dir = eval_config.action_gradient_norm_dir
+    # Shared cache (grad_cache_dir) lets multiple runs reuse the identical cached
+    # demos; otherwise each run caches under its own output dir.
+    cache_dir = eval_config.grad_cache_dir or os.path.join(out_dir, "val_cache")
+
+    # Cache val demos. Only demos with is_partial=False and
+    # has_subtask_annotations=True are cached: a filtering generator drops the
+    # rest before cache_val_episodes sees them, so it keeps pulling trajectories
+    # until num_grad_demos passing demos are written. allow_duplicate_repos=True
+    # so a single-repo dataset (real_shirt_hang) yields distinct per-episode pkls
+    # (matches train_value_function.py's FT path).
+    val_trajectory_dataset = _data_loader.create_rlds_dataset(
+        data_config,
+        action_horizon,
+        config.batch_size,
+        split = split,
+        shuffle = False,
+        return_trajectories = True,
+    )
+
+    def _filter_passing_trajectories(dataset):
+        for traj in dataset:
+            if len(traj["repo_id"]) == 0:
+                continue
+            is_partial = bool(np.asarray(traj["is_partial"][0]))
+            has_annotations = bool(np.asarray(traj["has_subtask_annotations"][0]))
+            if (not is_partial) and has_annotations:
+                yield traj
+
+    cache_val_episodes(
+        _filter_passing_trajectories(val_trajectory_dataset),
+        eval_config.num_grad_demos,
+        cache_dir,
+        include_repos = (),
+        save_only = True,
+        input_transform = val_input_transform,
+        allow_duplicate_repos = True,
+    )
+    del val_trajectory_dataset
+
+    traj_frames = _load_cached_trajectories(cache_dir)
+    selected = [(key, traj_frames[key]) for key in sorted(traj_frames.keys()) if traj_frames[key]]
+    if len(selected) < eval_config.num_grad_demos:
+        logger.warning(
+            "Cached only %d/%d demos with is_partial=False and has_subtask_annotations=True; "
+            "the validation split may not contain enough passing demos.",
+            len(selected), eval_config.num_grad_demos,
+        )
+
+    if action_prefix == "counterfactual_" and selected and "counterfactual_actions" not in selected[0][1][0]:
+        raise ValueError(
+            "grad_action_source='cached' requires cached counterfactual_actions, but none are "
+            "present in the cached frames. The counterfactual action store is only joined on the "
+            "train split (see rlds_dataset.py); use --split train and a config / "
+            "--counterfactual-action-store-dir that points at a store covering this split."
+        )
+
+    os.makedirs(out_dir, exist_ok = True)
+    batch_size = eval_config.batch_size
+    for key, frames in selected:
+        decode_episode_images(frames, image_size)
+        grad_sq_norms: list[float] = []
+        q_values: list[float] = []
+        for batch_start in range(0, len(frames), batch_size):
+            batch_frames = frames[batch_start : batch_start + batch_size]
+            num_real = len(batch_frames)
+            # Pad partial last batches to a fixed leading-axis size so the JIT'd
+            # backward isn't recompiled per trailing-batch length.
+            if num_real < batch_size:
+                batch_frames = batch_frames + [batch_frames[-1]] * (batch_size - num_real)
+            obs, act = get_obs_and_action(batch_frames, prefix = action_prefix, action_conditioned = True)
+            grad_sq_norm_np, q_np = jax.device_get(_jitted_action_grad_sq_norm(model, obs, act))
+            grad_sq_norms.extend(grad_sq_norm_np[:num_real].tolist())
+            q_values.extend(q_np[:num_real].tolist())
+
+        repo_id = frames[0]["repo_id"]
+        if isinstance(repo_id, np.ndarray):
+            repo_id = repo_id.item()
+        if isinstance(repo_id, bytes):
+            repo_id = repo_id.decode("utf-8")
+
+        npz_path = os.path.join(out_dir, f"{key}.npz")
+        np.savez(
+            npz_path,
+            grad_sq_norm = np.asarray(grad_sq_norms, dtype = np.float64),
+            predicted_value = np.asarray(q_values, dtype = np.float64),
+            mc_return = np.asarray([float(np.asarray(f["mc_return"])) for f in frames], dtype = np.float64),
+            frame_index = np.asarray([int(np.asarray(f["_frame_index"])) for f in frames], dtype = np.int32),
+            episode_index = np.int32(int(np.asarray(frames[0]["episode_index"]))),
+            repo_id = str(repo_id),
+            num_frames = np.int32(len(frames)),
+            action_source = str(eval_config.grad_action_source),
+        )
+        logger.info(
+            "Saved action-gradient-norm npz to %s (%d frames, mean ||grad_a Q||^2=%.4e).",
+            npz_path, len(frames), float(np.mean(grad_sq_norms)),
+        )
 
 
 def main(eval_config: EvalConfig):
@@ -1030,20 +1286,33 @@ def main(eval_config: EvalConfig):
                 config,
                 data = dataclasses.replace(config.data, counterfactual_action_store_dir = eval_config.counterfactual_action_store_dir),
             )
+        if eval_config.rlds_data_dir is not None:
+            config = dataclasses.replace(
+                config,
+                data = dataclasses.replace(config.data, rlds_data_dir = eval_config.rlds_data_dir),
+            )
         return dataclasses.replace(
             config,
             num_val_trajectories = eval_config.num_trajectories,
         )
 
+    resolved_fsdp_devices = eval_config.fsdp_devices or jax.device_count()
     model, critic_norm_stats, config, critic_step = load_critic(
         eval_config.config_name,
         eval_config.checkpoint_path,
         fine_tune = eval_config.fine_tune,
         step = eval_config.step,
         config_override = _config_override,
-        fsdp_devices = jax.device_count(),
+        fsdp_devices = resolved_fsdp_devices,
     )
-    action_conditioned = model.network.action_conditioned
+    # Rebuild the same mesh load_critic used so we can shard inference inputs
+    # consistently with the restored param sharding. With fsdp_devices=1 this is
+    # (device_count, 1) → data-parallel: replicated params, batch-axis-split inputs.
+    # Single-host only: on multi-host TPU, device_put of a host-local array across
+    # the global mesh is invalid, so leave inputs unsharded there and rely on the
+    # FSDP-sharded params (the original multi-host path).
+    inference_mesh = _sharding.make_mesh(resolved_fsdp_devices) if jax.process_count() == 1 else None
+    action_conditioned = _get_critic_network(model).action_conditioned
     logger.info(f"Loaded model from {eval_config.checkpoint_path}, action_conditioned={action_conditioned}")
 
     data_config = config.data.create(config.assets_dirs, config.model)
@@ -1066,9 +1335,34 @@ def main(eval_config: EvalConfig):
     cache_dir = _resolve_eval_cache_dir(eval_config)
     split = data_config.val_split if eval_config.split == "val" else eval_config.split
 
+    if eval_config.action_gradient_norm_dir is not None:
+        logger.info(
+            "Action-gradient-norm mode: computing ||grad_a Q(s, a)||^2 over %d validation demos -> %s",
+            eval_config.num_grad_demos, eval_config.action_gradient_norm_dir,
+        )
+        _run_action_gradient_norm(
+            model = model,
+            data_config = data_config,
+            action_horizon = action_horizon,
+            config = config,
+            val_input_transform = val_input_transform,
+            split = split,
+            eval_config = eval_config,
+            action_conditioned = action_conditioned,
+        )
+        logger.info("Action-gradient-norm computation complete.")
+        return
+
     cache_complete = False
-    if os.path.exists(cache_dir):
-        existing_pkls = {f for f in os.listdir(cache_dir) if f.endswith(".pkl")}
+    # epath.iterdir handles gs:// cache dirs (virtual prefix) as well as local/NFS.
+    from etils import epath
+
+    existing_pkls: set[str] = set()
+    try:
+        existing_pkls = {p.name for p in epath.Path(cache_dir).iterdir() if p.name.endswith(".pkl")}
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        existing_pkls = set()
+    if existing_pkls:
         required_pkls = {f"{repo.replace('/', '__')}.pkl" for repo in config.include_repos}
         if required_pkls.issubset(existing_pkls) and len(existing_pkls) >= eval_config.num_trajectories:
             cache_complete = True
@@ -1186,6 +1480,7 @@ def main(eval_config: EvalConfig):
             eval_config = eval_config,
             batch_size = eval_config.batch_size,
             action_conditioned = action_conditioned,
+            mesh = inference_mesh,
         )
 
     if eval_config.counterfactual_best_of_n and action_conditioned and not subtask_fast_path:

@@ -340,6 +340,7 @@ _CACHE_KEYS = {
     "negative_subtask_1_text", "random_actions", "counterfactual_actions",
     "mc_return", "include_subtask", "fps",
     "repo_id", "episode_index", "_frame_index", "_traj_index",
+    "is_partial", "has_subtask_annotations",
 }
 
 
@@ -667,6 +668,7 @@ def predict_values(
     ep_mc_returns: dict,
     action_conditioned: bool,
     batch_size: int = 64,
+    mesh: "jax.sharding.Mesh | None" = None,
 ) -> tuple[
     dict[str, list[float]],
     dict[str, list[float]],
@@ -708,6 +710,15 @@ def predict_values(
     all_predictions_shuffled: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_attn_scores: dict[str, list[np.ndarray]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
 
+    # Opt-in data-parallel sharding of each batched forward. When a mesh is
+    # given, the (padded) batch is split along DATA_AXIS across all devices;
+    # combined with fsdp_devices=1 (replicated params) this is pure data
+    # parallelism. mesh=None preserves the prior replicated-input behavior.
+    data_sharding = None
+    if mesh is not None:
+        from openpi.training import sharding as _sharding
+        data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(_sharding.DATA_AXIS))
+
     for batch_start in range(0, len(all_frames), batch_size):
         batch_end = min(batch_start + batch_size, len(all_frames))
         batch_frames = all_frames[batch_start:batch_end]
@@ -722,6 +733,14 @@ def predict_values(
             frame_dicts = frame_dicts + [frame_dicts[-1]] * (batch_size - len(frame_dicts))
 
         obs, act = get_obs_and_action(frame_dicts, prefix="", action_conditioned=action_conditioned)
+
+        # Shard the default-path batch across devices when a mesh is provided.
+        # Other obs variants below (negative / random / counterfactual /
+        # shuffled) are unused on the subtask-npz path, so they stay replicated.
+        if data_sharding is not None:
+            obs = jax.device_put(obs, data_sharding)
+            if act is not None:
+                act = jax.device_put(act, data_sharding)
 
         if batch_start == 0:
             logger.info(f"  Batch obs.state: shape={obs.state.shape}, dtype={obs.state.dtype}")

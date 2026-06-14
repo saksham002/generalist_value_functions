@@ -37,12 +37,13 @@ def load_train_module():
     return _load_script_module("train_value_function.py")
 
 
-def restore_state_with_shardings(checkpoint_manager, state_shape, state_sharding):
+def restore_state_with_shardings(checkpoint_manager, state_shape, state_sharding, *, step: int | None = None):
     """Restore checkpoint with explicit target shardings for cross-device loading.
 
     Use this instead of checkpoints.restore_state when the checkpoint was saved
     on a different device topology (e.g. loading a TPU pod checkpoint on a
-    single GPU).
+    single GPU). ``step=None`` restores the latest step (training-resume
+    behavior); pass an explicit step to restore a specific one.
     """
     with at.disable_typechecking():
         train_state, params = _checkpoints._split_params(state_shape)
@@ -52,7 +53,7 @@ def restore_state_with_shardings(checkpoint_manager, state_shape, state_sharding
             return jax.tree.map(lambda s: ocp.ArrayRestoreArgs(sharding = s), sharding_tree)
 
         restored = checkpoint_manager.restore(
-            step = None,
+            step = step,
             args = ocp.args.Composite(
                 train_state = ocp.args.PyTreeRestore(
                     item = train_state,
@@ -100,6 +101,7 @@ def load_critic(
     step: int | None = None,
     config_override: Callable[[Any], Any] | None = None,
     fsdp_devices: int = 16,
+    use_full_state_restore: bool = False,
 ) -> tuple[nnx.Module, dict[str, _normalize.NormStats], Any, int]:
     """Load a value-function checkpoint plus norm stats.
 
@@ -136,13 +138,24 @@ def load_critic(
         overwrite = False,
         resume = True,
     )
-    restored = restore_params_with_shardings(
-        checkpoint_manager, train_state_shape, state_sharding, step = step,
-    )
-    critic_model = nnx.merge(
-        train_state_shape.critic.model_def,
-        restored["params"]["critic"]["params"],
-    )
+    if use_full_state_restore:
+        # Mirror train_value_function.py's resume path: restore the full
+        # train_state (train_state + params Composite items) and pull the critic
+        # out of it, instead of the params-only Composite restore. The
+        # params-only path can deadlock on some load topologies.
+        restored_train_state = restore_state_with_shardings(
+            checkpoint_manager, train_state_shape, state_sharding, step = step,
+        )
+        critic_state = restored_train_state.critic
+        critic_model = nnx.merge(critic_state.model_def, critic_state.params)
+    else:
+        restored = restore_params_with_shardings(
+            checkpoint_manager, train_state_shape, state_sharding, step = step,
+        )
+        critic_model = nnx.merge(
+            train_state_shape.critic.model_def,
+            restored["params"]["critic"]["params"],
+        )
 
     data_config = config.data.create(config.assets_dirs, config.model)
     if step is not None:
@@ -179,6 +192,12 @@ class LoadPolicyConfig:
     # for the BestOfN sample-parallel path) forces re-sharding via
     # restore_params_with_shardings.
     fsdp_devices: int | None = None
+    # If True, the re-shard branch restores the full train_state via
+    # restore_state_with_shardings instead of the params-only
+    # restore_params_with_shardings. The params-only path can deadlock on some
+    # GPU load topologies (multi-L40S); the full-state path is the one
+    # train.py resumes with. Requires the checkpoint to contain train_state.
+    use_full_state_restore: bool = False
 
 
 def load_policy(load_config: LoadPolicyConfig):
@@ -223,6 +242,16 @@ def load_policy(load_config: LoadPolicyConfig):
 
         restored_state = _checkpoints.restore_state(
             checkpoint_manager, train_state_shape, _DummyLoader(), step = load_config.step,
+        )
+        params = restored_state.params
+        model_def = restored_state.model_def
+    elif load_config.use_full_state_restore:
+        logger.info(
+            "load_policy: fsdp_devices=%d device_count=%d mesh=%s; using restore_state_with_shardings (full train_state) to re-shard.",
+            fsdp_devices, jax.device_count(), mesh.devices.shape,
+        )
+        restored_state = restore_state_with_shardings(
+            checkpoint_manager, train_state_shape, state_sharding, step = load_config.step,
         )
         params = restored_state.params
         model_def = restored_state.model_def
