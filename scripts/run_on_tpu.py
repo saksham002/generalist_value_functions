@@ -70,8 +70,11 @@ class TPUJobConfig:
     tpu_name: str | None = None
     """Specific TPU name to use (optional). If not specified, finds or creates one."""
 
-    working_dir: str = "/nfs/aidm_nfs/saksham3/batch_value_learning"
-    """Working directory on the TPU."""
+    nfs_user: str = "saksham3"
+    """NFS username (e.g. 'saksham3', 'jeffyu'). Determines venv and default working_dir."""
+
+    working_dir: str = ""
+    """Working directory on the TPU. Defaults to /nfs/aidm_nfs/<nfs_user>/batch_value_learning."""
 
     sync_code: bool = True
     """Whether to sync code before running."""
@@ -87,8 +90,8 @@ class TPUJobConfig:
     )
     """Local Gemma helper checkout to sync from."""
 
-    remote_gemma_dir: str = "/nfs/aidm_nfs/saksham3/helper/gemma"
-    """Remote Gemma helper checkout path on NFS."""
+    remote_gemma_dir: str = ""
+    """Remote Gemma helper checkout path on NFS. Defaults to /nfs/aidm_nfs/<nfs_user>/helper/gemma."""
 
     retry_on_preemption: bool = False
     """Whether to retry the job if the TPU is preempted."""
@@ -214,6 +217,13 @@ def run_job(config: TPUJobConfig) -> int:
     Returns:
         Exit code (0 for success, non-zero for failure)
     """
+    nfs_base = f"/nfs/aidm_nfs/{config.nfs_user}"
+    config = dataclasses.replace(
+        config,
+        working_dir=config.working_dir or f"{nfs_base}/batch_value_learning",
+        remote_gemma_dir=config.remote_gemma_dir or f"{nfs_base}/helper/gemma",
+    )
+
     notifier = SlackNotifier(config.slack_webhook_url)
     tpu_config = get_tpu_config(config.tpu_type)
     retry_count = 0
@@ -226,7 +236,7 @@ def run_job(config: TPUJobConfig) -> int:
             notifier.notify_error("N/A", str(e), config.command)
             return 1
 
-        if not verify_setup(tpu_name, tpu_config):
+        if not verify_setup(tpu_name, tpu_config, nfs_user=config.nfs_user):
             logger.info("Setting up TPU %s...", tpu_name)
             try:
                 setup_tpu(tpu_name, tpu_config)
@@ -272,6 +282,7 @@ def run_job(config: TPUJobConfig) -> int:
             notifier,
             num_workers = num_workers,
             nfs_mount_path = tpu_config.nfs_mount_path,
+            nfs_user = config.nfs_user,
         )
 
         notifier.notify_started(tpu_name, config.tpu_type, config.command)

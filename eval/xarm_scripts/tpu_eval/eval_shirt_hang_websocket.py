@@ -719,11 +719,16 @@ def run_episode(
                     log_line += f", q_values=[{values_str}]"
                 logger.info(log_line)
 
-                # When the server decodes the current subtask (returns
-                # 'predicted_subtask'), dump the right/top camera frame so the
-                # decode can be eyeballed against what the critic actually saw.
+                # When the server AR-decodes the current subtask (returns
+                # 'predicted_subtask' on decode steps), log it next to the tracker's
+                # current subtask (the annotation) so alignment can be checked, and
+                # dump the right/top frame the critic saw.
                 predicted_subtask = infer_result.get("predicted_subtask")
                 if predicted_subtask is not None:
+                    logger.info(
+                        f"[subtask decode] step {t}: predicted={predicted_subtask!r}  "
+                        #f"annotation(tracker)=subtask{tracker.subtask}:{tracker.prompt!r}"
+                    )
                     decode_dir = os.path.join(
                         os.path.dirname(os.path.abspath(__file__)), "decoded_subtask_images"
                     )
@@ -734,13 +739,9 @@ def run_episode(
                             c if c.isalnum() else "_" for c in str(predicted_subtask)
                         )[:60]
                         out_path = os.path.join(
-                            decode_dir, f"ep{episode_idx}_step{t}_{safe_subtask}.png"
+                            decode_dir, f"ep{episode_idx}_step{t}_ann{tracker.subtask}_pred_{safe_subtask}.png"
                         )
                         imageio.imwrite(out_path, right_top_rgb)
-                        logger.info(
-                            f"[subtask decode] predicted={predicted_subtask!r} → "
-                            f"saved right/top image to {out_path}"
-                        )
 
                 if video_logger is not None:
                     video_logger.record_predict(images_rgb, q_values, t)
