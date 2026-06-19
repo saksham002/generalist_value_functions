@@ -13,6 +13,7 @@ import numpy as np
 from openpi.models.best_of_n import BestOfNWrapper
 from openpi.models.best_of_n import BestOfNWrapperConfig
 import openpi.models.model as _model
+from openpi.policies.subtask_decoder import SubtaskDecoder
 from openpi.robocoin_utils.load_model_utils import load_critic
 from openpi.robocoin_utils.load_model_utils import load_train_module
 from openpi.robocoin_utils.utils import cache_val_episodes
@@ -165,6 +166,14 @@ class EvalConfig:
     # Frame stride between autoregressive subtask decodes when subtask_npz_dir
     # is set. Ignored on the normal path (which decodes once per second).
     subtask_decode_stride: int = 30
+    # Subtask critics only. When True, decode the current subtask via the shared
+    # SubtaskDecoder module (openpi.policies.subtask_decoder) and condition the
+    # per-frame VALUE on that decoded subtask (rebuilding each frame's prompt as
+    # task_description + decoded_subtask + "\n") instead of the ground-truth
+    # subtask cached in the .pkl; the subtask video is then titled with the
+    # decoded subtask. Default False keeps the GT-conditioned value path
+    # byte-identical (uses the in-script decoder only for the title/perplexity).
+    condition_on_decoded_subtask: bool = False
     # Number of FSDP devices for the inference mesh. None → jax.device_count()
     # (prior default: pure FSDP, params sharded across devices, inputs
     # replicated). Set to 1 on a GPU node for pure data parallelism: params
@@ -573,6 +582,8 @@ def _render_subtask_video(
     subtask_texts: list[str] | None,
     output_dir: str | None,
     plot_key: str,
+    *,
+    condition_on_decoded: bool = False,
 ):
     """5-subplot video laid out 2 rows x 3 cols (6th cell empty).
 
@@ -642,7 +653,14 @@ def _render_subtask_video(
         ax_val.axvline(x = t, color = "red", linewidth = 2, alpha = 0.8)
         ax_val.set_xlabel("Timestep", fontsize = 11)
         ax_val.set_ylabel("Value", fontsize = 11)
-        ax_val.set_title(f"Episode {ep_idx} - Value", fontsize = 12)
+        if condition_on_decoded:
+            decoded_title = predicted_texts[t] if predicted_texts[t] is not None else "(no decode yet)"
+            ax_val.set_title(
+                f"Episode {ep_idx} - Value | decoded subtask: {decoded_title}",
+                fontsize = 12, wrap = True,
+            )
+        else:
+            ax_val.set_title(f"Episode {ep_idx} - Value", fontsize = 12)
         ax_val.legend(fontsize = 10)
         ax_val.grid(visible = True, alpha = 0.3)
 
@@ -873,6 +891,23 @@ def _run_subtask_prediction(
     eos_id = _resolve_eos_id(val_tokenizer)
     image_keys = tuple(_get_critic_network(model).config.image_keys)
 
+    # When conditioning value on the decoded subtask, drive the decode through
+    # the shared SubtaskDecoder module (same code path as serving / BestOfN).
+    # `predict()` is deterministic + SPMD-lockstep, so calling it on every rank
+    # yields the identical decoded tokens everywhere — which all ranks need to
+    # rebuild the value prompt (predict_values is SPMD). Quiet its per-decode
+    # INFO log on non-rank-0 to avoid 16x spam.
+    decode_module = None
+    if eval_config.condition_on_decoded_subtask:
+        decode_module = SubtaskDecoder(model, val_tokenizer, decode_every = 1, max_tokens = 16)
+        if not is_rank0:
+            logging.getLogger("openpi.policies.subtask_decoder").setLevel(logging.WARNING)
+        elif is_rank0:
+            logger.info(
+                "condition_on_decoded_subtask=True: per-frame value will be conditioned on the "
+                "module-decoded subtask (forward-filled between decode samples); video titled with it."
+            )
+
     rendered: dict[str, object] = {}
 
     snapshot_cfg = eval_config.snapshot_subtask
@@ -895,10 +930,15 @@ def _run_subtask_prediction(
         # _jitted_compute_value).
         seg_all_frames = [(traj_idx, i, f) for i, f in enumerate(frames)]
         seg_mc = {traj_idx: [f["mc_return"] for f in frames]}
-        preds, _, _, _, _, _ = predict_values(
-            model, seg_all_frames, seg_mc, action_conditioned, batch_size = batch_size, mesh = mesh,
-        )
-        predicted_values = preds[traj_idx]
+        predicted_values: list[float] | None = None
+        if not eval_config.condition_on_decoded_subtask:
+            # GT-conditioned value (cached .pkl prompt). When conditioning on the
+            # decoded subtask instead, value is computed after the decode +
+            # prompt rebuild below.
+            preds, _, _, _, _, _ = predict_values(
+                model, seg_all_frames, seg_mc, action_conditioned, batch_size = batch_size, mesh = mesh,
+            )
+            predicted_values = preds[traj_idx]
         if not fast_path:
             mc_returns = [float(np.asarray(v)) for v in seg_mc[traj_idx]]
 
@@ -929,6 +969,9 @@ def _run_subtask_prediction(
         predicted_texts: list[str | None] = [None] * len(frames)
         gt_texts: list[str | None] = [None] * len(frames)
 
+        # When conditioning value on the decoded subtask, the decoded text per
+        # sample index is needed on EVERY rank (to rebuild the SPMD value prompt).
+        sampled_decoded_text: dict[int, str] = {}
         last_perp: float | None = None
         last_pred: str | None = None
         last_gt: str | None = None
@@ -940,10 +983,19 @@ def _run_subtask_prediction(
             # invoke them in lockstep. Non-rank-0 hosts discard the outputs but
             # still need to participate so cross-host attention/all-gather
             # collectives complete.
-            predicted_tokens, _ = _greedy_decode_subtask(
-                closures, model, critic_obs, target_seqs,
-                max_tokens = 16, eos_id = eos_id,
-            )
+            module_text = None
+            if decode_module is not None:
+                # Module decode is deterministic + lockstep-safe → identical on
+                # every rank; store on all ranks for the value-prompt rebuild.
+                decoded = decode_module.predict(critic_obs)
+                predicted_tokens = decoded["predicted_subtask_tokens"]
+                module_text = decoded["predicted_subtask"]
+                sampled_decoded_text[t] = module_text
+            else:
+                predicted_tokens, _ = _greedy_decode_subtask(
+                    closures, model, critic_obs, target_seqs,
+                    max_tokens = 16, eos_id = eos_id,
+                )
             gt_tokens = _extract_gt_subtask_tokens(frames[t])
             gt_perp = (
                 _score_gt_perplexity(closures, model, critic_obs, gt_tokens)
@@ -951,7 +1003,7 @@ def _run_subtask_prediction(
             )
             if not is_rank0:
                 continue
-            predicted_text = _decode_token_ids(val_tokenizer, predicted_tokens)
+            predicted_text = module_text if module_text is not None else _decode_token_ids(val_tokenizer, predicted_tokens)
             gt_text = _decode_token_ids(val_tokenizer, gt_tokens) if gt_tokens else ""
             logger.info(
                 f"  [t={t}] gt_pp={gt_perp:.4f} pred={predicted_text!r} pred_ids={predicted_tokens} "
@@ -963,6 +1015,31 @@ def _run_subtask_prediction(
             perplexities[t] = gt_perp
             predicted_texts[t] = predicted_text
             gt_texts[t] = gt_text
+
+        # Condition value on the decoded subtask: forward-fill the decoded
+        # subtask across all frames (piecewise-constant between decode samples),
+        # rebuild each frame's prompt as `task_description + decoded_subtask +
+        # "\n"`, and recompute the per-frame value with it. Runs on EVERY rank
+        # (predict_values is SPMD; sampled_decoded_text is identical across ranks).
+        if decode_module is not None:
+            filled_subtask = ""
+            rebuilt_frames = []
+            for i, f in enumerate(frames):
+                if i in sampled_decoded_text:
+                    filled_subtask = sampled_decoded_text[i] or ""
+                tok, msk, s0, s1 = _transforms._tokenize_robocoin_subtask_prompt(
+                    val_tokenizer, prefix_text, filled_subtask, append_newline = True,
+                )
+                nf = dict(f)
+                nf["tokenized_prompt"] = np.asarray(tok)
+                nf["tokenized_prompt_mask"] = np.asarray(msk)
+                nf["subtask_start_index"] = np.int32(s0)
+                nf["subtask_end_index"] = np.int32(s1)
+                rebuilt_frames.append((traj_idx, i, nf))
+            preds, _, _, _, _, _ = predict_values(
+                model, rebuilt_frames, seg_mc, action_conditioned, batch_size = batch_size, mesh = mesh,
+            )
+            predicted_values = preds[traj_idx]
 
         if not is_rank0:
             continue
@@ -1042,6 +1119,7 @@ def _run_subtask_prediction(
                 subtask_texts = ep_subtasks[traj_idx],
                 output_dir = eval_config.output_dir,
                 plot_key = plot_key,
+                condition_on_decoded = eval_config.condition_on_decoded_subtask,
             )
 
         # Reuse this episode's already-computed per-frame perplexities /

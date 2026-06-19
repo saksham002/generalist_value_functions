@@ -73,6 +73,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         mask_50fps: bool = False,
         mask_boundary_actions: bool = True,
         variable_horizon: bool = False,
+        lower_action_horizon: int = 1,
         use_chunk_wise_delta: bool = False,
         state_dim: int = 14,
         subtask_prompt_mode: SubtaskPromptMode = "subtask_only",
@@ -113,6 +114,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         self._mask_50fps = mask_50fps
         self._mask_boundary_actions = mask_boundary_actions
         self._variable_horizon = variable_horizon
+        self._lower_action_horizon = lower_action_horizon
         self._state_dim = state_dim
         self._state_dim_checked = False
         self._subtask_prompt_mode = subtask_prompt_mode
@@ -123,6 +125,7 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             f"td_n={td_n}, filter_n={filter_n}, mask_50fps={mask_50fps}, "
             f"mask_boundary_actions={mask_boundary_actions}, "
             f"variable_horizon={variable_horizon}, "
+            f"lower_action_horizon={lower_action_horizon}, "
             f"state_dim={state_dim}, "
             f"subtask_prompt_mode={subtask_prompt_mode}, "
             f"counterfactual_action_dim_offset={counterfactual_action_dim_offset}"
@@ -333,10 +336,18 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
                 tf.constant(3 * self._action_chunk_size // 5, dtype = tf.int32),
                 tf.constant(self._action_chunk_size, dtype = tf.int32),
             )
+            lower_k = tf.maximum(
+                tf.constant(1, dtype = tf.int32),
+                tf.where(
+                    tf.equal(fps, 30),
+                    tf.constant(3 * self._lower_action_horizon // 5, dtype = tf.int32),
+                    tf.constant(self._lower_action_horizon, dtype = tf.int32),
+                ),
+            )
             if self._split == "train":
                 sampled_k_native = tf.random.uniform(
                     tf.shape(steps),
-                    minval = 1,
+                    minval = lower_k,
                     maxval = sampled_k_cap + 1,
                     dtype = tf.int32,
                 )

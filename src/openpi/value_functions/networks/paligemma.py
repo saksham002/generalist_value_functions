@@ -228,11 +228,11 @@ def compute_rope_positions(
     positions = jnp.cumsum(input_mask.astype(jnp.int32), axis = 1) - 1
     if subtask_start_index is not None and subtask_end_index is not None:
         # subtask_end_index points at the trailing "\n" _tokenize_robocoin_subtask_prompt
-        # appends after the subtask at train time (now included in the next-token objective),
-        # so the inclusive span length = end - start + 1 covers the subtask tokens plus that
-        # newline. The inference critic prompt omits the newline (best_of_n_policy.py uses
-        # append_newline=False), where subtask_end_index lands one past the last suffix token,
-        # yielding the same shift.
+        # appends after the subtask at train time (append_newline=True; the newline is part
+        # of the next-token objective), so the inclusive span end - start + 1 covers the
+        # subtask tokens plus that newline. This shift is reached only by the non-AR critic;
+        # the predict_subtask_ar critic passes subtask_start/end_index as None (via
+        # _position_shift_indices), keeping the subtask at its natural positions.
         shift_by = (subtask_end_index - subtask_start_index + 1).astype(jnp.int32)
         positions = positions.at[:, shift_start_index:].add(-shift_by[:, None])
     return positions
@@ -256,11 +256,11 @@ def compute_suffix_positions(
     )
     if subtask_start_index is not None and subtask_end_index is not None:
         # subtask_end_index points at the trailing "\n" _tokenize_robocoin_subtask_prompt
-        # appends after the subtask at train time (now included in the next-token objective),
-        # so the inclusive span length = end - start + 1 covers the subtask tokens plus that
-        # newline. The inference critic prompt omits the newline (best_of_n_policy.py uses
-        # append_newline=False), where subtask_end_index lands one past the last suffix token,
-        # yielding the same shift.
+        # appends after the subtask at train time (append_newline=True; the newline is part
+        # of the next-token objective), so the inclusive span end - start + 1 covers the
+        # subtask tokens plus that newline. This shift is reached only by the non-AR critic;
+        # the predict_subtask_ar critic passes subtask_start/end_index as None (via
+        # _position_shift_indices), keeping the subtask at its natural positions.
         shift_by = (subtask_end_index - subtask_start_index + 1).astype(jnp.int32)
         positions = positions - shift_by[:, None]
     return positions
