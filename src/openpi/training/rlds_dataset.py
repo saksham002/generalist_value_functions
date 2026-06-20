@@ -17,7 +17,6 @@ import logging
 from typing import Any
 
 import openpi.training.counterfactual_action_store as counterfactual_action_store
-import openpi.training.latent_store as latent_store
 
 
 @dataclasses.dataclass
@@ -67,8 +66,6 @@ class BaseRldsDataset:
         decode_images: bool = True,
         return_trajectories: bool = False,
         max_trajectories: int | None = None,
-        latent_store_dir: str | None = None,
-        latent_views: Sequence[latent_store.LatentViewConfig] = (),
         max_num_demos: int | None = None,
         counterfactual_action_store_dir: str | None = None,
         repeat_dataset: bool = True,
@@ -100,22 +97,9 @@ class BaseRldsDataset:
         self._decode_images = decode_images
         self._return_trajectories = return_trajectories
         self._max_trajectories = max_trajectories
-        self._latent_store_dir = latent_store_dir
-        self._latent_views = tuple(latent_views)
         self._counterfactual_action_store_dir = counterfactual_action_store_dir
         self._shuffle = shuffle
         self._shuffle_seed = shuffle_seed
-
-        # Load latent store manifest if configured
-        self._latent_manifest: latent_store.LatentStoreManifest | None = None
-        if latent_store_dir is not None and latent_views:
-            self._latent_manifest = latent_store.load_manifest(latent_store_dir)
-            logging.info(
-                f"Loaded latent store manifest: {self._latent_manifest.source_dataset_name} "
-                f"v{self._latent_manifest.source_dataset_version}, "
-                f"{len(self._latent_manifest.image_keys)} cameras, "
-                f"temporal_compression={self._latent_manifest.temporal_compression}"
-            )
 
         # Load counterfactual action store manifest if configured
         self._ca_manifest: counterfactual_action_store.CounterfactualActionStoreManifest | None = None
@@ -128,19 +112,6 @@ class BaseRldsDataset:
                 f"action_horizon={self._ca_manifest.action_horizon}, "
                 f"action_dim={self._ca_manifest.action_dim}"
             )
-
-        # Cache short_to_full_key mapping for latent view lookups (computed once, not per-trajectory)
-        self._short_to_full_key: dict[str, str] = {}
-        if self._latent_manifest is not None:
-            for full_key in self._latent_manifest.image_keys:
-                short_key = full_key.split("/")[-1]
-                if short_key in self._short_to_full_key:
-                    raise ValueError(
-                        f"Duplicate short key '{short_key}' from image keys "
-                        f"'{self._short_to_full_key[short_key]}' and '{full_key}'. "
-                        f"Use explicit image_keys in LatentViewConfig to disambiguate."
-                    )
-                self._short_to_full_key[short_key] = full_key
 
         # For multi-host training, each process loads its own shard
         process_count = jax.process_count()
@@ -221,16 +192,6 @@ class BaseRldsDataset:
                 read_config_kwargs=read_config_kwargs,
             )
 
-            # Join with latent store if configured (before repeat to maintain episode alignment)
-            if self._latent_store_dir is not None and self._latent_views and not for_trajectories:
-                dataset = self._join_latent_store(
-                    dataset,
-                    dataset_cfg,
-                    split,
-                    process_index if process_count > 1 else 0,
-                    max(1, process_count),
-                )
-
             # Join with counterfactual action store if configured (train split only)
             if self._counterfactual_action_store_dir is not None and split == "train":
                 dataset = self._join_counterfactual_action_store(
@@ -290,118 +251,6 @@ class BaseRldsDataset:
         self.batch_size = batch_size  # Global batch size
         self.local_batch_size = local_batch_size
         self.shuffle = shuffle
-
-    def _join_latent_store(
-        self,
-        dataset,
-        dataset_cfg: RLDSDataset,
-        split: str,
-        process_index: int,
-        process_count: int,
-    ):
-        """Join latent store episodes with RLDS episodes at trajectory level.
-
-        Uses TFDS builder to load the latent store with IDENTICAL settings as the RLDS
-        dataset (shuffle_seed, process sharding via split_for_jax_process). This ensures
-        both datasets yield episodes in the same order.
-
-        CRITICAL: Both datasets MUST use deterministic ordering for the zip to work.
-        We apply tf.data.Options with deterministic=True to override dlimp's default
-        non-deterministic mode. This ensures file interleaving is consistent.
-
-        Args:
-            dataset: The RLDS DLataset to join with.
-            dataset_cfg: Dataset configuration (for validation).
-            split: Split name (e.g., "train").
-            process_index: This process's index for sharding.
-            process_count: Total number of processes.
-
-        Returns:
-            Joined dataset where each trajectory has latent data attached.
-        """
-        import tensorflow as tf
-        import tensorflow_datasets as tfds
-
-        if self._latent_manifest is None:
-            return dataset
-
-        # Validate manifest matches the dataset
-        latent_store.validate_manifest_against_rlds(
-            self._latent_manifest,
-            rlds_data_dir="",  # Skip path check
-            dataset_name=dataset_cfg.name,
-            dataset_version=dataset_cfg.version,
-        )
-
-        # Load latent store as TFDS builder (ensures identical loading behavior)
-        latent_builder = latent_store.get_latent_store_builder(self._latent_store_dir)
-
-        # Use SAME process sharding as RLDS (tfds.split_for_jax_process)
-        split_to_use = (
-            tfds.split_for_jax_process(split, process_index=process_index, process_count=process_count)
-            if process_count > 1
-            else split
-        )
-
-        # CRITICAL: Use SAME read_config as RLDS (shuffle_seed + parallel reads for file ordering)
-        # Both must use identical interleave settings for consistent episode ordering.
-        read_config = tfds.ReadConfig(
-            skip_prefetch=True,  # Match dlimp's from_rlds
-            shuffle_seed=self._shuffle_seed if self._shuffle else None,
-            num_parallel_calls_for_interleave_files=self._num_parallel_reads,
-            interleave_cycle_length=self._num_parallel_reads,
-        )
-
-        # Load latent store with identical settings to RLDS
-        latent_ds = latent_builder.as_dataset(
-            split=split_to_use,
-            shuffle_files=self._shuffle,
-            read_config=read_config,
-        )
-
-        # CRITICAL: Force deterministic ordering on BOTH datasets.
-        # dlimp's _apply_options() sets deterministic=False which causes file interleaving
-        # to yield episodes in non-deterministic order, breaking the zip alignment.
-        deterministic_options = tf.data.Options()
-        deterministic_options.deterministic = True
-        dataset = dataset.with_options(deterministic_options)
-        latent_ds = latent_ds.with_options(deterministic_options)
-
-        # Zip the two datasets (DLataset IS a tf.data.Dataset subclass)
-        zipped = tf.data.Dataset.zip((dataset, latent_ds))
-
-        def merge_episode(rlds_episode: dict, latent_episode: dict) -> dict:
-            """Merge latent data into RLDS episode and verify alignment."""
-            # Verify episode_index matches between RLDS and latent store.
-            # RLDS stores episode_index per-step (broadcasted), so take first element.
-            rlds_ep_idx = rlds_episode["episode_index"][0]
-            latent_ep_idx = latent_episode["episode_index"]
-
-            tf.debugging.assert_equal(
-                rlds_ep_idx,
-                latent_ep_idx,
-                message="Episode index mismatch! RLDS and latent store are out of sync. "
-                "This may indicate different shuffle seeds or shard ordering.",
-            )
-
-            # Store full latent sequences in trajectory (slicing happens later)
-            # TFDS feature keys use underscore (e.g., "cam_0_latents"), convert to slash format
-            for image_key in self._latent_manifest.image_keys:
-                safe_key = image_key.replace("/", "_")
-                rlds_episode[f"latents/{image_key}"] = tf.cast(latent_episode[f"{safe_key}_latents"], tf.bfloat16)
-
-            # Broadcast scalar metadata to trajectory length (dlimp requires all fields to have
-            # a leading trajectory dimension for flatten() to work)
-            traj_len = rlds_episode["_len"][0]
-            rlds_episode["_num_latent_frames"] = tf.repeat(latent_episode["num_latent_frames"], traj_len)
-            rlds_episode["_latent_episode_index"] = tf.repeat(latent_episode["episode_index"], traj_len)
-            return rlds_episode
-
-        import dlimp as dl
-
-        # Map and convert back to DLataset for continued pipeline processing
-        merged = zipped.map(merge_episode, num_parallel_calls=self._num_parallel_calls)
-        return dl.DLataset.from_tfds_dataset(merged, is_flattened=False)
 
     def _join_counterfactual_action_store(
         self,
@@ -516,68 +365,6 @@ class BaseRldsDataset:
         merged = zipped.map(merge_episode, num_parallel_calls=self._num_parallel_calls)
         return dl.DLataset.from_tfds_dataset(merged, is_flattened=False)
 
-    def _apply_latent_views(self, traj: dict) -> dict:
-        """Slice latent sequences into per-step windows based on view configs.
-
-        Called during trajectory processing after trajectory_transforms.
-
-        Args:
-            traj: Trajectory dict containing "latents/{image_key}" entries.
-
-        Returns:
-            Updated trajectory dict with sliced latent windows.
-        """
-        import tensorflow as tf
-
-        if not self._latent_views or self._latent_manifest is None:
-            return traj
-
-        traj_len = tf.shape(traj["actions"])[0]
-        latent_keys_to_remove = []
-
-        for view_config in self._latent_views:
-            view_image_keys = view_config.image_keys or tuple(self._short_to_full_key.keys())
-
-            for short_key in view_image_keys:
-                # Map short key to full manifest key for latent lookup
-                full_key = self._short_to_full_key.get(short_key, short_key)
-                latent_key = f"latents/{full_key}"
-                if latent_key not in traj:
-                    available_latent_keys = [k for k in traj if k.startswith("latents/")]
-                    raise ValueError(
-                        f"Latent key '{latent_key}' not found in trajectory. "
-                        f"Available latent keys: {available_latent_keys}. "
-                        f"Check that latent_store_dir contains latents for image key '{short_key}'."
-                    )
-
-                full_latents = traj[latent_key]  # [C, T_lat, H, W]
-
-                # Build per-step sliced latents [T, C, window, H, W]
-                per_step_latents = latent_store.slice_latents_for_trajectory(
-                    full_latents,
-                    traj_len,
-                    self._latent_manifest.temporal_compression,
-                    view_config.direction,
-                    view_config.window_size,
-                    view_config.stride,
-                )
-
-                # Use short key for output (e.g., "video_latents_cam_0")
-                output_key = f"{view_config.output_key}_{short_key}"
-                traj[output_key] = tf.cast(per_step_latents, tf.bfloat16)
-                latent_keys_to_remove.append(latent_key)
-
-        # Remove source latent sequences (they don't have trajectory length as leading dim,
-        # which would cause dlimp's flatten() to fail)
-        for key in latent_keys_to_remove:
-            del traj[key]
-
-        # Also remove scalar metadata that was only needed for latent processing
-        traj.pop("_num_latent_frames", None)
-        traj.pop("_latent_episode_index", None)
-
-        return traj
-
     def trajectory_transforms(self, traj: dict, dataset_cfg: RLDSDataset) -> dict:
         """Per-trajectory processing. Override in subclasses.
 
@@ -595,20 +382,12 @@ class BaseRldsDataset:
         if "actions" not in mapped_traj:
             raise ValueError("trajectory_transforms must produce an 'actions' key for action chunking.")
 
-        # Carry over latent data from raw trajectory if present
-        for key, value in raw_traj.items():
-            if key.startswith(("latents/", "_latent")):
-                mapped_traj[key] = value
-
         # Carry over counterfactual action data if present
         if "counterfactual_actions" in raw_traj:
             mapped_traj["counterfactual_actions"] = raw_traj["counterfactual_actions"]
         for key in ("_ca_episode_index",):
             if key in raw_traj:
                 mapped_traj[key] = raw_traj[key]
-
-        # Apply latent view slicing before RL fields (so we can derive next_*)
-        mapped_traj = self._apply_latent_views(mapped_traj)
 
         if self._critic_mode:
             return self._apply_rl_fields(raw_traj, mapped_traj, self._action_chunk_size)
@@ -647,16 +426,6 @@ class BaseRldsDataset:
         mapped_traj["next_actions_raw"] = next_actions_raw
         if "counterfactual_actions" in mapped_traj:
             mapped_traj["counterfactual_next_actions"] = tf.gather(mapped_traj["counterfactual_actions"], next_indices)
-
-        # Derive next_* for past-facing latent views
-        if self._latent_views and self._latent_manifest is not None:
-            for view_config in self._latent_views:
-                if view_config.direction == "past":
-                    image_keys = view_config.image_keys or self._latent_manifest.image_keys
-                    for image_key in image_keys:
-                        key = f"{view_config.output_key}_{image_key}"
-                        if key in mapped_traj:
-                            mapped_traj[f"next_{key}"] = tf.gather(mapped_traj[key], next_indices)
 
         return mapped_traj
 

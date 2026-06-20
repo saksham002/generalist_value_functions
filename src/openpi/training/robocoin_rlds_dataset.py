@@ -83,8 +83,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         return_trajectories: bool = False,
         max_trajectories: int | None = None,
         max_num_demos: int | None = None,
-        latent_store_dir: str | None = None,
-        latent_views: Sequence[rlds_dataset.latent_store.LatentViewConfig] = (),
         counterfactual_action_store_dir: str | None = None,
         counterfactual_action_dim_offset: int = 0,
     ):
@@ -153,8 +151,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             return_trajectories = return_trajectories,
             max_trajectories = max_trajectories,
             max_num_demos = max_num_demos,
-            latent_store_dir = latent_store_dir,
-            latent_views = latent_views,
             counterfactual_action_store_dir = counterfactual_action_store_dir,
         )
 
@@ -231,11 +227,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             if key in traj:
                 result[key] = traj[key]
 
-        # Include video latents if present (for video prediction mode)
-        # Cast to bfloat16 to reduce shuffle buffer memory (~400KB -> ~200KB per sample)
-        if "video_latents" in traj:
-            result["video_latents"] = tf.cast(traj["video_latents"], tf.bfloat16)
-
         return result
 
     @staticmethod
@@ -300,9 +291,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         import tensorflow as tf
 
         mapped_traj = self.trajectory_transforms(raw_traj, dataset_cfg)
-        for key, value in raw_traj.items():
-            if key.startswith(("latents/", "_latent")):
-                mapped_traj[key] = value
         if "counterfactual_actions" in raw_traj:
             counterfactual_actions = raw_traj["counterfactual_actions"]
             if self._counterfactual_action_dim_offset > 0:
@@ -317,8 +305,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
         for key in ("_ca_episode_index",):
             if key in raw_traj:
                 mapped_traj[key] = raw_traj[key]
-
-        mapped_traj = self._apply_latent_views(mapped_traj)
 
         traj_len = tf.shape(mapped_traj["actions"])[0]
         fps = tf.cast(mapped_traj["fps"][0], tf.int32)
@@ -396,15 +382,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
 
         if "counterfactual_actions" in mapped_traj:
             mapped_traj["counterfactual_next_actions"] = tf.gather(mapped_traj["counterfactual_actions"], next_indices)
-
-        if self._latent_views and self._latent_manifest is not None:
-            for view_config in self._latent_views:
-                if view_config.direction == "past":
-                    image_keys = view_config.image_keys or self._latent_manifest.image_keys
-                    for image_key in image_keys:
-                        key = f"{view_config.output_key}_{image_key}"
-                        if key in mapped_traj:
-                            mapped_traj[f"next_{key}"] = tf.gather(mapped_traj[key], next_indices)
 
         return mapped_traj
 

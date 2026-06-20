@@ -61,8 +61,6 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         return_trajectories: bool = False,
         max_trajectories: int | None = None,
         max_num_demos: int | None = None,
-        latent_store_dir: str | None = None,
-        latent_views: Sequence[rlds_dataset.latent_store.LatentViewConfig] = (),
         counterfactual_action_store_dir: str | None = None,
         counterfactual_action_dim_offset: int = 0,
     ):
@@ -140,8 +138,6 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
             return_trajectories = return_trajectories,
             max_trajectories = max_trajectories,
             max_num_demos = max_num_demos,
-            latent_store_dir = latent_store_dir,
-            latent_views = latent_views,
             counterfactual_action_store_dir = counterfactual_action_store_dir,
         )
 
@@ -287,11 +283,6 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
             if key in traj:
                 result[key] = traj[key]
 
-        # Include video latents if present (for video prediction mode)
-        # Cast to bfloat16 to reduce shuffle buffer memory (~400KB -> ~200KB per sample)
-        if "video_latents" in traj:
-            result["video_latents"] = tf.cast(traj["video_latents"], tf.bfloat16)
-
         # Subsample case only: _subsample_trajectory has produced subsampled
         # counterfactual_actions and _ca_episode_index whose leading dims match
         # the subsampled main fields (T//2). Forward them so _prepare_trajectory
@@ -436,10 +427,6 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         if "actions" not in mapped_traj:
             raise ValueError("trajectory_transforms must produce an 'actions' key for action chunking.")
 
-        for key, value in raw_traj.items():
-            if key.startswith(("latents/", "_latent")):
-                mapped_traj[key] = value
-
         # When self._subsample is True, counterfactual_actions and _ca_episode_index
         # are already subsampled by _subsample_trajectory and passed through
         # trajectory_transforms' result. In the non-subsample case we still need to
@@ -458,8 +445,6 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         for key in ("_ca_episode_index",):
             if key in raw_traj and not self._subsample:
                 mapped_traj[key] = raw_traj[key]
-
-        mapped_traj = self._apply_latent_views(mapped_traj)
 
         return self._apply_rl_fields(raw_traj, mapped_traj, self._action_chunk_size)
 
@@ -558,15 +543,6 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
             mapped_traj["counterfactual_next_actions"] = tf.gather(
                 mapped_traj["counterfactual_actions"], next_indices
             )
-
-        if self._latent_views and self._latent_manifest is not None:
-            for view_config in self._latent_views:
-                if view_config.direction == "past":
-                    image_keys = view_config.image_keys or self._latent_manifest.image_keys
-                    for image_key in image_keys:
-                        key = f"{view_config.output_key}_{image_key}"
-                        if key in mapped_traj:
-                            mapped_traj[f"next_{key}"] = tf.gather(mapped_traj[key], next_indices)
 
         # Per-step RL fields (mc_return / reward / termination / truncation / td_discount).
         # `exponent_per_step` keeps the {5.0, 2.5} pair to match pre-training (robocoin

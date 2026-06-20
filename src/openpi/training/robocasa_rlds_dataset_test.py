@@ -16,9 +16,7 @@ def _make_robocasa_dataset_for_unit_tests():
     dataset._action_chunk_size = 3  # noqa: SLF001
     dataset._include_images = True  # noqa: SLF001
     dataset._image_obs_keys = ("robot0_agentview_left", "robot0_eye_in_hand")  # noqa: SLF001
-    # Latent-store attributes referenced by BaseRldsDataset._apply_rl_fields on this branch.
-    dataset._latent_views = ()  # noqa: SLF001
-    dataset._latent_manifest = None  # noqa: SLF001
+    dataset._prompt_mode = "subtask"  # noqa: SLF001
     # Interpolation kwargs default to None for unit tests (no FPS resampling).
     dataset._interpolation_config = None  # noqa: SLF001
     dataset._action_space_spec = None  # noqa: SLF001
@@ -115,7 +113,7 @@ class TestRoboCasaTrajectoryTransforms:
             "language_instruction": tf.constant("pick up the cup"),
         }
 
-        dataset_cfg = rlds_dataset.RLDSDataset(name = "dummy", version = "1.0.0", weight = 1.0)
+        dataset_cfg = rlds_dataset.RLDSDataset(name = "target__atomic__dummy", version = "1.0.0", weight = 1.0)
         mapped = dataset.trajectory_transforms(raw, dataset_cfg = dataset_cfg)
 
         assert set(mapped.keys()) == {"actions", "observation", "prompt"}
@@ -141,7 +139,7 @@ class TestRoboCasaTrajectoryTransforms:
             "is_last": tf.constant([False, False, False, False, False, False, False, True, False, False]),
         }
 
-        dataset_cfg = rlds_dataset.RLDSDataset(name = "dummy", version = "1.0.0", weight = 1.0)
+        dataset_cfg = rlds_dataset.RLDSDataset(name = "target__atomic__dummy", version = "1.0.0", weight = 1.0)
         mapped = dataset.trajectory_transforms(raw, dataset_cfg = dataset_cfg)
         mapped = dataset._apply_rl_fields(raw, mapped, action_chunk_size = 3)  # noqa: SLF001
         mapped = dataset._chunk_actions(mapped, action_chunk_size = 3)  # noqa: SLF001
@@ -171,7 +169,7 @@ class TestRoboCasaTrajectoryTransforms:
         assert mapped["truncation"].shape == (10,)
 
     def test_trajectory_transforms_excludes_images_when_disabled(self):
-        """Verify trajectory_transforms can emit state-only observations for joint latent training."""
+        """Verify trajectory_transforms can emit state-only observations when images are disabled."""
         dataset = _make_robocasa_dataset_for_unit_tests()
         dataset._include_images = False  # noqa: SLF001
         raw = {
@@ -185,7 +183,7 @@ class TestRoboCasaTrajectoryTransforms:
             "language_instruction": tf.constant("pick up the cup"),
         }
 
-        dataset_cfg = rlds_dataset.RLDSDataset(name = "dummy", version = "1.0.0", weight = 1.0)
+        dataset_cfg = rlds_dataset.RLDSDataset(name = "target__atomic__dummy", version = "1.0.0", weight = 1.0)
         mapped = dataset.trajectory_transforms(raw, dataset_cfg = dataset_cfg)
 
         assert set(mapped["observation"].keys()) == {"state"}

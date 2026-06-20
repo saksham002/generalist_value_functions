@@ -38,7 +38,6 @@ import openpi.shared.minari_utils as minari_utils
 from openpi.shared.action_bounds import ActionBounds
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
-import openpi.training.latent_store as latent_store
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
@@ -134,8 +133,6 @@ class DataConfig:
     robocoin_use_eef: bool = False
     val_split: str = "test"
     clip_normalized_bounds: dict[str, tuple[float, float]] | None = None
-    latent_store_dir: str | None = None
-    latent_views: tuple[latent_store.LatentViewConfig, ...] = ()
     counterfactual_action_store_dir: str | None = None
     max_num_demos: int | None = None
     rlds_kwargs: dict[str, Any] = dataclasses.field(default_factory = dict)
@@ -888,8 +885,6 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
         rlds_dataset.RLDSDataset(name = "robocoin_bimanual", version = "1.0.0", weight = 1.0),
     )
     val_split: str = "val"
-    latent_store_dir: str | None = None
-    latent_views: tuple[latent_store.LatentViewConfig, ...] = ()
     counterfactual_action_store_dir: str | None = None
     max_num_demos: int | None = None
     shuffle_buffer_size: int = 250_000
@@ -924,8 +919,6 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
     def __post_init__(self) -> None:
         if self.mask_boundary_actions and self.replace_boundary_actions:
             raise ValueError("At most one of mask_boundary_actions and replace_boundary_actions can be True.")
-        if self.latent_views and self.latent_store_dir is None:
-            raise ValueError("latent_views requires latent_store_dir to be set.")
 
     @override
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict | None:
@@ -1248,8 +1241,6 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
             robocoin_use_eef = self.use_eef,
             val_split = self.val_split,
             clip_normalized_bounds = self._create_clip_normalized_bounds(),
-            latent_store_dir = self.latent_store_dir,
-            latent_views = self.latent_views,
             counterfactual_action_store_dir = self.counterfactual_action_store_dir,
             max_num_demos = self.max_num_demos,
             rlds_kwargs = {
@@ -1291,8 +1282,6 @@ class Hdf5RldsDataConfig(DataConfigFactory):
         rlds_dataset.RLDSDataset(name = "real_hang", version = "1.0.0", weight = 1.0),
     )
     val_split: str = "val"
-    latent_store_dir: str | None = None
-    latent_views: tuple[latent_store.LatentViewConfig, ...] = ()
     counterfactual_action_store_dir: str | None = None
     max_num_demos: int | None = None
     shuffle_buffer_size: int = 250_000
@@ -1330,8 +1319,6 @@ class Hdf5RldsDataConfig(DataConfigFactory):
             raise ValueError("At most one of mask_boundary_actions and replace_boundary_actions can be True.")
         if self.variable_horizon and self.mask_boundary_actions:
             raise ValueError("variable_horizon=True requires mask_boundary_actions=False")
-        if self.latent_views and self.latent_store_dir is None:
-            raise ValueError("latent_views requires latent_store_dir to be set.")
         # State-dim invariant: (state_dim=16, use_eef=False) or (state_dim=14, use_eef=True).
         if not ((self.state_dim == 16 and not self.use_eef) or (self.state_dim == 14 and self.use_eef)):
             raise ValueError(
@@ -1496,8 +1483,6 @@ class Hdf5RldsDataConfig(DataConfigFactory):
             robocoin_use_eef = self.use_eef,
             val_split = self.val_split,
             clip_normalized_bounds = self._create_clip_normalized_bounds(),
-            latent_store_dir = self.latent_store_dir,
-            latent_views = self.latent_views,
             counterfactual_action_store_dir = self.counterfactual_action_store_dir,
             max_num_demos = self.max_num_demos,
             rlds_kwargs = {
@@ -1524,8 +1509,9 @@ class LeRobotRldsDataConfig(DataConfigFactory):
     """Data config for LeRobot-built RLDS datasets (e.g. ``realworld_xarm_packing``).
 
     Routes to ``LeRobotRldsDataset`` via ``rlds_dataset_class = "lerobot"``. State and
-    action are already 14D EEF, so there is no ``use_eef`` / ``state_dim`` knob; only
-    behavior cloning is supported (``critic_mode=False``).
+    action are already 14D EEF, so there is no ``use_eef`` / ``state_dim`` knob.
+    Supports both behavior cloning (``critic_mode=False``) and value-function training
+    (``critic_mode=True``).
     """
 
     repo_id: str = "realworld_xarm_packing"
@@ -1542,20 +1528,59 @@ class LeRobotRldsDataConfig(DataConfigFactory):
     num_parallel_calls: int = 8
 
     image_size: tuple[int, int] = (224, 224)
+    max_token_len: int = 48
 
     use_quantile_norm: bool = False
     use_chunk_wise_delta: bool = False
     filter_n: int | None = None
     prompt_mode: lerobot_rlds_dataset.PromptMode = "subtask"
 
+    # RL / value-function training
+    critic_mode: bool = False
+    discount: float = 0.99
+    reward_scale: float = 1.0
+    reward_bias: float = 0.0
+    td_n: int | None = None
+    mask_boundary_actions: bool = True
+    subsample: bool = False
+    counterfactual_action_store_dir: str | None = None
+
     def _create_clip_normalized_bounds(self) -> dict[str, tuple[float, float]]:
         clip_bound = 1.25 if self.use_quantile_norm else 5.0
-        return {
+        bounds = {
             "state": (-clip_bound, clip_bound),
             "actions": (-clip_bound, clip_bound),
         }
+        if self.critic_mode:
+            bounds.update({
+                "next_state": (-clip_bound, clip_bound),
+                "next_actions": (-clip_bound, clip_bound),
+                "counterfactual_actions": (-clip_bound, clip_bound),
+                "counterfactual_next_actions": (-clip_bound, clip_bound),
+            })
+        return bounds
+
+    def _get_critic_network_config(self, model_config: _model.BaseModelConfig):
+        if isinstance(model_config, _value_function.ValueFunctionConfig):
+            return model_config.network_config
+        if isinstance(model_config, _value_function.CQLValueFunctionConfig):
+            return model_config.q_network_config
+        if isinstance(model_config, _value_function.IQLValueFunctionConfig):
+            return model_config.q_network_config
+        return None
+
+    def _get_critic_tokenizer(
+        self, model_config: _model.BaseModelConfig
+    ) -> _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer | None:
+        network_config = self._get_critic_network_config(model_config)
+        if isinstance(network_config, _paligemma_network.PaliGemmaNetworkConfig):
+            return network_config.get_tokenizer(max_len = self.max_token_len)
+        return None
 
     def _get_action_dim(self, model_config: _model.BaseModelConfig) -> int:
+        network_config = self._get_critic_network_config(model_config)
+        if network_config is not None and hasattr(network_config, "action_dim"):
+            return network_config.action_dim
         if isinstance(model_config, pi0_config.Pi0Config):
             if model_config.action_dim_mask is not None:
                 return int(sum(model_config.action_dim_mask))
@@ -1565,14 +1590,32 @@ class LeRobotRldsDataConfig(DataConfigFactory):
         )
 
     def _create_model_transforms(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
-        base_transforms = ModelTransformFactory(default_prompt = None)(model_config)
-        return _transforms.Group(
-            inputs = (
-                DecodeRoboCoinPromptBytes(),
-                *base_transforms.inputs,
-            ),
-            outputs = base_transforms.outputs,
-        )
+        if not self.critic_mode:
+            base_transforms = ModelTransformFactory(default_prompt = None)(model_config)
+            return _transforms.Group(
+                inputs = (
+                    DecodeRoboCoinPromptBytes(),
+                    *base_transforms.inputs,
+                ),
+                outputs = base_transforms.outputs,
+            )
+
+        tokenizer = self._get_critic_tokenizer(model_config)
+        transforms: list[_transforms.DataTransformFn] = []
+        if tokenizer is not None:
+            if self.prompt_mode == "task_description_predict_current_subtask":
+                tokenize_transform: _transforms.DataTransformFn = _transforms.TokenizeRoboCoinSubtaskPrompt(
+                    tokenizer = tokenizer,
+                )
+            else:
+                tokenize_transform = _transforms.TokenizePrompt(tokenizer)
+            transforms.extend(
+                [
+                    DecodeRoboCoinPromptBytes(),
+                    tokenize_transform,
+                ]
+            )
+        return _transforms.Group(inputs = transforms, outputs = [])
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -1582,10 +1625,22 @@ class LeRobotRldsDataConfig(DataConfigFactory):
         asset_id = self.assets.asset_id or self.datasets[0].name
         norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
 
-        if norm_stats is not None and self.use_chunk_wise_delta and "action_diff" in norm_stats:
-            norm_stats["actions"] = _slice_action_diff_norm_stats(
-                norm_stats["action_diff"], model_config.action_horizon,
-            )
+        if norm_stats is not None:
+            if self.use_chunk_wise_delta and "action_diff" in norm_stats:
+                norm_stats["actions"] = _slice_action_diff_norm_stats(
+                    norm_stats["action_diff"], model_config.action_horizon,
+                    subsample = self.subsample,
+                )
+            # Critic mode reuses the state/actions stats for the next_* and cached
+            # counterfactual fields so they go through Normalize+Clip identically.
+            if self.critic_mode:
+                if "state" in norm_stats and "next_state" not in norm_stats:
+                    norm_stats["next_state"] = norm_stats["state"]
+                if "actions" in norm_stats and "next_actions" not in norm_stats:
+                    norm_stats["next_actions"] = norm_stats["actions"]
+                if "actions" in norm_stats and "counterfactual_actions" not in norm_stats:
+                    norm_stats["counterfactual_actions"] = norm_stats["actions"]
+                    norm_stats["counterfactual_next_actions"] = norm_stats["actions"]
 
         data_transforms_inputs: list[_transforms.DataTransformFn] = []
         data_transforms_outputs: list[_transforms.DataTransformFn] = []
@@ -1608,16 +1663,23 @@ class LeRobotRldsDataConfig(DataConfigFactory):
             data_transforms = _transforms.Group(inputs = data_transforms_inputs, outputs = data_transforms_outputs),
             model_transforms = self._create_model_transforms(model_config),
             use_quantile_norm = self.use_quantile_norm,
-            critic_mode = False,
+            critic_mode = self.critic_mode,
+            discount = self.discount,
+            reward_scale = self.reward_scale,
+            reward_bias = self.reward_bias,
             rlds_data_dir = self.rlds_data_dir,
             val_dataset_dir = self.val_dataset_dir,
             rlds_dataset_class = "lerobot",
             datasets = self.datasets,
             val_split = self.val_split,
             clip_normalized_bounds = self._create_clip_normalized_bounds(),
+            counterfactual_action_store_dir = self.counterfactual_action_store_dir,
             rlds_kwargs = {
+                "td_n": self.td_n,
                 "filter_n": self.filter_n,
+                "mask_boundary_actions": self.mask_boundary_actions,
                 "prompt_mode": self.prompt_mode,
+                "subsample": self.subsample,
                 "shuffle_buffer_size": self.shuffle_buffer_size,
                 "num_parallel_reads": self.num_parallel_reads,
                 "num_parallel_calls": self.num_parallel_calls,
@@ -4467,6 +4529,63 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         ),
         num_val_trajectories = 3,
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/real_shirt_hang/validation_cache_dir_real_shirt_hang_paligemma_cql_rlds_finetune_subtask_ar_final/",
+        include_repos = (),
+    ),
+    # LeRobot realworld_xarm_packing twin of the real_shirt_hang subtask_ar CQL FT:
+    # same recipe, LeRobotRldsDataConfig (critic_mode, subsample) on the packing
+    # dataset; max_token_len=160 (128 for the task + 32 for the predicted subtask).
+    FineTuneConfig(
+        name = "realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar_final",
+        data_factory = LeRobotRldsDataConfig(
+            repo_id = "realworld_xarm_packing",
+            rlds_data_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "realworld_xarm_packing", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/realworld_xarm_packing_pi05/",
+            max_token_len = 160,
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        # Restated q_network_config (matching the subtask_ar base) so the pretrained
+        # checkpoint loads cleanly; max_token_len bumped to 160 for the longer
+        # (task, subtask) concatenation of the packing prompts.
+        model_overrides = {
+            "action_horizon": 60,
+            "q_network_config": _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                max_token_len = 160,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = True,
+            ),
+        },
+        policy_overrides = {
+            "action_horizon": 60,
+        },
+        action_horizon = 60,
+        num_train_steps = 20_000,
+        save_interval = 10_000,
+        plot_interval = 10_000,
+        keep_period = 10_000,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
+        ),
+        num_val_trajectories = 3,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/realworld_xarm_packing/validation_cache_dir_realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar_final/",
         include_repos = (),
     ),
     # sim_bimanual_assembly twin of real_shirt_hang_paligemma_cql_rlds_finetune_subtask_ar_final:
@@ -7446,7 +7565,7 @@ _CONFIGS = [
             action_expert_variant = "gemma_300m",
             action_dim = 32,
             action_horizon = 60,
-            max_token_len = 96,
+            max_token_len = 128,
             pi05 = True,
             discrete_state_input = True,
             action_dim_offset = 14,

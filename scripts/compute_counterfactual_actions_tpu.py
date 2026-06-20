@@ -15,8 +15,8 @@ import logging
 import time
 from typing import Any
 
-from compute_latent_store import get_rlds_episode_index
-from compute_latent_store import resolve_config
+from rlds_build_utils import get_rlds_episode_index
+from rlds_build_utils import resolve_config
 from etils import epath
 import numpy as np
 import tqdm

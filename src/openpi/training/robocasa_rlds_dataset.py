@@ -97,8 +97,8 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
         prompt_mode: PromptMode = "subtask",
         **kwargs,
     ):
-        # Validation-only kwargs (val_split, val_latent_store_dir) are consumed by the
-        # validation dataset factory; accept and ignore them here.
+        # Validation-only kwargs (val_split) are consumed by the validation dataset
+        # factory; accept and ignore them here.
         del kwargs
         if critic_mode:
             logging.info(
@@ -223,7 +223,7 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
 
         observation = {"state": converted_state}
         if self._include_images:
-            # Remap to unified cam_* names so frame_transforms / latent store can use them.
+            # Remap to unified cam_* names so frame_transforms can use them.
             observation["cam_0"] = traj["observation"]["robot0_agentview_left"]
             observation["cam_1"] = traj["observation"]["robot0_agentview_right"]
             observation["cam_2"] = traj["observation"]["robot0_eye_in_hand"]
@@ -496,7 +496,7 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
         return per_step_terminations, per_step_truncations
 
     def frame_transforms(self, frame: dict) -> dict:
-        """Apply per-frame transforms with latent key remapping for unified camera names."""
+        """Apply per-frame transforms (image decoding + validity filter mask)."""
         import tensorflow as tf
 
         # Call base class for image decoding
@@ -521,20 +521,6 @@ class RoboCasaRldsDataset(rlds_dataset.BaseRldsDataset):
         if "annotation_success" in frame:
             is_valid = tf.logical_and(is_valid, tf.cast(frame["annotation_success"], tf.bool))
         frame["_filter_mask"] = is_valid
-
-        # Remap latent keys from original RoboCasa names to unified cam_0/1/2 names.
-        latent_key_mapping = {
-            "robot0_agentview_left": "cam_0",
-            "robot0_agentview_right": "cam_1",
-            "robot0_eye_in_hand": "cam_2",
-        }
-        keys_to_remap = list(frame.keys())
-        for key in keys_to_remap:
-            for original, unified in latent_key_mapping.items():
-                if original in key:
-                    new_key = key.replace(original, unified)
-                    frame[new_key] = frame.pop(key)
-                    break
 
         return frame
 
