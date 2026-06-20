@@ -36,6 +36,7 @@ import gymnasium as gym
 import imageio
 import numpy as np
 from openpi_client import image_tools
+from openpi_client import raw_artifact_logger as _raw_artifact_logger
 from openpi_client import websocket_client_policy as _websocket_client_policy
 from openpi.training.robocasa_online_subtask_tracker import get_online_tracker
 from robocasa.utils.dataset_registry import TASK_SET_REGISTRY
@@ -287,6 +288,16 @@ class Args:
     # When True, save the last frame's agentview_left + agentview_right side-by-side
     # PNG to <log_path>/last_frames/{successes,failures}/episode_<env_idx>.png.
     save_last_frames: bool = False
+    # When True, dump one JSON per episode under <log_path>/predictions/ holding
+    # the per-infer-call critic values and subtask predictions returned by the
+    # server (q_value(s), predicted_subtask, perplexity), plus a native-res
+    # agentview_left snapshot per infer call. Mirrors examples/sim_bimanual_assembly/main.py.
+    save_predictions: bool = False
+    # When True, additionally export RAW per-episode artifacts for website/demo
+    # use under <log_path>/raw/{successes,failures}/episode_<idx>/: one mp4 per
+    # top camera at the env control-freq fps (frames unresized/unmodified) and a
+    # q_values.npz mapping infer timestep -> the N candidate Q-values.
+    save_raw: bool = False
 
 
 def eval_main(args: Args) -> None:
@@ -321,6 +332,8 @@ def eval_main(args: Args) -> None:
             start_episode_idx=args.start_episode_idx,
             resume_from_dir=args.resume_from_dir,
             save_last_frames=args.save_last_frames,
+            save_predictions=args.save_predictions,
+            save_raw=args.save_raw,
         )
 
 
@@ -342,6 +355,8 @@ def eval_env(
     start_episode_idx: int = 0,
     resume_from_dir: str | None = None,
     save_last_frames: bool = False,
+    save_predictions: bool = False,
+    save_raw: bool = False,
 ) -> None:
     horizon = get_task_horizon(env_name)
     # ArrangeTea override.
@@ -417,6 +432,16 @@ def eval_env(
     if log_videos and log_path is not None:
         # Lazy init after first infer (need num_samples from q_values shape; 0 in BC mode).
         video_logger = "pending"
+
+    # Raw-artifact export (top cameras known up front, so no lazy init needed).
+    # Frames are buffered at the env control freq (env_action_fps).
+    raw_logger = None
+    if save_raw and log_path is not None:
+        raw_logger = _raw_artifact_logger.RawArtifactLogger(
+            output_dir = str(log_path / "raw"),
+            fps = max(1.0, float(env_action_fps)),
+            cam_names = ["agentview_left", "agentview_right", "eye_in_hand"],
+        )
 
     total_episodes, total_successes = 0, 0
     if resuming and log_path is not None:
@@ -510,9 +535,12 @@ def eval_env(
         ep_call_q_vars: list[float] = []
         ep_call_act_vars: list[float] = []
         ep_call_acs: list[float] = []
+        ep_prediction_records: list[dict] = []
 
         if isinstance(video_logger, VideoLogger):
             video_logger.start_episode(episode_idx)
+        if raw_logger is not None:
+            raw_logger.start_episode(episode_idx)
 
         for t in range(horizon):
             img = np.ascontiguousarray(obs["video.robot0_agentview_left"])
@@ -524,6 +552,11 @@ def eval_env(
                 )
                 skip_for_black = True
                 break
+            # Buffer the RAW (pre-resize) top-camera frames every env step (the
+            # control freq), for the optional raw-artifact export. img/img_right
+            # still hold the unmodified obs at this point.
+            if raw_logger is not None:
+                raw_logger.record_frame({"agentview_left": img, "agentview_right": img_right, "eye_in_hand": wrist_img})
             # Stretch resize matches tf.image.resize used by the RLDS dataset
             # builder during training (src/openpi/training/rlds_dataset.py:805).
             # resize_with_pad would letterbox these frames and the model has
@@ -609,6 +642,42 @@ def eval_env(
                 acs_value = infer_result.get("acs")
                 if acs_value is not None and np.isfinite(acs_value):
                     ep_call_acs.append(float(acs_value))
+                # Prefer the subtask the critic actually conditioned its value on
+                # (server-returned, e.g. an AR-decoded subtask), so headers/labels
+                # show what Q saw; fall back to the client-tracked prompt.
+                if "critic_subtask" in infer_result:
+                    header_subtask = infer_result["critic_subtask"] or "(no subtask)"
+                else:
+                    header_subtask = current_prompt
+                if raw_logger is not None:
+                    raw_logger.record_values(q_values, t, subtask = header_subtask)
+                if save_predictions:
+                    ep_prediction_records.append({
+                        "t": int(t),
+                        "prompt": current_prompt,
+                        "q_value": (float(infer_result["q_value"]) if "q_value" in infer_result else None),
+                        "q_values": (
+                            np.asarray(q_values, dtype = np.float32).reshape(-1).tolist()
+                            if q_values is not None else None
+                        ),
+                        "acs": (float(acs_value) if acs_value is not None else None),
+                        "predicted_subtask": infer_result.get("predicted_subtask"),
+                        "predicted_subtask_tokens": infer_result.get("predicted_subtask_tokens"),
+                        "subtask_perplexity": (
+                            float(infer_result["subtask_perplexity"])
+                            if "subtask_perplexity" in infer_result else None
+                        ),
+                    })
+                    if log_path is not None:
+                        # Native-resolution agentview_left frame (before the
+                        # client resizes to the policy input size), one PNG per
+                        # infer call.
+                        snap_dir = log_path / "snapshots" / f"episode_{episode_idx}"
+                        snap_dir.mkdir(parents = True, exist_ok = True)
+                        imageio.imwrite(
+                            str(snap_dir / f"{t:05d}.png"),
+                            np.ascontiguousarray(obs["video.robot0_agentview_left"]),
+                        )
                 # Server-reported compute time (set by BestOfNPolicy.infer / Policy.infer).
                 server_ms = infer_result.get("policy_timing", {}).get("infer_ms")
                 server_str = f"{server_ms:.1f}ms" if server_ms is not None else "n/a"
@@ -641,7 +710,7 @@ def eval_env(
                         },
                         q_values = (np.asarray(q_values).reshape(-1) if q_values is not None else None),
                         t = t,
-                        subtask = current_prompt,
+                        subtask = header_subtask,
                     )
 
             abs_action = action_plan.popleft()
@@ -698,6 +767,24 @@ def eval_env(
 
         if isinstance(video_logger, VideoLogger):
             video_logger.finish_episode(success = bool(done))
+        if raw_logger is not None:
+            raw_logger.finish_episode(success = bool(done))
+
+        if save_predictions and log_path is not None:
+            pred_dir = log_path / "predictions"
+            pred_dir.mkdir(parents = True, exist_ok = True)
+            pred_path = pred_dir / f"episode_{episode_idx}.json"
+            with open(pred_path, "w") as f:
+                json.dump(
+                    {
+                        "episode_idx": int(episode_idx),
+                        "success": bool(done),
+                        "records": ep_prediction_records,
+                    },
+                    f,
+                    indent = 4,
+                )
+            logging.info(f"Saved {len(ep_prediction_records)} prediction records: {pred_path}")
 
         if save_last_frames and log_path is not None:
             _sub = "successes" if done else "failures"
