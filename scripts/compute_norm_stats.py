@@ -6,8 +6,8 @@ to the config assets directory.
 """
 
 import dataclasses
-import pathlib
 
+from etils import epath
 import numpy as np
 import tqdm
 import tyro
@@ -286,7 +286,7 @@ def main(
     }
 
     if output_dir is not None:
-        output_path = pathlib.Path(output_dir)
+        output_path = epath.Path(output_dir)
     else:
         output_path = config.assets_dirs / output_id
     print(f"Writing stats to: {output_path}")

@@ -46,8 +46,6 @@ def _make_robocoin_dataset_for_unit_tests(
     dataset._action_chunk_size = 10  # noqa: SLF001
     dataset._return_trajectories = False  # noqa: SLF001
     dataset._include_images = True  # noqa: SLF001
-    dataset._latent_views = ()  # noqa: SLF001
-    dataset._latent_manifest = None  # noqa: SLF001
     return dataset
 
 

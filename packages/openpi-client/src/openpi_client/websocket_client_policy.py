@@ -35,7 +35,12 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
                 conn = websockets.sync.client.connect(
-                    self._uri, compression=None, max_size=None, additional_headers=headers
+                    self._uri, compression=None, max_size=None, additional_headers=headers,
+                    # Disable client keepalive pings: a slow server (e.g. the
+                    # subtask predictor's ~16-step autoregressive decode, ~20s
+                    # per infer) cannot pong within the default 20s ping_timeout,
+                    # which otherwise drops the connection with a 1011 error.
+                    ping_interval=None,
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata

@@ -18,8 +18,6 @@ def _make_base_dataset(*, discount: float = 0.99, reward_scale: float = 1.0, rew
     dataset._critic_mode = True  # noqa: SLF001
     dataset._action_chunk_size = 3  # noqa: SLF001
     dataset._image_obs_keys = ()  # noqa: SLF001
-    dataset._latent_views = ()  # noqa: SLF001
-    dataset._latent_manifest = None  # noqa: SLF001
     return dataset
 
 

@@ -481,7 +481,7 @@ source /nfs/aidm_nfs/saksham3/uv/vla/bin/activate
 
 #### Launching jobs via `scripts/run_on_tpu.py`
 
-When launching training via `run_on_tpu.py`, the `--command` must include additional args derived from `pod_config.py`. These are **not** automatically injected by `run_on_tpu.py`:
+When launching training via `run_on_tpu.py`, the `--command` must explicitly include the additional training args shown below. They are **not** automatically injected by `run_on_tpu.py`:
 
 **Batch size by pod size**: use `--batch-size=128` on v5e-32 pods and `--batch-size=256` on v5e-64 pods, unless the user states otherwise.
 

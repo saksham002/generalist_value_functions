@@ -34,6 +34,7 @@ import time
 import imageio
 import numpy as np
 from openpi_client import eval_image_helper as _eval_image_helper
+from openpi_client import raw_artifact_logger as _raw_artifact_logger
 from openpi_client import websocket_client_policy as _websocket_client_policy
 from scipy.spatial.transform import Rotation
 import tqdm
@@ -222,6 +223,16 @@ class Args:
     method: str = ""
     seed: int = 86
     log_videos: bool = False
+    # If True, dump one JSON per episode under <log_path>/predictions/ holding
+    # the per-infer-call critic values and subtask predictions returned by the
+    # SubtaskPredictorPolicy server (q_value(s), predicted_subtask, perplexity).
+    save_predictions: bool = False
+    # When True, additionally export RAW per-episode artifacts for website/demo
+    # use under <log_path>/raw/{successes,failures}/episode_<idx>/: one mp4 per
+    # top camera (left/top, right/top) at the env control-freq fps (frames
+    # unresized/unmodified) and a q_values.npz mapping infer timestep -> the N
+    # candidate Q-values.
+    save_raw: bool = False
 
     # Resume support. Skip the first `start_episode_idx` indices in the
     # per-episode loop, preserving the deterministic per-index reset seed
@@ -323,6 +334,8 @@ def eval_main(args: Args) -> None:
             log_videos = args.log_videos,
             start_episode_idx = args.start_episode_idx,
             resume_from_dir = args.resume_from_dir,
+            save_predictions = args.save_predictions,
+            save_raw = args.save_raw,
         )
 
 
@@ -338,6 +351,8 @@ def eval_env(
     log_videos: bool = False,
     start_episode_idx: int = 0,
     resume_from_dir: str | None = None,
+    save_predictions: bool = False,
+    save_raw: bool = False,
 ) -> None:
     log_path = None
     file_handler: logging.FileHandler | None = None
@@ -419,6 +434,16 @@ def eval_env(
     if log_videos and log_path is not None:
         video_logger = "pending"
 
+    # Raw-artifact export (top cameras known up front). Frames are buffered at
+    # the env control freq (env_control_freq).
+    raw_logger = None
+    if save_raw and log_path is not None:
+        raw_logger = _raw_artifact_logger.RawArtifactLogger(
+            output_dir = str(log_path / "raw"),
+            fps = max(1.0, float(env_control_freq)),
+            cam_names = ["left/top", "right/top"],
+        )
+
     total_episodes, total_successes = 0, 0
     if resuming and log_path is not None:
         prior_succ = sorted((log_path / "videos" / "successes").glob("episode_*.mp4"))
@@ -446,14 +471,22 @@ def eval_env(
         ep_call_q_vars: list[float] = []
         ep_call_act_vars: list[float] = []
         ep_call_acs: list[float] = []
+        ep_prediction_records: list[dict] = []
 
         if isinstance(video_logger, VideoLogger):
             video_logger.start_episode(episode_idx)
+        if raw_logger is not None:
+            raw_logger.start_episode(episode_idx)
 
         for t in range(horizon):
             right_top = np.ascontiguousarray(obs["images"]["right/top"])
             left_wrist = np.ascontiguousarray(obs["images"]["left/wrist"])
             right_wrist = np.ascontiguousarray(obs["images"]["right/wrist"])
+            # RAW top-camera capture every env step (control freq). left/top is
+            # read only for this export — the policy/critic use right/top.
+            if raw_logger is not None:
+                left_top = np.ascontiguousarray(obs["images"]["left/top"])
+                raw_logger.record_frame({"left/top": left_top, "right/top": right_top})
             element_images = image_helper.process_images({
                 "base_0_rgb": right_top,
                 "left_wrist_0_rgb": left_wrist,
@@ -484,6 +517,43 @@ def eval_env(
                 acs_value = infer_result.get("acs")
                 if acs_value is not None and np.isfinite(acs_value):
                     ep_call_acs.append(float(acs_value))
+
+                # Subtask the critic actually conditioned its value on
+                # (server-returned, e.g. an AR-decoded subtask); fall back to the
+                # client-latched subtask. Used for both the mosaic header and the
+                # raw q_values.npz labels.
+                if "critic_subtask" in infer_result:
+                    header_subtask = infer_result["critic_subtask"] or "(no subtask)"
+                else:
+                    header_subtask = SUBTASKS[prompt_idx]
+                if raw_logger is not None:
+                    raw_logger.record_values(q_values, t, subtask = header_subtask)
+
+                if save_predictions:
+                    ep_prediction_records.append({
+                        "t": int(t),
+                        "prompt_idx": int(prompt_idx),
+                        "prompt": SUBTASKS[prompt_idx],
+                        "q_value": (float(infer_result["q_value"]) if "q_value" in infer_result else None),
+                        "q_values": (
+                            np.asarray(q_values, dtype = np.float32).reshape(-1).tolist()
+                            if q_values is not None else None
+                        ),
+                        "acs": (float(acs_value) if acs_value is not None else None),
+                        "predicted_subtask": infer_result.get("predicted_subtask"),
+                        "predicted_subtask_tokens": infer_result.get("predicted_subtask_tokens"),
+                        "subtask_perplexity": (
+                            float(infer_result["subtask_perplexity"])
+                            if "subtask_perplexity" in infer_result else None
+                        ),
+                    })
+
+                if save_predictions and log_path is not None:
+                    # Native-resolution right/top frame (before EvalImageHelper
+                    # resizes to the policy input size), one PNG per infer call.
+                    snap_dir = log_path / "snapshots" / f"episode_{episode_idx}"
+                    snap_dir.mkdir(parents = True, exist_ok = True)
+                    imageio.imwrite(str(snap_dir / f"{t:05d}.png"), right_top)
                 server_ms = infer_result.get("policy_timing", {}).get("infer_ms")
                 server_str = f"{server_ms:.1f}ms" if server_ms is not None else "n/a"
                 q_str = ""
@@ -507,6 +577,10 @@ def eval_env(
                     )
                     video_logger.start_episode(episode_idx)
                 if isinstance(video_logger, VideoLogger):
+                    # header_subtask (computed above) titles the mosaic with the
+                    # subtask the critic actually conditioned its value on, so the
+                    # video shows what Q saw — including any stale / carried-over
+                    # subtask.
                     video_logger.record_predict(
                         images = {
                             "right/top": right_top,
@@ -515,7 +589,7 @@ def eval_env(
                         },
                         q_values = (np.asarray(q_values).reshape(-1) if q_values is not None else None),
                         t = t,
-                        subtask = SUBTASKS[prompt_idx],
+                        subtask = header_subtask,
                     )
 
             abs_action = action_plan.popleft()
@@ -540,6 +614,25 @@ def eval_env(
 
         if isinstance(video_logger, VideoLogger):
             video_logger.finish_episode(success = bool(done))
+        if raw_logger is not None:
+            raw_logger.finish_episode(success = bool(done))
+
+        if save_predictions and log_path is not None:
+            pred_dir = log_path / "predictions"
+            pred_dir.mkdir(parents = True, exist_ok = True)
+            pred_path = pred_dir / f"episode_{episode_idx}.json"
+            with open(pred_path, "w") as f:
+                json.dump(
+                    {
+                        "episode_idx": int(episode_idx),
+                        "success": bool(done),
+                        "final_prompt_idx": int(prompt_idx),
+                        "records": ep_prediction_records,
+                    },
+                    f,
+                    indent = 4,
+                )
+            logging.info(f"Saved {len(ep_prediction_records)} prediction records: {pred_path}")
 
         logging.info(f"Episode {total_episodes}: {'success' if done else 'failure'}")
         logging.info(f"Running: {total_successes}/{total_episodes} ({total_successes / total_episodes * 100:.1f}%)")

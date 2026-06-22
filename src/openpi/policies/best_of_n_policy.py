@@ -864,6 +864,15 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             if acs_value is not None:
                 result["acs"] = acs_value
 
+        # Subtask the critic conditioned its value forward on this call: the
+        # cached subtask used to build the value prompt in _prepare_inputs (None
+        # on the cold-start call before the first decode). Only emitted for
+        # predict_subtask_ar critics (a decoder is configured); non-AR critics
+        # and the policy-only path are unchanged. Captured before
+        # _maybe_decode_subtask below refreshes the cache for the next call.
+        if self._subtask_decoder is not None:
+            result["critic_subtask"] = self._cached_subtask_str
+
         # Subtask-AR critics: autoregressively decode the current subtask off the
         # same observation (cadence-gated) and cache it for the next call's value
         # prompt. Runs after the main inference so every rank hits the decode

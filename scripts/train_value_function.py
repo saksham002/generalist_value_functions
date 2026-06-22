@@ -785,6 +785,24 @@ def value_function_train_step(
         next_token_loss_arr = value_info.pop("next_token_loss")
         value_stats["next_token_loss"] = jnp.mean(next_token_loss_arr)
 
+    # Variable-horizon only: MC loss is inherently high at short sampled horizons, which
+    # does not imply inaccurate values at the longer horizons we ultimately use. Log MC
+    # loss restricted to samples whose sampled horizon k is at least half the action chunk
+    # (fps-scaled: 25 @50fps, 15 @30fps), plus the number of such samples.
+    if "q_pred_per_sample" in value_info:
+        q_pred_per_sample = value_info.pop("q_pred_per_sample")
+        mc_return_per_sample = value_info.pop("mc_return_per_sample")
+        if "variable_k_native" in batch:
+            per_sample_mc_loss = jnp.square(q_pred_per_sample - mc_return_per_sample)
+            half_action_chunk = config.action_horizon // 2
+            k_threshold = jnp.where(jnp.asarray(batch["fps"]) == 30, 3 * half_action_chunk // 5, half_action_chunk)
+            long_horizon_mask = (jnp.asarray(batch["variable_k_native"]) >= k_threshold).astype(jnp.float32)
+            num_long_horizon = jnp.sum(long_horizon_mask)
+            value_stats["mc_loss_long_horizon"] = (
+                jnp.sum(per_sample_mc_loss * long_horizon_mask) / jnp.maximum(num_long_horizon, 1.0)
+            )
+            value_stats["num_long_horizon"] = num_long_horizon
+
     grads_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), grads)
     kernel_params_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), kernel_params)
     target_params_f32 = jax.tree.map(lambda x: x.astype(jnp.float32), target_params)
@@ -2321,7 +2339,7 @@ def main(config: _config.TrainConfig):
         if jax.process_count() > 1:
             jax.experimental.multihost_utils.sync_global_devices("val_cache_write")
         del val_trajectory_dataset, val_input_transform, _val_data_config, _val_rlds_kwargs
-    elif data_config.rlds_dataset_class in ("robocoin", "hdf5"):
+    elif data_config.rlds_dataset_class in ("robocoin", "hdf5", "lerobot"):
         action_horizon = config.action_horizon or config.model.action_horizon
         val_tokenizer = config.data._get_critic_tokenizer(config.model)
         assert val_tokenizer is not None, "RoboCOIN/HDF5 validation variants require a critic tokenizer."
@@ -2463,7 +2481,7 @@ def main(config: _config.TrainConfig):
         step = int(critic_state.step)
         model = nnx.merge(critic_state.model_def, critic_state.params)
 
-        if data_config.rlds_dataset_class in ("robocoin", "robocasa", "hdf5"):
+        if data_config.rlds_dataset_class in ("robocoin", "robocasa", "hdf5", "lerobot"):
             generate_validation_plots_dlimp(
                 model = model,
                 val_episode_indices = val_episode_indices,
@@ -2653,7 +2671,7 @@ def main(config: _config.TrainConfig):
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)
 
-                if data_config.rlds_dataset_class in ("robocoin", "robocasa", "hdf5"):
+                if data_config.rlds_dataset_class in ("robocoin", "robocasa", "hdf5", "lerobot"):
                     generate_validation_plots_dlimp(
                         model = model,
                         val_episode_indices = val_episode_indices,

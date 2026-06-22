@@ -7,7 +7,7 @@ Actions are stored unnormalized in the dataset action space.
 For each step, actions are generated for the prompt used by policy training, resulting in shape:
     [num_steps, num_samples, action_horizon, action_dim]
 
-The store is stored as a TFDS dataset, mirroring the latent store pattern.
+The store is stored as a TFDS dataset that mirrors the source RLDS layout.
 This ensures identical loading behavior (file shuffling, process sharding) as the source
 RLDS dataset, enabling deterministic joining via tfds.builder_from_directory().
 
@@ -274,6 +274,17 @@ class CounterfactualActionStoreTFDSShardWriter:
         }
 
         serialized = self._features.serialize_example(example)
+        self._writer.write(serialized)
+        self._total_bytes += len(serialized)
+        self._episode_count += 1
+
+    def write_raw_record(self, serialized: bytes) -> None:
+        """Write a pre-serialized TFRecord example verbatim.
+
+        Used by re-sharding, which copies records between shard layouts without
+        decoding/re-encoding the payload. ``serialized`` must be an example produced
+        by another shard of the same store (same feature spec).
+        """
         self._writer.write(serialized)
         self._total_bytes += len(serialized)
         self._episode_count += 1

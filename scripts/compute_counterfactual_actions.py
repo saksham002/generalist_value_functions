@@ -44,10 +44,10 @@ import subprocess
 import time
 from typing import Annotated, Any
 
-from compute_latent_store import get_rlds_episode_index
-from compute_latent_store import get_total_episodes
-from compute_latent_store import parse_partition_split
-from compute_latent_store import resolve_config
+from rlds_build_utils import get_rlds_episode_index
+from rlds_build_utils import get_total_episodes
+from rlds_build_utils import parse_partition_split
+from rlds_build_utils import resolve_config
 from etils import epath
 import numpy as np
 import tqdm

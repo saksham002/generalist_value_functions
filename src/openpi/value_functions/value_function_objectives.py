@@ -774,6 +774,8 @@ def cql_objective(
         if q_pred_mc_diff is not None:
             info["mc_loss"] = jnp.mean(jnp.square(q_pred_mc_diff))
             info["avg_q_minus_mc"] = jnp.mean(q_pred_mc_diff)
+            info["q_pred_per_sample"] = q_pred_for_logging
+            info["mc_return_per_sample"] = transition.mc_return
         if next_token_loss is not None:
             info["next_token_loss"] = next_token_loss
         return q_loss, cql_loss, info

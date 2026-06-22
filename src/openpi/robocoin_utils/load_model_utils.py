@@ -157,7 +157,17 @@ def load_critic(
             restored["params"]["critic"]["params"],
         )
 
-    data_config = config.data.create(config.assets_dirs, config.model)
+    # Value-function critic configs leave model.action_horizon=None and take the
+    # action-chunk length from TrainConfig.action_horizon (which the FineTuneConfig
+    # overrides). data.create() slices the action_diff norm stats by
+    # model.action_horizon, so resolve it from the TrainConfig value when the model
+    # leaves it unset (mirrors how training resolves the critic action horizon).
+    # Only the norm-stats path is affected; the model used for checkpoint restore is
+    # left untouched.
+    data_model_config = config.model
+    if getattr(config.model, "action_horizon", None) is None and config.action_horizon is not None:
+        data_model_config = dataclasses.replace(config.model, action_horizon = config.action_horizon)
+    data_config = config.data.create(config.assets_dirs, data_model_config)
     if step is not None:
         resolved_step = step
     else:
