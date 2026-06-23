@@ -6,6 +6,10 @@ Run this on the POLICY COMPUTER to test connection to robot server.
 
 import argparse
 import sys
+from pathlib import Path
+
+# remote_environment_adapter lives in the parent xarm_scripts/ directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from remote_environment_adapter import RemoteEnvironmentAdapter
 

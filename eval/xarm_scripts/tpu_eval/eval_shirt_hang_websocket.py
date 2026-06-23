@@ -6,10 +6,10 @@ for actions and sending them to the physical robot.
 
 Usage:
     # Start the policy server on the TPU pod first:
-    ./eval/xarm_scripts/tpu_eval/shirt_hang/serve_policy_shirt_hang.sh
+    ./eval/xarm_scripts/tpu_eval/serve_policy_shirt_hang.sh
 
     # Then run the eval client:
-    uv run eval/xarm_scripts/tpu_eval/shirt_hang/eval_shirt_hang_websocket.py \
+    uv run eval/xarm_scripts/tpu_eval/eval_shirt_hang_websocket.py \
         --args.policy-host <tpu-worker-0-ip> \
         --args.robot-host xarmpc.pc.cs.cmu.edu
 """
@@ -111,7 +111,7 @@ class Args:
     """Debug mode: skip policy connection, save camera images to disk and print state instead."""
 
     debug_output_dir: str = ""
-    """Directory to save debug images when --debug is set. Defaults to eval/xarm_scripts/tpu_eval/shirt_hang/debug/."""
+    """Directory to save debug images when --debug is set. Defaults to eval/xarm_scripts/tpu_eval/debug/."""
 
     manual: bool = False
     """If set, advance subtasks manually by pressing Enter (auto heuristic is disabled)."""
@@ -127,10 +127,10 @@ class Args:
 
     log_videos: bool = False
     """If set, save a per-episode 4-panel mp4 (wrist + base + Q-value plot)
-    to eval/xarm_scripts/tpu_eval/shirt_hang/videos/episode_<n>.mp4 at FPS = control_freq / query_freq."""
+    to eval/xarm_scripts/tpu_eval/videos/episode_<n>.mp4 at FPS = control_freq / query_freq."""
 
     video_subdir: str = ""
-    """Optional subdirectory under eval/xarm_scripts/tpu_eval/shirt_hang/videos/ in which to store
+    """Optional subdirectory under eval/xarm_scripts/tpu_eval/videos/ in which to store
     this run's mp4s. Empty string saves directly into videos/."""
 
     use_critic_subtasks: bool = True
@@ -401,11 +401,6 @@ class VideoLogger:
             return
         q_matrix = np.stack(self._q_values, axis = 0)  # (T_replans, N)
         steps = np.asarray(self._steps, dtype = np.int64)
-        # Persist the exact per-replan Q-values plotted in the video so the numbers
-        # behind the rendered "Final Video" can be recovered for offline analysis.
-        qval_path = os.path.join(self.output_dir, f"Final Video q values_episode_{self._episode_idx}.npz")
-        np.savez(qval_path, steps = steps, q_values = q_matrix)
-        logger.info(f"Saved episode Q-values: {qval_path}")
         frames = [self._render_frame(i, q_matrix, steps) for i in range(len(self._images))]
         out_path = os.path.join(self.output_dir, f"episode_{self._episode_idx}.mp4")
         # imageio bundles its own ffmpeg with libx264; system ffmpeg on this cluster
@@ -724,16 +719,11 @@ def run_episode(
                     log_line += f", q_values=[{values_str}]"
                 logger.info(log_line)
 
-                # When the server AR-decodes the current subtask (returns
-                # 'predicted_subtask' on decode steps), log it next to the tracker's
-                # current subtask (the annotation) so alignment can be checked, and
-                # dump the right/top frame the critic saw.
+                # When the server decodes the current subtask (returns
+                # 'predicted_subtask'), dump the right/top camera frame so the
+                # decode can be eyeballed against what the critic actually saw.
                 predicted_subtask = infer_result.get("predicted_subtask")
                 if predicted_subtask is not None:
-                    logger.info(
-                        f"[subtask decode] step {t}: predicted={predicted_subtask!r}  "
-                        #f"annotation(tracker)=subtask{tracker.subtask}:{tracker.prompt!r}"
-                    )
                     decode_dir = os.path.join(
                         os.path.dirname(os.path.abspath(__file__)), "decoded_subtask_images"
                     )
@@ -744,9 +734,13 @@ def run_episode(
                             c if c.isalnum() else "_" for c in str(predicted_subtask)
                         )[:60]
                         out_path = os.path.join(
-                            decode_dir, f"ep{episode_idx}_step{t}_ann{tracker.subtask}_pred_{safe_subtask}.png"
+                            decode_dir, f"ep{episode_idx}_step{t}_{safe_subtask}.png"
                         )
                         imageio.imwrite(out_path, right_top_rgb)
+                        logger.info(
+                            f"[subtask decode] predicted={predicted_subtask!r} → "
+                            f"saved right/top image to {out_path}"
+                        )
 
                 if video_logger is not None:
                     video_logger.record_predict(images_rgb, q_values, t)
@@ -815,7 +809,7 @@ def main(args: Args) -> None:
     import sys
     from pathlib import Path
 
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    sys.path.insert(0, str(Path(__file__).parent.parent))
     from remote_environment_adapter import RemoteEnvironmentAdapter
 
     if args.manual:
