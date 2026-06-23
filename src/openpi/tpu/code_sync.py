@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 import subprocess
 
+from openpi.tpu.gcloud import _apply_ssh_user
 from openpi.tpu.gcloud import ssh_command
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,15 @@ def sync_code(
     # This handles files owned by other users and ensures binaries are executable.
     logger.info("Fixing file permissions on code directories...")
     code_dirs = ["src", "scripts", "packages", "examples", ".agent"]
-    chmod_cmd = " && ".join(f"sudo chmod -R 777 {remote_dir}/{d} 2>/dev/null || true" for d in code_dirs)
+    chmod_parts = [f"sudo chmod -R 777 {remote_dir}/{d} 2>/dev/null || true" for d in code_dirs]
+    # Also make the repo root dir + its top-level files writable. rsync writes each
+    # file through a temp file in the target directory, so a root dir owned by a
+    # different user blocks updates to root-level files (.gitignore, pyproject.toml,
+    # uv.lock, ...). -maxdepth 1 keeps this off the huge gitignored data/ and
+    # checkpoints/ dirs.
+    chmod_parts.append(f"sudo chmod 777 {remote_dir} 2>/dev/null || true")
+    chmod_parts.append(f"sudo find {remote_dir} -maxdepth 1 -type f -exec chmod 666 {{}} + 2>/dev/null || true")
+    chmod_cmd = " ; ".join(chmod_parts)
     ssh_command(
         tpu_name,
         zone,
@@ -57,7 +66,7 @@ def sync_code(
     )
 
     # Build rsync command with gcloud as SSH transport
-    ssh_cmd = f"gcloud compute tpus tpu-vm ssh {tpu_name} --zone={zone} --project={project} --worker=0 --"
+    ssh_cmd = f"gcloud compute tpus tpu-vm ssh {_apply_ssh_user(tpu_name)} --zone={zone} --project={project} --worker=0 --"
 
     rsync_args = [
         "rsync",

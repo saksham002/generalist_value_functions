@@ -36,6 +36,7 @@ class JobRunner:
         notifier: SlackNotifier | None = None,
         num_workers: int = 1,
         nfs_mount_path: str = "/nfs/aidm_nfs",
+        nfs_user: str = "saksham3",
     ):
         """Initialize the job runner.
 
@@ -55,6 +56,7 @@ class JobRunner:
         self.notifier = notifier
         self.num_workers = num_workers
         self.nfs_mount_path = nfs_mount_path
+        self.nfs_user = nfs_user
         self._exit_code_file = "~/tpu_job_exit_code"
         self._log_file = "~/tpu_job_output.log"
         self._local_session_name = f"tpu-{tpu_name}"
@@ -62,18 +64,19 @@ class JobRunner:
     def _build_job_preamble(self) -> str:
         """Build TPU job environment setup shared by all workers."""
         nfs = self.nfs_mount_path
+        user = self.nfs_user
         return (
             'source ~/.bashrc && '
-            f"source {nfs}/saksham3/uv/vla/bin/activate && "
-            f'export PATH="{nfs}/saksham3/uv/bin:$PATH" && '
-            f'export UV_PROJECT_ENVIRONMENT="{nfs}/saksham3/uv/vla" && '
+            f"source {nfs}/{user}/uv/vla/bin/activate && "
+            f'export PATH="{nfs}/{user}/uv/bin:$PATH" && '
+            f'export UV_PROJECT_ENVIRONMENT="{nfs}/{user}/uv/vla" && '
             "sudo mkdir -p /tmp/tpu_logs && "
             "sudo chmod -R 777 /tmp/tpu_logs && "
             # Copy PaliGemma 2B checkpoint from NFS to local cache if missing
             "PALIGEMMA_CACHE=$HOME/.cache/openpi/vertex-model-garden-paligemma-us/paligemma/pt_224.npz && "
             'if [ ! -f "$PALIGEMMA_CACHE" ]; then '
             'mkdir -p "$(dirname "$PALIGEMMA_CACHE")" && '
-            f'cp {nfs}/saksham3/gemma/2b/pt_224.npz "$PALIGEMMA_CACHE"; '
+            f'cp {nfs}/{user}/gemma/2b/pt_224.npz "$PALIGEMMA_CACHE" || true; '
             "fi && "
             "export PLATFORM=tpu"
         )

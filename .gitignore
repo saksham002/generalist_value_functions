@@ -8,9 +8,11 @@ project_status/
 # Separate repo
 eval/
 
+# Local gcloud config / credentials (CLOUDSDK_CONFIG)
+.gcloud/
+
 # Data directories.
 assets/
-checkpoints/
 data/
 wandb/
 

@@ -2,12 +2,24 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 import subprocess
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROJECT = "cmu-aidm-v2"
+
+
+def _apply_ssh_user(tpu_name: str) -> str:
+    """Prefix `<user>@` to tpu_name when OPENPI_TPU_SSH_USER is set.
+
+    Lets you launch from a machine whose local Linux user differs from the
+    user the TPU NFS dir is owned by (e.g. lab-PC `huzheyuan` -> NFS owned by
+    `jeffyu`). Requires OS Login on the GCP project to allow that mapping.
+    """
+    user = os.environ.get("OPENPI_TPU_SSH_USER")
+    return f"{user}@{tpu_name}" if user else tpu_name
 
 
 def run_gcloud(
@@ -256,7 +268,7 @@ def ssh_command(
             "tpus",
             "tpu-vm",
             "ssh",
-            tpu_name,
+            _apply_ssh_user(tpu_name),
             "--zone",
             zone,
             f"--worker={worker}",
@@ -296,7 +308,7 @@ def scp_to_tpu(
             "tpu-vm",
             "scp",
             str(local_path),
-            f"{tpu_name}:{remote_path}",
+            f"{_apply_ssh_user(tpu_name)}:{remote_path}",
             "--zone",
             zone,
             f"--worker={worker}",
@@ -333,7 +345,7 @@ def scp_from_tpu(
             "tpus",
             "tpu-vm",
             "scp",
-            f"{tpu_name}:{remote_path}",
+            f"{_apply_ssh_user(tpu_name)}:{remote_path}",
             str(local_path),
             "--zone",
             zone,

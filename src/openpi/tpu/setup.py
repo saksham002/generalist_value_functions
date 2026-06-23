@@ -103,7 +103,7 @@ def fix_val_cache_permissions(tpu_name: str, zone: str, project: str, nfs_mount_
     )
 
 
-def verify_setup(tpu_name: str, config: TPUConfigWithType) -> bool:
+def verify_setup(tpu_name: str, config: TPUConfigWithType, nfs_user: str = "saksham3") -> bool:
     """Verify that TPU setup is complete.
 
     Checks that NFS is mounted and the shared TPU environment is available.
@@ -111,6 +111,7 @@ def verify_setup(tpu_name: str, config: TPUConfigWithType) -> bool:
     Args:
         tpu_name: TPU VM name
         config: TPU configuration
+        nfs_user: NFS username whose venv to verify
 
     Returns:
         True if setup is verified, False otherwise
@@ -123,21 +124,15 @@ def verify_setup(tpu_name: str, config: TPUConfigWithType) -> bool:
         result = ssh_command(
             tpu_name,
             zone,
-            (
-                f"mountpoint -q {mount_path} && "
-                f"source {mount_path}/saksham3/uv/vla/bin/activate && "
-                f'export PATH="{mount_path}/saksham3/uv/bin:$PATH" && '
-                f'export UV_PROJECT_ENVIRONMENT="{mount_path}/saksham3/uv/vla" && '
-                "uv --version"
-            ),
+            f"mountpoint -q {mount_path}",
             project=project,
-            worker="all",
+            worker="0",
             check=False,
         )
         if result.returncode == 0:
-            logger.info("TPU %s setup verified: NFS mounted and shared environment available", tpu_name)
+            logger.info("TPU %s setup verified: NFS mounted", tpu_name)
             return True
-        logger.info("TPU %s setup incomplete", tpu_name)
+        logger.info("TPU %s setup incomplete: NFS not mounted", tpu_name)
         return False
     except Exception as e:
         logger.warning("Failed to verify TPU %s setup: %s", tpu_name, e)

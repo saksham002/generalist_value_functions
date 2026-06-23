@@ -1,0 +1,177 @@
+{
+  "description": "24 packing tasks sampled from chunks.json, 8 per two-box pairing. Each task uses exactly the two listed box sizes.",
+  "small_medium": [
+    {
+      "global_chunk_index": 57,
+      "repo_id": "xarm_baseline_round2",
+      "boxes": ["small", "medium"],
+      "num_subtasks": 5,
+      "task": "Pack the Cheez-It container, Soda can, Altoids container, and Liquid hand soap into the small box, then pack the Sponge into the medium box."
+    },
+    {
+      "global_chunk_index": 115,
+      "repo_id": "xarm_baseline_round3",
+      "boxes": ["small", "medium"],
+      "num_subtasks": 5,
+      "task": "Pack the Soda can and Pink tumbler into the small box, then pack the Cheez-It container, Altoids container, and Sponge into the medium box."
+    },
+    {
+      "global_chunk_index": 170,
+      "repo_id": "xarm_baseline_round4",
+      "boxes": ["small", "medium"],
+      "num_subtasks": 7,
+      "task": "Pack the Altoids container, Cheez-It container, and Whiteboard eraser into the small box, then pack the Box of M&Ms, Sponge, Donut, and Croissant into the medium box."
+    },
+    {
+      "global_chunk_index": 228,
+      "repo_id": "xarm_baseline_round5",
+      "boxes": ["small", "medium"],
+      "num_subtasks": 5,
+      "task": "Pack the Cheez-It container into the medium box, then pack the Altoids container and Sponge into the small box, then pack the Microfiber cloth into the medium box, then pack the GoGo fruit pouch into the small box."
+    },
+    {
+      "global_chunk_index": 284,
+      "repo_id": "xarm_baseline_round6",
+      "boxes": ["small", "medium"],
+      "num_subtasks": 5,
+      "task": "Pack the Cheez-It container, Altoids container, and Soda can into the small box, then pack the Sponge and Microfiber cloth into the medium box."
+    },
+    {
+      "global_chunk_index": 89,
+      "repo_id": "xarm_baseline_round2",
+      "boxes": ["small", "medium"],
+      "num_subtasks": 8,
+      "task": "Pack the Cheez-It container, Nesquik container, Donut, and Soda can into the medium box, then pack the Pringles chip bag, Altoids container, Croissant, and Microfiber cloth into the small box."
+    },
+    {
+      "global_chunk_index": 144,
+      "repo_id": "xarm_baseline_round3",
+      "boxes": ["small", "medium"],
+      "num_subtasks": 6,
+      "task": "Pack the Soda can, Soccer ball plush, and Sponge into the small box, then pack the Liquid hand soap, Altoids container, and Pringles chip bag into the medium box."
+    },
+    {
+      "global_chunk_index": 200,
+      "repo_id": "xarm_baseline_round4",
+      "boxes": ["small", "medium"],
+      "num_subtasks": 5,
+      "task": "Pack the Cheez-It container, Whiteboard eraser, and Donut into the medium box, then pack the Box of M&Ms and Sponge into the small box."
+    }
+  ],
+  "small_large": [
+    {
+      "global_chunk_index": 59,
+      "repo_id": "xarm_baseline_round2",
+      "boxes": ["small", "large"],
+      "num_subtasks": 6,
+      "task": "Pack the Soda can, Nesquik container, and Pink tumbler into the small box, then pack the Altoids container, Donut, and Pringles chip bag into the large box."
+    },
+    {
+      "global_chunk_index": 113,
+      "repo_id": "xarm_baseline_round3",
+      "boxes": ["small", "large"],
+      "num_subtasks": 6,
+      "task": "Pack the Nesquik container, Soda can, and Pink tumbler into the small box, then pack the Cinnamon Toast Crunch cereal, Pringles chip bag, and Liquid hand soap into the large box."
+    },
+    {
+      "global_chunk_index": 166,
+      "repo_id": "xarm_baseline_round4",
+      "boxes": ["small", "large"],
+      "num_subtasks": 5,
+      "task": "Pack the Spatula and Cling n' seal wrap into the large box, then pack the Soda can, Altoids container, and Sponge into the small box."
+    },
+    {
+      "global_chunk_index": 221,
+      "repo_id": "xarm_baseline_round5",
+      "boxes": ["small", "large"],
+      "num_subtasks": 5,
+      "task": "Pack the Sponge, Altoids container, and Box of M&Ms into the small box, then pack the Nesquik container and Soda can into the large box."
+    },
+    {
+      "global_chunk_index": 276,
+      "repo_id": "xarm_baseline_round6",
+      "boxes": ["small", "large"],
+      "num_subtasks": 8,
+      "task": "Pack the Nesquik container, Cinnamon Toast Crunch cereal, Pringles chip bag, Marker, Soda can, and Cheez-It container into the large box, then pack the Soccer ball plush and Box of M&Ms into the small box."
+    },
+    {
+      "global_chunk_index": 78,
+      "repo_id": "xarm_baseline_round2",
+      "boxes": ["small", "large"],
+      "num_subtasks": 5,
+      "task": "Pack the Nesquik container, Soda can, and Pink tumbler into the large box, then pack the Altoids container and Sponge into the small box."
+    },
+    {
+      "global_chunk_index": 139,
+      "repo_id": "xarm_baseline_round3",
+      "boxes": ["small", "large"],
+      "num_subtasks": 4,
+      "task": "Pack the Cheez-It container and Whiteboard eraser into the small box, then pack the Sponge and Soda can into the large box."
+    },
+    {
+      "global_chunk_index": 199,
+      "repo_id": "xarm_baseline_round4",
+      "boxes": ["small", "large"],
+      "num_subtasks": 6,
+      "task": "Pack the Nesquik container, Soda can, Pink tumbler, and Pringles chip bag into the large box, then pack the Altoids container and Sponge into the small box."
+    }
+  ],
+  "medium_large": [
+    {
+      "global_chunk_index": 81,
+      "repo_id": "xarm_baseline_round2",
+      "boxes": ["medium"],
+      "num_subtasks": 2,
+      "task": "Pack the  Cinnamon Toast Crunch cereal and the Cheez-It container into the medium box."
+    },
+    {
+      "global_chunk_index": 116,
+      "repo_id": "xarm_baseline_round3",
+      "boxes": ["medium", "large"],
+      "num_subtasks": 8,
+      "task": "Pack the Cheez-It container, Altoids container, Box of M&Ms, Donut, and GoGo fruit pouch into the medium box, then pack the Cinnamon Toast Crunch cereal, Microfiber cloth, and Marker into the large box."
+    },
+    {
+      "global_chunk_index": 171,
+      "repo_id": "xarm_baseline_round4",
+      "boxes": ["medium", "large"],
+      "num_subtasks": 4,
+      "task": "Pack the Nesquik container and Soda can into the medium box, then pack the Cheez-It container and Mustard into the large box."
+    },
+    {
+      "global_chunk_index": 225,
+      "repo_id": "xarm_baseline_round5",
+      "boxes": ["medium", "large"],
+      "num_subtasks": 6,
+      "task": "Pack the Pink tumbler, Soda can, Altoids container, Cheez-It container, and Microfiber cloth into the medium box, then pack the Nesquik container into the large box."
+    },
+    {
+      "global_chunk_index": 279,
+      "repo_id": "xarm_baseline_round6",
+      "boxes": ["medium", "large"],
+      "num_subtasks": 8,
+      "task": "Pack the GoGo fruit pouch, Donut, Croissant, and Baking soda into the medium box, then pack the Nutella container, Mustard, Liquid hand soap, and Microfiber cloth into the large box."
+    },
+    {
+      "global_chunk_index": 75,
+      "repo_id": "xarm_baseline_round2",
+      "boxes": ["medium", "large"],
+      "num_subtasks": 5,
+      "task": "Pack the Box of M&Ms and Cinnamon Toast Crunch cereal into the large box, then pack the Cheez-It container, Donut, and Croissant into the medium box."
+    },
+    {
+      "global_chunk_index": 129,
+      "repo_id": "xarm_baseline_round3",
+      "boxes": ["medium", "large"],
+      "num_subtasks": 8,
+      "task": "Pack the Nesquik container, Soda can, Donut, Croissant, Nutella container, and GoGo fruit pouch into the medium box, then pack the Marker and Microfiber cloth into the large box."
+    },
+    {
+      "global_chunk_index": 207,
+      "repo_id": "xarm_baseline_round4",
+      "boxes": ["medium", "large"],
+      "num_subtasks": 5,
+      "task": "Pack the Stuffed yak and Sponge into the medium box, then pack the Cling n' seal wrap, Whiteboard eraser, and Donut into the large box."
+    }
+  ]
+}
