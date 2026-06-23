@@ -184,6 +184,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         inject_noise: bool = False,
         noise_level: float = 0.0,
         subtask_decode_every: int = 20,
+        num_steps: int | None = None,
     ) -> None:
         # Both critic-config and critic-checkpoint must be provided together.
         critic_args_set = (critic_config_name is not None) or (critic_checkpoint_dir is not None)
@@ -330,6 +331,11 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         self._input_transform = policy._input_transform  # noqa: SLF001
         self._output_transform = policy._output_transform  # noqa: SLF001
         self._sample_kwargs = dict(policy._sample_kwargs)  # noqa: SLF001
+        # Override the flow-matching integration step count. Only consumed by the
+        # policy-only (BC) sampling path; the BestOfN-with-critic path samples
+        # via the BestOfN model, which uses the model's default num_steps.
+        if num_steps is not None:
+            self._sample_kwargs["num_steps"] = num_steps
         self._rng = policy._rng  # noqa: SLF001
         # Surface image sizes + critic-image flag to client metadata for EvalImageHelper.
         self._metadata = dict(policy.metadata)
@@ -1420,6 +1426,7 @@ def create_bestofn_policy(
     inject_noise: bool = False,
     noise_level: float = 0.0,
     subtask_decode_every: int = 20,
+    num_steps: int | None = None,
 ) -> BestOfNPolicy:
     """Convenience factory; matches the kwargs the serve_policy CLI exposes."""
     return BestOfNPolicy(
@@ -1445,4 +1452,5 @@ def create_bestofn_policy(
         inject_noise = inject_noise,
         noise_level = noise_level,
         subtask_decode_every = subtask_decode_every,
+        num_steps = num_steps,
     )
