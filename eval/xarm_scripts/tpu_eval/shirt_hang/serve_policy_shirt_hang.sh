@@ -16,7 +16,7 @@ POLICY_DIR="gs://saksham-euw4/checkpoints/robocoin/pi05_finetune/real_shirt_hang
 POLICY_STEP=60000
 
 # Set CRITIC_ENABLE=false to serve the policy without BestOfN.
-CRITIC_ENABLE=true
+CRITIC_ENABLE=false
 CRITIC_CONFIG="robocoin_bimanual_paligemma_cql_rlds"
 CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_cql_rlds/robocoin_bimanual_paligemma_cql_rlds/real_shirt_hang_paligemma_cql_rlds_finetune_task_description_final"
 CRITIC_STEP=240000

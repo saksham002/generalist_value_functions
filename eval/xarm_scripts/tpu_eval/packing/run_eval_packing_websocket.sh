@@ -15,7 +15,7 @@ ROBOT_HOST="xarmpc.pc.cs.cmu.edu"
 ROBOT_PORT=8080
 
 NUM_EPISODES=50
-START_EPISODE_IDX=16
+START_EPISODE_IDX=0
 CONTROL_FREQ=60
 QUERY_FREQ=30
 MAX_STEPS=7200
@@ -25,6 +25,11 @@ NUM_SAMPLES=8
 # true: critic conditioned on per-step subtask prompts; false: critic gets TASK_DESCRIPTION (same prompt as the policy).
 # Requires a critic served with a prompt_mode that reads the client prompt (NOT task_description_predict_current_subtask).
 USE_CRITIC_SUBTASKS=false
+# true: POLICY conditioned on the per-step subtask prompts from packing_tasks.json ("subtasks"),
+# advanced by pressing Enter; false: policy conditioned on the full TASK_DESCRIPTION.
+# Requires a policy whose prompt_mode reads the client prompt (do NOT pass --task-description to
+# serve_policy.py, or the server would pin the policy prompt and this would have no effect).
+USE_POLICY_SUBTASKS=true
 # Each episode loads its own task from packing_tasks.json, keyed on its episode index (0-7
 # small+medium, 8-15 small+large, 16-23 medium+large). Set START_EPISODE_IDX to pick which task
 # the run begins on; each subsequent episode advances to the next task.
@@ -32,7 +37,7 @@ USE_CRITIC_SUBTASKS=false
 TASK_DESCRIPTION=""
 
 LOG_VIDEOS=true
-VIDEO_SUBDIR="BC"   # optional subdir under eval/xarm_scripts/tpu_eval/packing/videos/ (empty = save directly there)
+VIDEO_SUBDIR="realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar, 250k steps, N=8"   # optional subdir under eval/xarm_scripts/tpu_eval/packing/videos/ (empty = save directly there)
 DEBUG_VALUES=false
 MANUAL=false
 # =============================================================================
@@ -53,6 +58,7 @@ echo "  Query freq:    ${QUERY_FREQ} steps"
 echo "  Has critic:    ${HAS_CRITIC}"
 echo "  Num samples:   ${NUM_SAMPLES}"
 echo "  Critic prompt: $([ "${USE_CRITIC_SUBTASKS}" = true ] && echo subtasks || echo "task description")"
+echo "  Policy prompt: $([ "${USE_POLICY_SUBTASKS}" = true ] && echo "subtasks (Enter to advance)" || echo "task description")"
 echo "  Manual:        ${MANUAL}"
 echo "  Log videos:    ${LOG_VIDEOS}"
 echo ""
@@ -65,6 +71,8 @@ ARGS=""
 [ "${MANUAL}" = true ]              && ARGS="${ARGS} --args.manual"
 [ "${USE_CRITIC_SUBTASKS}" = true ]  && ARGS="${ARGS} --args.use-critic-subtasks"
 [ "${USE_CRITIC_SUBTASKS}" = false ] && ARGS="${ARGS} --args.no-use-critic-subtasks"
+[ "${USE_POLICY_SUBTASKS}" = true ]  && ARGS="${ARGS} --args.use-policy-subtasks"
+[ "${USE_POLICY_SUBTASKS}" = false ] && ARGS="${ARGS} --args.no-use-policy-subtasks"
 
 uv run eval/xarm_scripts/tpu_eval/packing/eval_packing_websocket.py \
     --args.policy-host "${POLICY_HOST}" \

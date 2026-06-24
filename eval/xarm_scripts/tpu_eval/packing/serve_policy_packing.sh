@@ -11,20 +11,20 @@ TPU_TYPE="v5e-64"
 TPU_NAME="v5e-tpu-64-1"
 PORT=8005
 
-POLICY_CONFIG="realworld_xarm_packing_pi05"
-POLICY_DIR="gs://saksham-euw4/checkpoints/robocoin/pi05_finetune/realworld_xarm_packing_pi05/realworld_xarm_packing_pi05"
-POLICY_STEP=69999
+POLICY_CONFIG="realworld_xarm_packing_pi05_subtask"
+POLICY_DIR="gs://saksham-euw4/checkpoints/robocoin/pi05_finetune/realworld_xarm_packing_pi05_subtask/realworld_xarm_packing_pi05_subtask"
+POLICY_STEP=50000
 
 # Set CRITIC_ENABLE=false to serve the policy without BestOfN.
-CRITIC_ENABLE=false
+CRITIC_ENABLE=true
 CRITIC_CONFIG="robocoin_bimanual_paligemma_cql_rlds_subtask_ar"
-CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_cql_rlds_subtask_ar/robocoin_bimanual_paligemma_cql_rlds_subtask_ar/real_shirt_hang_paligemma_cql_rlds_finetune_subtask_ar_final"
+CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_cql_rlds_subtask_ar/robocoin_bimanual_paligemma_cql_rlds_subtask_ar/realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar"
 CRITIC_STEP=250000
-CRITIC_FT_CONFIG="real_shirt_hang_paligemma_cql_rlds_finetune_subtask_ar_final"
+CRITIC_FT_CONFIG="realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar"
 NUM_SAMPLES=8
 # AR-subtask decode cadence: the critic AR-decodes the predicted subtask once every
 # N critic calls (and conditions Q on it). 
-SUBTASK_DECODE_EVERY=10
+SUBTASK_DECODE_EVERY=4
 # When true, pass --critic.expect-critic-images: the critic consumes a separate obs["critic_image"]
 # stream (the eval client must send it; needed when the critic's image size/pipeline differs from the
 # policy, e.g. a gemma4 critic). When false, the critic reuses the policy's obs["image"].
@@ -56,7 +56,7 @@ else
     CRITIC_BLOCK=""
 fi
 
-TASK_DESCRIPTION="Place the shirt on the hanger and hang it from the rod."
+TASK_DESCRIPTION=""
 
 SERVE_INVOCATION="python scripts/serve_policy.py --port ${PORT} --task-description '${TASK_DESCRIPTION}' ${PRE_POLICY_FLAGS} ${POLICY_BLOCK} ${CRITIC_BLOCK}"
 COMMAND="${SERVE_INVOCATION}"

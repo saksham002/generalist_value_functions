@@ -134,6 +134,14 @@ class Args:
     """Optional subdirectory under eval/xarm_scripts/tpu_eval/packing/videos/ in which to store
     this run's mp4s. Empty string saves directly into videos/."""
 
+    use_policy_subtasks: bool = True
+    """Controls how the POLICY is conditioned. If True, the policy is conditioned on the live
+    per-step subtask prompt (obs["prompt"] = tracker.prompt); if False, on the constant task
+    description (obs["prompt"] = task_description, i.e. the packing task loaded from tasks_file).
+    This eval is policy-only (no BestOfN critic), so obs["prompt"] is consumed directly by the
+    policy — which must be trained to read the client prompt (its prompt_mode reads obs["prompt"],
+    not a server-side --task-description override)."""
+
     use_critic_subtasks: bool = True
     """If True, send the per-step subtask prompt to the critic via obs["prompt"]. If False,
     send task_description instead, so the critic is conditioned on the same prompt the policy
@@ -331,6 +339,44 @@ class SubtaskTracker:
             if self._can_accept_boundary(self._t45_candidate_step):
                 self._t45_step = self._t45_candidate_step
                 self._advance(self._t45_candidate_step)
+
+
+# =============================================================================
+# Packing subtask tracker (Enter-advanced)
+# =============================================================================
+
+
+class PackingSubtaskTracker:
+    """Steps through a fixed, ordered list of packing subtasks, advanced manually by Enter.
+
+    Unlike SubtaskTracker (which auto-detects shirt-hang boundaries from robot sensors), the
+    packing subtasks are the per-object steps loaded from packing_tasks.json ("subtasks" field).
+    They carry no sensor heuristics — the operator advances to the next subtask by pressing Enter.
+    The index clamps at the final subtask, so extra Enter presses are no-ops.
+    """
+
+    def __init__(self, subtasks: list[str]) -> None:
+        if not subtasks:
+            raise ValueError("PackingSubtaskTracker requires a non-empty list of subtasks.")
+        self._subtasks = list(subtasks)
+        self._index = 0
+
+    @property
+    def index(self) -> int:
+        return self._index
+
+    @property
+    def num_subtasks(self) -> int:
+        return len(self._subtasks)
+
+    @property
+    def prompt(self) -> str:
+        return self._subtasks[self._index]
+
+    def advance(self) -> None:
+        """Move to the next subtask, clamping at the final one."""
+        if self._index < len(self._subtasks) - 1:
+            self._index += 1
 
 
 # =============================================================================
@@ -630,15 +676,35 @@ def run_episode(
     image_helper: _eval_image_helper.EvalImageHelper,
     args: Args,
     episode_idx: int,
+    obs: dict[str, Any],
+    subtasks: list[str] | None = None,
 ) -> None:
     logger.info(f"Starting episode {episode_idx}")
-    obs, _ = env.reset(seed=episode_idx)
 
     tracker = SubtaskTracker(manual = args.manual)
-    if args.manual:
-        # Drain any Enter presses queued before this episode started.
+    # When subtask conditioning is on, the policy prompt comes from the packing task's ordered
+    # subtask list (packing_tasks.json "subtasks"), advanced by Enter — not the sensor-heuristic
+    # SubtaskTracker above.
+    packing_tracker: PackingSubtaskTracker | None = None
+    if args.use_policy_subtasks:
+        if not subtasks:
+            raise ValueError(
+                f"use_policy_subtasks=True but episode {episode_idx} has no 'subtasks' in "
+                f"packing_tasks.json. Add a subtasks list to the task entry or run with "
+                f"--no-use-policy-subtasks."
+            )
+        packing_tracker = PackingSubtaskTracker(subtasks)
+
+    # Drain any Enter presses queued before this episode started (both manual flows use Enter).
+    if args.manual or args.use_policy_subtasks:
         while not _advance_q.empty():
             _advance_q.get_nowait()
+    if args.use_policy_subtasks:
+        logger.info(
+            f"Subtask conditioning ON — press Enter to advance through "
+            f"{packing_tracker.num_subtasks} subtasks. Subtask 0: {packing_tracker.prompt!r}"
+        )
+    elif args.manual:
         logger.info("Manual subtask switching enabled — press Enter to advance subtask.")
 
     # Per-episode video logger. With a critic, the Q-value plot panel is animated;
@@ -669,21 +735,37 @@ def run_episode(
 
     try:
         while not (terminated or truncated) and t < args.max_steps:
-            tracker.update(obs)
-            if args.manual:
+            if args.use_policy_subtasks:
+                # Advance through the packing subtask list on each Enter press.
                 while not _advance_q.empty():
                     _advance_q.get_nowait()
-                    tracker.force_advance()
-                    logger.info(f"Manual advance → subtask {tracker.subtask} ({tracker.prompt!r})")
+                    packing_tracker.advance()
+                    logger.info(
+                        f"Manual advance → subtask {packing_tracker.index}/"
+                        f"{packing_tracker.num_subtasks - 1} ({packing_tracker.prompt!r})"
+                    )
                     if video_logger is not None:
                         video_logger.record_advance(t)
+            else:
+                tracker.update(obs)
+                if args.manual:
+                    while not _advance_q.empty():
+                        _advance_q.get_nowait()
+                        tracker.force_advance()
+                        logger.info(f"Manual advance → subtask {tracker.subtask} ({tracker.prompt!r})")
+                        if video_logger is not None:
+                            video_logger.record_advance(t)
 
             if t % args.query_freq == 0:
-                # With use_critic_subtasks=False, obs["prompt"] carries the task loaded from
-                # tasks_file (args.task_description) so the policy is conditioned on the selected
-                # packing task. With use_critic_subtasks=True it instead carries the per-step
-                # subtask prompt for the critic.
-                critic_prompt = tracker.prompt if args.use_critic_subtasks else args.task_description
+                # Policy-only eval: obs["prompt"] is consumed by the policy. use_policy_subtasks
+                # conditions the policy on the current packing subtask (from packing_tasks.json,
+                # advanced by Enter); otherwise on the constant task description.
+                if args.use_policy_subtasks:
+                    policy_prompt = packing_tracker.prompt
+                    subtask_idx = packing_tracker.index
+                else:
+                    policy_prompt = args.task_description
+                    subtask_idx = tracker.subtask
                 state, initial_eef_pose = extract_state(obs)
                 images_rgb = extract_images_rgb(obs, args.camera_names)
                 element_images = image_helper.process_images({
@@ -694,8 +776,14 @@ def run_episode(
                 obs_dict = {
                     **element_images,
                     "state": state,
-                    "prompt": critic_prompt,
+                    "prompt": policy_prompt,
                 }
+                if args.has_critic:
+                    # The critic (prompt_mode=task_description_predict_current_subtask) uses this as
+                    # its task prefix and AR-decodes the subtask itself. Sending the per-episode
+                    # packing task (from packing_tasks.json) overrides the server's pinned
+                    # --task-description; the policy (prompt_mode=subtask) ignores it.
+                    obs_dict["task_description"] = args.task_description
 
                 t0 = time.perf_counter()
 
@@ -721,8 +809,8 @@ def run_episode(
                     :, args.real_action_start : args.real_action_start + args.real_action_dim
                 ]
                 log_line = (
-                    f"Episode {episode_idx} step {t}: subtask={tracker.subtask} "
-                    f"critic_prompt={critic_prompt!r}, inference={elapsed:.3f}s"
+                    f"Episode {episode_idx} step {t}: subtask={subtask_idx} "
+                    f"policy_prompt={policy_prompt!r}, inference={elapsed:.3f}s"
                 )
                 if q_values is not None:
                     # B = 1 in the eval flow; flatten and format.
@@ -822,7 +910,7 @@ def load_packing_task(tasks_file: str, task_index: int) -> tuple[str, dict]:
 
     Tasks are stored under the category keys small_medium / small_large / medium_large and are
     flattened in that order, so `task_index` runs 0-23 across all three pairings. Returns the
-    task prompt string and its full metadata entry (global_chunk_index, repo_id, boxes, ...).
+    task prompt string and its full metadata entry (task_number, boxes, subtasks, setup, ...).
     """
     with open(tasks_file) as f:
         data = json.load(f)
@@ -847,7 +935,7 @@ def main(args: Args) -> None:
     if not tasks_available:
         logger.warning(f"tasks_file {tasks_file!r} not found; using --args.task-description as the policy prompt for all episodes.")
 
-    if args.manual:
+    if args.manual or args.use_policy_subtasks:
         _start_key_listener()
 
     if args.debug:
@@ -884,6 +972,8 @@ def main(args: Args) -> None:
             f"expect_critic_images={image_helper.expect_critic_images}"
         )
         # Each episode loads its own task from tasks_file, keyed on episode_idx.
+        subtasks_for_episode: list[str] | None = None
+        setup_for_episode: list[str] | None = None
         if tasks_available:
             try:
                 task_text, task_meta = load_packing_task(tasks_file, episode_idx)
@@ -891,21 +981,32 @@ def main(args: Args) -> None:
                 logger.error(f"No task available for episode {episode_idx}: {e}")
                 break
             args.task_description = task_text
+            subtasks_for_episode = task_meta.get("subtasks")
+            setup_for_episode = task_meta.get("setup")
             logger.info(
                 f"Loaded task #{episode_idx} from {os.path.basename(tasks_file)} "
-                f"(chunk {task_meta.get('global_chunk_index')}, boxes={'+'.join(task_meta.get('boxes', []))})"
+                f"(task_number {task_meta.get('task_number')}, boxes={'+'.join(task_meta.get('boxes', []))}, "
+                f"subtasks={len(subtasks_for_episode) if subtasks_for_episode else 0})"
             )
 
         # Print the task and block on an extra Enter so the scene can be set up before the robot
         # starts moving.
         logger.info(f"=== Episode {episode_idx} task: {args.task_description!r} ===")
+        # Log the setup order before resetting so objects can be gathered while the robot homes.
+        if setup_for_episode:
+            setup_str = ", ".join(f"{i + 1}) {obj}" for i, obj in enumerate(setup_for_episode))
+            logger.info(f"Scene setup order ({len(setup_for_episode)} objects): {setup_str}")
+        # Reset (home the robot) as soon as the task is announced, so the scene can be set up
+        # with the robot already in its reset pose rather than homing right before it moves.
+        logger.info(f"Resetting environment for episode {episode_idx}...")
+        obs, _ = env.reset(seed=episode_idx)
         logger.info("Set up the scene for the task above, then press Enter to start the episode.")
         try:
             input(f"Episode {episode_idx}: press Enter to start...")
         except EOFError:
             break
         try:
-            run_episode(env, client, image_helper, args, episode_idx)
+            run_episode(env, client, image_helper, args, episode_idx, obs, subtasks_for_episode)
         except KeyboardInterrupt:
             logger.info(f"Episode {episode_idx} interrupted by Ctrl+C")
         try:
