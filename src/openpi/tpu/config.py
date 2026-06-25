@@ -48,6 +48,14 @@ TPU_CONFIGS: dict[str, TPUConfig] = {
         nfs_server="10.155.154.42:/europe",
         nfs_mount_path="/nfs/aidm_nfs",
     ),
+    "v4": TPUConfig(
+        zone="us-central2-b",
+        project="cmu-aidm-v2",
+        is_spot=False,
+        runtime_version="tpu-ubuntu2204-base",
+        nfs_server="10.201.249.194:/aidm_nfs_1",
+        nfs_mount_path="/nfs/aidm_nfs",
+    ),
 }
 
 
@@ -70,8 +78,11 @@ def get_tpu_config(tpu_type: str) -> TPUConfigWithType:
         base_config = TPU_CONFIGS["v5e"]
         size = tpu_type.split("-")[1]
         accelerator_type = f"v5litepod-{size}"
+    elif tpu_type.startswith("v4"):
+        base_config = TPU_CONFIGS["v4"]
+        accelerator_type = tpu_type
     else:
-        raise ValueError(f"Unknown TPU type: {tpu_type}. Expected v6e-* or v5e-*")
+        raise ValueError(f"Unknown TPU type: {tpu_type}. Expected v6e-*, v5e-*, or v4-*")
 
     return TPUConfigWithType(
         zone=base_config.zone,
@@ -103,4 +114,8 @@ def get_worker_count(tpu_type: str) -> int:
         Number of workers (hosts) for this TPU type
     """
     chips = int(tpu_type.split("-")[1])
+    # v4 names count TensorCores (2 per chip) with 4 chips per host, so a
+    # v4-N pod has N // 8 workers (e.g. v4-32 -> 4 hosts).
+    if tpu_type.startswith("v4"):
+        return max(1, chips // 8)
     return max(1, chips // 4)
