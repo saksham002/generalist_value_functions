@@ -4531,6 +4531,74 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/real_shirt_hang/validation_cache_dir_real_shirt_hang_paligemma_cql_rlds_finetune_subtask_ar_final/",
         include_repos = (),
     ),
+    # real_lid twin of real_shirt_hang_paligemma_cql_rlds_finetune_subtask_ar_final:
+    # identical subtask_ar FT recipe, swapped onto the real_lid HDF5 dataset and its
+    # CF cache / norm-stats / validation cache.
+    FineTuneConfig(
+        name = "real_lid_paligemma_cql_rlds_finetune_subtask_ar_final",
+        data_factory = Hdf5RldsDataConfig(
+            repo_id = "real_lid",
+            rlds_data_dir = "gs://saksham-euw4/hdf5",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "real_lid", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/real_lid",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            use_eef = True,
+            state_dim = 14,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/real_lid_pi05/",
+            max_token_len = 96,
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        # q_network_config is byte-identical to the subtask_ar base's
+        # q_network_config (224x224 images, no_state=True, predict_subtask_ar=True,
+        # default paligemma backbone, no layernorm) — restated so the pretrained
+        # checkpoint loads without any shape mismatch and the AR behavior is preserved.
+        model_overrides = {
+            "action_horizon": 60,
+            "q_network_config": _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                max_token_len = 96,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = True,
+            ),
+        },
+        # Bump the Best-of-N policy's action_horizon to match the 60-frame
+        # data chunks. Without this the policy stays at the pretrain 50 and
+        # value_function_objectives.py reshape (~lines 339, 507, 521) blows up
+        # on the 60-frame CF candidates.
+        policy_overrides = {
+            "action_horizon": 60,
+        },
+        action_horizon = 60,
+        num_train_steps = 20_000,
+        save_interval = 10_000,
+        plot_interval = 10_000,
+        keep_period = 10_000,
+        # Cosine decay 5e-6 -> 5e-7 over the 20k FT steps. FineTuneConfig wraps
+        # this in an OffsetSchedule with offset=pretrained_step, so step 0 of the
+        # cosine corresponds to the FT-start absolute step.
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
+        ),
+        num_val_trajectories = 3,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/real_lid/validation_cache_dir_real_lid_paligemma_cql_rlds_finetune_subtask_ar_final/",
+        include_repos = (),
+    ),
     # LeRobot realworld_xarm_packing twin of the real_shirt_hang subtask_ar CQL FT:
     # same recipe, LeRobotRldsDataConfig (critic_mode, subsample) on the packing
     # dataset; max_token_len=160 (128 for the task + 32 for the predicted subtask).
@@ -4554,7 +4622,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             shuffle_buffer_size = 50_000,
             mask_boundary_actions = False,
             subsample = True,
-            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/realworld_xarm_packing_pi05/",
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/realworld_xarm_packing_pi05_subtask/",
             max_token_len = 160,
             prompt_mode = "task_description_predict_current_subtask",
         ),
@@ -7575,13 +7643,13 @@ _CONFIGS = [
             action_dim_offset = 14,
             action_dim_mask = (False,) * 14 + (True,) * 14 + (False,) * 4,
             pad_state_to_action_dim = False,
-            dtype = "float32",
+            dtype = "bfloat16",
         ),
         data = Hdf5RldsDataConfig(
-            rlds_data_dir = "gs://saksham-euw4/hdf5",
+            rlds_data_dir = "gs://saksham-usc2/datasets",
             datasets = (rlds_dataset.RLDSDataset(name = "real_shirt_hang", version = "1.0.0", weight = 1.0),),
             assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/hdf5/real_shirt_hang",
+                assets_dir = "gs://saksham-usc2/datasets/real_shirt_hang",
                 asset_id = "norm_stats",
             ),
             discount = 0.999,
@@ -7592,6 +7660,61 @@ _CONFIGS = [
             use_quantile_norm = True,
             filter_n = 8,
             # filter_intervention = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            state_dim = 14,
+            subsample = False,
+            prompt_mode = "task_description",
+        ),
+        weight_loader = weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps = 200_000,
+        batch_size = 128,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 5e-5,
+            decay_steps = 200_000,
+            decay_lr = 5e-6,
+        ),
+        optimizer = _optimizer.AdamW(),
+        num_workers = 0,
+        log_interval = 100,
+        save_interval = 10_000,
+        keep_period = 20_000,
+        fsdp_devices = 16,
+        action_horizon = 60,
+    ),
+    # Copy of real_shirt_hang_pi05 that reads the real_lid HDF5 RLDS data and its
+    # norm_stats entirely from local disk (no GCS) — used to cache counterfactual
+    # actions from the real_lid_pi05 60k checkpoint.
+    TrainConfig(
+        name = "real_lid_pi05",
+        model = pi0_config.Pi0Config(
+            paligemma_variant = "gemma_2b",
+            action_expert_variant = "gemma_300m",
+            action_dim = 32,
+            action_horizon = 60,
+            max_token_len = 96,
+            pi05 = True,
+            discrete_state_input = True,
+            action_dim_offset = 14,
+            action_dim_mask = (False,) * 14 + (True,) * 14 + (False,) * 4,
+            pad_state_to_action_dim = False,
+            dtype = "bfloat16",
+        ),
+        data = Hdf5RldsDataConfig(
+            rlds_data_dir = "/data/group_data/rl/saksham3/hdf5",
+            datasets = (rlds_dataset.RLDSDataset(name = "real_lid", version = "1.0.0", weight = 1.0),),
+            assets = AssetsConfig(
+                assets_dir = "/data/group_data/rl/saksham3/hdf5/real_lid",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            use_eef = True,
+            critic_mode = False,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            filter_n = 8,
             shuffle_buffer_size = 50_000,
             mask_boundary_actions = False,
             state_dim = 14,
@@ -7683,7 +7806,7 @@ _CONFIGS = [
             rlds_data_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
             datasets = (rlds_dataset.RLDSDataset(name = "realworld_xarm_packing", version = "1.0.0", weight = 1.0),),
             assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+                assets_dir = "/data/group_data/rl/saksham3/datasets/realworld_xarm_packing",
                 asset_id = "norm_stats",
             ),
             use_chunk_wise_delta = True,
