@@ -494,7 +494,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # (sim_bimanual_assembly etc.), False for the RoboCasa/RoboCoin
         # pipeline. Drives the prewarm dummy obs schema regardless of
         # whether a critic is loaded.
-        self._uses_hdf5_pipeline = isinstance(config.data, _config.Hdf5RldsDataConfig)
+        self._uses_hdf5_pipeline = isinstance(config.data, _config.Hdf5RldsDataConfig) or isinstance(config.data, _config.LeRobotRldsDataConfig)
 
         # JAX rank 0 binds the websocket; every other rank runs
         # participate_loop so the JIT'd inference doesn't deadlock waiting
