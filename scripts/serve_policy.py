@@ -156,6 +156,11 @@ class Args:
     inject_noise: bool = False
     noise_level: float = 0.0
 
+    # Number of flow-matching integration (Euler) steps for the policy's
+    # sample_actions. None → use the model default (10). Forwarded into the
+    # policy's sample_kwargs; only affects the policy-only (BC) sampling path.
+    num_steps: int | None = None
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -225,6 +230,7 @@ def create_policy(args: Args) -> _policy.BasePolicy:
                 inject_noise = args.critic.inject_noise,
                 noise_level = args.critic.noise_level,
                 subtask_decode_every = args.critic.subtask_decode_every,
+                num_steps = args.num_steps,
             )
         # use_bestofn_loader=True without critic: load policy through
         # BestOfNPolicy (which applies the bimanual-EEF action-dim slice)
@@ -241,12 +247,16 @@ def create_policy(args: Args) -> _policy.BasePolicy:
             fsdp_devices = args.fsdp_devices,
             inject_noise = args.inject_noise,
             noise_level = args.noise_level,
+            num_steps = args.num_steps,
         )
 
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                sample_kwargs={"num_steps": args.num_steps} if args.num_steps is not None else None,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

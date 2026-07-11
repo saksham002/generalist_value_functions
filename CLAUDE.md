@@ -481,6 +481,8 @@ source /nfs/aidm_nfs/saksham3/uv/vla/bin/activate
 
 #### Launching jobs via `scripts/run_on_tpu.py`
 
+**CRITICAL — never redirect `run_on_tpu.py` output to a log file.** Do NOT launch it as `python scripts/run_on_tpu.py … > some.log 2>&1`. Run it in the background *without any* `>` / `2>&1` redirect (Bash tool `run_in_background=true`, which already captures stdout/stderr on its own). Redirecting the launcher's output ties the run to the local session, so the remote TPU job dies when the session ends. Launching with **no redirect** keeps the job alive on the pod after the session is killed.
+
 When launching training via `run_on_tpu.py`, the `--command` must explicitly include the additional training args shown below. They are **not** automatically injected by `run_on_tpu.py`:
 
 **Batch size by pod size**: use `--batch-size=128` on v5e-32 pods and `--batch-size=256` on v5e-64 pods, unless the user states otherwise.
@@ -523,6 +525,12 @@ gcloud compute tpus tpu-vm ssh <pod-name> --zone=europe-west4-b --worker=0 --com
 gcloud compute tpus tpu-vm ssh <pod-name> --zone=europe-west4-b --worker=all --command="sudo lsof /dev/vfio/0 2>/dev/null || echo 'free'"
 ```
 If any worker shows a process holding `/dev/vfio/0`, the TPU is busy. Ask the user how to proceed before taking any action.
+
+**v4 pods (zone `us-central2-b`, e.g. `v4-32-0`/`v4-32-1`) expose the accelerator as `/dev/accel0..3`, NOT `/dev/vfio/*`.** The `/dev/vfio/0` check above returns a false "free" on v4. For v4, check with:
+```bash
+gcloud compute tpus tpu-vm ssh <pod-name> --zone=us-central2-b --worker=all --command="sudo lsof /dev/accel* 2>/dev/null | grep -v COMMAND | awk '{print \$1,\$3}' | sort -u || echo free"
+```
+v4 jobs launched via `--tpu_run` log to `/tmp/tpu_job_output.log` (not `~/tpu_job_output.log`).
 
 #### Killing all processes on a TPU pod
 Use `sudo pkill -9 python` (under `--worker=all`). Do NOT bother with `pkill -f tpc_launch_script` — it doesn't reliably take down the launch-script tmux session, and python kill alone is sufficient to free `/dev/vfio/*` for the next run:

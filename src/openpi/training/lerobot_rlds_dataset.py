@@ -149,7 +149,18 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
             "task_description": traj["traj_metadata"]["episode_metadata"]["task_description"],
             "steps_to_subtask_end": steps_to_subtask_end,
             "fps": fps,
+            # repo_id lives only in episode_metadata; forward it (and per-step repo_index
+            # below) so cache_val_episodes can key validation trajectories by repo.
+            # Mirrors Hdf5RldsDataset.
+            "repo_id": traj["traj_metadata"]["episode_metadata"]["repo_id"],
         }
+
+        # Per-step passthrough used by validation caching (cache_val_episodes sorts
+        # frames by _frame_index and keys trajectories by repo_index). Guarded so
+        # absent keys are skipped. Mirrors Hdf5RldsDataset's passthrough set.
+        for key in ("index", "episode_index", "_frame_index", "_traj_index", "repo_index", "frame_index", "_len"):
+            if key in traj:
+                result[key] = traj[key]
 
         # Subsample case only: counterfactual_actions / _ca_episode_index were already
         # subsampled by _subsample_trajectory and must be forwarded with the matching
