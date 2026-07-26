@@ -1,0 +1,4555 @@
+[
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-00",
+            "trays": [
+                "small",
+                "medium"
+            ],
+            "objects": [
+                "tuna_fish_can",
+                "candy_box",
+                "coffee_mug",
+                "gelatin_box"
+            ],
+            "description": "Pack the tuna fish can and candy box into the small tray, then pack the coffee mug into the medium tray, then pack the gelatin box into the small tray.",
+            "assignments": {
+                "tuna_fish_can": "small",
+                "candy_box": "small",
+                "coffee_mug": "medium",
+                "gelatin_box": "small"
+            }
+        },
+        "instruction": "Pack the tuna fish can and candy box into the small tray, then pack the coffee mug into the medium tray, then pack the gelatin box into the small tray.",
+        "subtasks": [
+            "Pack the tuna fish can into the small tray.",
+            "Pack the candy box into the small tray.",
+            "Pack the coffee mug into the medium tray.",
+            "Pack the gelatin box into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-01",
+            "trays": [
+                "small",
+                "medium"
+            ],
+            "objects": [
+                "can_opener",
+                "sugar_box",
+                "foam_brick",
+                "nesquik_canister"
+            ],
+            "description": "Pack the can opener into the small tray, then pack the sugar box into the medium tray, then pack the foam brick and nesquik canister into the small tray.",
+            "assignments": {
+                "can_opener": "small",
+                "sugar_box": "medium",
+                "foam_brick": "small",
+                "nesquik_canister": "small"
+            }
+        },
+        "instruction": "Pack the can opener into the small tray, then pack the sugar box into the medium tray, then pack the foam brick and nesquik canister into the small tray.",
+        "subtasks": [
+            "Pack the can opener into the small tray.",
+            "Pack the sugar box into the medium tray.",
+            "Pack the foam brick into the small tray.",
+            "Pack the nesquik canister into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-02",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "sugar_box",
+                "candy_box",
+                "cracker_box",
+                "coffee_mug"
+            ],
+            "description": "Pack the sugar box into the small tray, then pack the candy box into the medium tray, then pack the cracker box into the large tray, then pack the coffee mug into the medium tray.",
+            "assignments": {
+                "sugar_box": "small",
+                "candy_box": "medium",
+                "cracker_box": "large",
+                "coffee_mug": "medium"
+            }
+        },
+        "instruction": "Pack the sugar box into the small tray, then pack the candy box into the medium tray, then pack the cracker box into the large tray, then pack the coffee mug into the medium tray.",
+        "subtasks": [
+            "Pack the sugar box into the small tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the cracker box into the large tray.",
+            "Pack the coffee mug into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-03",
+            "trays": [
+                "small",
+                "medium"
+            ],
+            "objects": [
+                "candy_box",
+                "soup_can"
+            ],
+            "description": "Remove the tuna fish can from the medium tray, then pack the candy box into the medium tray, then pack the soup can into the small tray, then remove the cracker box from the small tray.",
+            "assignments": {
+                "candy_box": "medium",
+                "soup_can": "small"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "tuna_fish_can",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ],
+                "small": [
+                    {
+                        "object": "cracker_box",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "tuna_fish_can",
+                "cracker_box"
+            ]
+        },
+        "instruction": "Remove the tuna fish can from the medium tray, then pack the candy box into the medium tray, then pack the soup can into the small tray, then remove the cracker box from the small tray.",
+        "subtasks": [
+            "Remove the tuna fish can from the medium tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the soup can into the small tray.",
+            "Remove the cracker box from the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-04",
+            "trays": [
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "gelatin_box",
+                "can_opener",
+                "tuna_fish_can"
+            ],
+            "description": "Pack the coffee mug and gelatin box into the medium tray, then pack the can opener into the large tray, then pack the tuna fish can into the medium tray.",
+            "assignments": {
+                "coffee_mug": "medium",
+                "gelatin_box": "medium",
+                "can_opener": "large",
+                "tuna_fish_can": "medium"
+            }
+        },
+        "instruction": "Pack the coffee mug and gelatin box into the medium tray, then pack the can opener into the large tray, then pack the tuna fish can into the medium tray.",
+        "subtasks": [
+            "Pack the coffee mug into the medium tray.",
+            "Pack the gelatin box into the medium tray.",
+            "Pack the can opener into the large tray.",
+            "Pack the tuna fish can into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-05",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "gelatin_box",
+                "soup_can",
+                "coffee_mug"
+            ],
+            "description": "Remove the foam brick from the medium tray, then transfer the gelatin box from the large tray to the medium tray, then pack the soup can into the small tray, then pack the coffee mug into the large tray.",
+            "assignments": {
+                "gelatin_box": "medium",
+                "soup_can": "small",
+                "coffee_mug": "large"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "foam_brick",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ],
+                "large": [
+                    {
+                        "object": "gelatin_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "foam_brick"
+            ]
+        },
+        "instruction": "Remove the foam brick from the medium tray, then transfer the gelatin box from the large tray to the medium tray, then pack the soup can into the small tray, then pack the coffee mug into the large tray.",
+        "subtasks": [
+            "Remove the foam brick from the medium tray.",
+            "Transfer the gelatin box from the large tray to the medium tray.",
+            "Pack the soup can into the small tray.",
+            "Pack the coffee mug into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-06",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "candy_box",
+                "tuna_fish_can",
+                "sugar_box",
+                "can_opener"
+            ],
+            "description": "Pack the candy box into the medium tray, then pack the tuna fish can and sugar box into the small tray, then pack the can opener into the large tray.",
+            "assignments": {
+                "candy_box": "medium",
+                "tuna_fish_can": "small",
+                "sugar_box": "small",
+                "can_opener": "large"
+            }
+        },
+        "instruction": "Pack the candy box into the medium tray, then pack the tuna fish can and sugar box into the small tray, then pack the can opener into the large tray.",
+        "subtasks": [
+            "Pack the candy box into the medium tray.",
+            "Pack the tuna fish can into the small tray.",
+            "Pack the sugar box into the small tray.",
+            "Pack the can opener into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-07",
+            "trays": [
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "foam_brick",
+                "cracker_box",
+                "coffee_mug"
+            ],
+            "description": "Remove the candy box from the large tray, then pack the foam brick into the large tray, then pack the cracker box into the medium tray, then pack the coffee mug into the large tray.",
+            "assignments": {
+                "foam_brick": "large",
+                "cracker_box": "medium",
+                "coffee_mug": "large"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "candy_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "candy_box"
+            ]
+        },
+        "instruction": "Remove the candy box from the large tray, then pack the foam brick into the large tray, then pack the cracker box into the medium tray, then pack the coffee mug into the large tray.",
+        "subtasks": [
+            "Remove the candy box from the large tray.",
+            "Pack the foam brick into the large tray.",
+            "Pack the cracker box into the medium tray.",
+            "Pack the coffee mug into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-08",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "nesquik_canister",
+                "candy_box",
+                "foam_brick",
+                "tuna_fish_can"
+            ],
+            "description": "Pack the nesquik canister into the large tray, then transfer the candy box from the large tray to the medium tray, then transfer the foam brick from the medium tray to the small tray, then pack the tuna fish can into the medium tray.",
+            "assignments": {
+                "nesquik_canister": "large",
+                "candy_box": "medium",
+                "foam_brick": "small",
+                "tuna_fish_can": "medium"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "candy_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ],
+                "medium": [
+                    {
+                        "object": "foam_brick",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the nesquik canister into the large tray, then transfer the candy box from the large tray to the medium tray, then transfer the foam brick from the medium tray to the small tray, then pack the tuna fish can into the medium tray.",
+        "subtasks": [
+            "Pack the nesquik canister into the large tray.",
+            "Transfer the candy box from the large tray to the medium tray.",
+            "Transfer the foam brick from the medium tray to the small tray.",
+            "Pack the tuna fish can into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-09",
+            "trays": [
+                "small",
+                "medium"
+            ],
+            "objects": [
+                "candy_box",
+                "can_opener",
+                "nesquik_canister"
+            ],
+            "description": "Pack the candy box and can opener into the small tray, then remove the coffee mug from the medium tray, then pack the nesquik canister into the small tray.",
+            "assignments": {
+                "candy_box": "small",
+                "can_opener": "small",
+                "nesquik_canister": "small"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "coffee_mug",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "coffee_mug"
+            ]
+        },
+        "instruction": "Pack the candy box and can opener into the small tray, then remove the coffee mug from the medium tray, then pack the nesquik canister into the small tray.",
+        "subtasks": [
+            "Pack the candy box into the small tray.",
+            "Pack the can opener into the small tray.",
+            "Remove the coffee mug from the medium tray.",
+            "Pack the nesquik canister into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-10",
+            "trays": [
+                "small",
+                "medium"
+            ],
+            "objects": [
+                "cracker_box",
+                "soup_can",
+                "tuna_fish_can",
+                "nesquik_canister"
+            ],
+            "description": "Transfer the cracker box from the medium tray to the small tray, then pack the soup can into the medium tray, then pack the tuna fish can into the small tray, then pack the nesquik canister into the medium tray.",
+            "assignments": {
+                "cracker_box": "small",
+                "soup_can": "medium",
+                "tuna_fish_can": "small",
+                "nesquik_canister": "medium"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "cracker_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Transfer the cracker box from the medium tray to the small tray, then pack the soup can into the medium tray, then pack the tuna fish can into the small tray, then pack the nesquik canister into the medium tray.",
+        "subtasks": [
+            "Transfer the cracker box from the medium tray to the small tray.",
+            "Pack the soup can into the medium tray.",
+            "Pack the tuna fish can into the small tray.",
+            "Pack the nesquik canister into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-11",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "foam_brick",
+                "gelatin_box",
+                "can_opener",
+                "sugar_box"
+            ],
+            "description": "Transfer the foam brick from the medium tray to the small tray, then pack the gelatin box into the large tray, then transfer the can opener from the medium tray to the large tray, then pack the sugar box into the large tray.",
+            "assignments": {
+                "foam_brick": "small",
+                "gelatin_box": "large",
+                "can_opener": "large",
+                "sugar_box": "large"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "foam_brick",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Transfer the foam brick from the medium tray to the small tray, then pack the gelatin box into the large tray, then transfer the can opener from the medium tray to the large tray, then pack the sugar box into the large tray.",
+        "subtasks": [
+            "Transfer the foam brick from the medium tray to the small tray.",
+            "Pack the gelatin box into the large tray.",
+            "Transfer the can opener from the medium tray to the large tray.",
+            "Pack the sugar box into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-12",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "cracker_box",
+                "can_opener",
+                "foam_brick",
+                "tuna_fish_can"
+            ],
+            "description": "Transfer the cracker box from the small tray to the large tray, then pack the can opener into the large tray, then pack the foam brick and tuna fish can into the medium tray.",
+            "assignments": {
+                "cracker_box": "large",
+                "can_opener": "large",
+                "foam_brick": "medium",
+                "tuna_fish_can": "medium"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "cracker_box",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Transfer the cracker box from the small tray to the large tray, then pack the can opener into the large tray, then pack the foam brick and tuna fish can into the medium tray.",
+        "subtasks": [
+            "Transfer the cracker box from the small tray to the large tray.",
+            "Pack the can opener into the large tray.",
+            "Pack the foam brick into the medium tray.",
+            "Pack the tuna fish can into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-13",
+            "trays": [
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "can_opener",
+                "tuna_fish_can",
+                "candy_box",
+                "gelatin_box"
+            ],
+            "description": "Pack the can opener into the medium tray, then pack the tuna fish can into the large tray, then pack the candy box and gelatin box into the medium tray.",
+            "assignments": {
+                "can_opener": "medium",
+                "tuna_fish_can": "large",
+                "candy_box": "medium",
+                "gelatin_box": "medium"
+            }
+        },
+        "instruction": "Pack the can opener into the medium tray, then pack the tuna fish can into the large tray, then pack the candy box and gelatin box into the medium tray.",
+        "subtasks": [
+            "Pack the can opener into the medium tray.",
+            "Pack the tuna fish can into the large tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the gelatin box into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-14",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "cracker_box",
+                "tuna_fish_can"
+            ],
+            "description": "Pack the cracker box into the small tray, then remove the gelatin box and can opener from the large tray, then pack the tuna fish can into the medium tray.",
+            "assignments": {
+                "cracker_box": "small",
+                "tuna_fish_can": "medium"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "gelatin_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "gelatin_box",
+                "can_opener"
+            ]
+        },
+        "instruction": "Pack the cracker box into the small tray, then remove the gelatin box and can opener from the large tray, then pack the tuna fish can into the medium tray.",
+        "subtasks": [
+            "Pack the cracker box into the small tray.",
+            "Remove the gelatin box from the large tray.",
+            "Remove the can opener from the large tray.",
+            "Pack the tuna fish can into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-15",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "gelatin_box",
+                "soup_can",
+                "candy_box"
+            ],
+            "description": "Pack the gelatin box into the medium tray, then pack the soup can into the large tray, then pack the candy box into the small tray, then remove the nesquik canister from the small tray.",
+            "assignments": {
+                "gelatin_box": "medium",
+                "soup_can": "large",
+                "candy_box": "small"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "nesquik_canister",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "nesquik_canister"
+            ]
+        },
+        "instruction": "Pack the gelatin box into the medium tray, then pack the soup can into the large tray, then pack the candy box into the small tray, then remove the nesquik canister from the small tray.",
+        "subtasks": [
+            "Pack the gelatin box into the medium tray.",
+            "Pack the soup can into the large tray.",
+            "Pack the candy box into the small tray.",
+            "Remove the nesquik canister from the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-16",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "candy_box",
+                "coffee_mug",
+                "foam_brick"
+            ],
+            "description": "Pack the candy box and coffee mug into the small tray, then pack the foam brick into the large tray, then remove the nesquik canister from the medium tray.",
+            "assignments": {
+                "candy_box": "small",
+                "coffee_mug": "small",
+                "foam_brick": "large"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "nesquik_canister",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "nesquik_canister"
+            ]
+        },
+        "instruction": "Pack the candy box and coffee mug into the small tray, then pack the foam brick into the large tray, then remove the nesquik canister from the medium tray.",
+        "subtasks": [
+            "Pack the candy box into the small tray.",
+            "Pack the coffee mug into the small tray.",
+            "Pack the foam brick into the large tray.",
+            "Remove the nesquik canister from the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-17",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "soup_can",
+                "sugar_box",
+                "can_opener",
+                "nesquik_canister"
+            ],
+            "description": "Pack the soup can into the small tray, then pack the sugar box into the large tray, then pack the can opener into the medium tray, then transfer the nesquik canister from the medium tray to the large tray.",
+            "assignments": {
+                "soup_can": "small",
+                "sugar_box": "large",
+                "can_opener": "medium",
+                "nesquik_canister": "large"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "nesquik_canister",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the soup can into the small tray, then pack the sugar box into the large tray, then pack the can opener into the medium tray, then transfer the nesquik canister from the medium tray to the large tray.",
+        "subtasks": [
+            "Pack the soup can into the small tray.",
+            "Pack the sugar box into the large tray.",
+            "Pack the can opener into the medium tray.",
+            "Transfer the nesquik canister from the medium tray to the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-18",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "soup_can",
+                "cracker_box",
+                "nesquik_canister"
+            ],
+            "description": "Remove the candy box from the small tray, then pack the soup can into the large tray, then pack the cracker box into the small tray, then pack the nesquik canister into the medium tray.",
+            "assignments": {
+                "soup_can": "large",
+                "cracker_box": "small",
+                "nesquik_canister": "medium"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "candy_box",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "candy_box"
+            ]
+        },
+        "instruction": "Remove the candy box from the small tray, then pack the soup can into the large tray, then pack the cracker box into the small tray, then pack the nesquik canister into the medium tray.",
+        "subtasks": [
+            "Remove the candy box from the small tray.",
+            "Pack the soup can into the large tray.",
+            "Pack the cracker box into the small tray.",
+            "Pack the nesquik canister into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-19",
+            "trays": [
+                "small",
+                "medium"
+            ],
+            "objects": [
+                "sugar_box",
+                "foam_brick",
+                "coffee_mug",
+                "tuna_fish_can"
+            ],
+            "description": "Transfer the sugar box from the medium tray to the small tray, then pack the foam brick and coffee mug into the medium tray, then pack the tuna fish can into the small tray.",
+            "assignments": {
+                "sugar_box": "small",
+                "foam_brick": "medium",
+                "coffee_mug": "medium",
+                "tuna_fish_can": "small"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Transfer the sugar box from the medium tray to the small tray, then pack the foam brick and coffee mug into the medium tray, then pack the tuna fish can into the small tray.",
+        "subtasks": [
+            "Transfer the sugar box from the medium tray to the small tray.",
+            "Pack the foam brick into the medium tray.",
+            "Pack the coffee mug into the medium tray.",
+            "Pack the tuna fish can into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-20",
+            "trays": [
+                "small",
+                "medium"
+            ],
+            "objects": [
+                "nesquik_canister",
+                "tuna_fish_can",
+                "foam_brick",
+                "can_opener"
+            ],
+            "description": "Pack the nesquik canister and tuna fish can into the medium tray, then pack the foam brick into the small tray, then pack the can opener into the medium tray.",
+            "assignments": {
+                "nesquik_canister": "medium",
+                "tuna_fish_can": "medium",
+                "foam_brick": "small",
+                "can_opener": "medium"
+            }
+        },
+        "instruction": "Pack the nesquik canister and tuna fish can into the medium tray, then pack the foam brick into the small tray, then pack the can opener into the medium tray.",
+        "subtasks": [
+            "Pack the nesquik canister into the medium tray.",
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the foam brick into the small tray.",
+            "Pack the can opener into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-21",
+            "trays": [
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "candy_box",
+                "can_opener",
+                "nesquik_canister"
+            ],
+            "description": "Pack the candy box into the medium tray, then pack the can opener into the large tray, then pack the nesquik canister into the medium tray, then remove the cracker box from the large tray.",
+            "assignments": {
+                "candy_box": "medium",
+                "can_opener": "large",
+                "nesquik_canister": "medium"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "cracker_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "cracker_box"
+            ]
+        },
+        "instruction": "Pack the candy box into the medium tray, then pack the can opener into the large tray, then pack the nesquik canister into the medium tray, then remove the cracker box from the large tray.",
+        "subtasks": [
+            "Pack the candy box into the medium tray.",
+            "Pack the can opener into the large tray.",
+            "Pack the nesquik canister into the medium tray.",
+            "Remove the cracker box from the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-22",
+            "trays": [
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "can_opener",
+                "gelatin_box",
+                "cracker_box"
+            ],
+            "description": "Pack the can opener and gelatin box into the medium tray, then pack the cracker box into the large tray, then remove the candy box from the medium tray.",
+            "assignments": {
+                "can_opener": "medium",
+                "gelatin_box": "medium",
+                "cracker_box": "large"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "candy_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "candy_box"
+            ]
+        },
+        "instruction": "Pack the can opener and gelatin box into the medium tray, then pack the cracker box into the large tray, then remove the candy box from the medium tray.",
+        "subtasks": [
+            "Pack the can opener into the medium tray.",
+            "Pack the gelatin box into the medium tray.",
+            "Pack the cracker box into the large tray.",
+            "Remove the candy box from the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-23",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "soup_can",
+                "candy_box",
+                "cracker_box"
+            ],
+            "description": "Remove the coffee mug from the small tray, then pack the soup can into the large tray, then pack the candy box into the medium tray, then pack the cracker box into the large tray.",
+            "assignments": {
+                "soup_can": "large",
+                "candy_box": "medium",
+                "cracker_box": "large"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "coffee_mug",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "coffee_mug"
+            ]
+        },
+        "instruction": "Remove the coffee mug from the small tray, then pack the soup can into the large tray, then pack the candy box into the medium tray, then pack the cracker box into the large tray.",
+        "subtasks": [
+            "Remove the coffee mug from the small tray.",
+            "Pack the soup can into the large tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the cracker box into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-4OBJ-24",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "gelatin_box",
+                "soup_can",
+                "coffee_mug",
+                "cracker_box"
+            ],
+            "description": "Transfer the gelatin box from the small tray to the medium tray, then pack the soup can into the medium tray, then pack the coffee mug into the small tray, then pack the cracker box into the large tray.",
+            "assignments": {
+                "gelatin_box": "medium",
+                "soup_can": "medium",
+                "coffee_mug": "small",
+                "cracker_box": "large"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "gelatin_box",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Transfer the gelatin box from the small tray to the medium tray, then pack the soup can into the medium tray, then pack the coffee mug into the small tray, then pack the cracker box into the large tray.",
+        "subtasks": [
+            "Transfer the gelatin box from the small tray to the medium tray.",
+            "Pack the soup can into the medium tray.",
+            "Pack the coffee mug into the small tray.",
+            "Pack the cracker box into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-00",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "soup_can",
+                "gelatin_box",
+                "nesquik_canister",
+                "candy_box",
+                "tuna_fish_can"
+            ],
+            "description": "Transfer the soup can from the medium tray to the small tray, then pack the gelatin box into the small tray, then pack the nesquik canister and candy box into the medium tray, then pack the tuna fish can into the large tray.",
+            "assignments": {
+                "soup_can": "small",
+                "gelatin_box": "small",
+                "nesquik_canister": "medium",
+                "candy_box": "medium",
+                "tuna_fish_can": "large"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "soup_can",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Transfer the soup can from the medium tray to the small tray, then pack the gelatin box into the small tray, then pack the nesquik canister and candy box into the medium tray, then pack the tuna fish can into the large tray.",
+        "subtasks": [
+            "Transfer the soup can from the medium tray to the small tray.",
+            "Pack the gelatin box into the small tray.",
+            "Pack the nesquik canister into the medium tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the tuna fish can into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-01",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "gelatin_box",
+                "can_opener",
+                "foam_brick",
+                "tuna_fish_can",
+                "sugar_box"
+            ],
+            "description": "Pack the gelatin box and can opener into the small tray, then pack the foam brick into the large tray, then pack the tuna fish can and sugar box into the medium tray.",
+            "assignments": {
+                "gelatin_box": "small",
+                "can_opener": "small",
+                "foam_brick": "large",
+                "tuna_fish_can": "medium",
+                "sugar_box": "medium"
+            }
+        },
+        "instruction": "Pack the gelatin box and can opener into the small tray, then pack the foam brick into the large tray, then pack the tuna fish can and sugar box into the medium tray.",
+        "subtasks": [
+            "Pack the gelatin box into the small tray.",
+            "Pack the can opener into the small tray.",
+            "Pack the foam brick into the large tray.",
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the sugar box into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-02",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "can_opener",
+                "soup_can",
+                "sugar_box",
+                "candy_box",
+                "cracker_box"
+            ],
+            "description": "Pack the can opener into the large tray, then pack the soup can into the small tray, then pack the sugar box into the large tray, then pack the candy box into the small tray, then pack the cracker box into the medium tray.",
+            "assignments": {
+                "can_opener": "large",
+                "soup_can": "small",
+                "sugar_box": "large",
+                "candy_box": "small",
+                "cracker_box": "medium"
+            }
+        },
+        "instruction": "Pack the can opener into the large tray, then pack the soup can into the small tray, then pack the sugar box into the large tray, then pack the candy box into the small tray, then pack the cracker box into the medium tray.",
+        "subtasks": [
+            "Pack the can opener into the large tray.",
+            "Pack the soup can into the small tray.",
+            "Pack the sugar box into the large tray.",
+            "Pack the candy box into the small tray.",
+            "Pack the cracker box into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-03",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "candy_box",
+                "tuna_fish_can",
+                "sugar_box",
+                "coffee_mug",
+                "nesquik_canister"
+            ],
+            "description": "Transfer the candy box from the large tray to the small tray, then pack the tuna fish can into the medium tray, then pack the sugar box into the small tray, then pack the coffee mug and nesquik canister into the medium tray.",
+            "assignments": {
+                "candy_box": "small",
+                "tuna_fish_can": "medium",
+                "sugar_box": "small",
+                "coffee_mug": "medium",
+                "nesquik_canister": "medium"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "candy_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Transfer the candy box from the large tray to the small tray, then pack the tuna fish can into the medium tray, then pack the sugar box into the small tray, then pack the coffee mug and nesquik canister into the medium tray.",
+        "subtasks": [
+            "Transfer the candy box from the large tray to the small tray.",
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the sugar box into the small tray.",
+            "Pack the coffee mug into the medium tray.",
+            "Pack the nesquik canister into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-04",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "candy_box",
+                "soup_can",
+                "nesquik_canister",
+                "can_opener",
+                "tuna_fish_can"
+            ],
+            "description": "Pack the candy box into the medium tray, then pack the soup can into the small tray, then transfer the nesquik canister and can opener from the large tray to the small tray, then pack the tuna fish can into the medium tray.",
+            "assignments": {
+                "candy_box": "medium",
+                "soup_can": "small",
+                "nesquik_canister": "small",
+                "can_opener": "small",
+                "tuna_fish_can": "medium"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "nesquik_canister",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the candy box into the medium tray, then pack the soup can into the small tray, then transfer the nesquik canister and can opener from the large tray to the small tray, then pack the tuna fish can into the medium tray.",
+        "subtasks": [
+            "Pack the candy box into the medium tray.",
+            "Pack the soup can into the small tray.",
+            "Transfer the nesquik canister from the large tray to the small tray.",
+            "Transfer the can opener from the large tray to the small tray.",
+            "Pack the tuna fish can into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-05",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "can_opener",
+                "foam_brick",
+                "candy_box",
+                "coffee_mug",
+                "gelatin_box"
+            ],
+            "description": "Pack the can opener, foam brick, and candy box into the medium tray, then transfer the coffee mug from the large tray to the small tray, then pack the gelatin box into the large tray.",
+            "assignments": {
+                "can_opener": "medium",
+                "foam_brick": "medium",
+                "candy_box": "medium",
+                "coffee_mug": "small",
+                "gelatin_box": "large"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "coffee_mug",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the can opener, foam brick, and candy box into the medium tray, then transfer the coffee mug from the large tray to the small tray, then pack the gelatin box into the large tray.",
+        "subtasks": [
+            "Pack the can opener into the medium tray.",
+            "Pack the foam brick into the medium tray.",
+            "Pack the candy box into the medium tray.",
+            "Transfer the coffee mug from the large tray to the small tray.",
+            "Pack the gelatin box into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-06",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "candy_box",
+                "gelatin_box",
+                "cracker_box",
+                "nesquik_canister"
+            ],
+            "description": "Pack the candy box into the large tray, then pack the gelatin box into the medium tray, then pack the cracker box into the small tray, then pack the nesquik canister into the large tray, then remove the can opener from the medium tray.",
+            "assignments": {
+                "candy_box": "large",
+                "gelatin_box": "medium",
+                "cracker_box": "small",
+                "nesquik_canister": "large"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "can_opener"
+            ]
+        },
+        "instruction": "Pack the candy box into the large tray, then pack the gelatin box into the medium tray, then pack the cracker box into the small tray, then pack the nesquik canister into the large tray, then remove the can opener from the medium tray.",
+        "subtasks": [
+            "Pack the candy box into the large tray.",
+            "Pack the gelatin box into the medium tray.",
+            "Pack the cracker box into the small tray.",
+            "Pack the nesquik canister into the large tray.",
+            "Remove the can opener from the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-07",
+            "trays": [
+                "small",
+                "large"
+            ],
+            "objects": [
+                "sugar_box",
+                "foam_brick",
+                "cracker_box",
+                "coffee_mug",
+                "can_opener"
+            ],
+            "description": "Pack the sugar box and foam brick into the small tray, then pack the cracker box into the large tray, then pack the coffee mug into the small tray, then pack the can opener into the large tray.",
+            "assignments": {
+                "sugar_box": "small",
+                "foam_brick": "small",
+                "cracker_box": "large",
+                "coffee_mug": "small",
+                "can_opener": "large"
+            }
+        },
+        "instruction": "Pack the sugar box and foam brick into the small tray, then pack the cracker box into the large tray, then pack the coffee mug into the small tray, then pack the can opener into the large tray.",
+        "subtasks": [
+            "Pack the sugar box into the small tray.",
+            "Pack the foam brick into the small tray.",
+            "Pack the cracker box into the large tray.",
+            "Pack the coffee mug into the small tray.",
+            "Pack the can opener into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-08",
+            "trays": [
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "foam_brick",
+                "sugar_box",
+                "candy_box",
+                "coffee_mug",
+                "can_opener"
+            ],
+            "description": "Pack the foam brick into the large tray, then pack the sugar box and candy box into the medium tray, then pack the coffee mug and can opener into the large tray.",
+            "assignments": {
+                "foam_brick": "large",
+                "sugar_box": "medium",
+                "candy_box": "medium",
+                "coffee_mug": "large",
+                "can_opener": "large"
+            }
+        },
+        "instruction": "Pack the foam brick into the large tray, then pack the sugar box and candy box into the medium tray, then pack the coffee mug and can opener into the large tray.",
+        "subtasks": [
+            "Pack the foam brick into the large tray.",
+            "Pack the sugar box into the medium tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the coffee mug into the large tray.",
+            "Pack the can opener into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-09",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "gelatin_box",
+                "cracker_box",
+                "candy_box",
+                "foam_brick",
+                "coffee_mug"
+            ],
+            "description": "Pack the gelatin box into the small tray, then pack the cracker box into the large tray, then pack the candy box into the medium tray, then pack the foam brick and coffee mug into the large tray.",
+            "assignments": {
+                "gelatin_box": "small",
+                "cracker_box": "large",
+                "candy_box": "medium",
+                "foam_brick": "large",
+                "coffee_mug": "large"
+            }
+        },
+        "instruction": "Pack the gelatin box into the small tray, then pack the cracker box into the large tray, then pack the candy box into the medium tray, then pack the foam brick and coffee mug into the large tray.",
+        "subtasks": [
+            "Pack the gelatin box into the small tray.",
+            "Pack the cracker box into the large tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the foam brick into the large tray.",
+            "Pack the coffee mug into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-10",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "tuna_fish_can",
+                "candy_box",
+                "coffee_mug",
+                "nesquik_canister"
+            ],
+            "description": "Pack the tuna fish can into the medium tray, then pack the candy box into the small tray, then remove the foam brick from the small tray, then pack the coffee mug into the small tray, then pack the nesquik canister into the large tray.",
+            "assignments": {
+                "tuna_fish_can": "medium",
+                "candy_box": "small",
+                "coffee_mug": "small",
+                "nesquik_canister": "large"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "foam_brick",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "foam_brick"
+            ]
+        },
+        "instruction": "Pack the tuna fish can into the medium tray, then pack the candy box into the small tray, then remove the foam brick from the small tray, then pack the coffee mug into the small tray, then pack the nesquik canister into the large tray.",
+        "subtasks": [
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the candy box into the small tray.",
+            "Remove the foam brick from the small tray.",
+            "Pack the coffee mug into the small tray.",
+            "Pack the nesquik canister into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-11",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "tuna_fish_can",
+                "sugar_box",
+                "cracker_box",
+                "can_opener"
+            ],
+            "description": "Pack the tuna fish can into the medium tray, then pack the sugar box into the large tray, then pack the cracker box into the small tray, then pack the can opener into the large tray, then remove the candy box from the small tray.",
+            "assignments": {
+                "tuna_fish_can": "medium",
+                "sugar_box": "large",
+                "cracker_box": "small",
+                "can_opener": "large"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "candy_box",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "candy_box"
+            ]
+        },
+        "instruction": "Pack the tuna fish can into the medium tray, then pack the sugar box into the large tray, then pack the cracker box into the small tray, then pack the can opener into the large tray, then remove the candy box from the small tray.",
+        "subtasks": [
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the sugar box into the large tray.",
+            "Pack the cracker box into the small tray.",
+            "Pack the can opener into the large tray.",
+            "Remove the candy box from the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-12",
+            "trays": [
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "soup_can",
+                "can_opener",
+                "sugar_box"
+            ],
+            "description": "Pack the soup can into the large tray, then pack the can opener and sugar box into the medium tray, then remove the tuna fish can from the large tray, then remove the candy box from the medium tray.",
+            "assignments": {
+                "soup_can": "large",
+                "can_opener": "medium",
+                "sugar_box": "medium"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "tuna_fish_can",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ],
+                "medium": [
+                    {
+                        "object": "candy_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "tuna_fish_can",
+                "candy_box"
+            ]
+        },
+        "instruction": "Pack the soup can into the large tray, then pack the can opener and sugar box into the medium tray, then remove the tuna fish can from the large tray, then remove the candy box from the medium tray.",
+        "subtasks": [
+            "Pack the soup can into the large tray.",
+            "Pack the can opener into the medium tray.",
+            "Pack the sugar box into the medium tray.",
+            "Remove the tuna fish can from the large tray.",
+            "Remove the candy box from the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-13",
+            "trays": [
+                "small",
+                "medium"
+            ],
+            "objects": [
+                "nesquik_canister",
+                "tuna_fish_can",
+                "foam_brick",
+                "can_opener",
+                "sugar_box"
+            ],
+            "description": "Pack the nesquik canister into the small tray, then pack the tuna fish can into the medium tray, then pack the foam brick into the small tray, then pack the can opener into the medium tray, then transfer the sugar box from the small tray to the medium tray.",
+            "assignments": {
+                "nesquik_canister": "small",
+                "tuna_fish_can": "medium",
+                "foam_brick": "small",
+                "can_opener": "medium",
+                "sugar_box": "medium"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the nesquik canister into the small tray, then pack the tuna fish can into the medium tray, then pack the foam brick into the small tray, then pack the can opener into the medium tray, then transfer the sugar box from the small tray to the medium tray.",
+        "subtasks": [
+            "Pack the nesquik canister into the small tray.",
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the foam brick into the small tray.",
+            "Pack the can opener into the medium tray.",
+            "Transfer the sugar box from the small tray to the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-14",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "foam_brick",
+                "nesquik_canister",
+                "gelatin_box",
+                "tuna_fish_can"
+            ],
+            "description": "Pack the coffee mug into the small tray, then pack the foam brick and nesquik canister into the medium tray, then pack the gelatin box and tuna fish can into the large tray.",
+            "assignments": {
+                "coffee_mug": "small",
+                "foam_brick": "medium",
+                "nesquik_canister": "medium",
+                "gelatin_box": "large",
+                "tuna_fish_can": "large"
+            }
+        },
+        "instruction": "Pack the coffee mug into the small tray, then pack the foam brick and nesquik canister into the medium tray, then pack the gelatin box and tuna fish can into the large tray.",
+        "subtasks": [
+            "Pack the coffee mug into the small tray.",
+            "Pack the foam brick into the medium tray.",
+            "Pack the nesquik canister into the medium tray.",
+            "Pack the gelatin box into the large tray.",
+            "Pack the tuna fish can into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-15",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "foam_brick",
+                "soup_can",
+                "nesquik_canister",
+                "tuna_fish_can"
+            ],
+            "description": "Pack the coffee mug into the large tray, then pack the foam brick, soup can, and nesquik canister into the medium tray, then pack the tuna fish can into the small tray.",
+            "assignments": {
+                "coffee_mug": "large",
+                "foam_brick": "medium",
+                "soup_can": "medium",
+                "nesquik_canister": "medium",
+                "tuna_fish_can": "small"
+            }
+        },
+        "instruction": "Pack the coffee mug into the large tray, then pack the foam brick, soup can, and nesquik canister into the medium tray, then pack the tuna fish can into the small tray.",
+        "subtasks": [
+            "Pack the coffee mug into the large tray.",
+            "Pack the foam brick into the medium tray.",
+            "Pack the soup can into the medium tray.",
+            "Pack the nesquik canister into the medium tray.",
+            "Pack the tuna fish can into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-16",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "cracker_box",
+                "can_opener",
+                "gelatin_box",
+                "tuna_fish_can"
+            ],
+            "description": "Pack the cracker box into the small tray, then pack the can opener into the large tray, then pack the gelatin box into the medium tray, then transfer the tuna fish can from the medium tray to the small tray, then remove the nesquik canister from the medium tray.",
+            "assignments": {
+                "cracker_box": "small",
+                "can_opener": "large",
+                "gelatin_box": "medium",
+                "tuna_fish_can": "small"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "tuna_fish_can",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "nesquik_canister",
+                        "pos": [
+                            0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "nesquik_canister"
+            ]
+        },
+        "instruction": "Pack the cracker box into the small tray, then pack the can opener into the large tray, then pack the gelatin box into the medium tray, then transfer the tuna fish can from the medium tray to the small tray, then remove the nesquik canister from the medium tray.",
+        "subtasks": [
+            "Pack the cracker box into the small tray.",
+            "Pack the can opener into the large tray.",
+            "Pack the gelatin box into the medium tray.",
+            "Transfer the tuna fish can from the medium tray to the small tray.",
+            "Remove the nesquik canister from the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-17",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "cracker_box",
+                "nesquik_canister",
+                "can_opener"
+            ],
+            "description": "Transfer the cracker box from the large tray to the small tray, then pack the nesquik canister into the large tray, then remove the gelatin box from the medium tray, then pack the can opener into the small tray, then remove the sugar box from the medium tray.",
+            "assignments": {
+                "cracker_box": "small",
+                "nesquik_canister": "large",
+                "can_opener": "small"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "cracker_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ],
+                "medium": [
+                    {
+                        "object": "gelatin_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "gelatin_box",
+                "sugar_box"
+            ]
+        },
+        "instruction": "Transfer the cracker box from the large tray to the small tray, then pack the nesquik canister into the large tray, then remove the gelatin box from the medium tray, then pack the can opener into the small tray, then remove the sugar box from the medium tray.",
+        "subtasks": [
+            "Transfer the cracker box from the large tray to the small tray.",
+            "Pack the nesquik canister into the large tray.",
+            "Remove the gelatin box from the medium tray.",
+            "Pack the can opener into the small tray.",
+            "Remove the sugar box from the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-18",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "foam_brick",
+                "nesquik_canister",
+                "candy_box",
+                "cracker_box",
+                "sugar_box"
+            ],
+            "description": "Pack the foam brick into the large tray, then pack the nesquik canister into the small tray, then pack the candy box into the large tray, then pack the cracker box and sugar box into the medium tray.",
+            "assignments": {
+                "foam_brick": "large",
+                "nesquik_canister": "small",
+                "candy_box": "large",
+                "cracker_box": "medium",
+                "sugar_box": "medium"
+            }
+        },
+        "instruction": "Pack the foam brick into the large tray, then pack the nesquik canister into the small tray, then pack the candy box into the large tray, then pack the cracker box and sugar box into the medium tray.",
+        "subtasks": [
+            "Pack the foam brick into the large tray.",
+            "Pack the nesquik canister into the small tray.",
+            "Pack the candy box into the large tray.",
+            "Pack the cracker box into the medium tray.",
+            "Pack the sugar box into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-19",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "sugar_box",
+                "candy_box",
+                "tuna_fish_can"
+            ],
+            "description": "Pack the sugar box into the medium tray, then pack the candy box into the small tray, then remove the gelatin box from the medium tray, then remove the foam brick from the small tray, then pack the tuna fish can into the large tray.",
+            "assignments": {
+                "sugar_box": "medium",
+                "candy_box": "small",
+                "tuna_fish_can": "large"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "gelatin_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ],
+                "small": [
+                    {
+                        "object": "foam_brick",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "gelatin_box",
+                "foam_brick"
+            ]
+        },
+        "instruction": "Pack the sugar box into the medium tray, then pack the candy box into the small tray, then remove the gelatin box from the medium tray, then remove the foam brick from the small tray, then pack the tuna fish can into the large tray.",
+        "subtasks": [
+            "Pack the sugar box into the medium tray.",
+            "Pack the candy box into the small tray.",
+            "Remove the gelatin box from the medium tray.",
+            "Remove the foam brick from the small tray.",
+            "Pack the tuna fish can into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-20",
+            "trays": [
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "sugar_box",
+                "nesquik_canister",
+                "tuna_fish_can",
+                "cracker_box",
+                "candy_box"
+            ],
+            "description": "Pack the sugar box into the large tray, then transfer the nesquik canister from the large tray to the medium tray, then pack the tuna fish can and cracker box into the medium tray, then pack the candy box into the large tray.",
+            "assignments": {
+                "sugar_box": "large",
+                "nesquik_canister": "medium",
+                "tuna_fish_can": "medium",
+                "cracker_box": "medium",
+                "candy_box": "large"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "nesquik_canister",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the sugar box into the large tray, then transfer the nesquik canister from the large tray to the medium tray, then pack the tuna fish can and cracker box into the medium tray, then pack the candy box into the large tray.",
+        "subtasks": [
+            "Pack the sugar box into the large tray.",
+            "Transfer the nesquik canister from the large tray to the medium tray.",
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the cracker box into the medium tray.",
+            "Pack the candy box into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-21",
+            "trays": [
+                "small",
+                "medium"
+            ],
+            "objects": [
+                "soup_can",
+                "gelatin_box",
+                "tuna_fish_can",
+                "candy_box",
+                "sugar_box"
+            ],
+            "description": "Pack the soup can into the small tray, then pack the gelatin box, tuna fish can, and candy box into the medium tray, then pack the sugar box into the small tray.",
+            "assignments": {
+                "soup_can": "small",
+                "gelatin_box": "medium",
+                "tuna_fish_can": "medium",
+                "candy_box": "medium",
+                "sugar_box": "small"
+            }
+        },
+        "instruction": "Pack the soup can into the small tray, then pack the gelatin box, tuna fish can, and candy box into the medium tray, then pack the sugar box into the small tray.",
+        "subtasks": [
+            "Pack the soup can into the small tray.",
+            "Pack the gelatin box into the medium tray.",
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the sugar box into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-22",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "soup_can",
+                "cracker_box"
+            ],
+            "description": "Pack the coffee mug into the small tray, then remove the can opener from the large tray, then pack the soup can into the small tray, then transfer the cracker box from the small tray to the medium tray, then remove the gelatin box from the medium tray.",
+            "assignments": {
+                "coffee_mug": "small",
+                "soup_can": "small",
+                "cracker_box": "medium"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ],
+                "small": [
+                    {
+                        "object": "cracker_box",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ],
+                "medium": [
+                    {
+                        "object": "gelatin_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "can_opener",
+                "gelatin_box"
+            ]
+        },
+        "instruction": "Pack the coffee mug into the small tray, then remove the can opener from the large tray, then pack the soup can into the small tray, then transfer the cracker box from the small tray to the medium tray, then remove the gelatin box from the medium tray.",
+        "subtasks": [
+            "Pack the coffee mug into the small tray.",
+            "Remove the can opener from the large tray.",
+            "Pack the soup can into the small tray.",
+            "Transfer the cracker box from the small tray to the medium tray.",
+            "Remove the gelatin box from the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-23",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "cracker_box",
+                "candy_box",
+                "soup_can",
+                "can_opener"
+            ],
+            "description": "Pack the coffee mug and cracker box into the small tray, then pack the candy box into the medium tray, then pack the soup can into the large tray, then pack the can opener into the medium tray.",
+            "assignments": {
+                "coffee_mug": "small",
+                "cracker_box": "small",
+                "candy_box": "medium",
+                "soup_can": "large",
+                "can_opener": "medium"
+            }
+        },
+        "instruction": "Pack the coffee mug and cracker box into the small tray, then pack the candy box into the medium tray, then pack the soup can into the large tray, then pack the can opener into the medium tray.",
+        "subtasks": [
+            "Pack the coffee mug into the small tray.",
+            "Pack the cracker box into the small tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the soup can into the large tray.",
+            "Pack the can opener into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-5OBJ-24",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "gelatin_box",
+                "soup_can",
+                "tuna_fish_can",
+                "sugar_box",
+                "can_opener"
+            ],
+            "description": "Pack the gelatin box into the large tray, then pack the soup can into the small tray, then pack the tuna fish can into the large tray, then pack the sugar box into the medium tray, then pack the can opener into the large tray.",
+            "assignments": {
+                "gelatin_box": "large",
+                "soup_can": "small",
+                "tuna_fish_can": "large",
+                "sugar_box": "medium",
+                "can_opener": "large"
+            }
+        },
+        "instruction": "Pack the gelatin box into the large tray, then pack the soup can into the small tray, then pack the tuna fish can into the large tray, then pack the sugar box into the medium tray, then pack the can opener into the large tray.",
+        "subtasks": [
+            "Pack the gelatin box into the large tray.",
+            "Pack the soup can into the small tray.",
+            "Pack the tuna fish can into the large tray.",
+            "Pack the sugar box into the medium tray.",
+            "Pack the can opener into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-00",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "can_opener",
+                "coffee_mug",
+                "tuna_fish_can",
+                "candy_box"
+            ],
+            "description": "Pack the can opener into the small tray, then remove the sugar box from the large tray, then pack the coffee mug into the large tray, then pack the tuna fish can into the small tray, then transfer the candy box from the medium tray to the large tray, then remove the nesquik canister from the medium tray.",
+            "assignments": {
+                "can_opener": "small",
+                "coffee_mug": "large",
+                "tuna_fish_can": "small",
+                "candy_box": "large"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ],
+                "medium": [
+                    {
+                        "object": "candy_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "nesquik_canister",
+                        "pos": [
+                            0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "sugar_box",
+                "nesquik_canister"
+            ]
+        },
+        "instruction": "Pack the can opener into the small tray, then remove the sugar box from the large tray, then pack the coffee mug into the large tray, then pack the tuna fish can into the small tray, then transfer the candy box from the medium tray to the large tray, then remove the nesquik canister from the medium tray.",
+        "subtasks": [
+            "Pack the can opener into the small tray.",
+            "Remove the sugar box from the large tray.",
+            "Pack the coffee mug into the large tray.",
+            "Pack the tuna fish can into the small tray.",
+            "Transfer the candy box from the medium tray to the large tray.",
+            "Remove the nesquik canister from the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-01",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "soup_can",
+                "foam_brick",
+                "nesquik_canister",
+                "sugar_box",
+                "coffee_mug"
+            ],
+            "description": "Pack the soup can into the large tray, then remove the gelatin box from the small tray, then pack the foam brick into the medium tray, then pack the nesquik canister into the small tray, then pack the sugar box into the large tray, then pack the coffee mug into the small tray.",
+            "assignments": {
+                "soup_can": "large",
+                "foam_brick": "medium",
+                "nesquik_canister": "small",
+                "sugar_box": "large",
+                "coffee_mug": "small"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "gelatin_box",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "gelatin_box"
+            ]
+        },
+        "instruction": "Pack the soup can into the large tray, then remove the gelatin box from the small tray, then pack the foam brick into the medium tray, then pack the nesquik canister into the small tray, then pack the sugar box into the large tray, then pack the coffee mug into the small tray.",
+        "subtasks": [
+            "Pack the soup can into the large tray.",
+            "Remove the gelatin box from the small tray.",
+            "Pack the foam brick into the medium tray.",
+            "Pack the nesquik canister into the small tray.",
+            "Pack the sugar box into the large tray.",
+            "Pack the coffee mug into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-02",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "gelatin_box",
+                "sugar_box",
+                "soup_can",
+                "foam_brick",
+                "coffee_mug"
+            ],
+            "description": "Pack the gelatin box and sugar box into the small tray, then remove the can opener from the large tray, then transfer the soup can from the large tray to the medium tray, then pack the foam brick and coffee mug into the medium tray.",
+            "assignments": {
+                "gelatin_box": "small",
+                "sugar_box": "small",
+                "soup_can": "medium",
+                "foam_brick": "medium",
+                "coffee_mug": "medium"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "soup_can",
+                        "pos": [
+                            0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "can_opener"
+            ]
+        },
+        "instruction": "Pack the gelatin box and sugar box into the small tray, then remove the can opener from the large tray, then transfer the soup can from the large tray to the medium tray, then pack the foam brick and coffee mug into the medium tray.",
+        "subtasks": [
+            "Pack the gelatin box into the small tray.",
+            "Pack the sugar box into the small tray.",
+            "Remove the can opener from the large tray.",
+            "Transfer the soup can from the large tray to the medium tray.",
+            "Pack the foam brick into the medium tray.",
+            "Pack the coffee mug into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-03",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "can_opener",
+                "gelatin_box",
+                "cracker_box",
+                "candy_box",
+                "sugar_box"
+            ],
+            "description": "Pack the coffee mug into the large tray, then pack the can opener into the small tray, then pack the gelatin box into the large tray, then pack the cracker box into the medium tray, then pack the candy box into the large tray, then pack the sugar box into the medium tray.",
+            "assignments": {
+                "coffee_mug": "large",
+                "can_opener": "small",
+                "gelatin_box": "large",
+                "cracker_box": "medium",
+                "candy_box": "large",
+                "sugar_box": "medium"
+            }
+        },
+        "instruction": "Pack the coffee mug into the large tray, then pack the can opener into the small tray, then pack the gelatin box into the large tray, then pack the cracker box into the medium tray, then pack the candy box into the large tray, then pack the sugar box into the medium tray.",
+        "subtasks": [
+            "Pack the coffee mug into the large tray.",
+            "Pack the can opener into the small tray.",
+            "Pack the gelatin box into the large tray.",
+            "Pack the cracker box into the medium tray.",
+            "Pack the candy box into the large tray.",
+            "Pack the sugar box into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-04",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "foam_brick",
+                "tuna_fish_can",
+                "gelatin_box",
+                "sugar_box",
+                "cracker_box",
+                "nesquik_canister"
+            ],
+            "description": "Pack the foam brick into the small tray, then pack the tuna fish can into the large tray, then pack the gelatin box into the medium tray, then pack the sugar box into the small tray, then pack the cracker box into the medium tray, then transfer the nesquik canister from the large tray to the medium tray.",
+            "assignments": {
+                "foam_brick": "small",
+                "tuna_fish_can": "large",
+                "gelatin_box": "medium",
+                "sugar_box": "small",
+                "cracker_box": "medium",
+                "nesquik_canister": "medium"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "nesquik_canister",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the foam brick into the small tray, then pack the tuna fish can into the large tray, then pack the gelatin box into the medium tray, then pack the sugar box into the small tray, then pack the cracker box into the medium tray, then transfer the nesquik canister from the large tray to the medium tray.",
+        "subtasks": [
+            "Pack the foam brick into the small tray.",
+            "Pack the tuna fish can into the large tray.",
+            "Pack the gelatin box into the medium tray.",
+            "Pack the sugar box into the small tray.",
+            "Pack the cracker box into the medium tray.",
+            "Transfer the nesquik canister from the large tray to the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-05",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "tuna_fish_can",
+                "coffee_mug",
+                "candy_box",
+                "foam_brick",
+                "gelatin_box"
+            ],
+            "description": "Pack the tuna fish can into the medium tray, then remove the soup can from the small tray, then pack the coffee mug into the medium tray, then pack the candy box into the small tray, then pack the foam brick into the large tray, then pack the gelatin box into the small tray.",
+            "assignments": {
+                "tuna_fish_can": "medium",
+                "coffee_mug": "medium",
+                "candy_box": "small",
+                "foam_brick": "large",
+                "gelatin_box": "small"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "soup_can",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "soup_can"
+            ]
+        },
+        "instruction": "Pack the tuna fish can into the medium tray, then remove the soup can from the small tray, then pack the coffee mug into the medium tray, then pack the candy box into the small tray, then pack the foam brick into the large tray, then pack the gelatin box into the small tray.",
+        "subtasks": [
+            "Pack the tuna fish can into the medium tray.",
+            "Remove the soup can from the small tray.",
+            "Pack the coffee mug into the medium tray.",
+            "Pack the candy box into the small tray.",
+            "Pack the foam brick into the large tray.",
+            "Pack the gelatin box into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-06",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "can_opener",
+                "nesquik_canister",
+                "foam_brick"
+            ],
+            "description": "Pack the coffee mug into the large tray, then remove the sugar box from the large tray, then pack the can opener into the medium tray, then remove the candy box from the small tray, then pack the nesquik canister into the medium tray, then pack the foam brick into the small tray.",
+            "assignments": {
+                "coffee_mug": "large",
+                "can_opener": "medium",
+                "nesquik_canister": "medium",
+                "foam_brick": "small"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ],
+                "small": [
+                    {
+                        "object": "candy_box",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "sugar_box",
+                "candy_box"
+            ]
+        },
+        "instruction": "Pack the coffee mug into the large tray, then remove the sugar box from the large tray, then pack the can opener into the medium tray, then remove the candy box from the small tray, then pack the nesquik canister into the medium tray, then pack the foam brick into the small tray.",
+        "subtasks": [
+            "Pack the coffee mug into the large tray.",
+            "Remove the sugar box from the large tray.",
+            "Pack the can opener into the medium tray.",
+            "Remove the candy box from the small tray.",
+            "Pack the nesquik canister into the medium tray.",
+            "Pack the foam brick into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-07",
+            "trays": [
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "gelatin_box",
+                "tuna_fish_can",
+                "candy_box",
+                "cracker_box",
+                "can_opener"
+            ],
+            "description": "Transfer the coffee mug from the large tray to the medium tray, then pack the gelatin box and tuna fish can into the large tray, then pack the candy box into the medium tray, then pack the cracker box and can opener into the large tray.",
+            "assignments": {
+                "coffee_mug": "medium",
+                "gelatin_box": "large",
+                "tuna_fish_can": "large",
+                "candy_box": "medium",
+                "cracker_box": "large",
+                "can_opener": "large"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "coffee_mug",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Transfer the coffee mug from the large tray to the medium tray, then pack the gelatin box and tuna fish can into the large tray, then pack the candy box into the medium tray, then pack the cracker box and can opener into the large tray.",
+        "subtasks": [
+            "Transfer the coffee mug from the large tray to the medium tray.",
+            "Pack the gelatin box into the large tray.",
+            "Pack the tuna fish can into the large tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the cracker box into the large tray.",
+            "Pack the can opener into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-08",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "soup_can",
+                "nesquik_canister",
+                "cracker_box",
+                "gelatin_box",
+                "candy_box",
+                "foam_brick"
+            ],
+            "description": "Pack the soup can into the large tray, then pack the nesquik canister into the small tray, then transfer the cracker box from the large tray to the small tray, then pack the gelatin box into the large tray, then pack the candy box and foam brick into the medium tray.",
+            "assignments": {
+                "soup_can": "large",
+                "nesquik_canister": "small",
+                "cracker_box": "small",
+                "gelatin_box": "large",
+                "candy_box": "medium",
+                "foam_brick": "medium"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "cracker_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the soup can into the large tray, then pack the nesquik canister into the small tray, then transfer the cracker box from the large tray to the small tray, then pack the gelatin box into the large tray, then pack the candy box and foam brick into the medium tray.",
+        "subtasks": [
+            "Pack the soup can into the large tray.",
+            "Pack the nesquik canister into the small tray.",
+            "Transfer the cracker box from the large tray to the small tray.",
+            "Pack the gelatin box into the large tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the foam brick into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-09",
+            "trays": [
+                "small",
+                "medium"
+            ],
+            "objects": [
+                "sugar_box",
+                "tuna_fish_can",
+                "soup_can",
+                "cracker_box",
+                "candy_box",
+                "can_opener"
+            ],
+            "description": "Pack the sugar box and tuna fish can into the medium tray, then pack the soup can and cracker box into the small tray, then pack the candy box and can opener into the medium tray.",
+            "assignments": {
+                "sugar_box": "medium",
+                "tuna_fish_can": "medium",
+                "soup_can": "small",
+                "cracker_box": "small",
+                "candy_box": "medium",
+                "can_opener": "medium"
+            }
+        },
+        "instruction": "Pack the sugar box and tuna fish can into the medium tray, then pack the soup can and cracker box into the small tray, then pack the candy box and can opener into the medium tray.",
+        "subtasks": [
+            "Pack the sugar box into the medium tray.",
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the soup can into the small tray.",
+            "Pack the cracker box into the small tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the can opener into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-10",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "tuna_fish_can",
+                "soup_can",
+                "foam_brick",
+                "can_opener",
+                "candy_box"
+            ],
+            "description": "Pack the coffee mug and tuna fish can into the large tray, then pack the soup can into the small tray, then pack the foam brick into the medium tray, then transfer the can opener from the medium tray to the small tray, then pack the candy box into the medium tray.",
+            "assignments": {
+                "coffee_mug": "large",
+                "tuna_fish_can": "large",
+                "soup_can": "small",
+                "foam_brick": "medium",
+                "can_opener": "small",
+                "candy_box": "medium"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the coffee mug and tuna fish can into the large tray, then pack the soup can into the small tray, then pack the foam brick into the medium tray, then transfer the can opener from the medium tray to the small tray, then pack the candy box into the medium tray.",
+        "subtasks": [
+            "Pack the coffee mug into the large tray.",
+            "Pack the tuna fish can into the large tray.",
+            "Pack the soup can into the small tray.",
+            "Pack the foam brick into the medium tray.",
+            "Transfer the can opener from the medium tray to the small tray.",
+            "Pack the candy box into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-11",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "sugar_box",
+                "nesquik_canister",
+                "tuna_fish_can",
+                "candy_box",
+                "gelatin_box"
+            ],
+            "description": "Transfer the sugar box from the small tray to the medium tray, then pack the nesquik canister into the medium tray, then remove the can opener from the large tray, then pack the tuna fish can and candy box into the large tray, then pack the gelatin box into the medium tray.",
+            "assignments": {
+                "sugar_box": "medium",
+                "nesquik_canister": "medium",
+                "tuna_fish_can": "large",
+                "candy_box": "large",
+                "gelatin_box": "medium"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ],
+                "large": [
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "can_opener"
+            ]
+        },
+        "instruction": "Transfer the sugar box from the small tray to the medium tray, then pack the nesquik canister into the medium tray, then remove the can opener from the large tray, then pack the tuna fish can and candy box into the large tray, then pack the gelatin box into the medium tray.",
+        "subtasks": [
+            "Transfer the sugar box from the small tray to the medium tray.",
+            "Pack the nesquik canister into the medium tray.",
+            "Remove the can opener from the large tray.",
+            "Pack the tuna fish can into the large tray.",
+            "Pack the candy box into the large tray.",
+            "Pack the gelatin box into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-12",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "gelatin_box",
+                "tuna_fish_can",
+                "coffee_mug",
+                "nesquik_canister",
+                "cracker_box",
+                "soup_can"
+            ],
+            "description": "Pack the gelatin box into the medium tray, then pack the tuna fish can into the small tray, then pack the coffee mug and nesquik canister into the large tray, then pack the cracker box into the small tray, then transfer the soup can from the medium tray to the small tray.",
+            "assignments": {
+                "gelatin_box": "medium",
+                "tuna_fish_can": "small",
+                "coffee_mug": "large",
+                "nesquik_canister": "large",
+                "cracker_box": "small",
+                "soup_can": "small"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "soup_can",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the gelatin box into the medium tray, then pack the tuna fish can into the small tray, then pack the coffee mug and nesquik canister into the large tray, then pack the cracker box into the small tray, then transfer the soup can from the medium tray to the small tray.",
+        "subtasks": [
+            "Pack the gelatin box into the medium tray.",
+            "Pack the tuna fish can into the small tray.",
+            "Pack the coffee mug into the large tray.",
+            "Pack the nesquik canister into the large tray.",
+            "Pack the cracker box into the small tray.",
+            "Transfer the soup can from the medium tray to the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-13",
+            "trays": [
+                "small",
+                "large"
+            ],
+            "objects": [
+                "soup_can",
+                "sugar_box",
+                "coffee_mug",
+                "candy_box",
+                "foam_brick",
+                "can_opener"
+            ],
+            "description": "Pack the soup can into the large tray, then pack the sugar box into the small tray, then pack the coffee mug and candy box into the large tray, then pack the foam brick into the small tray, then pack the can opener into the large tray.",
+            "assignments": {
+                "soup_can": "large",
+                "sugar_box": "small",
+                "coffee_mug": "large",
+                "candy_box": "large",
+                "foam_brick": "small",
+                "can_opener": "large"
+            }
+        },
+        "instruction": "Pack the soup can into the large tray, then pack the sugar box into the small tray, then pack the coffee mug and candy box into the large tray, then pack the foam brick into the small tray, then pack the can opener into the large tray.",
+        "subtasks": [
+            "Pack the soup can into the large tray.",
+            "Pack the sugar box into the small tray.",
+            "Pack the coffee mug into the large tray.",
+            "Pack the candy box into the large tray.",
+            "Pack the foam brick into the small tray.",
+            "Pack the can opener into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-14",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "soup_can",
+                "candy_box",
+                "coffee_mug",
+                "foam_brick",
+                "sugar_box",
+                "cracker_box"
+            ],
+            "description": "Transfer the soup can and candy box from the large tray to the medium tray, then pack the coffee mug into the large tray, then transfer the foam brick from the small tray to the large tray, then pack the sugar box and cracker box into the small tray.",
+            "assignments": {
+                "soup_can": "medium",
+                "candy_box": "medium",
+                "coffee_mug": "large",
+                "foam_brick": "large",
+                "sugar_box": "small",
+                "cracker_box": "small"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "soup_can",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "candy_box",
+                        "pos": [
+                            0.05,
+                            0.0
+                        ]
+                    }
+                ],
+                "small": [
+                    {
+                        "object": "foam_brick",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Transfer the soup can and candy box from the large tray to the medium tray, then pack the coffee mug into the large tray, then transfer the foam brick from the small tray to the large tray, then pack the sugar box and cracker box into the small tray.",
+        "subtasks": [
+            "Transfer the soup can from the large tray to the medium tray.",
+            "Transfer the candy box from the large tray to the medium tray.",
+            "Pack the coffee mug into the large tray.",
+            "Transfer the foam brick from the small tray to the large tray.",
+            "Pack the sugar box into the small tray.",
+            "Pack the cracker box into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-15",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "sugar_box",
+                "gelatin_box",
+                "candy_box",
+                "tuna_fish_can",
+                "coffee_mug"
+            ],
+            "description": "Pack the sugar box into the medium tray, then remove the nesquik canister from the small tray, then transfer the gelatin box from the medium tray to the small tray, then pack the candy box into the small tray, then transfer the tuna fish can from the large tray to the medium tray, then pack the coffee mug into the large tray.",
+            "assignments": {
+                "sugar_box": "medium",
+                "gelatin_box": "small",
+                "candy_box": "small",
+                "tuna_fish_can": "medium",
+                "coffee_mug": "large"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "nesquik_canister",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ],
+                "medium": [
+                    {
+                        "object": "gelatin_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ],
+                "large": [
+                    {
+                        "object": "tuna_fish_can",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "nesquik_canister"
+            ]
+        },
+        "instruction": "Pack the sugar box into the medium tray, then remove the nesquik canister from the small tray, then transfer the gelatin box from the medium tray to the small tray, then pack the candy box into the small tray, then transfer the tuna fish can from the large tray to the medium tray, then pack the coffee mug into the large tray.",
+        "subtasks": [
+            "Pack the sugar box into the medium tray.",
+            "Remove the nesquik canister from the small tray.",
+            "Transfer the gelatin box from the medium tray to the small tray.",
+            "Pack the candy box into the small tray.",
+            "Transfer the tuna fish can from the large tray to the medium tray.",
+            "Pack the coffee mug into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-16",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "gelatin_box",
+                "tuna_fish_can",
+                "sugar_box",
+                "cracker_box",
+                "soup_can"
+            ],
+            "description": "Pack the gelatin box into the small tray, then pack the tuna fish can into the large tray, then remove the foam brick from the large tray, then pack the sugar box and cracker box into the large tray, then pack the soup can into the medium tray.",
+            "assignments": {
+                "gelatin_box": "small",
+                "tuna_fish_can": "large",
+                "sugar_box": "large",
+                "cracker_box": "large",
+                "soup_can": "medium"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "foam_brick",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "foam_brick"
+            ]
+        },
+        "instruction": "Pack the gelatin box into the small tray, then pack the tuna fish can into the large tray, then remove the foam brick from the large tray, then pack the sugar box and cracker box into the large tray, then pack the soup can into the medium tray.",
+        "subtasks": [
+            "Pack the gelatin box into the small tray.",
+            "Pack the tuna fish can into the large tray.",
+            "Remove the foam brick from the large tray.",
+            "Pack the sugar box into the large tray.",
+            "Pack the cracker box into the large tray.",
+            "Pack the soup can into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-17",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "cracker_box",
+                "soup_can",
+                "nesquik_canister",
+                "tuna_fish_can",
+                "can_opener"
+            ],
+            "description": "Pack the cracker box and soup can into the large tray, then pack the nesquik canister into the small tray, then pack the tuna fish can into the medium tray, then pack the can opener into the large tray, then remove the sugar box from the medium tray.",
+            "assignments": {
+                "cracker_box": "large",
+                "soup_can": "large",
+                "nesquik_canister": "small",
+                "tuna_fish_can": "medium",
+                "can_opener": "large"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "sugar_box"
+            ]
+        },
+        "instruction": "Pack the cracker box and soup can into the large tray, then pack the nesquik canister into the small tray, then pack the tuna fish can into the medium tray, then pack the can opener into the large tray, then remove the sugar box from the medium tray.",
+        "subtasks": [
+            "Pack the cracker box into the large tray.",
+            "Pack the soup can into the large tray.",
+            "Pack the nesquik canister into the small tray.",
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the can opener into the large tray.",
+            "Remove the sugar box from the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-18",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "tuna_fish_can",
+                "foam_brick",
+                "can_opener",
+                "cracker_box",
+                "soup_can",
+                "coffee_mug"
+            ],
+            "description": "Transfer the tuna fish can from the small tray to the large tray, then pack the foam brick into the medium tray, then pack the can opener into the small tray, then pack the cracker box, soup can, and coffee mug into the medium tray.",
+            "assignments": {
+                "tuna_fish_can": "large",
+                "foam_brick": "medium",
+                "can_opener": "small",
+                "cracker_box": "medium",
+                "soup_can": "medium",
+                "coffee_mug": "medium"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "tuna_fish_can",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Transfer the tuna fish can from the small tray to the large tray, then pack the foam brick into the medium tray, then pack the can opener into the small tray, then pack the cracker box, soup can, and coffee mug into the medium tray.",
+        "subtasks": [
+            "Transfer the tuna fish can from the small tray to the large tray.",
+            "Pack the foam brick into the medium tray.",
+            "Pack the can opener into the small tray.",
+            "Pack the cracker box into the medium tray.",
+            "Pack the soup can into the medium tray.",
+            "Pack the coffee mug into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-19",
+            "trays": [
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "foam_brick",
+                "sugar_box",
+                "gelatin_box",
+                "tuna_fish_can"
+            ],
+            "description": "Remove the soup can from the medium tray, then pack the coffee mug into the large tray, then pack the foam brick into the medium tray, then pack the sugar box into the large tray, then pack the gelatin box into the medium tray, then transfer the tuna fish can from the large tray to the medium tray.",
+            "assignments": {
+                "coffee_mug": "large",
+                "foam_brick": "medium",
+                "sugar_box": "large",
+                "gelatin_box": "medium",
+                "tuna_fish_can": "medium"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "soup_can",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ],
+                "large": [
+                    {
+                        "object": "tuna_fish_can",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "soup_can"
+            ]
+        },
+        "instruction": "Remove the soup can from the medium tray, then pack the coffee mug into the large tray, then pack the foam brick into the medium tray, then pack the sugar box into the large tray, then pack the gelatin box into the medium tray, then transfer the tuna fish can from the large tray to the medium tray.",
+        "subtasks": [
+            "Remove the soup can from the medium tray.",
+            "Pack the coffee mug into the large tray.",
+            "Pack the foam brick into the medium tray.",
+            "Pack the sugar box into the large tray.",
+            "Pack the gelatin box into the medium tray.",
+            "Transfer the tuna fish can from the large tray to the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-20",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "sugar_box",
+                "cracker_box",
+                "nesquik_canister",
+                "foam_brick",
+                "soup_can"
+            ],
+            "description": "Pack the coffee mug and sugar box into the medium tray, then pack the cracker box into the large tray, then pack the nesquik canister into the small tray, then transfer the foam brick from the large tray to the medium tray, then pack the soup can into the small tray.",
+            "assignments": {
+                "coffee_mug": "medium",
+                "sugar_box": "medium",
+                "cracker_box": "large",
+                "nesquik_canister": "small",
+                "foam_brick": "medium",
+                "soup_can": "small"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "foam_brick",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the coffee mug and sugar box into the medium tray, then pack the cracker box into the large tray, then pack the nesquik canister into the small tray, then transfer the foam brick from the large tray to the medium tray, then pack the soup can into the small tray.",
+        "subtasks": [
+            "Pack the coffee mug into the medium tray.",
+            "Pack the sugar box into the medium tray.",
+            "Pack the cracker box into the large tray.",
+            "Pack the nesquik canister into the small tray.",
+            "Transfer the foam brick from the large tray to the medium tray.",
+            "Pack the soup can into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-21",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "sugar_box",
+                "foam_brick",
+                "can_opener",
+                "gelatin_box",
+                "cracker_box",
+                "tuna_fish_can"
+            ],
+            "description": "Transfer the sugar box from the medium tray to the small tray, then pack the foam brick into the small tray, then transfer the can opener from the large tray to the medium tray, then pack the gelatin box and cracker box into the medium tray, then pack the tuna fish can into the small tray.",
+            "assignments": {
+                "sugar_box": "small",
+                "foam_brick": "small",
+                "can_opener": "medium",
+                "gelatin_box": "medium",
+                "cracker_box": "medium",
+                "tuna_fish_can": "small"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ],
+                "large": [
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Transfer the sugar box from the medium tray to the small tray, then pack the foam brick into the small tray, then transfer the can opener from the large tray to the medium tray, then pack the gelatin box and cracker box into the medium tray, then pack the tuna fish can into the small tray.",
+        "subtasks": [
+            "Transfer the sugar box from the medium tray to the small tray.",
+            "Pack the foam brick into the small tray.",
+            "Transfer the can opener from the large tray to the medium tray.",
+            "Pack the gelatin box into the medium tray.",
+            "Pack the cracker box into the medium tray.",
+            "Pack the tuna fish can into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-22",
+            "trays": [
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "nesquik_canister",
+                "soup_can",
+                "foam_brick",
+                "cracker_box",
+                "can_opener"
+            ],
+            "description": "Pack the nesquik canister into the medium tray, then pack the soup can into the large tray, then pack the foam brick into the medium tray, then remove the coffee mug from the medium tray, then pack the cracker box into the large tray, then transfer the can opener from the medium tray to the large tray.",
+            "assignments": {
+                "nesquik_canister": "medium",
+                "soup_can": "large",
+                "foam_brick": "medium",
+                "cracker_box": "large",
+                "can_opener": "large"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "coffee_mug",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "coffee_mug"
+            ]
+        },
+        "instruction": "Pack the nesquik canister into the medium tray, then pack the soup can into the large tray, then pack the foam brick into the medium tray, then remove the coffee mug from the medium tray, then pack the cracker box into the large tray, then transfer the can opener from the medium tray to the large tray.",
+        "subtasks": [
+            "Pack the nesquik canister into the medium tray.",
+            "Pack the soup can into the large tray.",
+            "Pack the foam brick into the medium tray.",
+            "Remove the coffee mug from the medium tray.",
+            "Pack the cracker box into the large tray.",
+            "Transfer the can opener from the medium tray to the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-23",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "candy_box",
+                "nesquik_canister",
+                "gelatin_box",
+                "tuna_fish_can",
+                "cracker_box"
+            ],
+            "description": "Pack the coffee mug into the medium tray, then pack the candy box into the small tray, then pack the nesquik canister into the large tray, then pack the gelatin box into the small tray, then pack the tuna fish can into the medium tray, then pack the cracker box into the large tray.",
+            "assignments": {
+                "coffee_mug": "medium",
+                "candy_box": "small",
+                "nesquik_canister": "large",
+                "gelatin_box": "small",
+                "tuna_fish_can": "medium",
+                "cracker_box": "large"
+            }
+        },
+        "instruction": "Pack the coffee mug into the medium tray, then pack the candy box into the small tray, then pack the nesquik canister into the large tray, then pack the gelatin box into the small tray, then pack the tuna fish can into the medium tray, then pack the cracker box into the large tray.",
+        "subtasks": [
+            "Pack the coffee mug into the medium tray.",
+            "Pack the candy box into the small tray.",
+            "Pack the nesquik canister into the large tray.",
+            "Pack the gelatin box into the small tray.",
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the cracker box into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-6OBJ-24",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "foam_brick",
+                "cracker_box",
+                "coffee_mug",
+                "candy_box",
+                "tuna_fish_can"
+            ],
+            "description": "Pack the foam brick into the medium tray, then pack the cracker box and coffee mug into the small tray, then remove the can opener from the large tray, then pack the candy box into the medium tray, then pack the tuna fish can into the large tray.",
+            "assignments": {
+                "foam_brick": "medium",
+                "cracker_box": "small",
+                "coffee_mug": "small",
+                "candy_box": "medium",
+                "tuna_fish_can": "large"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "can_opener"
+            ]
+        },
+        "instruction": "Pack the foam brick into the medium tray, then pack the cracker box and coffee mug into the small tray, then remove the can opener from the large tray, then pack the candy box into the medium tray, then pack the tuna fish can into the large tray.",
+        "subtasks": [
+            "Pack the foam brick into the medium tray.",
+            "Pack the cracker box into the small tray.",
+            "Pack the coffee mug into the small tray.",
+            "Remove the can opener from the large tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the tuna fish can into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-00",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "gelatin_box",
+                "candy_box",
+                "foam_brick",
+                "can_opener",
+                "nesquik_canister"
+            ],
+            "description": "Transfer the coffee mug from the small tray to the medium tray, then pack the gelatin box into the large tray, then pack the candy box into the medium tray, then pack the foam brick into the large tray, then remove the sugar box from the large tray, then pack the can opener and nesquik canister into the medium tray.",
+            "assignments": {
+                "coffee_mug": "medium",
+                "gelatin_box": "large",
+                "candy_box": "medium",
+                "foam_brick": "large",
+                "can_opener": "medium",
+                "nesquik_canister": "medium"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "coffee_mug",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ],
+                "large": [
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "sugar_box"
+            ]
+        },
+        "instruction": "Transfer the coffee mug from the small tray to the medium tray, then pack the gelatin box into the large tray, then pack the candy box into the medium tray, then pack the foam brick into the large tray, then remove the sugar box from the large tray, then pack the can opener and nesquik canister into the medium tray.",
+        "subtasks": [
+            "Transfer the coffee mug from the small tray to the medium tray.",
+            "Pack the gelatin box into the large tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the foam brick into the large tray.",
+            "Remove the sugar box from the large tray.",
+            "Pack the can opener into the medium tray.",
+            "Pack the nesquik canister into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-01",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "cracker_box",
+                "candy_box",
+                "foam_brick",
+                "gelatin_box",
+                "sugar_box"
+            ],
+            "description": "Remove the soup can from the large tray, then pack the cracker box into the large tray, then transfer the candy box from the medium tray to the large tray, then pack the foam brick into the medium tray, then transfer the gelatin box from the medium tray to the small tray, then remove the can opener from the large tray, then transfer the sugar box from the medium tray to the large tray.",
+            "assignments": {
+                "cracker_box": "large",
+                "candy_box": "large",
+                "foam_brick": "medium",
+                "gelatin_box": "small",
+                "sugar_box": "large"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "soup_can",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            0.05,
+                            0.0
+                        ]
+                    }
+                ],
+                "medium": [
+                    {
+                        "object": "candy_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "gelatin_box",
+                        "pos": [
+                            0.04,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            0.0,
+                            0.03
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "soup_can",
+                "can_opener"
+            ]
+        },
+        "instruction": "Remove the soup can from the large tray, then pack the cracker box into the large tray, then transfer the candy box from the medium tray to the large tray, then pack the foam brick into the medium tray, then transfer the gelatin box from the medium tray to the small tray, then remove the can opener from the large tray, then transfer the sugar box from the medium tray to the large tray.",
+        "subtasks": [
+            "Remove the soup can from the large tray.",
+            "Pack the cracker box into the large tray.",
+            "Transfer the candy box from the medium tray to the large tray.",
+            "Pack the foam brick into the medium tray.",
+            "Transfer the gelatin box from the medium tray to the small tray.",
+            "Remove the can opener from the large tray.",
+            "Transfer the sugar box from the medium tray to the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-02",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "tuna_fish_can",
+                "gelatin_box",
+                "can_opener",
+                "soup_can",
+                "candy_box",
+                "coffee_mug"
+            ],
+            "description": "Transfer the tuna fish can from the large tray to the medium tray, then pack the gelatin box into the large tray, then pack the can opener and soup can into the small tray, then pack the candy box into the medium tray, then remove the nesquik canister from the small tray, then pack the coffee mug into the small tray.",
+            "assignments": {
+                "tuna_fish_can": "medium",
+                "gelatin_box": "large",
+                "can_opener": "small",
+                "soup_can": "small",
+                "candy_box": "medium",
+                "coffee_mug": "small"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "tuna_fish_can",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ],
+                "small": [
+                    {
+                        "object": "nesquik_canister",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "nesquik_canister"
+            ]
+        },
+        "instruction": "Transfer the tuna fish can from the large tray to the medium tray, then pack the gelatin box into the large tray, then pack the can opener and soup can into the small tray, then pack the candy box into the medium tray, then remove the nesquik canister from the small tray, then pack the coffee mug into the small tray.",
+        "subtasks": [
+            "Transfer the tuna fish can from the large tray to the medium tray.",
+            "Pack the gelatin box into the large tray.",
+            "Pack the can opener into the small tray.",
+            "Pack the soup can into the small tray.",
+            "Pack the candy box into the medium tray.",
+            "Remove the nesquik canister from the small tray.",
+            "Pack the coffee mug into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-03",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "can_opener",
+                "nesquik_canister",
+                "soup_can",
+                "gelatin_box",
+                "cracker_box"
+            ],
+            "description": "Remove the foam brick from the large tray, then pack the can opener into the large tray, then pack the nesquik canister into the medium tray, then pack the soup can into the small tray, then pack the gelatin box into the large tray, then pack the cracker box into the small tray, then remove the sugar box from the medium tray.",
+            "assignments": {
+                "can_opener": "large",
+                "nesquik_canister": "medium",
+                "soup_can": "small",
+                "gelatin_box": "large",
+                "cracker_box": "small"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "foam_brick",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ],
+                "medium": [
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "foam_brick",
+                "sugar_box"
+            ]
+        },
+        "instruction": "Remove the foam brick from the large tray, then pack the can opener into the large tray, then pack the nesquik canister into the medium tray, then pack the soup can into the small tray, then pack the gelatin box into the large tray, then pack the cracker box into the small tray, then remove the sugar box from the medium tray.",
+        "subtasks": [
+            "Remove the foam brick from the large tray.",
+            "Pack the can opener into the large tray.",
+            "Pack the nesquik canister into the medium tray.",
+            "Pack the soup can into the small tray.",
+            "Pack the gelatin box into the large tray.",
+            "Pack the cracker box into the small tray.",
+            "Remove the sugar box from the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-04",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "tuna_fish_can",
+                "gelatin_box",
+                "foam_brick",
+                "can_opener",
+                "sugar_box",
+                "candy_box",
+                "cracker_box"
+            ],
+            "description": "Pack the tuna fish can into the medium tray, then pack the gelatin box into the small tray, then transfer the foam brick from the small tray to the medium tray, then pack the can opener and sugar box into the small tray, then pack the candy box into the medium tray, then pack the cracker box into the large tray.",
+            "assignments": {
+                "tuna_fish_can": "medium",
+                "gelatin_box": "small",
+                "foam_brick": "medium",
+                "can_opener": "small",
+                "sugar_box": "small",
+                "candy_box": "medium",
+                "cracker_box": "large"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "foam_brick",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the tuna fish can into the medium tray, then pack the gelatin box into the small tray, then transfer the foam brick from the small tray to the medium tray, then pack the can opener and sugar box into the small tray, then pack the candy box into the medium tray, then pack the cracker box into the large tray.",
+        "subtasks": [
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the gelatin box into the small tray.",
+            "Transfer the foam brick from the small tray to the medium tray.",
+            "Pack the can opener into the small tray.",
+            "Pack the sugar box into the small tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the cracker box into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-05",
+            "trays": [
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "cracker_box",
+                "can_opener",
+                "foam_brick",
+                "coffee_mug",
+                "nesquik_canister",
+                "tuna_fish_can",
+                "soup_can"
+            ],
+            "description": "Pack the cracker box and can opener into the medium tray, then pack the foam brick into the large tray, then pack the coffee mug into the medium tray, then pack the nesquik canister and tuna fish can into the large tray, then pack the soup can into the medium tray.",
+            "assignments": {
+                "cracker_box": "medium",
+                "can_opener": "medium",
+                "foam_brick": "large",
+                "coffee_mug": "medium",
+                "nesquik_canister": "large",
+                "tuna_fish_can": "large",
+                "soup_can": "medium"
+            }
+        },
+        "instruction": "Pack the cracker box and can opener into the medium tray, then pack the foam brick into the large tray, then pack the coffee mug into the medium tray, then pack the nesquik canister and tuna fish can into the large tray, then pack the soup can into the medium tray.",
+        "subtasks": [
+            "Pack the cracker box into the medium tray.",
+            "Pack the can opener into the medium tray.",
+            "Pack the foam brick into the large tray.",
+            "Pack the coffee mug into the medium tray.",
+            "Pack the nesquik canister into the large tray.",
+            "Pack the tuna fish can into the large tray.",
+            "Pack the soup can into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-06",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "foam_brick",
+                "tuna_fish_can",
+                "nesquik_canister",
+                "can_opener",
+                "soup_can"
+            ],
+            "description": "Remove the cracker box from the large tray, then pack the foam brick into the large tray, then pack the tuna fish can into the medium tray, then transfer the nesquik canister from the small tray to the large tray, then remove the sugar box from the large tray, then pack the can opener into the medium tray, then pack the soup can into the small tray.",
+            "assignments": {
+                "foam_brick": "large",
+                "tuna_fish_can": "medium",
+                "nesquik_canister": "large",
+                "can_opener": "medium",
+                "soup_can": "small"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "cracker_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            0.05,
+                            0.0
+                        ]
+                    }
+                ],
+                "small": [
+                    {
+                        "object": "nesquik_canister",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "cracker_box",
+                "sugar_box"
+            ]
+        },
+        "instruction": "Remove the cracker box from the large tray, then pack the foam brick into the large tray, then pack the tuna fish can into the medium tray, then transfer the nesquik canister from the small tray to the large tray, then remove the sugar box from the large tray, then pack the can opener into the medium tray, then pack the soup can into the small tray.",
+        "subtasks": [
+            "Remove the cracker box from the large tray.",
+            "Pack the foam brick into the large tray.",
+            "Pack the tuna fish can into the medium tray.",
+            "Transfer the nesquik canister from the small tray to the large tray.",
+            "Remove the sugar box from the large tray.",
+            "Pack the can opener into the medium tray.",
+            "Pack the soup can into the small tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-07",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "can_opener",
+                "cracker_box",
+                "soup_can",
+                "sugar_box",
+                "coffee_mug",
+                "candy_box",
+                "tuna_fish_can"
+            ],
+            "description": "Pack the can opener, cracker box, and soup can into the small tray, then pack the sugar box into the large tray, then pack the coffee mug into the medium tray, then pack the candy box into the large tray, then pack the tuna fish can into the medium tray.",
+            "assignments": {
+                "can_opener": "small",
+                "cracker_box": "small",
+                "soup_can": "small",
+                "sugar_box": "large",
+                "coffee_mug": "medium",
+                "candy_box": "large",
+                "tuna_fish_can": "medium"
+            }
+        },
+        "instruction": "Pack the can opener, cracker box, and soup can into the small tray, then pack the sugar box into the large tray, then pack the coffee mug into the medium tray, then pack the candy box into the large tray, then pack the tuna fish can into the medium tray.",
+        "subtasks": [
+            "Pack the can opener into the small tray.",
+            "Pack the cracker box into the small tray.",
+            "Pack the soup can into the small tray.",
+            "Pack the sugar box into the large tray.",
+            "Pack the coffee mug into the medium tray.",
+            "Pack the candy box into the large tray.",
+            "Pack the tuna fish can into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-08",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "nesquik_canister",
+                "soup_can",
+                "candy_box",
+                "sugar_box",
+                "foam_brick",
+                "cracker_box",
+                "can_opener"
+            ],
+            "description": "Pack the nesquik canister into the small tray, then pack the soup can into the medium tray, then pack the candy box into the large tray, then pack the sugar box and foam brick into the medium tray, then pack the cracker box into the large tray, then pack the can opener into the medium tray.",
+            "assignments": {
+                "nesquik_canister": "small",
+                "soup_can": "medium",
+                "candy_box": "large",
+                "sugar_box": "medium",
+                "foam_brick": "medium",
+                "cracker_box": "large",
+                "can_opener": "medium"
+            }
+        },
+        "instruction": "Pack the nesquik canister into the small tray, then pack the soup can into the medium tray, then pack the candy box into the large tray, then pack the sugar box and foam brick into the medium tray, then pack the cracker box into the large tray, then pack the can opener into the medium tray.",
+        "subtasks": [
+            "Pack the nesquik canister into the small tray.",
+            "Pack the soup can into the medium tray.",
+            "Pack the candy box into the large tray.",
+            "Pack the sugar box into the medium tray.",
+            "Pack the foam brick into the medium tray.",
+            "Pack the cracker box into the large tray.",
+            "Pack the can opener into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-09",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "foam_brick",
+                "gelatin_box",
+                "cracker_box",
+                "candy_box",
+                "nesquik_canister"
+            ],
+            "description": "Pack the foam brick into the medium tray, then transfer the gelatin box from the small tray to the medium tray, then remove the sugar box from the large tray, then pack the cracker box into the large tray, then pack the candy box into the medium tray, then pack the nesquik canister into the large tray, then remove the tuna fish can from the large tray.",
+            "assignments": {
+                "foam_brick": "medium",
+                "gelatin_box": "medium",
+                "cracker_box": "large",
+                "candy_box": "medium",
+                "nesquik_canister": "large"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "gelatin_box",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ],
+                "large": [
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "tuna_fish_can",
+                        "pos": [
+                            0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "sugar_box",
+                "tuna_fish_can"
+            ]
+        },
+        "instruction": "Pack the foam brick into the medium tray, then transfer the gelatin box from the small tray to the medium tray, then remove the sugar box from the large tray, then pack the cracker box into the large tray, then pack the candy box into the medium tray, then pack the nesquik canister into the large tray, then remove the tuna fish can from the large tray.",
+        "subtasks": [
+            "Pack the foam brick into the medium tray.",
+            "Transfer the gelatin box from the small tray to the medium tray.",
+            "Remove the sugar box from the large tray.",
+            "Pack the cracker box into the large tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the nesquik canister into the large tray.",
+            "Remove the tuna fish can from the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-10",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "cracker_box",
+                "coffee_mug",
+                "soup_can",
+                "nesquik_canister",
+                "tuna_fish_can",
+                "gelatin_box",
+                "foam_brick"
+            ],
+            "description": "Pack the cracker box into the small tray, then pack the coffee mug into the medium tray, then pack the soup can into the large tray, then pack the nesquik canister and tuna fish can into the small tray, then pack the gelatin box and foam brick into the medium tray.",
+            "assignments": {
+                "cracker_box": "small",
+                "coffee_mug": "medium",
+                "soup_can": "large",
+                "nesquik_canister": "small",
+                "tuna_fish_can": "small",
+                "gelatin_box": "medium",
+                "foam_brick": "medium"
+            }
+        },
+        "instruction": "Pack the cracker box into the small tray, then pack the coffee mug into the medium tray, then pack the soup can into the large tray, then pack the nesquik canister and tuna fish can into the small tray, then pack the gelatin box and foam brick into the medium tray.",
+        "subtasks": [
+            "Pack the cracker box into the small tray.",
+            "Pack the coffee mug into the medium tray.",
+            "Pack the soup can into the large tray.",
+            "Pack the nesquik canister into the small tray.",
+            "Pack the tuna fish can into the small tray.",
+            "Pack the gelatin box into the medium tray.",
+            "Pack the foam brick into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-11",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "can_opener",
+                "candy_box",
+                "soup_can",
+                "foam_brick",
+                "cracker_box",
+                "tuna_fish_can"
+            ],
+            "description": "Pack the coffee mug into the medium tray, then pack the can opener and candy box into the large tray, then pack the soup can into the small tray, then transfer the foam brick from the medium tray to the small tray, then pack the cracker box and tuna fish can into the medium tray.",
+            "assignments": {
+                "coffee_mug": "medium",
+                "can_opener": "large",
+                "candy_box": "large",
+                "soup_can": "small",
+                "foam_brick": "small",
+                "cracker_box": "medium",
+                "tuna_fish_can": "medium"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "foam_brick",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the coffee mug into the medium tray, then pack the can opener and candy box into the large tray, then pack the soup can into the small tray, then transfer the foam brick from the medium tray to the small tray, then pack the cracker box and tuna fish can into the medium tray.",
+        "subtasks": [
+            "Pack the coffee mug into the medium tray.",
+            "Pack the can opener into the large tray.",
+            "Pack the candy box into the large tray.",
+            "Pack the soup can into the small tray.",
+            "Transfer the foam brick from the medium tray to the small tray.",
+            "Pack the cracker box into the medium tray.",
+            "Pack the tuna fish can into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-12",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "gelatin_box",
+                "candy_box",
+                "can_opener",
+                "nesquik_canister",
+                "soup_can",
+                "foam_brick",
+                "cracker_box"
+            ],
+            "description": "Pack the gelatin box into the large tray, then pack the candy box and can opener into the medium tray, then pack the nesquik canister into the large tray, then pack the soup can and foam brick into the small tray, then pack the cracker box into the large tray.",
+            "assignments": {
+                "gelatin_box": "large",
+                "candy_box": "medium",
+                "can_opener": "medium",
+                "nesquik_canister": "large",
+                "soup_can": "small",
+                "foam_brick": "small",
+                "cracker_box": "large"
+            }
+        },
+        "instruction": "Pack the gelatin box into the large tray, then pack the candy box and can opener into the medium tray, then pack the nesquik canister into the large tray, then pack the soup can and foam brick into the small tray, then pack the cracker box into the large tray.",
+        "subtasks": [
+            "Pack the gelatin box into the large tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the can opener into the medium tray.",
+            "Pack the nesquik canister into the large tray.",
+            "Pack the soup can into the small tray.",
+            "Pack the foam brick into the small tray.",
+            "Pack the cracker box into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-13",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "foam_brick",
+                "soup_can",
+                "coffee_mug",
+                "can_opener",
+                "gelatin_box",
+                "cracker_box",
+                "nesquik_canister"
+            ],
+            "description": "Pack the foam brick into the large tray, then pack the soup can into the small tray, then pack the coffee mug into the large tray, then pack the can opener into the medium tray, then pack the gelatin box into the small tray, then pack the cracker box into the medium tray, then transfer the nesquik canister from the medium tray to the large tray.",
+            "assignments": {
+                "foam_brick": "large",
+                "soup_can": "small",
+                "coffee_mug": "large",
+                "can_opener": "medium",
+                "gelatin_box": "small",
+                "cracker_box": "medium",
+                "nesquik_canister": "large"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "nesquik_canister",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the foam brick into the large tray, then pack the soup can into the small tray, then pack the coffee mug into the large tray, then pack the can opener into the medium tray, then pack the gelatin box into the small tray, then pack the cracker box into the medium tray, then transfer the nesquik canister from the medium tray to the large tray.",
+        "subtasks": [
+            "Pack the foam brick into the large tray.",
+            "Pack the soup can into the small tray.",
+            "Pack the coffee mug into the large tray.",
+            "Pack the can opener into the medium tray.",
+            "Pack the gelatin box into the small tray.",
+            "Pack the cracker box into the medium tray.",
+            "Transfer the nesquik canister from the medium tray to the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-14",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "candy_box",
+                "gelatin_box",
+                "soup_can",
+                "foam_brick",
+                "tuna_fish_can",
+                "cracker_box",
+                "sugar_box"
+            ],
+            "description": "Pack the candy box and gelatin box into the large tray, then transfer the soup can from the small tray to the medium tray, then pack the foam brick into the medium tray, then pack the tuna fish can and cracker box into the small tray, then transfer the sugar box from the medium tray to the large tray.",
+            "assignments": {
+                "candy_box": "large",
+                "gelatin_box": "large",
+                "soup_can": "medium",
+                "foam_brick": "medium",
+                "tuna_fish_can": "small",
+                "cracker_box": "small",
+                "sugar_box": "large"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "soup_can",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ],
+                "medium": [
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            }
+        },
+        "instruction": "Pack the candy box and gelatin box into the large tray, then transfer the soup can from the small tray to the medium tray, then pack the foam brick into the medium tray, then pack the tuna fish can and cracker box into the small tray, then transfer the sugar box from the medium tray to the large tray.",
+        "subtasks": [
+            "Pack the candy box into the large tray.",
+            "Pack the gelatin box into the large tray.",
+            "Transfer the soup can from the small tray to the medium tray.",
+            "Pack the foam brick into the medium tray.",
+            "Pack the tuna fish can into the small tray.",
+            "Pack the cracker box into the small tray.",
+            "Transfer the sugar box from the medium tray to the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-15",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "can_opener",
+                "nesquik_canister",
+                "cracker_box",
+                "tuna_fish_can",
+                "foam_brick",
+                "sugar_box"
+            ],
+            "description": "Pack the can opener and nesquik canister into the large tray, then pack the cracker box into the medium tray, then transfer the tuna fish can from the medium tray to the small tray, then pack the foam brick into the medium tray, then remove the candy box from the medium tray, then pack the sugar box into the medium tray.",
+            "assignments": {
+                "can_opener": "large",
+                "nesquik_canister": "large",
+                "cracker_box": "medium",
+                "tuna_fish_can": "small",
+                "foam_brick": "medium",
+                "sugar_box": "medium"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "tuna_fish_can",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    },
+                    {
+                        "object": "candy_box",
+                        "pos": [
+                            0.04,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "candy_box"
+            ]
+        },
+        "instruction": "Pack the can opener and nesquik canister into the large tray, then pack the cracker box into the medium tray, then transfer the tuna fish can from the medium tray to the small tray, then pack the foam brick into the medium tray, then remove the candy box from the medium tray, then pack the sugar box into the medium tray.",
+        "subtasks": [
+            "Pack the can opener into the large tray.",
+            "Pack the nesquik canister into the large tray.",
+            "Pack the cracker box into the medium tray.",
+            "Transfer the tuna fish can from the medium tray to the small tray.",
+            "Pack the foam brick into the medium tray.",
+            "Remove the candy box from the medium tray.",
+            "Pack the sugar box into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-16",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "cracker_box",
+                "foam_brick",
+                "coffee_mug",
+                "candy_box",
+                "soup_can",
+                "sugar_box"
+            ],
+            "description": "Pack the cracker box into the large tray, then remove the can opener from the small tray, then pack the foam brick and coffee mug into the large tray, then transfer the candy box from the large tray to the medium tray, then pack the soup can into the medium tray, then pack the sugar box into the large tray.",
+            "assignments": {
+                "cracker_box": "large",
+                "foam_brick": "large",
+                "coffee_mug": "large",
+                "candy_box": "medium",
+                "soup_can": "medium",
+                "sugar_box": "large"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ],
+                "large": [
+                    {
+                        "object": "candy_box",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "can_opener"
+            ]
+        },
+        "instruction": "Pack the cracker box into the large tray, then remove the can opener from the small tray, then pack the foam brick and coffee mug into the large tray, then transfer the candy box from the large tray to the medium tray, then pack the soup can into the medium tray, then pack the sugar box into the large tray.",
+        "subtasks": [
+            "Pack the cracker box into the large tray.",
+            "Remove the can opener from the small tray.",
+            "Pack the foam brick into the large tray.",
+            "Pack the coffee mug into the large tray.",
+            "Transfer the candy box from the large tray to the medium tray.",
+            "Pack the soup can into the medium tray.",
+            "Pack the sugar box into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-17",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "foam_brick",
+                "tuna_fish_can",
+                "candy_box",
+                "can_opener",
+                "nesquik_canister",
+                "soup_can"
+            ],
+            "description": "Pack the coffee mug, foam brick, tuna fish can, and candy box into the medium tray, then pack the can opener into the large tray, then pack the nesquik canister into the small tray, then pack the soup can into the large tray.",
+            "assignments": {
+                "coffee_mug": "medium",
+                "foam_brick": "medium",
+                "tuna_fish_can": "medium",
+                "candy_box": "medium",
+                "can_opener": "large",
+                "nesquik_canister": "small",
+                "soup_can": "large"
+            }
+        },
+        "instruction": "Pack the coffee mug, foam brick, tuna fish can, and candy box into the medium tray, then pack the can opener into the large tray, then pack the nesquik canister into the small tray, then pack the soup can into the large tray.",
+        "subtasks": [
+            "Pack the coffee mug into the medium tray.",
+            "Pack the foam brick into the medium tray.",
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the candy box into the medium tray.",
+            "Pack the can opener into the large tray.",
+            "Pack the nesquik canister into the small tray.",
+            "Pack the soup can into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-18",
+            "trays": [
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "sugar_box",
+                "nesquik_canister",
+                "soup_can",
+                "tuna_fish_can",
+                "foam_brick",
+                "coffee_mug",
+                "candy_box"
+            ],
+            "description": "Pack the sugar box, nesquik canister, soup can, and tuna fish can into the large tray, then pack the foam brick, coffee mug, and candy box into the medium tray.",
+            "assignments": {
+                "sugar_box": "large",
+                "nesquik_canister": "large",
+                "soup_can": "large",
+                "tuna_fish_can": "large",
+                "foam_brick": "medium",
+                "coffee_mug": "medium",
+                "candy_box": "medium"
+            }
+        },
+        "instruction": "Pack the sugar box, nesquik canister, soup can, and tuna fish can into the large tray, then pack the foam brick, coffee mug, and candy box into the medium tray.",
+        "subtasks": [
+            "Pack the sugar box into the large tray.",
+            "Pack the nesquik canister into the large tray.",
+            "Pack the soup can into the large tray.",
+            "Pack the tuna fish can into the large tray.",
+            "Pack the foam brick into the medium tray.",
+            "Pack the coffee mug into the medium tray.",
+            "Pack the candy box into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-19",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "foam_brick",
+                "candy_box",
+                "nesquik_canister",
+                "coffee_mug",
+                "gelatin_box",
+                "soup_can"
+            ],
+            "description": "Transfer the foam brick from the medium tray to the small tray, then pack the candy box into the large tray, then pack the nesquik canister and coffee mug into the medium tray, then remove the sugar box from the small tray, then pack the gelatin box into the large tray, then pack the soup can into the medium tray.",
+            "assignments": {
+                "foam_brick": "small",
+                "candy_box": "large",
+                "nesquik_canister": "medium",
+                "coffee_mug": "medium",
+                "gelatin_box": "large",
+                "soup_can": "medium"
+            },
+            "initial_tray_contents": {
+                "medium": [
+                    {
+                        "object": "foam_brick",
+                        "pos": [
+                            -0.04,
+                            0.0
+                        ]
+                    }
+                ],
+                "small": [
+                    {
+                        "object": "sugar_box",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "sugar_box"
+            ]
+        },
+        "instruction": "Transfer the foam brick from the medium tray to the small tray, then pack the candy box into the large tray, then pack the nesquik canister and coffee mug into the medium tray, then remove the sugar box from the small tray, then pack the gelatin box into the large tray, then pack the soup can into the medium tray.",
+        "subtasks": [
+            "Transfer the foam brick from the medium tray to the small tray.",
+            "Pack the candy box into the large tray.",
+            "Pack the nesquik canister into the medium tray.",
+            "Pack the coffee mug into the medium tray.",
+            "Remove the sugar box from the small tray.",
+            "Pack the gelatin box into the large tray.",
+            "Pack the soup can into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-20",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "candy_box",
+                "nesquik_canister",
+                "coffee_mug",
+                "soup_can",
+                "sugar_box",
+                "can_opener"
+            ],
+            "description": "Remove the foam brick from the small tray, then pack the candy box into the small tray, then pack the nesquik canister, coffee mug, and soup can into the medium tray, then pack the sugar box into the small tray, then pack the can opener into the large tray.",
+            "assignments": {
+                "candy_box": "small",
+                "nesquik_canister": "medium",
+                "coffee_mug": "medium",
+                "soup_can": "medium",
+                "sugar_box": "small",
+                "can_opener": "large"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "foam_brick",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "foam_brick"
+            ]
+        },
+        "instruction": "Remove the foam brick from the small tray, then pack the candy box into the small tray, then pack the nesquik canister, coffee mug, and soup can into the medium tray, then pack the sugar box into the small tray, then pack the can opener into the large tray.",
+        "subtasks": [
+            "Remove the foam brick from the small tray.",
+            "Pack the candy box into the small tray.",
+            "Pack the nesquik canister into the medium tray.",
+            "Pack the coffee mug into the medium tray.",
+            "Pack the soup can into the medium tray.",
+            "Pack the sugar box into the small tray.",
+            "Pack the can opener into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-21",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "nesquik_canister",
+                "coffee_mug",
+                "tuna_fish_can",
+                "sugar_box",
+                "can_opener",
+                "cracker_box",
+                "foam_brick"
+            ],
+            "description": "Pack the nesquik canister into the small tray, then pack the coffee mug into the medium tray, then pack the tuna fish can into the small tray, then pack the sugar box into the medium tray, then pack the can opener into the large tray, then pack the cracker box into the medium tray, then pack the foam brick into the large tray.",
+            "assignments": {
+                "nesquik_canister": "small",
+                "coffee_mug": "medium",
+                "tuna_fish_can": "small",
+                "sugar_box": "medium",
+                "can_opener": "large",
+                "cracker_box": "medium",
+                "foam_brick": "large"
+            }
+        },
+        "instruction": "Pack the nesquik canister into the small tray, then pack the coffee mug into the medium tray, then pack the tuna fish can into the small tray, then pack the sugar box into the medium tray, then pack the can opener into the large tray, then pack the cracker box into the medium tray, then pack the foam brick into the large tray.",
+        "subtasks": [
+            "Pack the nesquik canister into the small tray.",
+            "Pack the coffee mug into the medium tray.",
+            "Pack the tuna fish can into the small tray.",
+            "Pack the sugar box into the medium tray.",
+            "Pack the can opener into the large tray.",
+            "Pack the cracker box into the medium tray.",
+            "Pack the foam brick into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-22",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "coffee_mug",
+                "gelatin_box",
+                "nesquik_canister",
+                "tuna_fish_can",
+                "sugar_box",
+                "candy_box"
+            ],
+            "description": "Remove the can opener from the large tray, then pack the coffee mug into the small tray, then transfer the gelatin box from the small tray to the medium tray, then pack the nesquik canister, tuna fish can, and sugar box into the large tray, then pack the candy box into the medium tray.",
+            "assignments": {
+                "coffee_mug": "small",
+                "gelatin_box": "medium",
+                "nesquik_canister": "large",
+                "tuna_fish_can": "large",
+                "sugar_box": "large",
+                "candy_box": "medium"
+            },
+            "initial_tray_contents": {
+                "large": [
+                    {
+                        "object": "can_opener",
+                        "pos": [
+                            -0.05,
+                            0.0
+                        ]
+                    }
+                ],
+                "small": [
+                    {
+                        "object": "gelatin_box",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "can_opener"
+            ]
+        },
+        "instruction": "Remove the can opener from the large tray, then pack the coffee mug into the small tray, then transfer the gelatin box from the small tray to the medium tray, then pack the nesquik canister, tuna fish can, and sugar box into the large tray, then pack the candy box into the medium tray.",
+        "subtasks": [
+            "Remove the can opener from the large tray.",
+            "Pack the coffee mug into the small tray.",
+            "Transfer the gelatin box from the small tray to the medium tray.",
+            "Pack the nesquik canister into the large tray.",
+            "Pack the tuna fish can into the large tray.",
+            "Pack the sugar box into the large tray.",
+            "Pack the candy box into the medium tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-23",
+            "trays": [
+                "small",
+                "large"
+            ],
+            "objects": [
+                "candy_box",
+                "can_opener",
+                "soup_can",
+                "sugar_box",
+                "tuna_fish_can",
+                "foam_brick"
+            ],
+            "description": "Remove the nesquik canister from the small tray, then pack the candy box into the large tray, then pack the can opener into the small tray, then pack the soup can into the large tray, then pack the sugar box into the small tray, then pack the tuna fish can and foam brick into the large tray.",
+            "assignments": {
+                "candy_box": "large",
+                "can_opener": "small",
+                "soup_can": "large",
+                "sugar_box": "small",
+                "tuna_fish_can": "large",
+                "foam_brick": "large"
+            },
+            "initial_tray_contents": {
+                "small": [
+                    {
+                        "object": "nesquik_canister",
+                        "pos": [
+                            0.0,
+                            0.0
+                        ]
+                    }
+                ]
+            },
+            "clutter_objects": [
+                "nesquik_canister"
+            ]
+        },
+        "instruction": "Remove the nesquik canister from the small tray, then pack the candy box into the large tray, then pack the can opener into the small tray, then pack the soup can into the large tray, then pack the sugar box into the small tray, then pack the tuna fish can and foam brick into the large tray.",
+        "subtasks": [
+            "Remove the nesquik canister from the small tray.",
+            "Pack the candy box into the large tray.",
+            "Pack the can opener into the small tray.",
+            "Pack the soup can into the large tray.",
+            "Pack the sugar box into the small tray.",
+            "Pack the tuna fish can into the large tray.",
+            "Pack the foam brick into the large tray."
+        ]
+    },
+    {
+        "goal": {
+            "goal_id": "EVAL-7OBJ-24",
+            "trays": [
+                "small",
+                "medium",
+                "large"
+            ],
+            "objects": [
+                "nesquik_canister",
+                "tuna_fish_can",
+                "sugar_box",
+                "coffee_mug",
+                "foam_brick",
+                "soup_can",
+                "cracker_box"
+            ],
+            "description": "Pack the nesquik canister, tuna fish can, sugar box, and coffee mug into the medium tray, then pack the foam brick and soup can into the large tray, then pack the cracker box into the small tray.",
+            "assignments": {
+                "nesquik_canister": "medium",
+                "tuna_fish_can": "medium",
+                "sugar_box": "medium",
+                "coffee_mug": "medium",
+                "foam_brick": "large",
+                "soup_can": "large",
+                "cracker_box": "small"
+            }
+        },
+        "instruction": "Pack the nesquik canister, tuna fish can, sugar box, and coffee mug into the medium tray, then pack the foam brick and soup can into the large tray, then pack the cracker box into the small tray.",
+        "subtasks": [
+            "Pack the nesquik canister into the medium tray.",
+            "Pack the tuna fish can into the medium tray.",
+            "Pack the sugar box into the medium tray.",
+            "Pack the coffee mug into the medium tray.",
+            "Pack the foam brick into the large tray.",
+            "Pack the soup can into the large tray.",
+            "Pack the cracker box into the small tray."
+        ]
+    }
+]

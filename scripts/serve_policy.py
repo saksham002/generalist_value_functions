@@ -98,6 +98,11 @@ class CriticArgs:
     # every N infer calls and reuse the cached subtask string in between (the
     # subtask is a slow-changing phase label). Ignored for non-subtask_ar critics.
     subtask_decode_every: int = 20
+    # For a predict_subtask_ar critic only: condition the POLICY prompt on the
+    # critic's decoded subtask server-side (fresh on decode-cadence calls in
+    # that same call, cached latest in between). When False (default) the
+    # policy uses the client-sent prompt unchanged.
+    policy_use_decoded_subtask: bool = False
 
 
 @dataclasses.dataclass
@@ -230,6 +235,7 @@ def create_policy(args: Args) -> _policy.BasePolicy:
                 inject_noise = args.critic.inject_noise,
                 noise_level = args.critic.noise_level,
                 subtask_decode_every = args.critic.subtask_decode_every,
+                policy_use_decoded_subtask = args.critic.policy_use_decoded_subtask,
                 num_steps = args.num_steps,
             )
         # use_bestofn_loader=True without critic: load policy through

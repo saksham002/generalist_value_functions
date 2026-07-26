@@ -710,7 +710,7 @@ def test_paligemma_prefix_cache_matches_uncached_features_across_samples():
     uncached_result = network.compute_features(expanded_observation, flat_actions)
     uncached_features = uncached_result[0] if isinstance(uncached_result, tuple) else uncached_result
 
-    raw_kv_cache, raw_prefix_mask = network.compute_prefix_cache(observation)
+    raw_kv_cache, raw_prefix_mask, raw_subtask_mask = network.compute_prefix_cache(observation)
 
     assert raw_prefix_mask.shape == (batch_size, len(IMAGE_KEYS) * 256 + max_token_len + 1)
     cache_leaves = jax.tree_util.tree_leaves(raw_kv_cache)
@@ -723,11 +723,12 @@ def test_paligemma_prefix_cache_matches_uncached_features_across_samples():
         raw_kv_cache,
     )
     repeated_prefix_mask = jnp.repeat(raw_prefix_mask, num_samples, axis = 0)
+    repeated_subtask_mask = None if raw_subtask_mask is None else jnp.repeat(raw_subtask_mask, num_samples, axis = 0)
 
     cached_features = network.compute_features(
         expanded_observation,
         flat_actions,
-        prefix_cache = (repeated_kv_cache, repeated_prefix_mask),
+        prefix_cache = (repeated_kv_cache, repeated_prefix_mask, repeated_subtask_mask),
     )
 
     assert repeated_prefix_mask.shape == (batch_size * num_samples, raw_prefix_mask.shape[1])

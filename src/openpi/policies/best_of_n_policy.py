@@ -184,6 +184,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         inject_noise: bool = False,
         noise_level: float = 0.0,
         subtask_decode_every: int = 20,
+        policy_use_decoded_subtask: bool = False,
         num_steps: int | None = None,
     ) -> None:
         # Both critic-config and critic-checkpoint must be provided together.
@@ -193,6 +194,11 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 "BestOfNPolicy: critic_config_name and critic_checkpoint_dir must be "
                 "provided together (both or neither)."
             )
+        if policy_use_decoded_subtask and not critic_args_set:
+            raise ValueError(
+                "policy_use_decoded_subtask=True requires a critic (the decoded "
+                "subtask comes from the critic's AR subtask decoder)."
+            )
         self._return_q_values = return_q_values
         self._expect_critic_images = expect_critic_images
         self._inject_noise = bool(inject_noise)
@@ -201,6 +207,14 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # Subtask-AR decoding state (populated in the critic-load block when the
         # critic's value network has predict_subtask_ar=True). Defaults keep the
         # feature off for non-subtask_ar critics and the policy-only path.
+        # `policy_use_decoded_subtask=True` (explicit opt-in) additionally
+        # routes the decoded subtask into the POLICY prompt: on decode-cadence
+        # calls the decode runs BEFORE the policy forward and its fresh subtask
+        # conditions the policy (and the critic's value prompt) in that same
+        # call; in-between calls reuse the latest cached subtask. When False
+        # the policy uses the client-sent prompt (e.g. a client-computed
+        # ground-truth subtask) unchanged.
+        self._policy_use_decoded_subtask = bool(policy_use_decoded_subtask)
         self._subtask_decode_every = int(subtask_decode_every)
         self._critic_predict_subtask_ar = False
         self._subtask_decoder: _subtask_decoder.SubtaskDecoder | None = None
@@ -247,13 +261,6 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                     )
                 fsdp_override = fsdp_devices
             batch_axis_size = device_count // fsdp_override
-            if num_samples % batch_axis_size != 0:
-                raise ValueError(
-                    f"sample_parallel=True requires num_samples ({num_samples}) divisible "
-                    f"by BATCH_AXIS size ({batch_axis_size} = device_count/fsdp_devices). "
-                    f"With device_count={device_count} and fsdp_devices={fsdp_override}, "
-                    f"valid num_samples values are multiples of {batch_axis_size}."
-                )
             self._fsdp_devices_override: int | None = fsdp_override
             self._sample_parallel_batch_axis = batch_axis_size
             logger.info(
@@ -301,6 +308,16 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         logger.info(f"Loading policy norm stats from {norm_stats_dir}")
         all_norm_stats = _normalize.load(norm_stats_dir)
         norm_stats = {k: v for k, v in all_norm_stats.items() if k in _INFERENCE_NORM_KEYS}
+        # BC-trained policies (critic_mode=False data configs, e.g.
+        # LeRobotRldsDataConfig) save norm stats without the next_state /
+        # next_actions aliases that critic-mode stats carry. BestOfNWrapper
+        # asserts identical core key sets, so replicate the aliasing the
+        # critic-mode configs apply (next_* stats are pure aliases of
+        # state/actions everywhere in this repo).
+        if "state" in norm_stats and "next_state" not in norm_stats:
+            norm_stats["next_state"] = norm_stats["state"]
+        if "actions" in norm_stats and "next_actions" not in norm_stats:
+            norm_stats["next_actions"] = norm_stats["actions"]
 
         policy = _policy_module.Policy(
             model,
@@ -493,8 +510,15 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # True when the POLICY's data factory is the HDF5 pipeline
         # (sim_bimanual_assembly etc.), False for the RoboCasa/RoboCoin
         # pipeline. Drives the prewarm dummy obs schema regardless of
-        # whether a critic is loaded.
-        self._uses_hdf5_pipeline = isinstance(config.data, _config.Hdf5RldsDataConfig)
+        # whether a critic is loaded. LeRobotRldsDataConfig policies
+        # (sim_xarm_packing etc.) consume the same client obs schema as the
+        # HDF5 pipeline (`image` dict + flat 14D `state` + `prompt`), so they
+        # share its prewarm dummy — the RoboCasa flat observation/* dummy
+        # raises KeyError('image') in their input transform, and a failed
+        # rank-0 prewarm desyncs the workers' decode cadence on multi-host.
+        self._uses_hdf5_pipeline = isinstance(
+            config.data, (_config.Hdf5RldsDataConfig, _config.LeRobotRldsDataConfig)
+        )
 
         # JAX rank 0 binds the websocket; every other rank runs
         # participate_loop so the JIT'd inference doesn't deadlock waiting
@@ -514,10 +538,26 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         self._sharding_mod = _sharding_mod
         self._mesh = _sharding_mod.make_mesh(config.fsdp_devices)
         if self._sample_parallel:
-            # No padding: sample_rngs.shape[0] == num_samples; the BATCH_AXIS
-            # either matches num_samples (1 per batch position, parallel) or
-            # divides num_samples (multiple per batch position, sequential vmap).
-            self._num_samples_padded = num_samples
+            # sample_rngs.shape[0] must be a multiple of BATCH_AXIS so the
+            # leading axis shards cleanly: the BATCH_AXIS either matches
+            # num_samples (1 per batch position, parallel) or divides it
+            # (multiple per batch position, sequential vmap). When num_samples
+            # is not a multiple (e.g. the n=1 BC-only phase on a (4 batch,
+            # 16 fsdp) v5e-64 mesh), pad up to the next multiple: the JIT
+            # samples + scores num_samples_padded candidates on the trained
+            # fsdp topology and the host-side `[:n]` slice in `infer` keeps
+            # only the first num_samples. (Raising fsdp_devices to
+            # device_count instead compiles a fresh mesh topology, which hit
+            # cross-host XLA-compilation nondeterminism — "unexpected peer in
+            # the launch group" — on v5e-64.)
+            batch_axis = self._sample_parallel_batch_axis
+            self._num_samples_padded = ((num_samples + batch_axis - 1) // batch_axis) * batch_axis
+            if self._num_samples_padded != num_samples:
+                logger.info(
+                    "BestOfNPolicy sample_parallel: padding num_samples %d -> %d (next multiple "
+                    "of BATCH_AXIS=%d); extra candidates are sampled+scored then discarded.",
+                    num_samples, self._num_samples_padded, batch_axis,
+                )
         else:
             # Pad num_samples to a multiple of jax.device_count() so a single
             # PartitionSpec(DATA_AXIS, None) cleanly splits the leading axis across
@@ -636,6 +676,17 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 logger.info(
                     f"Critic predict_subtask_ar=True: subtask decoding enabled "
                     f"(decode_every={self._subtask_decode_every})."
+                )
+            if self._policy_use_decoded_subtask:
+                if self._subtask_decoder is None:
+                    raise ValueError(
+                        "policy_use_decoded_subtask=True requires a predict_subtask_ar "
+                        "critic (no subtask decoder is configured for this critic)."
+                    )
+                logger.info(
+                    "policy_use_decoded_subtask=True: the policy prompt is conditioned "
+                    "on the critic's decoded subtask (same-call on decode-cadence calls, "
+                    "cached latest in between)."
                 )
 
             # `use_chunk_wise_delta` lives on the data FACTORY (RLDSRoboCasaDataConfig
@@ -768,11 +819,36 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # string BEFORE _input_transform runs (TokenizePrompt pops it) so we
         # can re-tokenize for the critic.
         obs = jax.tree.map(lambda x: x, obs)
+        # Pristine copy for the decode-call re-prepare below (the transform
+        # pipeline pops keys from the dict it is handed).
+        obs_pristine = jax.tree.map(lambda x: x, obs)
         batched, extras = self._prepare_inputs_rank0(obs, noise = noise)
+        # Subtask the critic's value prompt was built from in the prepare above
+        # (None on the cold-start call before the first decode). Updated after
+        # the decode-call re-prepare so it always names the subtask THIS call's
+        # value forward conditioned on.
+        used_subtask = self._cached_subtask_str
 
-        # NOTE: order matches participate_loop (broadcast_inputs → next_sample_rng)
-        # so collective ops on multi-host hit in the same sequence on every rank.
+        # NOTE: order matches participate_loop (broadcast_inputs → decode →
+        # next_sample_rng) so collective ops on multi-host hit in the same
+        # sequence on every rank.
         batched, extras = self._broadcast_inputs(batched, extras)
+
+        # Subtask-AR critics: autoregressively decode the current subtask off
+        # this call's observation (cadence-gated) BEFORE the policy forward.
+        # Every rank hits the decode collectives at the same all-ranks point
+        # (see _maybe_decode_subtask).
+        did_decode, decode_out = self._maybe_decode_subtask(batched, extras, on_rank0 = True)
+        if did_decode and self._policy_use_decoded_subtask:
+            # Same-call threading: re-prepare with the fresh subtask (now in
+            # _cached_subtask_str) so this call's policy prompt AND critic value
+            # prompt condition on it, then re-broadcast the updated package
+            # (workers mirror this second broadcast off their own decode
+            # counter).
+            batched, extras = self._prepare_inputs_rank0(obs_pristine, noise = noise)
+            used_subtask = self._cached_subtask_str
+            batched, extras = self._broadcast_inputs(batched, extras)
+
         sample_rng, sample_rngs = self._next_sample_rng()
 
         # ---- DIAGNOSTIC: dump fingerprints of batched + rng + extras keys
@@ -871,19 +947,13 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 result["acs"] = acs_value
 
         # Subtask the critic conditioned its value forward on this call: the
-        # cached subtask used to build the value prompt in _prepare_inputs (None
-        # on the cold-start call before the first decode). Only emitted for
-        # predict_subtask_ar critics (a decoder is configured); non-AR critics
-        # and the policy-only path are unchanged. Captured before
-        # _maybe_decode_subtask below refreshes the cache for the next call.
+        # cached subtask used to build the value prompt in the (re-)prepare
+        # above (None on the cold-start call before the first decode). Only
+        # emitted for predict_subtask_ar critics (a decoder is configured);
+        # non-AR critics and the policy-only path are unchanged.
         if self._subtask_decoder is not None:
-            result["critic_subtask"] = self._cached_subtask_str
+            result["critic_subtask"] = used_subtask
 
-        # Subtask-AR critics: autoregressively decode the current subtask off the
-        # same observation (cadence-gated) and cache it for the next call's value
-        # prompt. Runs after the main inference so every rank hits the decode
-        # collectives at the same all-ranks point (see _maybe_decode_subtask).
-        decode_out = self._maybe_decode_subtask(batched, extras, on_rank0 = True)
         if decode_out is not None:
             result["predicted_subtask"] = decode_out["predicted_subtask"]
             result["predicted_subtask_tokens"] = decode_out["predicted_subtask_tokens"]
@@ -896,23 +966,27 @@ class BestOfNPolicy(_base_policy.BasePolicy):
 
     def _maybe_decode_subtask(
         self, batched: dict[str, Any], extras: dict[str, Any], *, on_rank0: bool,
-    ) -> dict[str, Any] | None:
-        """All-ranks post-inference subtask decode for predict_subtask_ar critics.
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """All-ranks pre-inference subtask decode for predict_subtask_ar critics.
 
         Gated by `self._subtask_iter % self._subtask_decode_every`, advanced
         exactly once per inference on EVERY rank (rank 0 via `infer`, workers via
         `participate_loop`/`_prewarm_jit`), so the decode JIT collectives fire on
         the identical step on every host. On rank 0 the decoded subtask is cached
-        for the next call's value prompt and the decode dict is returned; on
-        workers the same JIT chain runs in lockstep and None is returned. No-op
-        when no decoder is configured (non-subtask_ar critic / policy-only path).
+        (consumed by this call's re-prepare when policy_use_decoded_subtask=True,
+        else by the next call's value prompt) and the decode dict is returned; on
+        workers the same JIT chain runs in lockstep. Returns `(did_run, out)` —
+        `did_run` is identical on every rank (shared counter), letting workers
+        mirror rank 0's decode-call-only second broadcast; `out` is non-None only
+        on rank 0 decode calls. No-op `(False, None)` when no decoder is
+        configured (non-subtask_ar critic / policy-only path).
         """
         if self._subtask_decoder is None:
-            return None
+            return False, None
         run = (self._subtask_iter % self._subtask_decode_every == 0)
         self._subtask_iter += 1
         if not run:
-            return None
+            return False, None
         critic_obs = _model.Observation.from_dict(batched)
         critic_obs = dataclasses.replace(
             critic_obs,
@@ -924,9 +998,9 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         if on_rank0:
             out = self._subtask_decoder.predict(critic_obs)
             self._cached_subtask_str = out["predicted_subtask"]
-            return out
+            return True, out
         self._subtask_decoder.run_lockstep(critic_obs)
-        return None
+        return True, None
 
     def _prepare_inputs_rank0(
         self, obs: dict, *, noise: np.ndarray | None = None,
@@ -950,8 +1024,26 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         critic_task_desc = None
         if self._critic_prompt_mode == "task_description_predict_current_subtask":
             critic_task_desc = per_call_task_desc or self._critic_task_description
+        # A subtask-decoding critic REQUIRES a task description: without one the
+        # extras package drops the decode_critic_* leaves, so rank 0 broadcasts
+        # a structurally different package than the workers' dummies and the
+        # multi-host launch group desyncs (workers hang / one rank halts).
+        # Fail loudly instead.
+        if self._subtask_decoder is not None and critic_task_desc is None:
+            raise ValueError(
+                "Subtask-decoding critic needs a task description on every call: "
+                "send obs['task_description'] from the client or serve with "
+                "--task-description."
+            )
         if policy_task_desc is not None:
             obs = {**obs, "prompt": policy_task_desc}
+        # policy_use_decoded_subtask: condition the policy on the critic's
+        # AR-decoded subtask instead of the client-sent prompt — fresh on
+        # decode-cadence calls (via the re-prepare in `infer`), cached latest
+        # in between. Falls back to the client prompt before the first decode
+        # (only reachable when prewarm was skipped: the first call decodes).
+        if self._policy_use_decoded_subtask and self._cached_subtask_str:
+            obs = {**obs, "prompt": self._cached_subtask_str}
 
         # Pull critic_image out before _input_transform (which only knows about `image`).
         critic_image_dict = obs.get("critic_image") if isinstance(obs, dict) else None
@@ -1293,6 +1385,15 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             try:
                 batched, extras = self._make_dummy_inputs()
                 batched, extras = self._broadcast_inputs(batched, extras)
+                # Drive the subtask decode in lockstep with rank 0 (no-op unless
+                # this is a decode step for a predict_subtask_ar critic). Runs
+                # BEFORE inference, mirroring rank 0's `infer` order.
+                did_decode, _ = self._maybe_decode_subtask(batched, extras, on_rank0 = False)
+                if did_decode and self._policy_use_decoded_subtask:
+                    # Rank 0 re-broadcasts a prompt-updated package on decode
+                    # calls; consume it (did_decode is rank-consistent).
+                    batched, extras = self._make_dummy_inputs()
+                    batched, extras = self._broadcast_inputs(batched, extras)
                 sample_rng, sample_rngs = self._next_sample_rng()
                 actions_out, q_values = self._run_jit_inference(
                     batched, extras, sample_rng, sample_rngs,
@@ -1302,9 +1403,6 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                     q_values = jax.block_until_ready(q_values)
                     # Participate in rank 0's process_allgather; discard result.
                     self._gather_local_candidates(actions_out, q_values)
-                # Drive the subtask decode in lockstep with rank 0 (no-op unless
-                # this is a decode step for a predict_subtask_ar critic).
-                self._maybe_decode_subtask(batched, extras, on_rank0 = False)
                 local_iter += 1
                 if local_iter % 100 == 0:
                     logger.info(f"Worker (JAX rank {rank}): participated in {local_iter} inferences")
@@ -1334,6 +1432,12 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 )
                 batched, extras = self._make_dummy_inputs()
                 batched, extras = self._broadcast_inputs(batched, extras)
+                # Compile the decode JIT in lockstep with rank 0's prewarm infer
+                # (decode runs BEFORE inference, mirroring `infer`'s order).
+                did_decode, _ = self._maybe_decode_subtask(batched, extras, on_rank0 = False)
+                if did_decode and self._policy_use_decoded_subtask:
+                    batched, extras = self._make_dummy_inputs()
+                    batched, extras = self._broadcast_inputs(batched, extras)
                 sample_rng, sample_rngs = self._next_sample_rng()
                 actions_out, q_values = self._run_jit_inference(
                     batched, extras, sample_rng, sample_rngs,
@@ -1341,8 +1445,6 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 jax.block_until_ready(actions_out)
                 if q_values is not None:
                     self._gather_local_candidates(actions_out, jax.block_until_ready(q_values))
-                # Compile the decode JIT in lockstep with rank 0's prewarm infer.
-                self._maybe_decode_subtask(batched, extras, on_rank0 = False)
                 # Reset cadence + cache so the first real inference re-decodes
                 # (prewarm decoded from zero-image dummies → a garbage subtask).
                 self._subtask_iter = 0
@@ -1361,6 +1463,13 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                     "image": {k: zero_image for k in self._image_keys},
                     "state": np.zeros(self._state_dim, dtype = np.float32),
                     "prompt": "prewarm",
+                    # Keeps the prewarm broadcast package structurally identical
+                    # to real client calls: without a task description a
+                    # subtask-decoding critic's extras drop the decode_critic_*
+                    # leaves, so rank 0 compiles a different broadcast program
+                    # than the workers' dummies → "unexpected peer in the
+                    # launch group" desync on multi-host.
+                    "task_description": "prewarm",
                 }
                 # Include critic_image so prewarm compiles the actual inference path.
                 if self._expect_critic_images:
@@ -1426,6 +1535,7 @@ def create_bestofn_policy(
     inject_noise: bool = False,
     noise_level: float = 0.0,
     subtask_decode_every: int = 20,
+    policy_use_decoded_subtask: bool = False,
     num_steps: int | None = None,
 ) -> BestOfNPolicy:
     """Convenience factory; matches the kwargs the serve_policy CLI exposes."""
@@ -1452,5 +1562,6 @@ def create_bestofn_policy(
         inject_noise = inject_noise,
         noise_level = noise_level,
         subtask_decode_every = subtask_decode_every,
+        policy_use_decoded_subtask = policy_use_decoded_subtask,
         num_steps = num_steps,
     )

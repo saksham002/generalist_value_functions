@@ -165,6 +165,10 @@ class LaunchArgs(CommonArgs):
     gres: str = "gpu:L40S:1"
     """SLURM GPU resource spec."""
 
+    extra_args: str | None = None
+    """Extra sbatch arguments appended verbatim to the worker and merge submissions
+    (e.g. '--exclude babel-m5-32')."""
+
     max_episodes: int | None = None
     """Limit total episodes to process across all workers."""
 
@@ -274,7 +278,12 @@ def run_worker(args: WorkerArgs) -> None:
     # shared path entirely. Respect an externally-set OPENPI_DATA_HOME first so a
     # pre-staged local asset cache (e.g. the PaliGemma tokenizer) can be used to
     # avoid GCS fetches on DNS-flaky nodes.
-    if "OPENPI_DATA_HOME" not in os.environ:
+    if "OPENPI_DATA_HOME" in os.environ:
+        # Suffix the external cache root with the worker id so workers never share a
+        # cache path (pre-stage per-worker copies of local assets, e.g. the PaliGemma
+        # tokenizer, under <root>/<worker_id>/big_vision/).
+        os.environ["OPENPI_DATA_HOME"] = os.path.join(os.environ["OPENPI_DATA_HOME"], str(worker_id))
+    else:
         cache_tag = os.environ.get("SLURM_JOB_ID") or f"worker_{worker_id}"
         os.environ["OPENPI_DATA_HOME"] = os.path.expanduser(f"~/.cache/openpi_ca/{cache_tag}")
 
@@ -1331,6 +1340,8 @@ def run_launch(args: LaunchArgs) -> None:
             sbatch_cmd.extend(["--cpus-per-task", str(args.cpus_per_task)])
         if args.qos is not None:
             sbatch_cmd.extend(["--qos", args.qos])
+        if args.extra_args is not None:
+            sbatch_cmd.extend(shlex.split(args.extra_args))
 
         if args.dry_run:
             logger.info(f"[DRY RUN] Worker {worker_id}: {' '.join(sbatch_cmd)}")
@@ -1377,6 +1388,8 @@ def run_launch(args: LaunchArgs) -> None:
             merge_sbatch_cmd.extend(["--cpus-per-task", str(args.cpus_per_task)])
         if args.qos is not None:
             merge_sbatch_cmd.extend(["--qos", args.qos])
+        if args.extra_args is not None:
+            merge_sbatch_cmd.extend(shlex.split(args.extra_args))
         merge_job_id = _submit_sbatch(merge_sbatch_cmd)
         logger.info(f"Merge job submitted: {merge_job_id} (depends on workers: {dep_str})")
 
