@@ -4674,12 +4674,12 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         name = "realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar",
         data_factory = LeRobotRldsDataConfig(
             repo_id = "realworld_xarm_packing",
-            rlds_data_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+            rlds_data_dir = "gs://saksham-usc2/datasets",
             datasets = (
                 rlds_dataset.RLDSDataset(name = "realworld_xarm_packing", version = "1.0.0", weight = 1.0),
             ),
             assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+                assets_dir = "gs://saksham-usc2/datasets/realworld_xarm_packing",
                 asset_id = "norm_stats",
             ),
             discount = 0.999,
@@ -4690,7 +4690,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             shuffle_buffer_size = 50_000,
             mask_boundary_actions = False,
             subsample = True,
-            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/realworld_xarm_packing_pi05_subtask/",
+            counterfactual_action_store_dir = "gs://saksham-usc2/robocoin/cached_actions/realworld_xarm_packing_pi05_subtask/",
             max_token_len = 160,
             prompt_mode = "task_description_predict_current_subtask",
         ),
@@ -4731,12 +4731,12 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         name = "realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar_n32",
         data_factory = LeRobotRldsDataConfig(
             repo_id = "realworld_xarm_packing",
-            rlds_data_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+            rlds_data_dir = "gs://saksham-usc2/datasets",
             datasets = (
                 rlds_dataset.RLDSDataset(name = "realworld_xarm_packing", version = "1.0.0", weight = 1.0),
             ),
             assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+                assets_dir = "gs://saksham-usc2/datasets/realworld_xarm_packing",
                 asset_id = "norm_stats",
             ),
             discount = 0.999,
@@ -4747,7 +4747,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             shuffle_buffer_size = 50_000,
             mask_boundary_actions = False,
             subsample = True,
-            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/realworld_xarm_packing_pi05_subtask/",
+            counterfactual_action_store_dir = "gs://saksham-usc2/robocoin/cached_actions/realworld_xarm_packing_pi05_subtask/",
             max_token_len = 160,
             prompt_mode = "task_description_predict_current_subtask",
         ),
