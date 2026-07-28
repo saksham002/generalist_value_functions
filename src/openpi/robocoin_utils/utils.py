@@ -135,6 +135,37 @@ def _jitted_compute_value(
     return model_to_use.compute_value(obs, act, take_min_over_ensemble = True)
 
 
+@nnx.jit
+def _jitted_compute_value_best_cached(
+    model_to_use: _value_fn.BaseValueFunction,
+    obs: _model.Observation,
+    actions: _model.Actions,
+) -> jnp.ndarray:
+    """Per-frame value of the highest-value cached counterfactual action.
+
+    ``actions`` is ``[b, num_samples, action_horizon, action_dim]``. The prefix
+    KV cache (images + prompt + state) is computed once per frame, then all
+    ``num_samples`` candidates are scored against the shared cache and the
+    per-frame max over candidates is returned (shape ``[b]``).
+    """
+    from openpi.models.best_of_n import expand_observation
+
+    num_samples = actions.shape[1]
+    kv_cache, prefix_mask, subtask_mask = model_to_use.compute_prefix_cache(obs)
+    expanded_obs = expand_observation(obs, num_samples)
+    flat_actions = actions.reshape(actions.shape[0] * num_samples, actions.shape[2], actions.shape[3])
+    repeated_kv_cache = jax.tree.map(lambda x: jnp.repeat(x, num_samples, axis = 1), kv_cache)
+    repeated_prefix_mask = jnp.repeat(prefix_mask, num_samples, axis = 0)
+    repeated_subtask_mask = None if subtask_mask is None else jnp.repeat(subtask_mask, num_samples, axis = 0)
+    out = model_to_use.compute_value(
+        expanded_obs, flat_actions,
+        take_min_over_ensemble = True,
+        prefix_cache = (repeated_kv_cache, repeated_prefix_mask, repeated_subtask_mask),
+    )
+    val = out[0] if isinstance(out, tuple) else out
+    return jnp.max(val.reshape(actions.shape[0], num_samples), axis = 1)
+
+
 def stack_frames(frame_dicts: list[dict], key: str) -> jax.Array | None:
     """Stack a single key across all frame dicts into a JAX array.
 
@@ -275,8 +306,6 @@ def get_obs_and_action(
     action_mask = None
     if action_conditioned:
         action = stack_frames(frame_dicts, actions_key)
-        if action is not None and action.ndim == 4:
-            action = action[:, 0]
         action_mask = stack_frames(frame_dicts, action_mask_key)
 
     obs = _model.Observation(
@@ -774,12 +803,14 @@ def predict_values(
             pred_values_random_np, _ = jax.device_get(_jitted_compute_value(model, obs_random, act_random))
 
         pred_values_counterfactual_np = None
-        if "counterfactual_actions" in frame_dicts[0]:
+        if action_conditioned and "counterfactual_actions" in frame_dicts[0]:
             obs_counterfactual, act_counterfactual = get_obs_and_action(
-                frame_dicts, prefix = "counterfactual_", action_conditioned = action_conditioned
+                frame_dicts, prefix = "counterfactual_", action_conditioned = True
             )
-            pred_values_counterfactual_np, _ = jax.device_get(
-                _jitted_compute_value(model, obs_counterfactual, act_counterfactual)
+            # act_counterfactual is [b, num_samples, ah, ad]; score all cached
+            # candidates against a shared prefix cache and keep the per-frame max.
+            pred_values_counterfactual_np = jax.device_get(
+                _jitted_compute_value_best_cached(model, obs_counterfactual, act_counterfactual)
             )
 
         pred_values_shuffled_np = None

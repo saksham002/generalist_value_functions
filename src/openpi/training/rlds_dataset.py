@@ -162,11 +162,17 @@ class BaseRldsDataset:
                 # below). Without this, every host iterates the full N-shard
                 # val dataset which accumulates host RAM until at least one
                 # worker is OOM-killed and drops the JAX coordinator.
-                split_to_use = (
-                    tfds.split_for_jax_process(base_split, process_index=process_index, process_count=process_count)
-                    if process_count > 1
-                    else base_split
-                )
+                # Exception: when the split has fewer examples than processes,
+                # even-splitting hands the trailing hosts an empty slice and TFDS
+                # raises "Instruction [] corresponds to no data!". Such small
+                # splits don't risk the OOM above, so every host reads the full
+                # split instead.
+                if process_count > 1 and builder.info.splits[split].num_examples >= process_count:
+                    split_to_use = tfds.split_for_jax_process(
+                        base_split, process_index=process_index, process_count=process_count
+                    )
+                else:
+                    split_to_use = base_split
                 logging.info(
                     f"  Dataset {dataset_cfg.name} (trajectory mode): using split {split_to_use!r}"
                 )
@@ -192,8 +198,11 @@ class BaseRldsDataset:
                 read_config_kwargs=read_config_kwargs,
             )
 
-            # Join with counterfactual action store if configured (train split only)
-            if self._counterfactual_action_store_dir is not None and split == "train":
+            # Join with counterfactual action store if configured. The join fires for
+            # any split; _join_counterfactual_action_store skips gracefully when the
+            # store has no shards for the requested split (e.g. a train-only store
+            # queried for "val"), so this is safe for stores that don't cover a split.
+            if self._counterfactual_action_store_dir is not None:
                 dataset = self._join_counterfactual_action_store(
                     dataset,
                     dataset_cfg,
@@ -303,11 +312,26 @@ class BaseRldsDataset:
             self._counterfactual_action_store_dir
         )
 
-        split_to_use = (
-            tfds.split_for_jax_process(split, process_index=process_index, process_count=process_count)
-            if process_count > 1
-            else split
-        )
+        # A store need not cover every RLDS split (e.g. a train-only store queried for
+        # "val"); skip the join rather than failing on a missing split.
+        if split not in ca_builder.info.splits:
+            logging.warning(
+                "Counterfactual action store at %s has no '%s' split (available: %s); skipping join.",
+                self._counterfactual_action_store_dir, split, list(ca_builder.info.splits),
+            )
+            return dataset
+
+        # Mirror the RLDS trajectory-load guard: when the split has fewer examples
+        # than processes, even-splitting hands trailing hosts empty slices and (worse)
+        # the RLDS side reads the FULL split while this side would read a per-host
+        # slice — desyncing the positional zip (episode-index mismatch). Read the full
+        # split here too so both sides enumerate episodes in the same order.
+        if process_count > 1 and ca_builder.info.splits[split].num_examples >= process_count:
+            split_to_use = tfds.split_for_jax_process(
+                split, process_index=process_index, process_count=process_count
+            )
+        else:
+            split_to_use = split
 
         read_config = tfds.ReadConfig(
             skip_prefetch=True,

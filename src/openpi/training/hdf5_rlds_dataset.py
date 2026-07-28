@@ -152,21 +152,34 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         else:
             # Heuristic guess for is_partial. When reward is absent, fall back to per-episode subtask annotations: a
             # trajectory is complete iff has_subtask_annotations is True, the terminal
-            # subtask_1 frame matches the task's final subtask, AND the right TCP z
-            # (eef_sim_pose_state[:, 8]) clears 0.4 somewhere inside the terminal subtask.
-            # The terminal-subtask span is the last subtask_len[-1] frames; subtask_is_first
-            # at that start index must be True as a sanity check.
+            # subtask_1 frame matches the task's final subtask, AND a dataset-specific
+            # end-of-episode geometric check passes. Both the final-subtask string and the
+            # geometric check are keyed on repo_id:
+            #   - real_hang ("dexterous_hang"): final subtask "Place the hanger on the rod"; the
+            #     right TCP z (eef_sim_pose_state[:, 8]) clears 0.4 somewhere inside the terminal
+            #     subtask. The terminal-subtask span is the last subtask_len[-1] frames;
+            #     subtask_is_first at that start index must be True as a sanity check.
+            #   - real_lid ("dexterous_lid"): final subtask "Close the second flap pair" (last entry
+            #     of annotations_final.json's subtask_definitions); at the terminal frame the left EEF
+            #     y (eef_sim_pose_state[-1, 1]) minus the right EEF y (eef_sim_pose_state[-1, 7]) > 0.5.
             has_subtask_annotations = tf.cast(
                 traj["traj_metadata"]["episode_metadata"]["has_subtask_annotations"][0], tf.bool,
             )
+            is_real_lid = tf.equal(
+                traj["traj_metadata"]["episode_metadata"]["repo_id"][0], "dexterous_lid"
+            )
             terminal_subtask = traj["subtask_1"][-1]
-            matches_terminal = tf.equal(terminal_subtask, "Place the hanger on the rod")
+            matches_terminal = tf.cond(
+                is_real_lid,
+                lambda: tf.equal(terminal_subtask, "Close the second flap pair"),
+                lambda: tf.equal(terminal_subtask, "Place the hanger on the rod"),
+            )
 
             # Short-circuit on has_subtask_annotations: subtask_len / subtask_is_first can
             # be garbage on episodes without annotations, and the whole AND collapses to
             # False there anyway — so skip the assertion + reduce_max in that branch.
             def _right_tcp_z_clears():
-                # subtask_len / subtask_is_first are per-step shape (5,); slot 0 tracks
+                # real_hang: subtask_len / subtask_is_first are per-step shape (5,); slot 0 tracks
                 # the active subtask (matching the existing steps_to_subtask_end[:, 0]
                 # convention in _apply_rl_fields).
                 terminal_subtask_len = tf.cast(traj["subtask_len"][-1, 0], tf.int32)
@@ -182,15 +195,21 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
                     right_tcp_z = tf.cast(traj["eef_sim_pose_state"], tf.float32)[terminal_start_idx:, 8]
                     return tf.identity(tf.reduce_max(right_tcp_z) > tf.constant(0.4, dtype = tf.float32))
 
-            right_tcp_z_clears = tf.cond(
+            def _lid_eef_y_gap_clears():
+                # real_lid: eef_sim_pose_state layout is [left_xyz(3), left_rpy(3), right_xyz(3),
+                # right_rpy(3)] -> left y = idx 1, right y = idx 7. Evaluated at the terminal frame.
+                eef_terminal = tf.cast(traj["eef_sim_pose_state"], tf.float32)[-1]
+                return (eef_terminal[1] - eef_terminal[7]) > tf.constant(0.5, dtype = tf.float32)
+
+            terminal_geometry_clears = tf.cond(
                 has_subtask_annotations,
-                _right_tcp_z_clears,
+                lambda: tf.cond(is_real_lid, _lid_eef_y_gap_clears, _right_tcp_z_clears),
                 lambda: tf.constant(False, dtype = tf.bool),
             )
             is_partial_scalar = tf.logical_not(
                 tf.logical_and(
                     has_subtask_annotations,
-                    tf.logical_and(matches_terminal, right_tcp_z_clears),
+                    tf.logical_and(matches_terminal, terminal_geometry_clears),
                 )
             )
 

@@ -98,6 +98,11 @@ class CriticArgs:
     # every N infer calls and reuse the cached subtask string in between (the
     # subtask is a slow-changing phase label). Ignored for non-subtask_ar critics.
     subtask_decode_every: int = 20
+    # For a predict_subtask_ar critic only: condition the POLICY prompt on the
+    # critic's decoded subtask server-side (fresh on decode-cadence calls in
+    # that same call, cached latest in between). When False (default) the
+    # policy uses the client-sent prompt unchanged.
+    policy_use_decoded_subtask: bool = False
 
 
 @dataclasses.dataclass
@@ -155,6 +160,11 @@ class Args:
     # --critic.inject-noise / --critic.noise-level instead.)
     inject_noise: bool = False
     noise_level: float = 0.0
+
+    # Number of flow-matching integration (Euler) steps for the policy's
+    # sample_actions. None → use the model default (10). Forwarded into the
+    # policy's sample_kwargs; only affects the policy-only (BC) sampling path.
+    num_steps: int | None = None
 
 
 # Default checkpoints that should be used for each environment.
@@ -225,6 +235,8 @@ def create_policy(args: Args) -> _policy.BasePolicy:
                 inject_noise = args.critic.inject_noise,
                 noise_level = args.critic.noise_level,
                 subtask_decode_every = args.critic.subtask_decode_every,
+                policy_use_decoded_subtask = args.critic.policy_use_decoded_subtask,
+                num_steps = args.num_steps,
             )
         # use_bestofn_loader=True without critic: load policy through
         # BestOfNPolicy (which applies the bimanual-EEF action-dim slice)
@@ -241,12 +253,16 @@ def create_policy(args: Args) -> _policy.BasePolicy:
             fsdp_devices = args.fsdp_devices,
             inject_noise = args.inject_noise,
             noise_level = args.noise_level,
+            num_steps = args.num_steps,
         )
 
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                sample_kwargs={"num_steps": args.num_steps} if args.num_steps is not None else None,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

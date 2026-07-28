@@ -135,6 +135,10 @@ class CommonArgs:
     rlds_data_dir: str | None = None
     """Optional override of the config's data dir (e.g. a local mini dataset). Forwarded to workers."""
 
+    sampling_num_steps: int | None = None
+    """Flow-matching integration steps for action sampling (model.sample_actions's num_steps).
+    None leaves the model default (10)."""
+
 
 @dataclasses.dataclass
 class LaunchArgs(CommonArgs):
@@ -160,6 +164,10 @@ class LaunchArgs(CommonArgs):
 
     gres: str = "gpu:L40S:1"
     """SLURM GPU resource spec."""
+
+    extra_args: str | None = None
+    """Extra sbatch arguments appended verbatim to the worker and merge submissions
+    (e.g. '--exclude babel-m5-32')."""
 
     max_episodes: int | None = None
     """Limit total episodes to process across all workers."""
@@ -267,9 +275,17 @@ def run_worker(args: WorkerArgs) -> None:
     # Isolate this worker's download cache. maybe_download's filelock does not
     # serialize across NFS-mounted nodes, so workers sharing ~/.cache/openpi race
     # on the force_download=True norm-stats fetch. A per-job cache dir removes the
-    # shared path entirely.
-    cache_tag = os.environ.get("SLURM_JOB_ID") or f"worker_{worker_id}"
-    os.environ["OPENPI_DATA_HOME"] = os.path.expanduser(f"~/.cache/openpi_ca/{cache_tag}")
+    # shared path entirely. Respect an externally-set OPENPI_DATA_HOME first so a
+    # pre-staged local asset cache (e.g. the PaliGemma tokenizer) can be used to
+    # avoid GCS fetches on DNS-flaky nodes.
+    if "OPENPI_DATA_HOME" in os.environ:
+        # Suffix the external cache root with the worker id so workers never share a
+        # cache path (pre-stage per-worker copies of local assets, e.g. the PaliGemma
+        # tokenizer, under <root>/<worker_id>/big_vision/).
+        os.environ["OPENPI_DATA_HOME"] = os.path.join(os.environ["OPENPI_DATA_HOME"], str(worker_id))
+    else:
+        cache_tag = os.environ.get("SLURM_JOB_ID") or f"worker_{worker_id}"
+        os.environ["OPENPI_DATA_HOME"] = os.path.expanduser(f"~/.cache/openpi_ca/{cache_tag}")
 
     config, data_config, dataset_cfg, _ = _resolve_config_with_fine_tune(
         args.config_name, args.fine_tune, args.rlds_data_dir,
@@ -398,6 +414,9 @@ def run_worker(args: WorkerArgs) -> None:
     input_transform = policy._input_transform  # noqa: SLF001
     output_transform = policy._output_transform  # noqa: SLF001
     sample_kwargs = dict(policy._sample_kwargs)  # noqa: SLF001
+    if args.sampling_num_steps is not None:
+        sample_kwargs["num_steps"] = args.sampling_num_steps
+        logger.info(f"Overriding flow-matching integration steps: num_steps={args.sampling_num_steps}")
     rng = policy._rng  # noqa: SLF001
 
     # Disable classifier-free guidance for counterfactual action generation.
@@ -537,6 +556,11 @@ def run_worker(args: WorkerArgs) -> None:
         action_dim_offset = getattr(policy_model_config, "action_dim_offset", 0)
     max_subtasks = 5
     prompt_mode = data_config.rlds_kwargs.get("prompt_mode", "subtask")
+    # LeRobot datasets (rlds_dataset_class="lerobot") carry a single per-step `subtask`
+    # field — no subtask_1..5 / first_null_index — and the subtask prompt is that text
+    # verbatim (LeRobotRldsDataset.frame_transforms: frame["prompt"] = frame["subtask"]).
+    # RoboCoin/HDF5 datasets instead carry subtask_1..5 and build a composite prompt.
+    is_lerobot = getattr(data_config, "rlds_dataset_class", None) == "lerobot"
 
     def _select_task_description_prompt(
         step: dict[str, Any], fps: int, task_description: str,
@@ -553,6 +577,31 @@ def run_worker(args: WorkerArgs) -> None:
             valid_30fps_actions = 3 * action_horizon // 5
             action_mask &= np.arange(action_horizon, dtype = np.int32) < valid_30fps_actions
         return task_description, 0, action_mask
+
+    def _select_lerobot_subtask_prompt(
+        step: dict[str, Any],
+    ) -> tuple[str | None, int, np.ndarray]:
+        """LeRobot subtask-conditioned prompt: the per-step `subtask` text verbatim.
+
+        Mirrors LeRobotRldsDataset under prompt_mode="subtask"
+        (frame["prompt"] = frame["subtask"]). The LeRobot schema exposes a single
+        `subtask` field (no subtask_1..5 / first_null_index), so the prompt is that
+        string as-is — training feeds it unmodified and the tokenizer only strips
+        whitespace.
+
+        action_mask is always all-ones: this config runs with critic_mode=False, where
+        the training data path never sets an action_mask, so the model defaults it to
+        all-ones (pi0.py).
+        """
+        subtask_text = step["subtask"]
+        if hasattr(subtask_text, "numpy"):
+            subtask_text = subtask_text.numpy()
+        if isinstance(subtask_text, bytes):
+            subtask_text = subtask_text.decode("utf-8")
+        if not subtask_text:
+            return None, 0, np.zeros(action_horizon, dtype = np.bool_)
+        action_mask = np.ones(action_horizon, dtype = np.bool_)
+        return subtask_text, 0, action_mask
 
     logger.info(
         f"Action horizon={action_horizon}, action_dim={action_dim}, num_samples={args.num_samples}, "
@@ -701,6 +750,13 @@ def run_worker(args: WorkerArgs) -> None:
                 repo_id = repo_id.numpy()
             embodiment = extract_embodiment(repo_id)
             fps = int(episode["episode_metadata"]["fps"])
+            # Optional (dexterous/hdf5 configs only): whether this episode carries subtask
+            # boundary annotations. Logged alongside the debug metrics below.
+            has_subtask_annotations = episode["episode_metadata"].get("has_subtask_annotations")
+            if hasattr(has_subtask_annotations, "numpy"):
+                has_subtask_annotations = has_subtask_annotations.numpy()
+            if has_subtask_annotations is not None:
+                has_subtask_annotations = bool(has_subtask_annotations)
             episode_task_description = ""
             if prompt_mode == "task_description":
                 td = episode["episode_metadata"]["task_description"]
@@ -745,6 +801,11 @@ def run_worker(args: WorkerArgs) -> None:
 
             if prompt_mode == "task_description":
                 skip_whole_episode = not episode_task_description
+            elif is_lerobot:
+                # LeRobot subtask schema has no first_null_index and every step normally
+                # carries a `subtask`; process the episode and let the per-step path skip
+                # any empty-subtask step (leaving all-zeros, same as a whole-episode skip).
+                skip_whole_episode = False
             else:
                 skip_whole_episode = not any(int(step["first_null_index"]) > 0 for step in episode["steps"])
             if skip_whole_episode:
@@ -791,20 +852,32 @@ def run_worker(args: WorkerArgs) -> None:
                 for strided_idx, step_idx in enumerate(range(0, num_steps, args.stride)):
                     step = episode["steps"][step_idx]
 
+                    # subtask_1..subtask_5 exist only in the RoboCoin/HDF5 subtask schema
+                    # and feed the composite subtask prompt path; task_description mode and
+                    # the LeRobot single-`subtask` mode don't use them, so skip the read.
                     subtask_texts = []
-                    for si in range(1, max_subtasks + 1):
-                        text = step[f"subtask_{si}"]
-                        if hasattr(text, "numpy"):
-                            text = text.numpy()
-                        if isinstance(text, bytes):
-                            text = text.decode("utf-8")
-                        subtask_texts.append(text)
+                    if prompt_mode != "task_description" and not is_lerobot:
+                        for si in range(1, max_subtasks + 1):
+                            text = step[f"subtask_{si}"]
+                            if hasattr(text, "numpy"):
+                                text = text.numpy()
+                            if isinstance(text, bytes):
+                                text = text.decode("utf-8")
+                            subtask_texts.append(text)
 
 
                     if prompt_mode == "task_description":
                         policy_prompt, sampled_idx, action_mask = _select_task_description_prompt(
                             step, fps, episode_task_description,
                         )
+                    elif is_lerobot:
+                        # LeRobot subtask-conditioned caching only supports prompt_mode="subtask"
+                        # (prompt = per-step subtask verbatim). Fail loudly on anything else.
+                        if prompt_mode != "subtask":
+                            raise ValueError(
+                                f"LeRobot counterfactual caching supports prompt_mode='subtask', got {prompt_mode!r}."
+                            )
+                        policy_prompt, sampled_idx, action_mask = _select_lerobot_subtask_prompt(step)
                     else:
                         policy_prompt, sampled_idx, action_mask = _select_policy_subtask(
                             step, subtask_texts, fps,
@@ -829,7 +902,7 @@ def run_worker(args: WorkerArgs) -> None:
                             step_eef_state = step_eef_state.numpy()
                         step_eef_state = np.asarray(step_eef_state, dtype = np.float32)
                         step_state = _construct_eef_repr_np(step_state, step_eef_state)
-                    elif data_config.rlds_kwargs["state_dim"] == 16 and step_state.shape[-1] == 14:
+                    elif data_config.rlds_kwargs.get("state_dim") == 16 and step_state.shape[-1] == 14:
                         step_state = np.concatenate([step_state[:6], [0.0], step_state[6:13], [0.0], step_state[13:]], axis = 0).astype(np.float32)
 
                     # Decode images once per step (not per subtask). Resize to the model's
@@ -1073,6 +1146,7 @@ def run_worker(args: WorkerArgs) -> None:
             timed_episode_count += 1
             logger.info(
                 "Worker %d shard %d episode_index=%d num_steps=%d valid_frames=%d "
+                "has_subtask_annotations=%s "
                 "sampling_l1=%.6f sampling_mse=%.6f cov_trace_per_timestep=%.6f "
                 "debug_metrics=%s elapsed=%.2fs",
                 worker_id,
@@ -1080,6 +1154,7 @@ def run_worker(args: WorkerArgs) -> None:
                 rlds_episode_index,
                 num_steps,
                 episode_valid_frames,
+                has_subtask_annotations,
                 episode_sampling_l1_sum / max(episode_sampling_num_valid, 1.0),
                 episode_sampling_mse_sum / max(episode_sampling_num_valid, 1.0),
                 episode_cov_trace_sum / max(episode_cov_trace_num_valid, 1.0),
@@ -1178,9 +1253,22 @@ def run_launch(args: LaunchArgs) -> None:
         return result.stdout.strip().split(";")[0]
 
     def _make_wrap_cmd(inner_cmd: str) -> str:
+        # Propagate OPENPI_DATA_HOME from the launcher env to each worker so a pre-staged
+        # local asset cache (e.g. the PaliGemma tokenizer) is used instead of refetching
+        # from GCS on DNS-flaky nodes. No-op when unset (workers fall back to their default).
+        openpi_data_home = os.environ.get("OPENPI_DATA_HOME")
+        data_home_export = (
+            f"export OPENPI_DATA_HOME={shlex.quote(openpi_data_home)} && " if openpi_data_home else ""
+        )
         return (
             f'bash -lc "'
             f"source ~/.bashrc && "
+            # Force the CUDA backend: sbatch --export=ALL propagates the submit shell's env, so a stray
+            # JAX_PLATFORMS=cpu (e.g. left over from CPU-only debugging) would otherwise silently push
+            # the policy onto CPU (~1000x slower). Exporting here overrides any inherited value. Use
+            # "cuda" not "gpu": "gpu" also tries the rocm backend, which fails fatally on these nodes.
+            f"export JAX_PLATFORMS=cuda && "
+            f"{data_home_export}"
             f"export CURL_CA_BUNDLE=\\$(python3 -c 'import certifi; print(certifi.where())' 2>/dev/null || echo /etc/ssl/certs/ca-bundle.crt) && "
             f"export REQUESTS_CA_BUNDLE=\\$CURL_CA_BUNDLE && "
             f"export SSL_CERT_FILE=\\$CURL_CA_BUNDLE && "
@@ -1208,6 +1296,8 @@ def run_launch(args: LaunchArgs) -> None:
         extra_worker_args += ["--fine-tune", args.fine_tune]
     if args.rlds_data_dir is not None:
         extra_worker_args += ["--rlds-data-dir", args.rlds_data_dir]
+    if args.sampling_num_steps is not None:
+        extra_worker_args += ["--sampling-num-steps", str(args.sampling_num_steps)]
 
     extra_args_str = " ".join(extra_worker_args)
 
@@ -1250,6 +1340,8 @@ def run_launch(args: LaunchArgs) -> None:
             sbatch_cmd.extend(["--cpus-per-task", str(args.cpus_per_task)])
         if args.qos is not None:
             sbatch_cmd.extend(["--qos", args.qos])
+        if args.extra_args is not None:
+            sbatch_cmd.extend(shlex.split(args.extra_args))
 
         if args.dry_run:
             logger.info(f"[DRY RUN] Worker {worker_id}: {' '.join(sbatch_cmd)}")
@@ -1296,6 +1388,8 @@ def run_launch(args: LaunchArgs) -> None:
             merge_sbatch_cmd.extend(["--cpus-per-task", str(args.cpus_per_task)])
         if args.qos is not None:
             merge_sbatch_cmd.extend(["--qos", args.qos])
+        if args.extra_args is not None:
+            merge_sbatch_cmd.extend(shlex.split(args.extra_args))
         merge_job_id = _submit_sbatch(merge_sbatch_cmd)
         logger.info(f"Merge job submitted: {merge_job_id} (depends on workers: {dep_str})")
 

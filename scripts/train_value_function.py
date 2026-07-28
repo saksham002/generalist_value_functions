@@ -2679,7 +2679,7 @@ def main(config: _config.TrainConfig):
                         action_conditioned = action_conditioned,
                         data_config = data_config,
                         cache_dir = val_episodes_cache_dir,
-                        batch_size = 16,
+                        batch_size = 8,
                     )
                 else:
                     plot_images = generate_validation_plots(

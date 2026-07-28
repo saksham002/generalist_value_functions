@@ -4674,12 +4674,12 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         name = "realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar",
         data_factory = LeRobotRldsDataConfig(
             repo_id = "realworld_xarm_packing",
-            rlds_data_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+            rlds_data_dir = "gs://saksham-usc2/datasets",
             datasets = (
                 rlds_dataset.RLDSDataset(name = "realworld_xarm_packing", version = "1.0.0", weight = 1.0),
             ),
             assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+                assets_dir = "gs://saksham-usc2/datasets/realworld_xarm_packing",
                 asset_id = "norm_stats",
             ),
             discount = 0.999,
@@ -4690,7 +4690,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             shuffle_buffer_size = 50_000,
             mask_boundary_actions = False,
             subsample = True,
-            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/realworld_xarm_packing_pi05_subtask/",
+            counterfactual_action_store_dir = "gs://saksham-usc2/robocoin/cached_actions/realworld_xarm_packing_pi05_subtask/",
             max_token_len = 160,
             prompt_mode = "task_description_predict_current_subtask",
         ),
@@ -4725,18 +4725,18 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         include_repos = (),
     ),
     # Same as realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar but with
-    # BestOfN num_samples=64 to match the 64-sample counterfactual-action store, so eval
-    # scores all 64 cached candidates per state instead of the inherited 8.
+    # BestOfN num_samples=32 to match the 32-sample counterfactual-action store, so eval
+    # scores all 32 cached candidates per state instead of the inherited 8.
     FineTuneConfig(
-        name = "realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar_n64",
+        name = "realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar_n32",
         data_factory = LeRobotRldsDataConfig(
             repo_id = "realworld_xarm_packing",
-            rlds_data_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+            rlds_data_dir = "gs://saksham-usc2/datasets",
             datasets = (
                 rlds_dataset.RLDSDataset(name = "realworld_xarm_packing", version = "1.0.0", weight = 1.0),
             ),
             assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+                assets_dir = "gs://saksham-usc2/datasets/realworld_xarm_packing",
                 asset_id = "norm_stats",
             ),
             discount = 0.999,
@@ -4747,7 +4747,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             shuffle_buffer_size = 50_000,
             mask_boundary_actions = False,
             subsample = True,
-            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/realworld_xarm_packing_pi05/",
+            counterfactual_action_store_dir = "gs://saksham-usc2/robocoin/cached_actions/realworld_xarm_packing_pi05_subtask/",
             max_token_len = 160,
             prompt_mode = "task_description_predict_current_subtask",
         ),
@@ -4768,7 +4768,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         },
         policy_overrides = {
             "action_horizon": 60,
-            "num_samples": 64,
+            "num_samples": 32,
         },
         action_horizon = 60,
         num_train_steps = 20_000,
@@ -4780,6 +4780,63 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         ),
         num_val_trajectories = 3,
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/realworld_xarm_packing/validation_cache_dir_realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar/",
+        include_repos = (),
+    ),
+    # Sim twin of realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar: same
+    # recipe on the sim_xarm_packing LeRobot RLDS dataset and its CF cache / norm stats.
+    FineTuneConfig(
+        name = "sim_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar",
+        data_factory = LeRobotRldsDataConfig(
+            repo_id = "sim_xarm_packing",
+            rlds_data_dir = "gs://saksham-euw4/datasets",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "sim_xarm_packing", version = "1.0.0", weight = 1.0),
+            ),
+            # Mirrored in saksham-usc2 (see sim_xarm_packing_pi05_subtask note).
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-usc2/datasets/sim_xarm_packing",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/sim_xarm_packing_pi05_subtask/",
+            max_token_len = 160,
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        # Restated q_network_config (matching the subtask_ar base) so the pretrained
+        # checkpoint loads cleanly; max_token_len bumped to 160 for the longer
+        # (task, subtask) concatenation of the packing prompts.
+        model_overrides = {
+            "action_horizon": 60,
+            "q_network_config": _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                max_token_len = 160,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = True,
+            ),
+        },
+        policy_overrides = {
+            "action_horizon": 60,
+        },
+        action_horizon = 60,
+        num_train_steps = 20_000,
+        save_interval = 10_000,
+        plot_interval = 10_000,
+        keep_period = 10_000,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
+        ),
+        num_val_trajectories = 3,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/sim_xarm_packing/validation_cache_dir_sim_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar/",
         include_repos = (),
     ),
     # sim_bimanual_assembly twin of real_shirt_hang_paligemma_cql_rlds_finetune_subtask_ar_final:
@@ -7996,10 +8053,65 @@ _CONFIGS = [
             dtype = "float32",
         ),
         data = LeRobotRldsDataConfig(
-            rlds_data_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+            # Rebuilt (baseline + adversarial) dataset lives in saksham-usc2 so the
+            # v4-64-0 (us-central2) training run avoids a cross-region read; the
+            # local source of truth is /data/group_data/rl/saksham3/datasets.
+            # rlds_data_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+            rlds_data_dir = "gs://saksham-usc2/datasets",
             datasets = (rlds_dataset.RLDSDataset(name = "realworld_xarm_packing", version = "1.0.0", weight = 1.0),),
             assets = AssetsConfig(
-                assets_dir = "/data/group_data/rl/saksham3/datasets/realworld_xarm_packing",
+                # assets_dir = "/data/group_data/rl/saksham3/datasets/realworld_xarm_packing",
+                assets_dir = "gs://saksham-usc2/datasets/realworld_xarm_packing",
+                asset_id = "norm_stats",
+            ),
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            filter_n = 8,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            prompt_mode = "subtask",
+        ),
+        weight_loader = weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps = 100_000,
+        batch_size = 256,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 5e-5,
+            decay_steps = 100_000,
+            decay_lr = 5e-6,
+        ),
+        optimizer = _optimizer.AdamW(),
+        num_workers = 0,
+        log_interval = 100,
+        save_interval = 5_000,
+        keep_period = 25_000,
+        fsdp_devices = 16,
+        action_horizon = 60,
+    ),
+    # Sim twin of realworld_xarm_packing_pi05_subtask, trained on the sim_xarm_packing
+    # (LeRobot-built) dataset.
+    TrainConfig(
+        name = "sim_xarm_packing_pi05_subtask",
+        model = pi0_config.Pi0Config(
+            paligemma_variant = "gemma_2b",
+            action_expert_variant = "gemma_300m",
+            action_dim = 32,
+            action_horizon = 60,
+            max_token_len = 160,
+            pi05 = True,
+            discrete_state_input = True,
+            action_dim_offset = 14,
+            action_dim_mask = (False,) * 14 + (True,) * 14 + (False,) * 4,
+            pad_state_to_action_dim = False,
+            dtype = "float32",
+        ),
+        data = LeRobotRldsDataConfig(
+            rlds_data_dir = "gs://saksham-euw4/datasets",
+            datasets = (rlds_dataset.RLDSDataset(name = "sim_xarm_packing", version = "1.0.0", weight = 1.0),),
+            # Mirrored in saksham-usc2 so v4 (us-central2) serving avoids a
+            # cross-region read; the euw4 original stays the source of truth.
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-usc2/datasets/sim_xarm_packing",
                 asset_id = "norm_stats",
             ),
             use_chunk_wise_delta = True,

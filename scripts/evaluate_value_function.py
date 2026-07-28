@@ -1036,10 +1036,12 @@ def _run_subtask_prediction(
                 nf["subtask_start_index"] = np.int32(s0)
                 nf["subtask_end_index"] = np.int32(s1)
                 rebuilt_frames.append((traj_idx, i, nf))
-            preds, _, _, _, _, _ = predict_values(
+            preds, _, _, preds_cf, _, _ = predict_values(
                 model, rebuilt_frames, seg_mc, action_conditioned, batch_size = batch_size, mesh = mesh,
             )
-            predicted_values = preds[traj_idx]
+            # Plot the value of the highest-value cached counterfactual action when a
+            # counterfactual store is joined; otherwise fall back to the dataset action.
+            predicted_values = preds_cf[traj_idx] if preds_cf.get(traj_idx) else preds[traj_idx]
 
         if not is_rank0:
             continue
@@ -1233,8 +1235,9 @@ def _run_action_gradient_norm(
         raise ValueError(
             f"--grad-action-source must be 'dataset' or 'cached', got {eval_config.grad_action_source!r}."
         )
-    # "cached" evaluates Q / grad at cached_action[0] = counterfactual_actions[:, 0]
-    # (get_obs_and_action with prefix="counterfactual_" already takes [:, 0]).
+    # "cached" evaluates Q / grad at cached_action[0] = counterfactual_actions[:, 0].
+    # get_obs_and_action now returns all cached candidates, so the [:, 0] is taken at
+    # the call site below (a single action is needed for the gradient).
     action_prefix = "counterfactual_" if eval_config.grad_action_source == "cached" else ""
 
     critic_network = _get_critic_network(model)
@@ -1311,6 +1314,8 @@ def _run_action_gradient_norm(
             if num_real < batch_size:
                 batch_frames = batch_frames + [batch_frames[-1]] * (batch_size - num_real)
             obs, act = get_obs_and_action(batch_frames, prefix = action_prefix, action_conditioned = True)
+            if action_prefix == "counterfactual_" and act is not None:
+                act = act[:, 0]
             grad_sq_norm_np, q_np = jax.device_get(_jitted_action_grad_sq_norm(model, obs, act))
             grad_sq_norms.extend(grad_sq_norm_np[:num_real].tolist())
             q_values.extend(q_np[:num_real].tolist())
