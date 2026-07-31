@@ -1532,7 +1532,17 @@ class LeRobotRldsDataConfig(DataConfigFactory):
 
     use_quantile_norm: bool = False
     use_chunk_wise_delta: bool = False
+    # Semantics of the 14D action/state vector, which decide how use_chunk_wise_delta
+    # builds its targets. Both layouts are 2 arms x (6 dims + 1 gripper):
+    #   "eef":   dims 3:6 / 10:13 are extrinsic-xyz euler angles, so the delta is a
+    #            relative rotation (R_action @ R_state.inv()), not a subtraction.
+    #   "joint": every masked dim is a joint position, so the delta is a plain
+    #            elementwise subtraction and the rotation branch must stay off.
+    action_space: Literal["eef", "joint"] = "eef"
     filter_n: int | None = None
+    # Requires episode_metadata/subtask_is_partial; drops the trailing td_n (or
+    # action_horizon when td_n is None) steps of every partial subtask.
+    filter_partial: bool = False
     prompt_mode: lerobot_rlds_dataset.PromptMode = "subtask"
 
     # RL / value-function training
@@ -1646,13 +1656,15 @@ class LeRobotRldsDataConfig(DataConfigFactory):
         data_transforms_outputs: list[_transforms.DataTransformFn] = []
         if self.use_chunk_wise_delta:
             action_dim = self._get_action_dim(model_config)
-            assert action_dim == 14, f"LeRobotRldsDataConfig expects 14D EEF actions, got {action_dim}"
+            assert action_dim == 14, f"LeRobotRldsDataConfig expects 14D actions, got {action_dim}"
+            # Same mask for both layouts: 6 delta dims + 1 absolute gripper per arm.
             delta_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            rpy_index_start = (3, 10) if self.action_space == "eef" else None
             data_transforms_inputs.append(
-                _transforms.DeltaActions(mask = delta_mask, rpy_index_start = (3, 10))
+                _transforms.DeltaActions(mask = delta_mask, rpy_index_start = rpy_index_start)
             )
             data_transforms_outputs.append(
-                _transforms.AbsoluteActions(mask = delta_mask, rpy_index_start = (3, 10))
+                _transforms.AbsoluteActions(mask = delta_mask, rpy_index_start = rpy_index_start)
             )
 
         return DataConfig(
@@ -1677,6 +1689,7 @@ class LeRobotRldsDataConfig(DataConfigFactory):
             rlds_kwargs = {
                 "td_n": self.td_n,
                 "filter_n": self.filter_n,
+                "filter_partial": self.filter_partial,
                 "mask_boundary_actions": self.mask_boundary_actions,
                 "prompt_mode": self.prompt_mode,
                 "subsample": self.subsample,
@@ -8062,6 +8075,62 @@ _CONFIGS = [
             use_chunk_wise_delta = True,
             use_quantile_norm = True,
             filter_n = 8,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            prompt_mode = "subtask",
+        ),
+        weight_loader = weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps = 70_000,
+        batch_size = 256,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 5e-5,
+            decay_steps = 70_000,
+            decay_lr = 5e-6,
+        ),
+        optimizer = _optimizer.AdamW(),
+        num_workers = 0,
+        log_interval = 100,
+        save_interval = 5_000,
+        keep_period = 25_000,
+        fsdp_devices = 16,
+        action_horizon = 60,
+    ),
+    # Lego twin of realworld_xarm_packing_pi05_subtask: same pi-0.5 recipe on the
+    # lego LeRobot RLDS dataset (3 cameras, subtask prompts). Unlike the packing
+    # datasets the 14D action/state are joint positions (yam bimanual, 6 joints +
+    # 1 gripper per arm), so action_space="joint" keeps the chunk-wise delta a
+    # plain subtraction instead of the EEF relative-rotation composition.
+    TrainConfig(
+        name = "lego_pi05_subtask",
+        model = pi0_config.Pi0Config(
+            paligemma_variant = "gemma_2b",
+            action_expert_variant = "gemma_300m",
+            action_dim = 32,
+            action_horizon = 60,
+            max_token_len = 160,
+            pi05 = True,
+            discrete_state_input = True,
+            # Real 14D joint values occupy dims 0:14 (the packing configs use 14:28).
+            # PadStatesAndActions takes the insertion offset from the mask's first True.
+            action_dim_offset = 0,
+            action_dim_mask = (True,) * 14 + (False,) * 18,
+            pad_state_to_action_dim = False,
+            dtype = "float32",
+        ),
+        data = LeRobotRldsDataConfig(
+            repo_id = "lego",
+            rlds_data_dir = "gs://saksham-usc2/datasets",
+            datasets = (rlds_dataset.RLDSDataset(name = "lego", version = "1.0.0", weight = 1.0),),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-usc2/datasets/lego",
+                asset_id = "norm_stats",
+            ),
+            use_chunk_wise_delta = True,
+            action_space = "joint",
+            use_quantile_norm = True,
+            filter_n = 8,
+            filter_partial = True,
             shuffle_buffer_size = 50_000,
             mask_boundary_actions = False,
             prompt_mode = "subtask",
