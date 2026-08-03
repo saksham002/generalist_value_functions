@@ -514,6 +514,23 @@ W&B group conventions:
 - `Value Functions` — value function pre-training runs
 - `Fine-Tuned Value Functions` — value function fine-tuning runs (i.e., when `--fine-tune <name>` is set)
 
+#### Launching on a PREEMPTIBLE (spot) pod
+
+**CRITICAL**: when the target pod is preemptible/spot, always launch via `scripts/launch_preemptible.sh` — never call `run_on_tpu.py` directly. `run_on_tpu.py` is a one-shot launch: nothing restarts training after a preemption, and its `monitor_job` can report a false `Job failed with exit code None` while the run is actually healthy. The watchdog re-derives state from the pod every `--interval` seconds, keeps the spot-pod creator job alive, relaunches on an idle pod, and exits 0 once `--final-checkpoint` commits.
+
+```bash
+sbatch scripts/launch_preemptible.sh \
+    --pod v5e-saksham-spot-64-0 \
+    --zone europe-west4-a \
+    --tpu-type v5e-64 \
+    --creator-script random/create_spot_pod_until_ready.sbatch \
+    --creator-name spot_pod_creator \
+    --final-checkpoint gs://saksham-euw4/checkpoints/robocoin/pi05_finetune/<config>/<exp>/70000 \
+    --command "python scripts/train.py <config> --resume --batch-size=256 ..."
+```
+
+Safe to submit while a run is already going: it sees the running job and does nothing until the pod goes idle.
+
 #### TPU job logs
 Jobs launched via `run_on_tpu.py` write output to `~/tpu_job_output.log` on each worker. The exit code is written to `~/tpu_job_exit_code`. To check logs:
 ```bash

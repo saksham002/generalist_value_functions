@@ -33,15 +33,15 @@ class TPUConfigWithType(TPUConfig):
 
 TPU_CONFIGS: dict[str, TPUConfig] = {
     "v6e": TPUConfig(
-        zone="us-central1-b",
+        zone="europe-west4-a",
         project="cmu-aidm-v2",
         is_spot=True,
         runtime_version="v2-alpha-tpuv6e",
-        nfs_server="10.4.84.2:/nfs_us_central1_b",
+        nfs_server="10.155.154.42:/europe",
         nfs_mount_path="/nfs/aidm_nfs",
     ),
     "v5e": TPUConfig(
-        zone="europe-west4-b",
+        zone="europe-west4-a",
         project="cmu-aidm-v2",
         is_spot=False,
         runtime_version="v2-alpha-tpuv5-lite",
