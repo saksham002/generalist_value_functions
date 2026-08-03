@@ -44,6 +44,8 @@ import subprocess
 import time
 from typing import Annotated, Any
 
+import openpi.training.yam_eef as yam_eef
+
 from rlds_build_utils import get_rlds_episode_index
 from rlds_build_utils import get_total_episodes
 from rlds_build_utils import parse_partition_split
@@ -127,6 +129,14 @@ class CommonArgs:
 
     debug_metrics: bool = False
     """If True, compute extra normalized-space diagnostics such as sampling loss."""
+
+    convert_joint_actions_to_eef: bool = False
+    """Run YAM forward kinematics on the policy's absolute joint actions so the store
+    holds the 14D EEF layout (pos3+euler3+gripper per arm) the critic was pretrained on.
+    Only valid for joint-space YAM policies; the conversion is not invertible here."""
+
+    yam_fk_dir: str = yam_eef.DEFAULT_YAM_FK_DIR
+    """Directory holding yam_fk.py + vendor/yam_vendor_kin.xml (see --convert-joint-actions-to-eef)."""
 
     reverse: bool = False
     """If True, reverse shard processing order and skip metadata writes. Intended for running
@@ -1098,6 +1108,13 @@ def run_worker(args: WorkerArgs) -> None:
                             }
                         )
                     output_actions = transformed_outputs["actions"]
+                    if args.convert_joint_actions_to_eef:
+                        # Must run here: output_transform has already applied
+                        # Unnormalize + AbsoluteActions, so these are absolute joint
+                        # positions. FK on a delta or on normalized values is meaningless.
+                        output_actions = yam_eef.joint_actions_to_eef(
+                            output_actions, yam_fk_dir = args.yam_fk_dir,
+                        )
 
                     offset = 0
                     for request, n in batch_requests:
@@ -1298,6 +1315,8 @@ def run_launch(args: LaunchArgs) -> None:
         extra_worker_args += ["--rlds-data-dir", args.rlds_data_dir]
     if args.sampling_num_steps is not None:
         extra_worker_args += ["--sampling-num-steps", str(args.sampling_num_steps)]
+    if args.convert_joint_actions_to_eef:
+        extra_worker_args += ["--convert-joint-actions-to-eef", "--yam-fk-dir", args.yam_fk_dir]
 
     extra_args_str = " ".join(extra_worker_args)
 
