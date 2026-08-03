@@ -210,6 +210,15 @@ def main(
         )
         print("Overrode use_chunk_wise_delta=False for stats computation.")
 
+    # Stats are computed from state/actions only, never from counterfactual actions. Keeping
+    # the store attached would make this fail on a config whose store is still being built —
+    # which is the normal ordering, since caching consumes a policy trained on these stats.
+    if getattr(config.data, "counterfactual_action_store_dir", None) is not None:
+        config = dataclasses.replace(
+            config, data = dataclasses.replace(config.data, counterfactual_action_store_dir = None),
+        )
+        print("Overrode counterfactual_action_store_dir=None for stats computation.")
+
     data_config = config.data.create(config.assets_dirs, config.model)
 
     # Pull chunks at the config's effective action_horizon (after FineTune overrides)
@@ -236,14 +245,17 @@ def main(
         )
         output_id = data_config.repo_id
 
-    # Hard-coded for the 14D bimanual EEF-layout chunk-wise-delta action space
-    # (left xyz, left rpy, left gripper, right xyz, right rpy, right gripper).
-    # rpy_index_start covers both arms' rotation slots so they use relative-
-    # rotation composition; the mask keeps grippers absolute.
+    # 14D bimanual chunk-wise-delta action space; the mask keeps grippers absolute.
+    # The EEF layout (left xyz, left rpy, left gripper, right xyz, right rpy, right
+    # gripper) composes the two rpy blocks as relative rotations, whereas a joint
+    # layout is a plain subtraction — so mirror the data config's use_eef here,
+    # otherwise the stats describe a different delta than training consumes.
+    use_eef = getattr(config.data, "use_eef", True)
     action_diff_transform = transforms.DeltaActions(
         mask = transforms.make_bool_mask(6, -1, 6, -1),
-        rpy_index_start = (3, 10),
+        rpy_index_start = (3, 10) if use_eef else None,
     )
+    print(f"action_diff delta uses use_eef={use_eef}")
 
     state_stats = normalize.RunningStats()
     action_stats = normalize.RunningStats()  # populated only with action[0] -> (D,)

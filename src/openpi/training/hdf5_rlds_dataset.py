@@ -242,7 +242,7 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
                 True,
                 message = "use_eef=True requires raw action of dim 14 or 16",
             )
-            actions = self._construct_eef_repr(raw_action, eef_action)
+            actions = self.construct_eef_repr(raw_action, eef_action)
             state = self._construct_eef_state(raw_state, eef_state)
         else:
             actions = tf.cast(traj["action"], tf.float32)
@@ -380,7 +380,7 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
         return out
 
     @staticmethod
-    def _construct_eef_repr(data, eef_data):
+    def construct_eef_repr(data, eef_data):
         """Construct 14D EEF representation from 12D EEF pose and two gripper slots of `data`.
 
         EEF pose is always laid out as [left_xyz(3), left_rpy(3), right_xyz(3), right_rpy(3)].
@@ -411,7 +411,7 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
     @staticmethod
     def _construct_eef_state(state, eef_state):
         """Compatibility alias for the 14D EEF representation helper."""
-        return Hdf5RldsDataset._construct_eef_repr(state, eef_state)
+        return Hdf5RldsDataset.construct_eef_repr(state, eef_state)
 
     @staticmethod
     def _extract_embodiment(repo_id):

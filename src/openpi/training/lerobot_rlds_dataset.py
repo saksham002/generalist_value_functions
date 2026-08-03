@@ -1,11 +1,19 @@
 """RLDS data loader for LeRobot-built real-world datasets (e.g. ``realworld_xarm_packing``).
 
 Sibling of ``Hdf5RldsDataset`` for datasets exported by the LeRobot RLDS builder.
-Unlike the HDF5 schema, here ``observation/state`` and ``action`` are already 14D
-EEF (``pos3 + euler3 + gripper`` per arm, no separate ``eef_sim_pose_*`` fields to
-reconstruct), the subtask annotation is a single per-step ``subtask`` string, and
-every demo is an expert/complete trajectory (no ``reward`` field, no ``is_partial``
-heuristic, no ``has_subtask_annotations``).
+Unlike the HDF5 schema, here ``observation/state`` and ``action`` are usually already
+14D EEF (``pos3 + euler3 + gripper`` per arm, no separate ``eef_sim_pose_*`` fields to
+reconstruct); joint-space datasets (e.g. ``lego``) are the exception and do ship 12D
+``eef_sim_pose_action`` / ``eef_sim_pose_state``, which ``use_eef=True`` splices with
+the joint grippers to rebuild the 14D EEF layout. The subtask annotation is a single
+per-step ``subtask`` string, and every demo is an expert/complete trajectory (no
+``reward`` field, no ``is_partial`` heuristic, no ``has_subtask_annotations``).
+
+Datasets that do carry partial demos annotate them per SUBTASK: ``episode_metadata``
+holds a ``subtask_is_partial`` bool array of length ``num_subtasks``. Setting
+``filter_partial=True`` marks every step of a partial subtask and drops that
+subtask's trailing ``td_n`` (or ``action_chunk_size`` when ``td_n`` is None) steps,
+independently of ``critic_mode``.
 
 Supports both behavior cloning (``critic_mode=False``) and value-function training
 (``critic_mode=True``). In critic mode the next-step gathers, action masks and
@@ -18,6 +26,7 @@ from collections.abc import Sequence
 import logging
 from typing import Any, Literal
 
+import openpi.training.hdf5_rlds_dataset as hdf5_rlds_dataset
 import openpi.training.rlds_dataset as rlds_dataset
 
 PromptMode = Literal["subtask", "task_description", "task_description_predict_current_subtask"]
@@ -43,8 +52,10 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
         discount: float = 0.99,
         reward_scale: float = 1.0,
         reward_bias: float = 0.0,
+        use_eef: bool = False,
         td_n: int | None = None,
         filter_n: int | None = None,
+        filter_partial: bool = False,
         mask_boundary_actions: bool = True,
         prompt_mode: PromptMode = "subtask",
         subsample: bool = False,
@@ -68,14 +79,17 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
         )
 
         self._split = split
+        self._use_eef = use_eef
         self._td_n = td_n
         self._filter_n = filter_n
+        self._filter_partial = filter_partial
         self._mask_boundary_actions = mask_boundary_actions
         self._prompt_mode = prompt_mode
         self._subsample = subsample
         self._counterfactual_action_dim_offset = counterfactual_action_dim_offset
         logging.info(
-            f"LeRobotRldsDataset: critic_mode={critic_mode}, td_n={td_n}, filter_n={filter_n}, "
+            f"LeRobotRldsDataset: critic_mode={critic_mode}, use_eef={use_eef}, td_n={td_n}, "
+            f"filter_n={filter_n}, filter_partial={filter_partial}, "
             f"mask_boundary_actions={mask_boundary_actions}, prompt_mode={prompt_mode}, subsample={subsample}"
         )
 
@@ -115,6 +129,27 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
 
         actions = tf.cast(traj["action"], tf.float32)
         state = tf.cast(traj["observation/state"], tf.float32)
+
+        # Most LeRobot datasets are already 14D EEF, so `action` / `observation/state` are
+        # used as-is. Joint-space ones (e.g. lego) additionally ship 12D `eef_sim_pose_*`,
+        # from which the 14D EEF layout is rebuilt by splicing in the two gripper slots —
+        # the same construction Hdf5RldsDataset uses. Keyed on field presence rather than
+        # on use_eef alone so that use_eef=True stays correct for both schemas; `traj` is a
+        # plain dict at trace time, so this costs nothing at runtime.
+        has_eef_pose = "eef_sim_pose_action" in traj or "eef_sim_pose_state" in traj
+        if self._use_eef and has_eef_pose:
+            if "eef_sim_pose_action" not in traj or "eef_sim_pose_state" not in traj:
+                raise ValueError(
+                    "use_eef=True needs both eef_sim_pose_action and eef_sim_pose_state; "
+                    "found only one, which would pair an EEF action with a joint state."
+                )
+            actions = hdf5_rlds_dataset.Hdf5RldsDataset.construct_eef_repr(
+                actions, tf.cast(traj["eef_sim_pose_action"], tf.float32)
+            )
+            state = hdf5_rlds_dataset.Hdf5RldsDataset.construct_eef_repr(
+                state, tf.cast(traj["eef_sim_pose_state"], tf.float32)
+            )
+
         tf.debugging.assert_equal(
             tf.shape(state)[-1], 14, message="LeRobotRldsDataset requires 14D observation/state",
         )
@@ -154,6 +189,29 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
             # Mirrors Hdf5RldsDataset.
             "repo_id": traj["traj_metadata"]["episode_metadata"]["repo_id"],
         }
+
+        # Partiality is per-SUBTASK here, not per-episode: episode_metadata carries a
+        # `subtask_is_partial` bool array of length num_subtasks, so every step of a
+        # partial subtask is marked via its `subtask_index`. Unlike Hdf5RldsDataset
+        # there is no heuristic to infer it.
+        if self._filter_partial:
+            episode_metadata = traj["traj_metadata"]["episode_metadata"]
+            if "subtask_is_partial" not in episode_metadata:
+                raise ValueError(
+                    "filter_partial=True requires episode_metadata/subtask_is_partial, "
+                    "which this dataset does not provide."
+                )
+            if "subtask_index" not in traj:
+                raise ValueError("filter_partial=True requires a per-step subtask_index.")
+            # dlimp broadcasts SCALAR episode_metadata (e.g. fps) to [T], but leaves a
+            # variable-length array like this one as [num_subtasks] — so index it by
+            # subtask_index directly rather than taking a per-step row.
+            subtask_is_partial = tf.cast(episode_metadata["subtask_is_partial"], tf.bool)
+            tf.debugging.assert_rank(
+                subtask_is_partial, 1,
+                message="expected subtask_is_partial of shape [num_subtasks]",
+            )
+            result["is_partial"] = tf.gather(subtask_is_partial, tf.cast(traj["subtask_index"], tf.int32))
 
         # Per-step passthrough used by validation caching (cache_val_episodes sorts
         # frames by _frame_index and keys trajectories by repo_index). Guarded so
@@ -215,6 +273,19 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
         ep_meta["fps"] = tf.fill(tf.shape(ep_meta["fps"]), tf.cast(30, ep_meta["fps"].dtype))
 
         return out
+
+    def _partial_tail_window(self, fps):
+        """Native-step window dropped from the end of every partial subtask.
+
+        Mirrors Hdf5RldsDataset's is_partial tail filter, but keyed on the subtask
+        rather than the episode, and applied regardless of critic_mode: with td_n set
+        the window is td_n (the bootstrap span), otherwise it is the action horizon.
+        Both are in 60 Hz units, so fps=30 halves them.
+        """
+        import tensorflow as tf
+
+        span = self._td_n if self._td_n is not None else self._action_chunk_size
+        return tf.where(tf.equal(fps, 30), span // 2, span)
 
     def _compute_next_indices(self, traj_len, fps):
         import tensorflow as tf
@@ -415,6 +486,12 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
             fps = tf.cast(traj["fps"], tf.int32)
             filter_n_native = tf.where(tf.equal(fps, 30), self._filter_n // 2, self._filter_n)
             mask = tf.logical_and(mask, traj["steps_to_subtask_end"] >= filter_n_native)
+        # Drop the tail of every partial subtask: those steps have no terminal anchor
+        # (no successful subtask end to bootstrap toward or imitate).
+        if self._filter_partial:
+            window = self._partial_tail_window(tf.cast(traj["fps"], tf.int32))
+            tail = traj["steps_to_subtask_end"] < window
+            mask = tf.logical_and(mask, tf.logical_not(tf.logical_and(tail, traj["is_partial"])))
         return tf.nest.map_structure(lambda x: tf.boolean_mask(x, mask), traj)
 
     def frame_filter(self, frame: dict) -> bool:
@@ -426,4 +503,9 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
             fps = tf.cast(frame["fps"], tf.int32)
             filter_n_native = tf.where(tf.equal(fps, 30), self._filter_n // 2, self._filter_n)
             keep = tf.logical_and(keep, frame["steps_to_subtask_end"] >= filter_n_native)
+        # Mirror _apply_frame_transforms_to_trajectory.
+        if self._filter_partial:
+            window = self._partial_tail_window(tf.cast(frame["fps"], tf.int32))
+            tail = frame["steps_to_subtask_end"] < window
+            keep = tf.logical_and(keep, tf.logical_not(tf.logical_and(tail, frame["is_partial"])))
         return keep

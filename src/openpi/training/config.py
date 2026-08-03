@@ -1534,11 +1534,13 @@ class LeRobotRldsDataConfig(DataConfigFactory):
     use_chunk_wise_delta: bool = False
     # Semantics of the 14D action/state vector, which decide how use_chunk_wise_delta
     # builds its targets. Both layouts are 2 arms x (6 dims + 1 gripper):
-    #   "eef":   dims 3:6 / 10:13 are extrinsic-xyz euler angles, so the delta is a
-    #            relative rotation (R_action @ R_state.inv()), not a subtraction.
-    #   "joint": every masked dim is a joint position, so the delta is a plain
-    #            elementwise subtraction and the rotation branch must stay off.
-    action_space: Literal["eef", "joint"] = "eef"
+    #   True:  dims 3:6 / 10:13 are extrinsic-xyz euler angles, so the delta is a
+    #          relative rotation (R_action @ R_state.inv()), not a subtraction.
+    #   False: every masked dim is a joint position, so the delta is a plain
+    #          elementwise subtraction and the rotation branch must stay off.
+    # Also selects the action/state source in the loader, but only for datasets that
+    # ship eef_sim_pose_*; EEF-native ones are unaffected and pass through as-is.
+    use_eef: bool = False
     filter_n: int | None = None
     # Requires episode_metadata/subtask_is_partial; drops the trailing td_n (or
     # action_horizon when td_n is None) steps of every partial subtask.
@@ -1659,7 +1661,7 @@ class LeRobotRldsDataConfig(DataConfigFactory):
             assert action_dim == 14, f"LeRobotRldsDataConfig expects 14D actions, got {action_dim}"
             # Same mask for both layouts: 6 delta dims + 1 absolute gripper per arm.
             delta_mask = _transforms.make_bool_mask(6, -1, 6, -1)
-            rpy_index_start = (3, 10) if self.action_space == "eef" else None
+            rpy_index_start = (3, 10) if self.use_eef else None
             data_transforms_inputs.append(
                 _transforms.DeltaActions(mask = delta_mask, rpy_index_start = rpy_index_start)
             )
@@ -1687,6 +1689,7 @@ class LeRobotRldsDataConfig(DataConfigFactory):
             clip_normalized_bounds = self._create_clip_normalized_bounds(),
             counterfactual_action_store_dir = self.counterfactual_action_store_dir,
             rlds_kwargs = {
+                "use_eef": self.use_eef,
                 "td_n": self.td_n,
                 "filter_n": self.filter_n,
                 "filter_partial": self.filter_partial,
@@ -4686,6 +4689,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
     FineTuneConfig(
         name = "realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar",
         data_factory = LeRobotRldsDataConfig(
+            use_eef = True,
             repo_id = "realworld_xarm_packing",
             rlds_data_dir = "gs://saksham-usc2/datasets",
             datasets = (
@@ -4743,6 +4747,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
     FineTuneConfig(
         name = "realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar_n32",
         data_factory = LeRobotRldsDataConfig(
+            use_eef = True,
             repo_id = "realworld_xarm_packing",
             rlds_data_dir = "gs://saksham-usc2/datasets",
             datasets = (
@@ -4800,6 +4805,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
     FineTuneConfig(
         name = "sim_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar",
         data_factory = LeRobotRldsDataConfig(
+            use_eef = True,
             repo_id = "sim_xarm_packing",
             rlds_data_dir = "gs://saksham-euw4/datasets",
             datasets = (
@@ -4850,6 +4856,65 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         ),
         num_val_trajectories = 3,
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/sim_xarm_packing/validation_cache_dir_sim_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar/",
+        include_repos = (),
+    ),
+    # lego twin of the packing subtask_ar fine-tunes. The lego policy trains in joint
+    # space, but the subtask_ar base critic was pretrained on the 14D EEF layout, so
+    # use_eef=True rebuilds actions/state from the dataset's eef_sim_pose_* fields and
+    # switches the chunk-wise delta back to relative-rotation composition. The CF store
+    # matches: it was cached with --convert-joint-actions-to-eef. Its norm stats are a
+    # separate asset_id from the policy's joint-space stats, which must not be clobbered.
+    FineTuneConfig(
+        name = "lego_paligemma_cql_rlds_finetune_subtask_ar",
+        data_factory = LeRobotRldsDataConfig(
+            use_eef = True,
+            repo_id = "lego",
+            rlds_data_dir = "gs://saksham-euw4/datasets",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "lego", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/datasets/lego",
+                asset_id = "norm_stats_eef",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            filter_partial = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/lego_pi05_subtask/",
+            max_token_len = 160,
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        model_overrides = {
+            "action_horizon": 60,
+            "q_network_config": _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                max_token_len = 160,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = True,
+            ),
+        },
+        policy_overrides = {
+            "action_horizon": 60,
+        },
+        action_horizon = 60,
+        num_train_steps = 20_000,
+        save_interval = 10_000,
+        plot_interval = 10_000,
+        keep_period = 10_000,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
+        ),
+        num_val_trajectories = 3,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/lego/validation_cache_dir_lego_paligemma_cql_rlds_finetune_subtask_ar/",
         include_repos = (),
     ),
     # sim_bimanual_assembly twin of real_shirt_hang_paligemma_cql_rlds_finetune_subtask_ar_final:
@@ -6466,81 +6531,6 @@ _CONFIGS = [
         include_repos = ("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_cql_rlds_subtask_ar/",
     ),
-    # Copy of robocoin_bimanual_paligemma_cql_rlds with
-    # predict_subtask_ar=True and variable_horizon=True.
-    # save_interval is 25k; the validation cache is shared with
-    # robocoin_bimanual_paligemma_cql_rlds_subtask_ar (cached val episodes hold
-    # obs/action/mc_return, which neither flag changes).
-    TrainConfig(
-        name = "robocoin_bimanual_paligemma_cql_rlds_variable_horizon_subtask_ar",
-        model = _value_function.CQLValueFunctionConfig(
-            q_network_config = _paligemma_network.PaliGemmaNetworkConfig(
-                state_dim = 14,
-                num_cameras = 3,
-                image_size = (224, 224),
-                max_token_len = 96,
-                action_dim = 14,
-                dtype = "float32",
-                no_state = True,
-                predict_subtask_ar = True,
-            ),
-            q_head_config = _heads.RegressionHeadConfig(),
-            next_token_loss_weight = 0.1,
-            action_horizon = 50,
-            discount = 0.999,
-            tau = 0.005,
-            action_bounds = ActionBounds.from_uniform(-1.25, 1.25, action_dim = 14, is_normalized = True),
-            cql_alpha = 0.0,
-        ),
-        policy = _best_of_n.BestOfNWrapperConfig(
-            action_dim = 14,
-            action_horizon = 50,
-            base_model_config = None,
-            num_samples = 8,
-            use_target_value = True,
-        ),
-        policy_extraction = _policy_extraction.NoopPolicyConfig(),
-        weight_loader = weight_loaders.PaliGemmaWeightLoader(),
-        data = RoboCoinRldsDataConfig(
-            rlds_data_dir = "gs://saksham-euw4/robocoin_bimanual",
-            assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/robocoin_bimanual/norm_stats",
-                asset_id = "embodiment_wise",
-            ),
-            datasets = (rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
-            discount = 0.999,
-            td_n = 50,
-            use_eef = True,
-            use_chunk_wise_delta = True,
-            use_quantile_norm = True,
-            shuffle_buffer_size = 50_000,
-            mask_boundary_actions = False,
-            replace_boundary_actions = False,
-            variable_horizon = True,
-            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/robocoin_bimanual_pi05_rlds",
-            state_dim = 14,
-            max_token_len = 96,
-            subtask_prompt_mode = "task_description_predict_current_subtask",
-        ),
-        num_train_steps = 230_000,
-        batch_size = 256,
-        lr_schedule = _optimizer.CosineDecaySchedule(
-            warmup_steps = 1000,
-            peak_lr = 1e-5,
-            decay_steps = 230_000,
-            decay_lr = 1e-6,
-        ),
-        optimizer = _optimizer.AdamW(weight_decay = 1e-6),
-        num_workers = 0,
-        log_interval = 100,
-        plot_interval = 50_000,
-        save_interval = 25_000,
-        fsdp_devices = 16,
-        action_horizon = 50,
-        num_val_trajectories = 10,
-        include_repos = ("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
-        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_cql_rlds_subtask_ar/",
-    ),
     # Copy of robocoin_bimanual_paligemma_cql_rlds_variable_horizon_subtask_ar with lower_action_horizon=25.
     TrainConfig(
         name = "robocoin_bimanual_paligemma_cql_rlds_variable_horizon_subtask_ar_lb25",
@@ -7963,6 +7953,7 @@ _CONFIGS = [
             dtype = "float32",
         ),
         data = LeRobotRldsDataConfig(
+            use_eef = True,
             rlds_data_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
             datasets = (rlds_dataset.RLDSDataset(name = "realworld_xarm_packing", version = "1.0.0", weight = 1.0),),
             assets = AssetsConfig(
@@ -8011,6 +8002,7 @@ _CONFIGS = [
             dtype = "float32",
         ),
         data = LeRobotRldsDataConfig(
+            use_eef = True,
             # Rebuilt (baseline + adversarial) dataset lives in saksham-usc2 so the
             # v4-64-0 (us-central2) training run avoids a cross-region read; the
             # local source of truth is /data/group_data/rl/saksham3/datasets.
@@ -8064,6 +8056,7 @@ _CONFIGS = [
             dtype = "float32",
         ),
         data = LeRobotRldsDataConfig(
+            use_eef = True,
             rlds_data_dir = "gs://saksham-euw4/datasets",
             datasets = (rlds_dataset.RLDSDataset(name = "sim_xarm_packing", version = "1.0.0", weight = 1.0),),
             # Mirrored in saksham-usc2 so v4 (us-central2) serving avoids a
@@ -8127,13 +8120,67 @@ _CONFIGS = [
                 asset_id = "norm_stats",
             ),
             use_chunk_wise_delta = True,
-            action_space = "joint",
+            use_eef = False,
             use_quantile_norm = True,
             filter_n = 8,
             filter_partial = True,
             shuffle_buffer_size = 50_000,
             mask_boundary_actions = False,
             prompt_mode = "subtask",
+        ),
+        weight_loader = weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps = 70_000,
+        batch_size = 256,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 5e-5,
+            decay_steps = 70_000,
+            decay_lr = 5e-6,
+        ),
+        optimizer = _optimizer.AdamW(),
+        num_workers = 0,
+        log_interval = 100,
+        save_interval = 5_000,
+        keep_period = 25_000,
+        fsdp_devices = 16,
+        action_horizon = 60,
+    ),
+    # Identical to above except the prompt is the full task description
+    # instead of the current subtask, and the data/assets are read from the euw4
+    # mirror (identical contents to the usc2 copy the subtask config points at).
+    TrainConfig(
+        name = "lego_pi05_task",
+        model = pi0_config.Pi0Config(
+            paligemma_variant = "gemma_2b",
+            action_expert_variant = "gemma_300m",
+            action_dim = 32,
+            action_horizon = 60,
+            max_token_len = 160,
+            pi05 = True,
+            discrete_state_input = True,
+            # Real 14D joint values occupy dims 0:14 (the packing configs use 14:28).
+            # PadStatesAndActions takes the insertion offset from the mask's first True.
+            action_dim_offset = 0,
+            action_dim_mask = (True,) * 14 + (False,) * 18,
+            pad_state_to_action_dim = False,
+            dtype = "float32",
+        ),
+        data = LeRobotRldsDataConfig(
+            repo_id = "lego",
+            rlds_data_dir = "gs://saksham-euw4/datasets",
+            datasets = (rlds_dataset.RLDSDataset(name = "lego", version = "1.0.0", weight = 1.0),),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/datasets/lego",
+                asset_id = "norm_stats",
+            ),
+            use_chunk_wise_delta = True,
+            use_eef = False,
+            use_quantile_norm = True,
+            filter_n = 8,
+            filter_partial = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            prompt_mode = "task_description",
         ),
         weight_loader = weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps = 70_000,
