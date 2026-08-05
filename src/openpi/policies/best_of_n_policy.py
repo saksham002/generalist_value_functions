@@ -697,6 +697,19 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             critic_use_chunk_wise_delta = critic_kwargs["use_chunk_wise_delta"]
             critic_subsample = critic_kwargs["subsample"]
 
+            # A joint-space policy scored by an EEF critic (e.g. lego_pi05_subtask vs
+            # lego_paligemma_cql_rlds_finetune_subtask_ar) needs its candidates carried
+            # through forward kinematics before the critic sees them; the wrapper does
+            # this in-graph. The reverse has no inverse-kinematics path.
+            policy_use_eef = getattr(config.data, "use_eef", False)
+            critic_use_eef = getattr(critic_config.data, "use_eef", False)
+            if policy_use_eef and not critic_use_eef:
+                raise ValueError(
+                    "Policy is EEF-space but the critic is joint-space; there is no "
+                    "inverse-kinematics path to convert candidates for scoring."
+                )
+            convert_policy_actions_to_eef = critic_use_eef and not policy_use_eef
+
             resolved_offset = (
                 critic_action_dim_offset if critic_action_dim_offset is not None else self._action_dim_offset
             )
@@ -710,8 +723,15 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 f"policy_action_horizon={policy_action_horizon}, "
                 f"critic_action_horizon={critic_action_horizon}, "
                 f"policy_use_chunk_wise_delta={policy_use_chunk_wise_delta}, "
-                f"critic_use_chunk_wise_delta={critic_use_chunk_wise_delta})"
+                f"critic_use_chunk_wise_delta={critic_use_chunk_wise_delta}, "
+                f"convert_policy_actions_to_eef={convert_policy_actions_to_eef})"
             )
+            if convert_policy_actions_to_eef:
+                logger.info(
+                    "Joint-space policy + EEF critic: candidates are converted via YAM "
+                    "forward kinematics before scoring. Executed actions stay joint-space, "
+                    "so the logged acs is a joint-space similarity."
+                )
             wrapper_critic_kwargs = {
                 "use_quantile_norm": critic_kwargs["use_quantile_norm"],
                 "subsample": critic_subsample,
@@ -736,6 +756,8 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 critic_kwargs = wrapper_critic_kwargs,
                 inject_noise = self._inject_noise,
                 noise_level = self._noise_level,
+                convert_policy_actions_to_eef = convert_policy_actions_to_eef,
+                policy_use_quantile_norm = data_config.use_quantile_norm,
             )
             if self._inject_noise:
                 logger.info(

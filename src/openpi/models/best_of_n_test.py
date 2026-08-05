@@ -500,3 +500,202 @@ def test_best_of_n_uses_target_prefix_cache_when_configured():
     model.sample_actions(rng, transition, value_function = vf)
 
     assert vf.last_use_target is True
+
+
+@dataclasses.dataclass
+class _RecordingValueFunction(_base_vf.BaseValueFunction):
+    """Captures the action chunk the critic is handed, so tests can assert on it."""
+
+    last_actions: at.Array | None = None
+
+    @override
+    def compute_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        **kwargs,
+    ) -> at.Array:
+        self.last_actions = action
+        return jnp.zeros((action.shape[0],))
+
+    @override
+    def compute_target_value(
+        self,
+        observation: _model.Observation,
+        action: _model.Actions | None = None,
+        **kwargs,
+    ) -> at.Array:
+        return self.compute_value(observation, action, **kwargs)
+
+    @override
+    def compute_loss(self, transition, *, train = False, rng = None, policy = None):
+        return jnp.zeros((1,)), {}
+
+
+def _make_eef_norm_stats(seed: int, action_horizon: int, action_dim: int, *, pad_from: int | None = None):
+    """Quantile norm stats: 2-D `(ah, ad)` for actions, 1-D `(ad,)` for state.
+
+    `pad_from` mirrors `_slice_action_diff_norm_stats`: rows at and beyond it are the
+    all-zero padding a subsampled critic carries, which `_sanitize_quantile_norm_stats`
+    later expands to (-1, 1).
+    """
+    import numpy as np
+
+    from openpi.shared.normalize import NormStats
+
+    rng = np.random.default_rng(seed)
+    q01 = rng.uniform(-2.0, -0.5, size = (action_horizon, action_dim))
+    q99 = rng.uniform(0.5, 2.0, size = (action_horizon, action_dim))
+    if pad_from is not None:
+        q01[pad_from:] = 0.0
+        q99[pad_from:] = 0.0
+    state_q01 = rng.uniform(-2.0, -0.5, size = (action_dim,))
+    state_q99 = rng.uniform(0.5, 2.0, size = (action_dim,))
+    return {
+        "actions": NormStats(mean = np.zeros_like(q01), std = np.ones_like(q01), q01 = q01, q99 = q99),
+        "state": NormStats(
+            mean = np.zeros_like(state_q01), std = np.ones_like(state_q01),
+            q01 = state_q01, q99 = state_q99,
+        ),
+    }
+
+
+def test_convert_policy_actions_to_eef_matches_host_transforms():
+    """The in-graph joint -> EEF conversion must match the offline numpy pipeline.
+
+    The lego counterfactual-action store was built with
+    `Unnormalize -> AbsoluteActions -> yam_eef.joint_actions_to_eef`; the critic then
+    consumes `DeltaActions(rpy_index_start=(3, 10)) -> Normalize`. This pins the
+    wrapper's traced version of that chain to the host-side transforms themselves.
+
+    The reference below subsamples before the EEF delta while the wrapper deltas the
+    full chunk, so agreement also pins the commutation the wrapper relies on.
+    """
+    import numpy as np
+
+    import openpi.training.yam_eef as yam_eef
+    import openpi.transforms as _transforms
+
+    action_horizon, action_dim, batch_size, num_samples = 60, 14, 2, 3
+    policy_norm_stats = _make_eef_norm_stats(86, action_horizon, action_dim)
+    critic_norm_stats = _make_eef_norm_stats(87, action_horizon, action_dim, pad_from = 30)
+
+    model = best_of_n.BestOfNWrapper(
+        action_dim = action_dim,
+        action_horizon = action_horizon,
+        max_token_len = 0,
+        base_model = None,
+        num_samples = num_samples,
+        take_min_over_ensemble = True,
+        use_target_value = False,
+        selection_mode = "argmax",
+        softmax_temperature = 1.0,
+        policy_norm_stats = policy_norm_stats,
+        critic_norm_stats = critic_norm_stats,
+        policy_use_chunk_wise_delta = True,
+        critic_use_chunk_wise_delta = True,
+        critic_kwargs = {
+            "use_quantile_norm": True,
+            "subsample": True,
+            "policy_subsample": False,
+            "action_dim_offset": 0,
+            "action_horizon": action_horizon,
+        },
+        convert_policy_actions_to_eef = True,
+        policy_use_quantile_norm = True,
+    )
+
+    rng = np.random.default_rng(86)
+    state = rng.uniform(-1.0, 1.0, size = (batch_size, action_dim)).astype(np.float32)
+    candidates = rng.uniform(-1.0, 1.0, size = (batch_size, num_samples, action_horizon, action_dim)).astype(np.float32)
+
+    obs = _model.Observation(images = {}, image_masks = {}, state = jnp.asarray(state))
+    transition = Transition(observation = obs, counterfactual_actions = jnp.asarray(candidates))
+    vf = _RecordingValueFunction()
+    model.sample_actions(jax.random.key(86), transition, value_function = vf)
+
+    # Host-side reference: exactly the transforms the offline pipeline composes.
+    mask = np.asarray(_transforms.make_bool_mask(6, -1, 6, -1))
+    unnormalized = _transforms.Unnormalize(policy_norm_stats, use_quantiles = True)(
+        {"actions": candidates, "state": state}
+    )
+    absolute = _transforms.AbsoluteActions(mask = mask, rpy_index_start = None)(
+        {"actions": unnormalized["actions"], "state": unnormalized["state"][:, None, :]}
+    )["actions"]
+    eef_actions = yam_eef.joint_actions_to_eef(absolute)[:, :, 1::2, :]
+    eef_state = yam_eef.joint_actions_to_eef(unnormalized["state"])
+    delta = _transforms.DeltaActions(mask = mask, rpy_index_start = (3, 10))(
+        {"actions": eef_actions, "state": eef_state[:, None, :]}
+    )["actions"]
+    padded = np.pad(delta, ((0, 0), (0, 0), (0, action_horizon - delta.shape[2]), (0, 0)))
+    expected = _transforms.Normalize(critic_norm_stats, use_quantiles = True)(
+        {"actions": padded, "state": eef_state}
+    )["actions"]
+    expected = np.clip(expected, -1.25, 1.25)
+
+    actual = np.asarray(vf.last_actions).reshape(batch_size, num_samples, action_horizon, action_dim)
+    np.testing.assert_allclose(actual, expected, atol = 1e-4)
+    # The zero padding must survive normalization as (near-)zero rather than
+    # collapsing to -1: that is what `_sanitize_quantile_norm_stats` buys us. The
+    # residual is the +1e-6 epsilon in the quantile formula.
+    np.testing.assert_allclose(actual[:, :, 30:, :], 0.0, atol = 1e-5)
+
+
+
+def test_convert_policy_actions_to_eef_runs_under_nnx_jit():
+    """The conversion must trace: the serve path runs `sample_actions` inside `nnx.jit`.
+
+    `Normalize` / `Unnormalize` are numpy-authored but only do dict plumbing plus
+    arithmetic against numpy constants, so they operate on tracers. This is what makes
+    reusing them (rather than reimplementing the normalization) sound; a test that only
+    ran eagerly would not catch a regression here.
+    """
+    import numpy as np
+    from flax import nnx
+
+    action_horizon, action_dim, batch_size, num_samples = 60, 14, 1, 2
+    model = best_of_n.BestOfNWrapper(
+        action_dim = action_dim,
+        action_horizon = action_horizon,
+        max_token_len = 0,
+        base_model = None,
+        num_samples = num_samples,
+        take_min_over_ensemble = True,
+        use_target_value = False,
+        selection_mode = "argmax",
+        softmax_temperature = 1.0,
+        policy_norm_stats = _make_eef_norm_stats(86, action_horizon, action_dim),
+        critic_norm_stats = _make_eef_norm_stats(87, action_horizon, action_dim, pad_from = 30),
+        policy_use_chunk_wise_delta = True,
+        critic_use_chunk_wise_delta = True,
+        critic_kwargs = {
+            "use_quantile_norm": True,
+            "subsample": True,
+            "policy_subsample": False,
+            "action_dim_offset": 0,
+            "action_horizon": action_horizon,
+        },
+        convert_policy_actions_to_eef = True,
+        policy_use_quantile_norm = True,
+    )
+
+    rng = np.random.default_rng(86)
+    obs = _model.Observation(
+        images = {}, image_masks = {},
+        state = jnp.asarray(rng.uniform(-1.0, 1.0, size = (batch_size, action_dim)).astype(np.float32)),
+    )
+    transition = Transition(
+        observation = obs,
+        counterfactual_actions = jnp.asarray(
+            rng.uniform(-1.0, 1.0, size = (batch_size, num_samples, action_horizon, action_dim)).astype(np.float32)
+        ),
+    )
+    vf = _MockValueFunction()
+
+    @nnx.jit
+    def sample(bon, value_function, key, trans):
+        return bon.sample_actions(key, trans, value_function = value_function)
+
+    _, q_values = sample(model, vf, jax.random.key(86), transition)
+    assert q_values.shape == (batch_size, num_samples)
+    assert bool(jnp.all(jnp.isfinite(q_values)))

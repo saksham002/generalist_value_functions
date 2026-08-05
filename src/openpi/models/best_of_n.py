@@ -17,14 +17,23 @@ import numpy as np
 from typing_extensions import override
 
 from openpi.models import model as _model
+from openpi.models import yam_eef_jax as _yam_eef_jax
 from openpi.shared import array_typing as at
 from openpi.shared.normalize import NormStats
+from openpi.training import yam_eef as _yam_eef
+import openpi.transforms as _transforms
 
 # Set OPENPI_DEBUG=1 in the environment to enable observation/action-stat logging
 # during `BestOfNWrapper.sample_actions` and the policy-only path in
 # `BestOfNPolicy._run_jit_inference`. Read once at module import.
 _DEBUG: bool = os.environ.get("OPENPI_DEBUG", "0") == "1"
 from openpi.value_functions import base_value_functions as _base_vf
+
+# Chunk-wise-delta layout shared by the joint and EEF sides of the YAM bimanual
+# 14D vector: 6 delta dims + 1 absolute gripper per arm. Only the EEF side carries
+# rotations, at dims 3:6 and 10:13. Mirrors `LeRobotRldsDataConfig.create`.
+_JOINT_DELTA_MASK = np.asarray(_transforms.make_bool_mask(6, -1, 6, -1))
+_EEF_RPY_INDEX_START = (3, 10)
 
 
 def _log_model_inputs(
@@ -149,6 +158,12 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
     # Temperature for softmax selection (only used when selection_mode="softmax").
     softmax_temperature: float = 1.0
 
+    # Joint-space policy scored by an EEF critic: convert the candidates into the
+    # critic's 14D EEF space before scoring. See `BestOfNWrapper.__init__`.
+    convert_policy_actions_to_eef: bool = False
+    policy_use_quantile_norm: bool = False
+    yam_fk_dir: str = _yam_eef.DEFAULT_YAM_FK_DIR
+
     def __post_init__(self):
         if self.base_model_config is not None:
             # Sync inherited fields from base_model_config (frozen dataclass requires object.__setattr__).
@@ -188,6 +203,9 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
             policy_use_chunk_wise_delta=self.policy_use_chunk_wise_delta,
             critic_use_chunk_wise_delta=self.critic_use_chunk_wise_delta,
             critic_kwargs=self.critic_kwargs,
+            convert_policy_actions_to_eef=self.convert_policy_actions_to_eef,
+            policy_use_quantile_norm=self.policy_use_quantile_norm,
+            yam_fk_dir=self.yam_fk_dir,
         )
 
     @override
@@ -230,6 +248,9 @@ class BestOfNWrapper(_model.BaseModel):
     policy_subsample: bool
     critic_action_dim_offset: int | None
     critic_action_horizon: int | None
+    convert_policy_actions_to_eef: bool
+    policy_use_quantile_norm: bool
+    yam_fk_dir: str
 
     def __init__(
         self,
@@ -250,6 +271,9 @@ class BestOfNWrapper(_model.BaseModel):
         critic_kwargs: dict | None = None,
         inject_noise: bool = False,
         noise_level: float = 0.0,
+        convert_policy_actions_to_eef: bool = False,
+        policy_use_quantile_norm: bool = False,
+        yam_fk_dir: str = _yam_eef.DEFAULT_YAM_FK_DIR,
     ):
         super().__init__(action_dim, action_horizon, max_token_len)
         self.base_model = base_model
@@ -264,6 +288,9 @@ class BestOfNWrapper(_model.BaseModel):
         self.critic_use_chunk_wise_delta = critic_use_chunk_wise_delta
         self.inject_noise = inject_noise
         self.noise_level = noise_level
+        self.convert_policy_actions_to_eef = convert_policy_actions_to_eef
+        self.policy_use_quantile_norm = policy_use_quantile_norm
+        self.yam_fk_dir = yam_fk_dir
         ck = critic_kwargs or {}
         self.critic_use_quantile_norm = ck.get("use_quantile_norm", False)
         self.critic_subsample = ck.get("subsample", False)
@@ -284,7 +311,27 @@ class BestOfNWrapper(_model.BaseModel):
             raise ValueError(
                 "policy_norm_stats and critic_norm_stats must both be provided or both be None."
             )
-        if policy_norm_stats is not None:
+        # Joint-space policy + EEF critic. The candidates are carried into the
+        # critic's space inside `sample_actions` (unnormalize -> absolute -> FK ->
+        # EEF delta -> renormalize), so the two sides deliberately reference
+        # different norm-stat assets and the equality guard below does not apply.
+        # `Normalize` / `Unnormalize` are pure arithmetic over dict leaves, so the
+        # same transforms the host-side pipeline uses run on traced arrays. Only the
+        # stats they need are stored: a frozen-dataclass transform object held as an
+        # nnx attribute would be hashed as static graphdef and its dict field is
+        # unhashable, so the transforms are constructed at trace time instead.
+        self._conversion_stats = None
+        if convert_policy_actions_to_eef:
+            if policy_norm_stats is None:
+                raise ValueError(
+                    "convert_policy_actions_to_eef=True requires policy_norm_stats and "
+                    "critic_norm_stats (the conversion runs through both)."
+                )
+            self._conversion_stats = {
+                "policy": {k: policy_norm_stats[k] for k in ("state", "actions")},
+                "critic": {k: critic_norm_stats[k] for k in ("state", "actions")},
+            }
+        elif policy_norm_stats is not None:
             # Only the core transition keys must match between policy and critic
             # norm stats; extra keys (e.g. 'action_diff', which a chunk-wise-delta
             # critic carries but a non-delta policy does not) are ignored for both
@@ -352,6 +399,46 @@ class BestOfNWrapper(_model.BaseModel):
         self.critic_action_horizon = critic_action_horizon
         if action_horizon == 60 and critic_action_horizon == 60:
             assert self.critic_subsample, "(60, 60) regime requires critic_subsample=True"
+        if convert_policy_actions_to_eef and not (
+            policy_use_chunk_wise_delta and critic_use_chunk_wise_delta
+        ):
+            raise ValueError(
+                "convert_policy_actions_to_eef=True is only implemented for chunk-wise-delta "
+                "policies and critics (the conversion undoes the joint delta and re-applies "
+                "it in EEF space). Got "
+                f"policy_use_chunk_wise_delta={policy_use_chunk_wise_delta}, "
+                f"critic_use_chunk_wise_delta={critic_use_chunk_wise_delta}."
+            )
+
+    def _to_eef(self, actions: at.Array, state_joint: at.Array) -> tuple[at.Array, at.Array]:
+        """Carry normalized joint candidates into the critic's unnormalized EEF delta space.
+
+        `actions` is [B, N, ah, 14] in the policy's normalized chunk-wise-delta space and
+        `state_joint` is [B, 14] normalized. Undoes the joint delta, runs forward
+        kinematics, and re-applies the delta in EEF space (where rotations compose as
+        `R_action @ R_state.inv()`). Returns the EEF-delta actions alongside the absolute
+        EEF state, which the caller still needs to normalize for the critic observation.
+
+        Both delta steps are elementwise over the chunk axis, so this commutes with the
+        caller's stride-2 subsample and can run on the full chunk.
+        """
+        unnormalize = _transforms.Unnormalize(
+            self._conversion_stats["policy"], use_quantiles = self.policy_use_quantile_norm,
+        )
+        unnormalized = unnormalize({"actions": actions, "state": state_joint})
+        absolute_joint = _yam_eef_jax.apply_absolute(
+            unnormalized["actions"],
+            unnormalized["state"][:, None, :],
+            _JOINT_DELTA_MASK,
+            None,
+        )
+        origins, axes = _yam_eef_jax.chain_constants(self.yam_fk_dir)
+        absolute_eef = _yam_eef_jax.joint_to_eef(absolute_joint, origins, axes)
+        state_eef = _yam_eef_jax.joint_to_eef(unnormalized["state"], origins, axes)
+        delta_eef = _yam_eef_jax.apply_delta(
+            absolute_eef, state_eef[:, None, :], _JOINT_DELTA_MASK, _EEF_RPY_INDEX_START,
+        )
+        return delta_eef, state_eef
 
     def _get_cached_actions(
         self,
@@ -554,11 +641,20 @@ class BestOfNWrapper(_model.BaseModel):
                     f"[debug] policy raw_actions shape={all_actions.shape} sample0={{v}}",
                     v = all_actions[0, 0],
                 )
-            # Clip into the critic's training range for CRITIC SCORING ONLY —
-            # `all_actions` (what we return for execution) stays at the raw
-            # policy output. Cached counterfactuals are pre-clipped at load time.
-            clip_bound = 1.25 if self.critic_use_quantile_norm else 5.0
-            eval_actions = jnp.clip(all_actions, -clip_bound, clip_bound)
+            if self.convert_policy_actions_to_eef:
+                # No clip here: the candidates are still in the policy's joint space,
+                # and the clip that matters is the one applied after the conversion,
+                # in the critic's range. Clipping joint values before forward
+                # kinematics would also distort the resulting pose in a way the
+                # offline caching pipeline (which converts straight after
+                # Unnormalize + AbsoluteActions) never does.
+                eval_actions = all_actions
+            else:
+                # Clip into the critic's training range for CRITIC SCORING ONLY —
+                # `all_actions` (what we return for execution) stays at the raw
+                # policy output. Cached counterfactuals are pre-clipped at load time.
+                clip_bound = 1.25 if self.critic_use_quantile_norm else 5.0
+                eval_actions = jnp.clip(all_actions, -clip_bound, clip_bound)
         else:
             # Use cached counterfactual actions (already pre-clipped).
             all_actions = self._get_cached_actions(
@@ -584,6 +680,14 @@ class BestOfNWrapper(_model.BaseModel):
                     )
                 start = self.critic_action_dim_offset
                 eval_actions = eval_actions[..., start : start + critic_action_dim]
+
+        # Joint-space policy + EEF critic: carry the candidates into the critic's
+        # unnormalized EEF delta space. Renormalization is deferred until after the
+        # horizon adapt below so the critic's full-length stats apply to the padded
+        # chunk in one go.
+        state_eef = None
+        if self.convert_policy_actions_to_eef:
+            eval_actions, state_eef = self._to_eef(eval_actions, observation.state)
 
         # Adapt the policy chunk to the critic's expected horizon. Regimes are
         # supported (validated in __init__):
@@ -635,8 +739,27 @@ class BestOfNWrapper(_model.BaseModel):
 
             action_horizon = self.critic_action_horizon
 
+        # Normalize the EEF candidates into the critic's space. Padding first lets
+        # the critic's full-length 2-D stats apply as-is: the padded rows are the
+        # degenerate `q01 == q99 == 0` ones that `_sanitize_quantile_norm_stats`
+        # expands to (-1, 1), so the zero padding still normalizes to 0.
+        critic_state = None
+        if state_eef is not None:
+            normalize = _transforms.Normalize(
+                self._conversion_stats["critic"], use_quantiles = self.critic_use_quantile_norm,
+            )
+            normalized = normalize({"actions": eval_actions, "state": state_eef})
+            critic_clip_bound = 1.25 if self.critic_use_quantile_norm else 5.0
+            eval_actions = jnp.clip(normalized["actions"], -critic_clip_bound, critic_clip_bound)
+            critic_state = normalized["state"]
+
         # Fallback to policy obs when no critic override (shared norm stats make this safe).
         effective_critic_obs = critic_observation if critic_observation is not None else observation
+        if critic_state is not None:
+            # The joint-space state the policy pipeline normalized is meaningless to
+            # an EEF critic. This critic has no_state=True so it never reads it, but
+            # leaving it in place would silently mislead the next one that does.
+            effective_critic_obs = dataclasses.replace(effective_critic_obs, state = critic_state)
 
         expanded_obs = expand_observation(effective_critic_obs, n)
         if critic_action_mask is not None:
