@@ -1,5 +1,7 @@
 """Parity tests pinning the jnp YAM FK / delta ops to their numpy+scipy originals."""
 
+import pathlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -11,6 +13,27 @@ import openpi.transforms as _transforms
 
 # The jnp path runs in float32 through a six-matrix chain; the numpy reference is float64.
 TOLERANCE = 1e-4
+
+
+BUILDER_YAM_FK_DIR = pathlib.Path("/home/saksham3/projects/AIRe/rlds_dataset_builder/scratch")
+
+
+@pytest.mark.parametrize("relative_path", ["yam_fk.py", "vendor/yam_vendor_kin.xml"])
+def test_vendored_fk_matches_builder_copy(relative_path):
+    """The in-repo FK must stay byte-identical to the RLDS builder's pinned copy.
+
+    `yam_eef.DEFAULT_YAM_FK_DIR` points at the vendored copy because the builder path is a
+    developer-machine path that does not exist on the TPU serve hosts. Vendoring is only
+    safe while the two agree. Skipped where the builder repo is absent (e.g. on a pod).
+    """
+    builder_file = BUILDER_YAM_FK_DIR / relative_path
+    if not builder_file.is_file():
+        pytest.skip(f"builder copy not present at {builder_file}")
+
+    vendored_file = pathlib.Path(yam_eef.DEFAULT_YAM_FK_DIR) / relative_path
+    assert vendored_file.read_bytes() == builder_file.read_bytes(), (
+        f"{vendored_file} has drifted from {builder_file}; re-vendor it."
+    )
 
 
 def _random_joint_actions(shape: tuple[int, ...], seed: int = 86) -> np.ndarray:

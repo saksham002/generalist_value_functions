@@ -20,7 +20,6 @@ from openpi.models import model as _model
 from openpi.models import yam_eef_jax as _yam_eef_jax
 from openpi.shared import array_typing as at
 from openpi.shared.normalize import NormStats
-from openpi.training import yam_eef as _yam_eef
 import openpi.transforms as _transforms
 
 # Set OPENPI_DEBUG=1 in the environment to enable observation/action-stat logging
@@ -162,7 +161,6 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
     # critic's 14D EEF space before scoring. See `BestOfNWrapper.__init__`.
     convert_policy_actions_to_eef: bool = False
     policy_use_quantile_norm: bool = False
-    yam_fk_dir: str = _yam_eef.DEFAULT_YAM_FK_DIR
 
     def __post_init__(self):
         if self.base_model_config is not None:
@@ -205,7 +203,6 @@ class BestOfNWrapperConfig(_model.BaseModelConfig):
             critic_kwargs=self.critic_kwargs,
             convert_policy_actions_to_eef=self.convert_policy_actions_to_eef,
             policy_use_quantile_norm=self.policy_use_quantile_norm,
-            yam_fk_dir=self.yam_fk_dir,
         )
 
     @override
@@ -250,7 +247,6 @@ class BestOfNWrapper(_model.BaseModel):
     critic_action_horizon: int | None
     convert_policy_actions_to_eef: bool
     policy_use_quantile_norm: bool
-    yam_fk_dir: str
 
     def __init__(
         self,
@@ -273,7 +269,6 @@ class BestOfNWrapper(_model.BaseModel):
         noise_level: float = 0.0,
         convert_policy_actions_to_eef: bool = False,
         policy_use_quantile_norm: bool = False,
-        yam_fk_dir: str = _yam_eef.DEFAULT_YAM_FK_DIR,
     ):
         super().__init__(action_dim, action_horizon, max_token_len)
         self.base_model = base_model
@@ -290,7 +285,6 @@ class BestOfNWrapper(_model.BaseModel):
         self.noise_level = noise_level
         self.convert_policy_actions_to_eef = convert_policy_actions_to_eef
         self.policy_use_quantile_norm = policy_use_quantile_norm
-        self.yam_fk_dir = yam_fk_dir
         ck = critic_kwargs or {}
         self.critic_use_quantile_norm = ck.get("use_quantile_norm", False)
         self.critic_subsample = ck.get("subsample", False)
@@ -432,7 +426,7 @@ class BestOfNWrapper(_model.BaseModel):
             _JOINT_DELTA_MASK,
             None,
         )
-        origins, axes = _yam_eef_jax.chain_constants(self.yam_fk_dir)
+        origins, axes = _yam_eef_jax.chain_constants()
         absolute_eef = _yam_eef_jax.joint_to_eef(absolute_joint, origins, axes)
         state_eef = _yam_eef_jax.joint_to_eef(unnormalized["state"], origins, axes)
         delta_eef = _yam_eef_jax.apply_delta(

@@ -4,7 +4,8 @@ The YAM policy emits joint space (6 joints + 1 gripper per arm), but the critic 
 pretrained on ``pos3 + euler3 + gripper`` per arm. Converting requires forward
 kinematics, so this module reuses the FK implementation that produced the canonical
 cartesian stream for these datasets rather than reimplementing the chain:
-``rlds_dataset_builder/scratch/yam_fk.py`` (and its pinned ``vendor/yam_vendor_kin.xml``).
+``rlds_dataset_builder/scratch/yam_fk.py`` (and its pinned ``vendor/yam_vendor_kin.xml``),
+vendored verbatim under ``yam_fk_vendor/``.
 
 Two conventions are inherited from that module and must not drift:
   * the synthesized pose is the **flange** (``link6``), NOT a TCP — ABC-130k mixes
@@ -26,7 +27,12 @@ from scipy.spatial.transform import Rotation
 
 # yam_fk.py resolves its XML relative to its own directory, so pointing at the
 # directory is enough to pick up the pinned vendor model.
-DEFAULT_YAM_FK_DIR = "/home/saksham3/projects/AIRe/rlds_dataset_builder/scratch"
+#
+# Vendored in-repo rather than referenced at its `rlds_dataset_builder` origin because
+# that is a developer-machine path: the BestOfN serve path runs on TPU hosts, where it
+# does not exist. `yam_eef_jax_test` byte-compares both files against the builder's copy,
+# so drift fails loudly wherever that repo is present.
+DEFAULT_YAM_FK_DIR = str(pathlib.Path(__file__).resolve().parent / "yam_fk_vendor")
 
 JOINTS_PER_ARM = 6
 ACTION_DIM = 14
