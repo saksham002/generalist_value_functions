@@ -96,6 +96,8 @@ class MCValueFunctionConfig(ValueFunctionConfig):
     Uses mc_return from transitions as target.
     """
 
+    next_token_loss_weight: float = 0.0
+
     @override
     def create(self, rng: at.KeyArrayLike) -> MCValueFunction:
         rng = jax.random.key(rng) if isinstance(rng, int) else rng
@@ -109,7 +111,11 @@ class MCValueFunctionConfig(ValueFunctionConfig):
             network = self.network_config.create(net_rng)
         head = self.head_config.create(network.feature_dim, head_rng)
 
-        return MCValueFunction(network=network, head=head)
+        return MCValueFunction(
+            network=network,
+            head=head,
+            next_token_loss_weight=self.next_token_loss_weight,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -305,6 +311,17 @@ class ValueFunction(BaseValueFunction):
 class MCValueFunction(ValueFunction):
     """Monte-Carlo value function."""
 
+    next_token_loss_weight: float
+
+    def __init__(
+        self,
+        network: BaseValueNetwork,
+        head: ValueHead,
+        next_token_loss_weight: float = 0.0,
+    ):
+        super().__init__(network, head)
+        self.next_token_loss_weight = next_token_loss_weight
+
     @override
     def compute_loss(
         self,
@@ -315,7 +332,13 @@ class MCValueFunction(ValueFunction):
         policy: _model.BaseModel | None = None,
     ) -> tuple[at.Float[at.Array, "*b"], dict[str, at.Array]]:
         del policy
-        return _objectives.mc_objective(self.network, self.head, transition, rng=rng)
+        return _objectives.mc_objective(
+            self.network,
+            self.head,
+            transition,
+            next_token_loss_weight=self.next_token_loss_weight,
+            rng=rng,
+        )
 
 
 class SARSAValueFunction(ValueFunction):

@@ -89,6 +89,7 @@ def mc_objective(
     head: ValueHead,
     transition: Transition | MultiTransition,
     *,
+    next_token_loss_weight: float = 0.0,
     rng: at.KeyArrayLike | None = None,
 ) -> tuple[at.Array, dict[str, at.Array]]:
     """Monte-Carlo regression: target = mc_return.
@@ -99,14 +100,33 @@ def mc_objective(
         network: Value network for feature extraction.
         head: Value head for value prediction.
         transition: Transition or MultiTransition.
+        next_token_loss_weight: Weight on the auxiliary next-token loss. Only applies when
+            the network emits next-token aux (PaliGemma with subtask indices in the batch).
         rng: Optional random key for stochastic operations (e.g., image augmentation).
 
     Returns:
         Tuple of (per_sample_loss, info_dict).
     """
     action = transition.action if network.action_conditioned else None
-    features = network.compute_features(transition.observation, action, rng=rng)
+    # PaliGemma returns (features, aux) when the observation carries subtask indices; aux
+    # carries the next-token-prediction targets. Unwrap exactly like sarsa_objective so the
+    # head sees features (not the tuple) and the aux loss can be composed.
+    network_out = network.compute_features(transition.observation, action, rng=rng)
+    if isinstance(network_out, tuple) and len(network_out) == 2 and isinstance(network_out[1], dict):
+        features, aux = network_out
+    else:
+        features, aux = network_out, {}
     loss = _compute_value_loss(head, features, transition.mc_return)
+    next_token_embeddings = aux.get("next_token_embeddings")
+    next_token_loss = None
+    if next_token_embeddings is not None:
+        next_token_loss = next_token_objective(
+            network,
+            next_token_embeddings,
+            aux["next_token_targets"],
+            aux["next_token_mask"],
+        )
+        loss = loss + next_token_loss_weight * next_token_loss
 
     pred = head(features)
     td_error = pred - transition.mc_return
@@ -116,6 +136,8 @@ def mc_objective(
         "target_value": transition.mc_return,
         "td_error": td_error,
     }
+    if next_token_loss is not None:
+        info["next_token_loss"] = next_token_loss
     return loss, info
 
 
