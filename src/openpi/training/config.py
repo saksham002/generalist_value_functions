@@ -7,6 +7,7 @@ import difflib
 import logging
 import numpy as np
 import pathlib
+import sys
 from typing import Any, ClassVar, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
@@ -1524,8 +1525,9 @@ class LeRobotRldsDataConfig(DataConfigFactory):
     )
     val_split: str = "val"
     shuffle_buffer_size: int = 250_000
-    num_parallel_reads: int = 8
-    num_parallel_calls: int = 8
+    # Host RSS scales with these: the trajectory-level maps buffer whole episodes.
+    num_parallel_reads: int = 4
+    num_parallel_calls: int = 4
 
     image_size: tuple[int, int] = (224, 224)
     max_token_len: int = 48
@@ -1545,6 +1547,8 @@ class LeRobotRldsDataConfig(DataConfigFactory):
     # Requires episode_metadata/subtask_is_partial; drops the trailing td_n (or
     # action_horizon when td_n is None) steps of every partial subtask.
     filter_partial: bool = False
+    # Requires episode_metadata/is_adversarial; drops every episode carrying the flag.
+    filter_adversarial: bool = False
     prompt_mode: lerobot_rlds_dataset.PromptMode = "subtask"
 
     # RL / value-function training
@@ -1693,6 +1697,7 @@ class LeRobotRldsDataConfig(DataConfigFactory):
                 "td_n": self.td_n,
                 "filter_n": self.filter_n,
                 "filter_partial": self.filter_partial,
+                "filter_adversarial": self.filter_adversarial,
                 "mask_boundary_actions": self.mask_boundary_actions,
                 "prompt_mode": self.prompt_mode,
                 "subsample": self.subsample,
@@ -2308,7 +2313,9 @@ class FineTuneConfig:
         - "data_dir": mapped to rlds_data_dir
         - "dataset_name": split "name:version" into a new datasets tuple
         """
-        # Full factory replacement takes precedence over data_overrides.
+        # Full factory replacement takes precedence over data_overrides. The early return
+        # also skips the isinstance whitelist below, which is what lets a data_factory be a
+        # LeRobotRldsDataConfig; falling through would reject those.
         if self.data_factory is not None:
             logging.info(
                 "Applied FineTuneConfig data_factory replacement: %s -> %s",
@@ -2466,8 +2473,10 @@ class TrainConfig:
     critic_steps_per_policy_step: int = 1
 
     # === Fine-Tuning / Validation-Only Mode ===
-    # Name of a FineTuneConfig to apply. When set, overrides dataset, schedule, and intervals.
-    fine_tune: str | None = None
+    # A FineTuneConfig to apply. When set, overrides dataset, schedule, and intervals.
+    # Holds the config object rather than its name so that tyro recurses into it and
+    # exposes its fields as `--fine-tune.*` overrides; see cli().
+    fine_tune: FineTuneConfig | None = None
 
     # === Policy Evaluation ===
     # How often (in training steps) to run policy evaluation. 0 = disabled.
@@ -2499,10 +2508,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
-        if self.fine_tune is not None and self.fine_tune not in _FINE_TUNE_CONFIGS_DICT:
-            closest = difflib.get_close_matches(self.fine_tune, _FINE_TUNE_CONFIGS_DICT.keys(), n = 1, cutoff = 0.0)
-            closest_str = f" Did you mean '{closest[0]}'? " if closest else ""
-            raise ValueError(f"FineTuneConfig '{self.fine_tune}' not found.{closest_str}")
+        # fine_tune holds a resolved FineTuneConfig, so there is no name left to validate:
+        # cli() resolves it through get_fine_tune_config, which rejects unknown names.
 
 
 def _make_antmaze_large_diverse_configs() -> list[TrainConfig]:
@@ -4907,7 +4914,64 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         },
         action_horizon = 60,
         num_train_steps = 20_000,
-        save_interval = 10_000,
+        save_interval = 2_500,
+        plot_interval = 10_000,
+        keep_period = 10_000,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
+        ),
+        num_val_trajectories = 3,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/lego/validation_cache_dir_lego_paligemma_cql_rlds_finetune_subtask_ar/",
+        include_repos = (),
+    ),
+    # Same as lego_paligemma_cql_rlds_finetune_subtask_ar but with BestOfN
+    # num_samples=32 to match the 32-sample counterfactual-action store, so eval scores
+    # all 32 cached candidates per state instead of the inherited 8.
+    FineTuneConfig(
+        name = "lego_paligemma_cql_rlds_finetune_subtask_ar_n32",
+        data_factory = LeRobotRldsDataConfig(
+            use_eef = True,
+            repo_id = "lego",
+            rlds_data_dir = "gs://saksham-euw4/datasets",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "lego", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/datasets/lego",
+                asset_id = "norm_stats_eef",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            filter_partial = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/lego_pi05_subtask/",
+            max_token_len = 160,
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        model_overrides = {
+            "action_horizon": 60,
+            "q_network_config": _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                max_token_len = 160,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = True,
+            ),
+        },
+        policy_overrides = {
+            "action_horizon": 60,
+            "num_samples": 32,
+        },
+        action_horizon = 60,
+        num_train_steps = 20_000,
+        save_interval = 2_500,
         plot_interval = 10_000,
         keep_period = 10_000,
         lr_schedule = _optimizer.CosineDecaySchedule(
@@ -6456,6 +6520,302 @@ _CONFIGS = [
         num_val_trajectories = 10,
         include_repos = ("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_cql_rlds/",
+    ),
+    # SARSA critic on sim_bimanual_assembly straight from PaliGemma: bootstrapped targets
+    # anchored on the subtask countdown, with the AR subtask head and its next-token loss
+    # enabled.
+    TrainConfig(
+        name = "sim_bimanual_assembly_paligemma_sarsa_subtask_ar",
+        model = _value_function.SARSAValueFunctionConfig(
+            network_config = _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                max_token_len = 96,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = True,
+            ),
+            head_config = _heads.RegressionHeadConfig(),
+            action_horizon = 60,
+            discount = 0.999,
+            tau = 0.005,
+            next_token_loss_weight = 0.1,
+        ),
+        weight_loader = weight_loaders.PaliGemmaWeightLoader(),
+        data = Hdf5RldsDataConfig(
+            repo_id = "sim_bimanual_assembly",
+            rlds_data_dir = "gs://saksham-usc2/datasets",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "sim_bimanual_assembly", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-usc2/datasets/sim_bimanual_assembly",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            use_eef = True,
+            state_dim = 14,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            num_parallel_reads = 4,
+            num_parallel_calls = 4,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            subsample = True,
+            max_token_len = 96,
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        num_train_steps = 20_000,
+        batch_size = 128,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 5e-6,
+            decay_steps = 20_000,
+            decay_lr = 5e-7,
+        ),
+        optimizer = _optimizer.AdamW(weight_decay = 1e-6),
+        num_workers = 0,
+        log_interval = 100,
+        plot_interval = 10_000,
+        save_interval = 2_500,
+        keep_period = 10_000,
+        fsdp_devices = 16,
+        action_horizon = 60,
+        num_val_trajectories = 2,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/sim_bimanual_assembly/validation_cache_dir_sim_bimanual_assembly_sarsa_subtask_ar/",
+        include_repos = (),
+    ),
+    # TD-BoN critic on sim_bimanual_assembly straight from PaliGemma, with the episode-anchored
+    # prompt_mode="task_description" (the exact string is what selects the episode-end countdown).
+    TrainConfig(
+        name = "sim_bimanual_assembly_paligemma_td_bon_task_description",
+        model = _value_function.CQLValueFunctionConfig(
+            q_network_config = _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                max_token_len = 48,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = False,
+            ),
+            q_head_config = _heads.RegressionHeadConfig(),
+            next_token_loss_weight = 0.0,
+            action_horizon = 60,
+            discount = 0.9995,
+            tau = 0.005,
+            action_bounds = ActionBounds.from_uniform(-1.25, 1.25, action_dim = 14, is_normalized = True),
+            cql_alpha = 0.0,
+        ),
+        policy = _best_of_n.BestOfNWrapperConfig(
+            action_dim = 14,
+            action_horizon = 60,
+            base_model_config = None,
+            num_samples = 8,
+            use_target_value = True,
+        ),
+        policy_extraction = _policy_extraction.NoopPolicyConfig(),
+        weight_loader = weight_loaders.PaliGemmaWeightLoader(),
+        data = Hdf5RldsDataConfig(
+            repo_id = "sim_bimanual_assembly",
+            rlds_data_dir = "gs://saksham-euw4/hdf5",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "sim_bimanual_assembly", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/sim_bimanual_assembly",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.9995,
+            td_n = 60,
+            use_eef = True,
+            state_dim = 14,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            num_parallel_reads = 4,
+            num_parallel_calls = 4,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/sim_bimanual_assembly_pi05/",
+            max_token_len = 48,
+            prompt_mode = "task_description",
+        ),
+        num_train_steps = 20_000,
+        batch_size = 128,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 5e-6,
+            decay_steps = 20_000,
+            decay_lr = 5e-7,
+        ),
+        optimizer = _optimizer.AdamW(weight_decay = 1e-6),
+        num_workers = 0,
+        log_interval = 100,
+        plot_interval = 10_000,
+        save_interval = 2_500,
+        keep_period = 10_000,
+        fsdp_devices = 16,
+        action_horizon = 60,
+        num_val_trajectories = 2,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/sim_bimanual_assembly/validation_cache_dir_sim_bimanual_assembly_td_bon_task_description/",
+        include_repos = (),
+    ),
+    # sim_bimanual_assembly_paligemma_td_bon_task_description with autoregressive subtask
+    # prediction added. Note the prompt_mode change also moves reward/termination/td_discount
+    # from episode-anchored to subtask-anchored, since only the exact string
+    # "task_description" selects the episode-end countdown.
+    TrainConfig(
+        name = "sim_bimanual_assembly_paligemma_td_bon_subtask_ar",
+        model = _value_function.CQLValueFunctionConfig(
+            q_network_config = _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                max_token_len = 96,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = True,
+            ),
+            q_head_config = _heads.RegressionHeadConfig(),
+            next_token_loss_weight = 0.1,
+            action_horizon = 60,
+            discount = 0.999,
+            tau = 0.005,
+            action_bounds = ActionBounds.from_uniform(-1.25, 1.25, action_dim = 14, is_normalized = True),
+            cql_alpha = 0.0,
+        ),
+        policy = _best_of_n.BestOfNWrapperConfig(
+            action_dim = 14,
+            action_horizon = 60,
+            base_model_config = None,
+            num_samples = 8,
+            use_target_value = True,
+        ),
+        policy_extraction = _policy_extraction.NoopPolicyConfig(),
+        weight_loader = weight_loaders.PaliGemmaWeightLoader(),
+        data = Hdf5RldsDataConfig(
+            repo_id = "sim_bimanual_assembly",
+            rlds_data_dir = "gs://saksham-euw4/hdf5",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "sim_bimanual_assembly", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/sim_bimanual_assembly",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            use_eef = True,
+            state_dim = 14,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            num_parallel_reads = 4,
+            num_parallel_calls = 4,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/sim_bimanual_assembly_pi05/",
+            max_token_len = 96,
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        num_train_steps = 20_000,
+        batch_size = 128,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 5e-6,
+            decay_steps = 20_000,
+            decay_lr = 5e-7,
+        ),
+        optimizer = _optimizer.AdamW(weight_decay = 1e-6),
+        num_workers = 0,
+        log_interval = 100,
+        plot_interval = 10_000,
+        save_interval = 2_500,
+        keep_period = 10_000,
+        fsdp_devices = 16,
+        action_horizon = 60,
+        num_val_trajectories = 2,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/sim_bimanual_assembly/validation_cache_dir_sim_bimanual_assembly_td_bon_subtask_ar/",
+        include_repos = (),
+    ),
+    # MC counterpart of sim_bimanual_assembly_paligemma_td_bon_subtask_ar: same subtask-AR
+    # prompt and NTP weight, target is mc_return instead of a bootstrapped backup. No
+    # counterfactual_action_store_dir — MC never reads counterfactual actions.
+    TrainConfig(
+        name = "sim_bimanual_assembly_paligemma_mc_subtask_ar",
+        model = _value_function.MCValueFunctionConfig(
+            network_config = _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                max_token_len = 96,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = True,
+            ),
+            head_config = _heads.RegressionHeadConfig(),
+            next_token_loss_weight = 0.1,
+            action_horizon = 60,
+        ),
+        weight_loader = weight_loaders.PaliGemmaWeightLoader(),
+        data = Hdf5RldsDataConfig(
+            repo_id = "sim_bimanual_assembly",
+            rlds_data_dir = "gs://saksham-euw4/hdf5",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "sim_bimanual_assembly", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/sim_bimanual_assembly",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            use_eef = True,
+            state_dim = 14,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            num_parallel_reads = 4,
+            num_parallel_calls = 4,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            subsample = True,
+            max_token_len = 96,
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        num_train_steps = 20_000,
+        batch_size = 128,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 5e-6,
+            decay_steps = 20_000,
+            decay_lr = 5e-7,
+        ),
+        optimizer = _optimizer.AdamW(weight_decay = 1e-6),
+        num_workers = 0,
+        log_interval = 100,
+        plot_interval = 10_000,
+        save_interval = 2_500,
+        keep_period = 10_000,
+        fsdp_devices = 16,
+        action_horizon = 60,
+        num_val_trajectories = 2,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/sim_bimanual_assembly/validation_cache_dir_sim_bimanual_assembly_mc_subtask_ar/",
+        include_repos = (),
     ),
     # Copy of robocoin_bimanual_paligemma_cql_rlds_subtask_ar but with a from-scratch
     # gemma_300m LLM backbone and the SigLIP vision tower loaded from pretrained PaliGemma
@@ -8199,6 +8559,60 @@ _CONFIGS = [
         fsdp_devices = 16,
         action_horizon = 60,
     ),
+    # Identical to lego_pi05_task except adversarial episodes are dropped and the
+    # schedule is shortened to 40k steps (decay included).
+    TrainConfig(
+        name = "lego_pi05_task_description_baseline",
+        model = pi0_config.Pi0Config(
+            paligemma_variant = "gemma_2b",
+            action_expert_variant = "gemma_300m",
+            action_dim = 32,
+            action_horizon = 60,
+            max_token_len = 160,
+            pi05 = True,
+            discrete_state_input = True,
+            # Real 14D joint values occupy dims 0:14 (the packing configs use 14:28).
+            # PadStatesAndActions takes the insertion offset from the mask's first True.
+            action_dim_offset = 0,
+            action_dim_mask = (True,) * 14 + (False,) * 18,
+            pad_state_to_action_dim = False,
+            dtype = "float32",
+        ),
+        data = LeRobotRldsDataConfig(
+            repo_id = "lego",
+            rlds_data_dir = "gs://saksham-euw4/datasets",
+            datasets = (rlds_dataset.RLDSDataset(name = "lego", version = "2.0.0", weight = 1.0),),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/datasets/lego",
+                asset_id = "norm_stats",
+            ),
+            use_chunk_wise_delta = True,
+            use_eef = False,
+            use_quantile_norm = True,
+            filter_n = 8,
+            filter_partial = True,
+            filter_adversarial = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            prompt_mode = "task_description",
+        ),
+        weight_loader = weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps = 40_000,
+        batch_size = 256,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 5e-5,
+            decay_steps = 40_000,
+            decay_lr = 5e-6,
+        ),
+        optimizer = _optimizer.AdamW(),
+        num_workers = 0,
+        log_interval = 100,
+        save_interval = 5_000,
+        keep_period = 25_000,
+        fsdp_devices = 16,
+        action_horizon = 60,
+    ),
     # Identical to real_shirt_hang_pi05 but with filter_intervention=True.
     TrainConfig(
         name = "real_shirt_hang_filter_pi05",
@@ -8366,8 +8780,48 @@ if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
 
 
+def _pop_fine_tune_name(argv: list[str]) -> tuple[list[str], str | None]:
+    """Split `--fine-tune <name>` out of ``argv``, returning the rest and the name."""
+    remaining: list[str] = []
+    name: str | None = None
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--fine-tune":
+            if index + 1 >= len(argv):
+                raise ValueError("--fine-tune requires a FineTuneConfig name")
+            name = argv[index + 1]
+            index += 2
+            continue
+        if argument.startswith("--fine-tune="):
+            name = argument.split("=", 1)[1]
+            index += 1
+            continue
+        remaining.append(argument)
+        index += 1
+    return remaining, name
+
+
 def cli() -> TrainConfig:
-    return tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
+    """Parse a TrainConfig from the command line.
+
+    `--fine-tune <name>` selects a FineTuneConfig and is handled here rather than by tyro.
+    tyro is given fully-instantiated configs, so every field always carries a default and
+    `tyro.conf.AvoidSubcommands` (applied by overridable_config_cli) collapses unions onto
+    it; a `None` default therefore renders nothing at all. Resolving the name first and
+    seeding it as the default is what makes tyro recurse into the chosen config and expose
+    `--fine-tune.data-factory.rlds-data-dir` and friends. Keeping selection out of the type
+    also keeps fine-tunes orthogonal to base configs: any fine-tune applies to any config.
+    """
+    argv, fine_tune_name = _pop_fine_tune_name(sys.argv[1:])
+    configs = {name: (name, config) for name, config in _CONFIGS_DICT.items()}
+    if fine_tune_name is not None:
+        fine_tune = get_fine_tune_config(fine_tune_name)
+        configs = {
+            name: (description, dataclasses.replace(config, fine_tune = fine_tune))
+            for name, (description, config) in configs.items()
+        }
+    return tyro.extras.overridable_config_cli(configs, args = argv)
 
 
 def get_config(config_name: str) -> TrainConfig:

@@ -86,9 +86,6 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
                 "variable_horizon=True requires td_n == action_chunk_size, "
                 f"got td_n={td_n}, action_chunk_size={action_chunk_size}"
             )
-        assert not (critic_mode and prompt_mode == "task_description"), (
-            "critic_mode=True is incompatible with prompt_mode='task_description'"
-        )
 
         self._split = split
         self._use_eef = use_eef

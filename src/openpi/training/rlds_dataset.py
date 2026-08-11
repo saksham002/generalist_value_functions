@@ -211,6 +211,11 @@ class BaseRldsDataset:
                     max(1, process_count),
                 )
 
+            # Episode-level filtering runs after the counterfactual join (dropping episodes
+            # before it would misalign the zip) and before repeat(), so a dropped episode
+            # never reaches the frame pipeline in either trajectory or training mode.
+            dataset = dataset.filter(lambda traj: self.trajectory_filter(traj))
+
             if not for_trajectories and repeat_dataset:
                 dataset = dataset.repeat()
 
@@ -632,6 +637,19 @@ class BaseRldsDataset:
 
         Returns True to keep the frame, False to discard it.
         Default implementation keeps all frames.
+        """
+        import tensorflow as tf
+
+        return tf.constant(value=True)
+
+    def trajectory_filter(self, traj: dict) -> bool:
+        """Filter predicate for whole episodes. Override in subclasses to drop episodes.
+
+        Runs on the raw trajectory, before ``trajectory_transforms``, so episode metadata
+        is still available under ``traj["traj_metadata"]["episode_metadata"]``.
+
+        Returns True to keep the episode, False to discard it.
+        Default implementation keeps all episodes.
         """
         import tensorflow as tf
 

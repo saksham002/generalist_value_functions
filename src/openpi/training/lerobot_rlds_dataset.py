@@ -56,6 +56,7 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
         td_n: int | None = None,
         filter_n: int | None = None,
         filter_partial: bool = False,
+        filter_adversarial: bool = False,
         mask_boundary_actions: bool = True,
         prompt_mode: PromptMode = "subtask",
         subsample: bool = False,
@@ -83,13 +84,14 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
         self._td_n = td_n
         self._filter_n = filter_n
         self._filter_partial = filter_partial
+        self._filter_adversarial = filter_adversarial
         self._mask_boundary_actions = mask_boundary_actions
         self._prompt_mode = prompt_mode
         self._subsample = subsample
         self._counterfactual_action_dim_offset = counterfactual_action_dim_offset
         logging.info(
             f"LeRobotRldsDataset: critic_mode={critic_mode}, use_eef={use_eef}, td_n={td_n}, "
-            f"filter_n={filter_n}, filter_partial={filter_partial}, "
+            f"filter_n={filter_n}, filter_partial={filter_partial}, filter_adversarial={filter_adversarial}, "
             f"mask_boundary_actions={mask_boundary_actions}, prompt_mode={prompt_mode}, subsample={subsample}"
         )
 
@@ -493,6 +495,22 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
             tail = traj["steps_to_subtask_end"] < window
             mask = tf.logical_and(mask, tf.logical_not(tf.logical_and(tail, traj["is_partial"])))
         return tf.nest.map_structure(lambda x: tf.boolean_mask(x, mask), traj)
+
+    def trajectory_filter(self, traj: dict) -> bool:
+        """Drop whole episodes flagged adversarial when ``filter_adversarial`` is set."""
+        import tensorflow as tf
+
+        if not self._filter_adversarial:
+            return tf.constant(value=True)
+
+        episode_metadata = traj["traj_metadata"]["episode_metadata"]
+        if "is_adversarial" not in episode_metadata:
+            raise ValueError(
+                "filter_adversarial=True requires episode_metadata/is_adversarial, "
+                f"which this dataset does not provide (keys: {sorted(episode_metadata)})."
+            )
+        # dlimp broadcasts scalar episode_metadata to [T], so take the first entry.
+        return tf.logical_not(tf.cast(episode_metadata["is_adversarial"][0], tf.bool))
 
     def frame_filter(self, frame: dict) -> bool:
         """Drop frames within ``filter_n`` steps of the (sub)task end."""
