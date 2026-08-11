@@ -26,25 +26,40 @@ Example usage:
 """
 
 import dataclasses
+import json
 import logging
 from pathlib import Path
+import re
 import subprocess
 import sys
+import threading
 import time
 
 import tyro
 
+from openpi.tpu import buckets
+from openpi.tpu.buckets import localize_command
 from openpi.tpu.code_sync import install_deps
+from openpi.tpu.code_sync import install_uv
+from openpi.tpu.code_sync import stage_paligemma_weights
 from openpi.tpu.code_sync import sync_code
 from openpi.tpu.code_sync import sync_wandb_credentials
-from openpi.tpu.config import get_tpu_config
+from openpi.tpu.config import DEFAULT_PROJECT
+from openpi.tpu.config import DEFAULT_TPU_USER
+from openpi.tpu.config import get_tpu_user
 from openpi.tpu.config import get_worker_count
+from openpi.tpu.config import resolve_from_pod
 from openpi.tpu.gcloud import ssh_command
 from openpi.tpu.job import JobRunner
+from openpi.tpu.job import JobStatus
+from openpi.tpu.manager import TPUAllocation
+from openpi.tpu.manager import allocate_spot_tpu
 from openpi.tpu.manager import cleanup_preempted
-from openpi.tpu.manager import create_tpu
 from openpi.tpu.manager import find_available_tpu
-from openpi.tpu.manager import wait_for_tpu_ready
+from openpi.tpu.manager import is_tpu_preempted
+from openpi.tpu.manager import running_process_owners
+from openpi.tpu.setup import mark_setup_finished
+from openpi.tpu.setup import mark_setup_started
 from openpi.tpu.setup import setup_tpu
 from openpi.tpu.setup import verify_setup
 from openpi.tpu.slack import SlackNotifier
@@ -55,6 +70,9 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Google's own bucket denies anonymous reads, so pods pull from this project's copy.
+PALIGEMMA_WEIGHTS_URI = "gs://saksham-euw4/base_checkpoints/paligemma/pt_224.npz"
 
 
 @dataclasses.dataclass
@@ -70,6 +88,25 @@ class TPUJobConfig:
     tpu_name: str | None = None
     """Specific TPU name to use (optional). If not specified, finds or creates one."""
 
+    user: str = DEFAULT_TPU_USER
+    """Key in TPU_USERS; determines resource names and the regional write bucket."""
+
+    project: str = DEFAULT_PROJECT
+    """GCP project searched for pods, quota and Filestore instances."""
+
+    spot: bool = False
+    """Race every zone with live spot quota instead of reusing a reserved pod."""
+
+    done_marker: str | None = None
+    """Empty GCS object the remote command creates on success. Its presence is how a fresh
+    launcher learns the work already finished; it is deleted once detected, so the handshake
+    is one-shot and cannot go stale."""
+
+    carry_checkpoints_from: str | None = None
+    """Checkpoint root to seed this run from on its FIRST launch, e.g. a previous run's
+    region bucket. The newest committed checkpoint under it is copied into wherever this
+    launch actually writes. Across preemption retries the carry happens automatically."""
+
     nfs_user: str = "saksham3"
     """NFS username (e.g. 'saksham3', 'jeffyu'). Determines venv and default working_dir."""
 
@@ -82,11 +119,11 @@ class TPUJobConfig:
     install_deps: bool = False
     """Whether to run uv sync on the TPU after syncing code."""
 
-    local_code_dir: str = dataclasses.field(default_factory = lambda: str(Path(__file__).resolve().parents[1]))
+    local_code_dir: str = dataclasses.field(default_factory=lambda: str(Path(__file__).resolve().parents[1]))
     """Local code directory to sync from."""
 
     local_gemma_dir: str = dataclasses.field(
-        default_factory = lambda: str(Path.home() / "projects/AIRe/robocoin/helper/gemma")
+        default_factory=lambda: str(Path.home() / "projects/AIRe/robocoin/helper/gemma")
     )
     """Local Gemma helper checkout to sync from."""
 
@@ -108,104 +145,277 @@ class TPUJobConfig:
     wait_timeout: int = 600
     """Seconds to wait for TPU to become ready."""
 
+    race_timeout: int = 21600
+    """Seconds a spot race may ride the queue. Stockouts last hours, so this is far larger
+    than wait_timeout: timing out deletes every candidate, losing queue position."""
+
+    rss_guard_interval: int = 300
+    """Seconds between host-RSS checks while a job runs. 0 disables the guard."""
+
     verbose: bool = False
     """Show all gcloud commands being executed."""
 
     local_tmux: bool = True
     """Create a local tmux session with one window per worker for viewing outputs."""
 
+    endpoint_file: str | None = None
+    """Path to write the allocated pod's name and zone to, as JSON, once it is resolved.
+    A spot race picks both at runtime, so a client that has to reach the job (an eval
+    hitting a policy server, say) has no other way to learn where it landed. Rewritten on
+    every preemption retry, so the reader always sees the pod currently serving."""
 
-def sync_gemma_helper(config: TPUJobConfig, tpu_name: str, tpu_config) -> None:
-    """Sync the local Gemma helper checkout to the TPU NFS path."""
+
+def sync_gemma_helper(config: TPUJobConfig, tpu_name: str, tpu_config, workers=None) -> None:
+    """Sync the local Gemma helper checkout to the pod.
+
+    With NFS one worker suffices; without it every worker needs its own copy.
+    """
     local_gemma_dir = Path(config.local_gemma_dir)
     if not local_gemma_dir.exists():
         raise FileNotFoundError(f"Local Gemma helper directory does not exist: {local_gemma_dir}")
 
     remote_parent = str(Path(config.remote_gemma_dir).parent)
+    targets = list(workers) if workers else [0]
     ssh_command(
         tpu_name,
         tpu_config.zone,
         f"mkdir -p {remote_parent}",
-        project = tpu_config.project,
-        worker = "0",
+        project=tpu_config.project,
+        worker="all" if workers else "0",
     )
 
-    ssh_cmd = (
-        f"gcloud compute tpus tpu-vm ssh {tpu_name} "
-        f"--zone={tpu_config.zone} --project={tpu_config.project} --worker=0 --"
-    )
-    rsync_args = [
-        "rsync",
-        "-rltvz",
-        "--progress",
-        "--omit-dir-times",
-        "--exclude=.git",
-        "--exclude=.venv",
-        "--exclude=__pycache__",
-        "--exclude=*.pyc",
-        "-e",
-        ssh_cmd,
-        f"{local_gemma_dir}/",
-        f":{config.remote_gemma_dir}",
-    ]
+    for worker in targets:
+        ssh_cmd = (
+            f"gcloud compute tpus tpu-vm ssh {tpu_name} "
+            f"--zone={tpu_config.zone} --project={tpu_config.project} --worker={worker} --"
+        )
+        rsync_args = [
+            "rsync",
+            "-rltvz",
+            "--omit-dir-times",
+            "--exclude=.git",
+            "--exclude=.venv",
+            "--exclude=__pycache__",
+            "--exclude=*.pyc",
+            "-e",
+            ssh_cmd,
+            f"{local_gemma_dir}/",
+            f":{config.remote_gemma_dir}",
+        ]
+        logger.info("Syncing Gemma helper to %s worker %s:%s", tpu_name, worker, config.remote_gemma_dir)
+        # gcloud ssh returns 255 on a transient connection failure, and one blip across
+        # eight serial per-worker syncs would otherwise abort the whole launch.
+        for attempt in range(1, 4):
+            result = subprocess.run(rsync_args, check=False)
+            if result.returncode == 0:
+                break
+            if attempt == 3:
+                raise subprocess.CalledProcessError(result.returncode, rsync_args)
+            logger.warning("Gemma sync to worker %s failed (rc=%s); retry %s/3", worker, result.returncode, attempt)
+            time.sleep(10)
 
-    logger.info("Syncing Gemma helper from %s to %s:%s", local_gemma_dir, tpu_name, config.remote_gemma_dir)
-    subprocess.run(rsync_args, check = True)
 
+def install_gemma_helper(config: TPUJobConfig, tpu_name: str, tpu_config, nfs_user: str = "") -> None:
+    """Install the synced Gemma helper into the environment the job will use.
 
-def install_gemma_helper(config: TPUJobConfig, tpu_name: str, tpu_config) -> None:
-    """Install the synced Gemma helper into the shared uv environment."""
-    nfs = tpu_config.nfs_mount_path
-    uv_bin = f"{nfs}/saksham3/uv/bin/uv"
-    vla_env = f"{nfs}/saksham3/uv/vla"
+    On NFS that is the one shared uv env; on a local-disk pod each worker has its own,
+    so the install has to run everywhere.
+    """
+    if tpu_config.uses_nfs:
+        uv_root = f"{tpu_config.nfs_mount_path}/{nfs_user or tpu_config.nfs_directory}/uv"
+        worker = "0"
+    else:
+        uv_root = "$HOME/uv"
+        worker = "all"
+    uv_bin = f"{uv_root}/bin/uv"
+    vla_env = f"{uv_root}/vla"
     ssh_command(
         tpu_name,
         tpu_config.zone,
         (
             f"source {vla_env}/bin/activate && "
             f'export UV_PROJECT_ENVIRONMENT="{vla_env}" && '
-            f'SITE_PACKAGES="$({vla_env}/bin/python -c \'import site; print(site.getsitepackages()[0])\')" && '
+            f"SITE_PACKAGES=\"$({vla_env}/bin/python -c 'import site; print(site.getsitepackages()[0])')\" && "
             f"sudo chmod -R 777 {config.remote_gemma_dir} && "
             'sudo chmod 777 "$SITE_PACKAGES" && '
             f"cd {config.remote_gemma_dir} && "
             f"{uv_bin} pip install --python {vla_env}/bin/python -e . --no-deps && "
             'sudo chmod -R 777 "$SITE_PACKAGES"/gemma.pth "$SITE_PACKAGES"/gemma-*.dist-info'
         ),
-        project = tpu_config.project,
-        worker = "0",
+        project=tpu_config.project,
+        worker=worker,
     )
 
 
-def find_or_create_tpu(config: TPUJobConfig) -> str:
-    """Find an available TPU or create a new one.
+def find_or_create_tpu(config: TPUJobConfig) -> TPUAllocation:
+    """Resolve the pod to run on, and where it lives.
 
-    Args:
-        config: Job configuration
-
-    Returns:
-        Name of the TPU to use
+    A named pod must already exist and describes itself. An unnamed spot launch races
+    every zone with live quota; an unnamed reserved launch reuses an idle pod of the
+    right shape wherever it is.
     """
     if config.tpu_name:
         logger.info("Using specified TPU: %s", config.tpu_name)
-        return config.tpu_name
+        resolved = resolve_from_pod(config.tpu_name, user=config.user, project=config.project, tpu_type=config.tpu_type)
+        # Naming a pod says which one to use, not that it is free. Pods are shared, and a
+        # pod that was idle when the launch was prepared may have been claimed since; a
+        # second job on the same TPU makes one of the two fail on the accelerator lock.
+        owners = running_process_owners(config.tpu_name, resolved)
+        if owners is None:
+            raise RuntimeError(
+                f"Cannot tell what is running on {config.tpu_name}; refusing to start a job on it. "
+                "Check the pod by hand, or omit --tpu-name to pick an idle pod automatically."
+            )
+        if owners:
+            raise RuntimeError(
+                f"{config.tpu_name} is already busy with processes owned by {sorted(owners)}. "
+                "Wait for it to free up, or omit --tpu-name to pick an idle pod automatically."
+            )
+        return TPUAllocation(name=config.tpu_name, config=resolved)
 
-    logger.info("Looking for available %s TPU...", config.tpu_type)
-    tpu_name = find_available_tpu(config.tpu_type)
+    if config.spot:
+        logger.info("Allocating spot %s across every zone with quota...", config.tpu_type)
+        return allocate_spot_tpu(config.tpu_type, user=config.user, project=config.project, timeout=config.race_timeout)
 
-    if tpu_name:
-        logger.info("Found available TPU: %s", tpu_name)
-        return tpu_name
+    logger.info("Looking for an available %s TPU...", config.tpu_type)
+    # Scope to this user's own pods: matching on family prefix alone would adopt someone
+    # else's reserved pod of the same shape.
+    allocation = find_available_tpu(
+        config.tpu_type,
+        project=config.project,
+        user=config.user,
+        resource_owner=get_tpu_user(config.user).resource_owner,
+    )
+    if allocation is None:
+        raise RuntimeError(
+            f"No idle {config.tpu_type} TPU exists. Reserved launches target an existing pod; "
+            "pass --tpu-name, create one, or use --spot to race for capacity."
+        )
+    logger.info("Found available TPU %s in %s", allocation.name, allocation.config.zone)
+    return allocation
 
-    logger.info("No available TPU found, creating new one...")
-    tpu_name = create_tpu(config.tpu_type)
-    logger.info("Created TPU: %s", tpu_name)
 
-    tpu_config = get_tpu_config(config.tpu_type)
-    logger.info("Waiting for TPU to become ready...")
-    if not wait_for_tpu_ready(tpu_name, tpu_config.zone, tpu_config.project, timeout=config.wait_timeout):
-        raise RuntimeError(f"TPU {tpu_name} did not become ready within {config.wait_timeout}s")
+def checkpoint_root_of(command: str) -> str | None:
+    """The per-run checkpoint directory a training command writes to.
 
-    return tpu_name
+    ``--checkpoint-base-dir`` is shared across runs; the run's own tree is
+    ``<base>/<config>/<exp-name or config>``, matching TrainConfig.checkpoint_dir.
+    """
+    if not buckets.is_train_command(command):
+        return None
+    base = re.search(r"--checkpoint-base-dir[=\s]+(\S+)", command)
+    if base is None:
+        return None
+    tokens = command.split()
+    entry = next((i for i, t in enumerate(tokens) if t.endswith(".py")), None)
+    if entry is None or entry + 1 >= len(tokens):
+        return None
+    config_name = tokens[entry + 1]
+    if config_name.startswith("-"):
+        return None
+    exp = re.search(r"--exp-name[=\s]+(\S+)", command)
+    exp_name = exp.group(1) if exp else config_name
+    return f"{base.group(1).rstrip('/')}/{config_name}/{exp_name}"
+
+
+def adjust_mesh_flags(command: str, tpu_config) -> str:
+    """Make the FSDP axis expressible on the pod that was actually allocated.
+
+    A pod's physical mesh is [4, hosts, 1] — four chips per host. An FSDP axis is only
+    assignable if it is a product of a subset of those axis sizes, so a config written for
+    a 16-host v5e-64 asks for 16 and fails on a v6e-32, whose mesh is [4, 8, 1]:
+
+        NotImplementedError: Failed to find assignment for logical_axis_index 1 of
+        size 16 with remaining assignable mesh [4, 8, 1]
+
+    The host count is always an axis, so it is the safe choice. Only applied when the
+    command does not already pin the value.
+    """
+    # Match any namespaced spelling (`--fsdp-devices`, `--critic.fsdp-devices`, ...): a
+    # command that already pins the axis under a subcommand prefix must not have a second,
+    # top-level flag appended, which its CLI would reject outright.
+    if tpu_config.family != "v6e" or "fsdp-devices" in command:
+        return command
+    hosts = get_worker_count(tpu_config.tpu_type)
+    logger.info("Setting --fsdp-devices=%d for %s (mesh [4, %d, 1])", hosts, tpu_config.tpu_type, hosts)
+    return f"{command} --fsdp-devices={hosts}"
+
+
+def worker_rss_over_limit(allocation: TPUAllocation, *, job_pattern: str = "scripts/train") -> str | None:
+    """Return a description of the worst offending worker, or None if all are under.
+
+    The ceiling is the family's host RAM less headroom: a worker that crosses it is about
+    to be OOM-killed and will drop the JAX coordinator, so the run is better killed and
+    reported than silently relaunched into the same memory profile.
+    """
+    limit_mb = int(allocation.config.host_ram_gb * 1024 * 0.95)
+    awk = (
+        "max=$(ps -eo rss=,comm=,args= | awk -v pat='" + job_pattern + "' "
+        "'$2 ~ /^python/ && index($0, pat) > 0 { if ($1 > m) m = $1 } END { print m + 0 }'); "
+        'echo "RSSMB $(hostname) $((max / 1024))"'
+    )
+    try:
+        result = ssh_command(
+            allocation.name,
+            allocation.config.zone,
+            awk,
+            project=allocation.config.project,
+            worker="all",
+            check=False,
+        )
+    except Exception as e:
+        logger.warning("RSS probe failed on %s: %s", allocation.name, e)
+        return None
+
+    worst: tuple[str, int] | None = None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == "RSSMB" and parts[2].isdigit():
+            megabytes = int(parts[2])
+            if worst is None or megabytes > worst[1]:
+                worst = (parts[1], megabytes)
+    if worst is None:
+        return None
+    logger.info("worker RSS max: %s %d MB (limit %d MB)", worst[0], worst[1], limit_mb)
+    return f"{worst[0]}={worst[1]}MB" if worst[1] > limit_mb else None
+
+
+def _marker_exists(marker: str) -> bool:
+    result = subprocess.run(
+        ["gcloud", "storage", "ls", marker], capture_output=True, text=True, timeout=300, check=False
+    )
+    return result.returncode == 0
+
+
+def consume_done_marker(marker: str | None) -> bool:
+    """Return whether the work already completed, clearing the marker if so.
+
+    Generic by construction: run_on_tpu knows nothing about checkpoints, only that the
+    command it was given reported success by creating this object.
+    """
+    if not marker or not _marker_exists(marker):
+        return False
+    logger.info("Completion marker %s present: work already finished", marker)
+    subprocess.run(["gcloud", "storage", "rm", marker], capture_output=True, text=True, timeout=300, check=False)
+    return True
+
+
+def command_with_done_marker(command: str, marker: str | None) -> str:
+    """Append marker creation so only a successful command records completion."""
+    if not marker:
+        return command
+    return f"{command} && gcloud storage cp /dev/null {marker}"
+
+
+def preemption_retry_available(config: TPUJobConfig, retry_count: int) -> bool:
+    """Whether losing the pod right now may be answered by re-acquiring one.
+
+    Only a spot launch can re-acquire: a reserved launch would go looking for an idle pod
+    that the preemption just removed.
+    """
+    if not (config.retry_on_preemption and config.spot):
+        return False
+    return config.max_retries is None or retry_count < config.max_retries
 
 
 def run_job(config: TPUJobConfig) -> int:
@@ -217,32 +427,111 @@ def run_job(config: TPUJobConfig) -> int:
     Returns:
         Exit code (0 for success, non-zero for failure)
     """
-    nfs_base = f"/nfs/aidm_nfs/{config.nfs_user}"
-    config = dataclasses.replace(
-        config,
-        working_dir=config.working_dir or f"{nfs_base}/batch_value_learning",
-        remote_gemma_dir=config.remote_gemma_dir or f"{nfs_base}/helper/gemma",
-    )
-
     notifier = SlackNotifier(config.slack_webhook_url)
-    tpu_config = get_tpu_config(config.tpu_type)
     retry_count = 0
+    # Where the previous attempt wrote, so a retry that lands elsewhere can carry it over.
+    previous_checkpoint_root: str | None = None
 
     while True:
+        # Lets a preemption-retry loop terminate instead of relaunching forever.
+        if consume_done_marker(config.done_marker):
+            return 0
+
         try:
-            tpu_name = find_or_create_tpu(config)
+            allocation = find_or_create_tpu(config)
         except Exception as e:
             logger.error("Failed to find or create TPU: %s", e)
             notifier.notify_error("N/A", str(e), config.command)
             return 1
 
+        # Zone, NFS and the RSS ceiling all come from the pod that was actually allocated.
+        tpu_name = allocation.name
+        tpu_config = allocation.config
+
+        if config.endpoint_file:
+            # Written before setup rather than after the job starts: a client that blocks
+            # on this file should be free to begin probing while the pod is still being
+            # prepared, and setup on a fresh spot pod takes minutes.
+            endpoint = {"name": tpu_name, "zone": tpu_config.zone, "project": tpu_config.project}
+            Path(config.endpoint_file).parent.mkdir(parents=True, exist_ok=True)
+            Path(config.endpoint_file).write_text(json.dumps(endpoint))
+            logger.info("Wrote endpoint %s to %s", endpoint, config.endpoint_file)
+
+        # Claim the pod the moment it is ours. Marking inside setup_tpu is too late: the
+        # localize, carry and verify steps before it take minutes, during which the pod has
+        # no processes and a second launcher's idle check reads it as free.
+        mark_setup_started(tpu_name, tpu_config)
+
+        # Remote paths depend on whether this pod has a shared filesystem, which is only
+        # known once it is allocated: a local-disk pod keeps everything in each worker's
+        # own home directory.
+        if tpu_config.uses_nfs:
+            remote_base = f"{tpu_config.nfs_mount_path}/{config.nfs_user}"
+            sync_workers = None
+        else:
+            remote_base = "~"
+            sync_workers = list(range(get_worker_count(config.tpu_type)))
+        run_config = dataclasses.replace(
+            config,
+            working_dir=config.working_dir or f"{remote_base}/batch_value_learning",
+            remote_gemma_dir=config.remote_gemma_dir or f"{remote_base}/helper/gemma",
+        )
+        config = run_config
+
+        # A raced pod can land in any US/EU zone, so point the command's GCS paths at that
+        # region before running it. Reserved launches never move and are left alone.
+        if config.spot:
+            try:
+                localized, rewrites = localize_command(config.command, tpu_config)
+            except Exception as e:
+                logger.error("Failed to localize GCS paths for %s: %s", tpu_config.zone, e)
+                notifier.notify_error(tpu_name, str(e), config.command)
+                mark_setup_finished(tpu_name, tpu_config)
+                return 1
+            if rewrites:
+                config = dataclasses.replace(config, command=localized)
+
+        config = dataclasses.replace(config, command=adjust_mesh_flags(config.command, tpu_config))
+
+        # A re-raced pod can land in a different region, where localization points writes
+        # at that region's bucket — an empty one. Carry the newest committed checkpoint
+        # over, or the run silently restarts from step 0 while its progress sits elsewhere.
+        current_root = checkpoint_root_of(config.command)
+        source_root = previous_checkpoint_root or config.carry_checkpoints_from
+        if current_root and source_root:
+            try:
+                buckets.carry_checkpoints(source_root, current_root)
+            except Exception as e:
+                logger.error("Failed to carry checkpoints from %s: %s", source_root, e)
+                notifier.notify_error(tpu_name, f"checkpoint carry failed: {e}", config.command)
+                mark_setup_finished(tpu_name, tpu_config)
+                return 1
+        previous_checkpoint_root = current_root or previous_checkpoint_root
+
         if not verify_setup(tpu_name, tpu_config, nfs_user=config.nfs_user):
             logger.info("Setting up TPU %s...", tpu_name)
             try:
                 setup_tpu(tpu_name, tpu_config)
+                if not tpu_config.uses_nfs:
+                    # Each worker needs its own uv and its own copy of the PaliGemma
+                    # weights; neither can be shared without a filesystem.
+                    install_uv(tpu_name, tpu_config.zone, tpu_config.project)
+                    stage_paligemma_weights(tpu_name, tpu_config.zone, tpu_config.project, PALIGEMMA_WEIGHTS_URI)
             except Exception as e:
+                # A spot pod can vanish mid-setup, and every remaining ssh then hangs to its
+                # timeout and surfaces as a setup error. Retrying is the whole point of
+                # --retry-on-preemption, so ask the pod before giving up on the run.
+                if preemption_retry_available(config, retry_count) and is_tpu_preempted(
+                    tpu_name, tpu_config.zone, tpu_config.project
+                ):
+                    logger.info("%s was preempted during setup; re-acquiring", tpu_name)
+                    retry_count += 1
+                    cleanup_preempted(config.tpu_type, project=config.project)
+                    mark_setup_finished(tpu_name, tpu_config)
+                    continue
                 logger.error("Failed to setup TPU: %s", e)
                 notifier.notify_error(tpu_name, f"Setup failed: {e}", config.command)
+                mark_setup_finished(tpu_name, tpu_config)
                 return 1
 
         if config.sync_code:
@@ -254,23 +543,40 @@ def run_job(config: TPUJobConfig) -> int:
                     tpu_config.zone,
                     config.working_dir,
                     tpu_config.project,
+                    workers=sync_workers,
                 )
-                sync_gemma_helper(config, tpu_name, tpu_config)
-                install_gemma_helper(config, tpu_name, tpu_config)
-                if config.install_deps:
-                    install_deps(tpu_name, tpu_config.zone, config.working_dir, tpu_config.project, tpu_config.nfs_mount_path)
+                # Dependencies first: on a local-disk pod the venv does not exist yet, and
+                # the gemma helper installs into it. On NFS the venv is pre-built, which is
+                # why the old order happened to work there.
+                if config.install_deps or not tpu_config.uses_nfs:
+                    install_deps(
+                        tpu_name,
+                        tpu_config.zone,
+                        config.working_dir,
+                        tpu_config.project,
+                        tpu_config.nfs_mount_path if tpu_config.uses_nfs else None,
+                    )
+                sync_gemma_helper(config, tpu_name, tpu_config, workers=sync_workers)
+                install_gemma_helper(config, tpu_name, tpu_config, nfs_user=config.nfs_user)
                 sync_wandb_credentials(tpu_name, tpu_config.zone, tpu_config.project)
-            except subprocess.CalledProcessError as e:
-                logger.error("Failed to sync code: %s", e)
-                if e.stdout:
-                    logger.error("Command stdout:\n%s", e.stdout)
-                if e.stderr:
-                    logger.error("Command stderr:\n%s", e.stderr)
-                notifier.notify_error(tpu_name, f"Code sync failed: {e}", config.command)
-                return 1
             except Exception as e:
+                # Same exposure as setup: a pod lost mid-sync surfaces as an rsync/ssh error.
+                if preemption_retry_available(config, retry_count) and is_tpu_preempted(
+                    tpu_name, tpu_config.zone, tpu_config.project
+                ):
+                    logger.info("%s was preempted during code sync; re-acquiring", tpu_name)
+                    retry_count += 1
+                    cleanup_preempted(config.tpu_type, project=config.project)
+                    mark_setup_finished(tpu_name, tpu_config)
+                    continue
                 logger.error("Failed to sync code: %s", e)
+                if isinstance(e, subprocess.CalledProcessError):
+                    if e.stdout:
+                        logger.error("Command stdout:\n%s", e.stdout)
+                    if e.stderr:
+                        logger.error("Command stderr:\n%s", e.stderr)
                 notifier.notify_error(tpu_name, f"Code sync failed: {e}", config.command)
+                mark_setup_finished(tpu_name, tpu_config)
                 return 1
 
         num_workers = get_worker_count(config.tpu_type)
@@ -280,16 +586,17 @@ def run_job(config: TPUJobConfig) -> int:
             tpu_config.project,
             config.working_dir,
             notifier,
-            num_workers = num_workers,
-            nfs_mount_path = tpu_config.nfs_mount_path,
-            nfs_user = config.nfs_user,
+            num_workers=num_workers,
+            nfs_mount_path=tpu_config.nfs_mount_path,
+            nfs_user=config.nfs_user,
         )
 
+        mark_setup_finished(tpu_name, tpu_config)
         notifier.notify_started(tpu_name, config.tpu_type, config.command)
         start_time = time.time()
 
         try:
-            runner.start_job(config.command)
+            runner.start_job(command_with_done_marker(config.command, config.done_marker))
         except Exception as e:
             logger.error("Failed to start job: %s", e)
             notifier.notify_error(tpu_name, f"Failed to start job: {e}", config.command)
@@ -301,21 +608,76 @@ def run_job(config: TPUJobConfig) -> int:
                 runner.local_session_name,
             )
 
+        rss_breach: list[str] = []
+        stop_guard = threading.Event()
+
+        # Bind every loop variable as a default: the closure outlives one iteration of the
+        # retry loop, and late binding would let it police the previous pod.
+        def _guard(
+            stop=stop_guard,
+            alloc=allocation,
+            breach=rss_breach,
+            name=tpu_name,
+            cfg=tpu_config,
+            interval=config.rss_guard_interval,
+        ) -> None:
+            while not stop.wait(interval):
+                over = worker_rss_over_limit(alloc)
+                if over:
+                    breach.append(over)
+                    logger.error("Host RSS over limit on %s (%s); killing the run", name, over)
+                    ssh_command(name, cfg.zone, "sudo pkill -9 python", project=cfg.project, worker="all", check=False)
+                    return
+
+        guard_thread = None
+        if config.rss_guard_interval > 0:
+            guard_thread = threading.Thread(target=_guard, daemon=True)
+            guard_thread.start()
+
         try:
-            status = runner.monitor_job(poll_interval=config.poll_interval)
+            try:
+                status = runner.monitor_job(poll_interval=config.poll_interval)
+            except Exception as monitor_error:
+                # Monitoring throws when the pod stops answering — a timed-out ssh, a
+                # vanished resource. That is overwhelmingly a preemption, and treating it
+                # as a generic failure skips the retry loop that exists for exactly it.
+                stop_guard.set()
+                logger.warning("Monitoring %s failed (%s); checking the pod", tpu_name, monitor_error)
+                if not is_tpu_preempted(tpu_name, tpu_config.zone, tpu_config.project):
+                    raise
+                logger.info("%s is gone; treating as preemption", tpu_name)
+                status = JobStatus(state="preempted")
+            stop_guard.set()
             duration = time.time() - start_time
 
+            if rss_breach:
+                # Relaunching would reproduce the same memory profile, so stop instead.
+                notifier.notify_error(tpu_name, f"host RSS over limit ({rss_breach[0]})", config.command)
+                return 1
+
             if status.state == "completed":
+                # Clear the handshake here as well: reaching this branch means the run
+                # finished in *this* process, and a marker left behind would make the next
+                # legitimate launch of the same command a no-op.
+                consume_done_marker(config.done_marker)
                 notifier.notify_completion(tpu_name, config.command, duration, success=True)
                 logger.info("Job completed successfully in %s", _format_duration(duration))
                 return 0
 
             if status.state == "preempted":
-                cleanup_preempted(config.tpu_type)
+                cleanup_preempted(config.tpu_type, project=config.project)
 
                 can_retry = config.retry_on_preemption and (
                     config.max_retries is None or retry_count < config.max_retries
                 )
+                # A reserved retry would look for an idle pod that preemption just removed
+                # and raise "no idle TPU"; only a spot launch can actually re-acquire.
+                if can_retry and not config.spot:
+                    logger.error(
+                        "--retry-on-preemption needs --spot: a reserved launch has no way to "
+                        "re-acquire capacity after its pod is gone."
+                    )
+                    can_retry = False
 
                 if can_retry:
                     retry_count += 1

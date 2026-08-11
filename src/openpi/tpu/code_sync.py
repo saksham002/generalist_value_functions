@@ -1,5 +1,7 @@
 """Code synchronization utilities for TPU."""
 
+from collections.abc import Sequence
+import concurrent.futures
 import logging
 from pathlib import Path
 import subprocess
@@ -17,6 +19,48 @@ def sync_code(
     remote_dir: str,
     project: str,
     *,
+    workers: "Sequence[int] | None" = None,
+    dry_run: bool = False,
+) -> None:
+    """Sync code to a TPU.
+
+    With shared NFS one worker suffices, since every worker sees the same filesystem.
+    On a local-disk pod each worker needs its own copy, so pass every worker index;
+    they run concurrently because doing eight serially costs ~20 minutes.
+    """
+    targets = list(workers) if workers is not None else [0]
+    if len(targets) == 1:
+        sync_code_to_worker(
+            local_dir, tpu_name, zone, remote_dir, project, worker=targets[0], dry_run=dry_run
+        )
+        return
+
+    logger.info("Syncing code to %d workers of %s in parallel", len(targets), tpu_name)
+    errors: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        futures = {
+            pool.submit(
+                sync_code_to_worker,
+                local_dir, tpu_name, zone, remote_dir, project, worker=w, dry_run=dry_run,
+            ): w
+            for w in targets
+        }
+        for future in concurrent.futures.as_completed(futures):
+            error = future.exception()
+            if error is not None:
+                errors.append(f"worker {futures[future]}: {error}")
+    if errors:
+        raise RuntimeError(f"Code sync failed on {len(errors)} worker(s): {'; '.join(errors)}")
+
+
+def sync_code_to_worker(
+    local_dir: str | Path,
+    tpu_name: str,
+    zone: str,
+    remote_dir: str,
+    project: str,
+    *,
+    worker: int = 0,
     dry_run: bool = False,
 ) -> None:
     """Sync code to TPU using rsync over gcloud SSH.
@@ -41,7 +85,7 @@ def sync_code(
         zone,
         f"mkdir -p {remote_dir}",
         project=project,
-        worker="0",
+        worker=str(worker),
     )
 
     # Fix permissions only on code directories (not checkpoints/datasets which are huge).
@@ -62,11 +106,11 @@ def sync_code(
         zone,
         chmod_cmd,
         project=project,
-        worker="0",
+        worker=str(worker),
     )
 
     # Build rsync command with gcloud as SSH transport
-    ssh_cmd = f"gcloud compute tpus tpu-vm ssh {_apply_ssh_user(tpu_name)} --zone={zone} --project={project} --worker=0 --"
+    ssh_cmd = f"gcloud compute tpus tpu-vm ssh {_apply_ssh_user(tpu_name)} --zone={zone} --project={project} --worker={worker} --"
 
     rsync_args = [
         "rsync",
@@ -104,7 +148,7 @@ def install_deps(
     zone: str,
     remote_dir: str,
     project: str,
-    nfs_mount_path: str = "/nfs/aidm_nfs",
+    nfs_mount_path: str | None = "/nfs/aidm_nfs",
 ) -> None:
     """Install Python dependencies on TPU using uv.
 
@@ -116,19 +160,69 @@ def install_deps(
         nfs_mount_path: NFS mount path (e.g. /nfs/aidm_nfs)
     """
     logger.info("Installing dependencies on TPU %s", tpu_name)
+    if nfs_mount_path:
+        uv_root = f"{nfs_mount_path}/saksham3/uv"
+        worker = "0"
+    else:
+        # No shared filesystem: every worker builds its own environment in its own home,
+        # which also sidesteps the per-worker uid mismatch that breaks chmod on NFS.
+        uv_root = "$HOME/uv"
+        worker = "all"
+
     ssh_command(
         tpu_name,
         zone,
         (
-            f"source {nfs_mount_path}/saksham3/uv/vla/bin/activate && "
-            f'export PATH="{nfs_mount_path}/saksham3/uv/bin:$PATH" && '
-            f'export UV_PROJECT_ENVIRONMENT="{nfs_mount_path}/saksham3/uv/vla" && '
-            f"cd {remote_dir} && uv sync --extra tpu --group rlds"
+            f'export PATH="{uv_root}/bin:$PATH" && '
+            f'export UV_CACHE_DIR="{uv_root}/cache" && '
+            f'export UV_PROJECT_ENVIRONMENT="{uv_root}/vla" && '
+            # uv pip install ignores UV_PROJECT_ENVIRONMENT unless VIRTUAL_ENV is set too.
+            f'export VIRTUAL_ENV="{uv_root}/vla" && '
+            f"cd {remote_dir} && "
+            "GIT_LFS_SKIP_SMUDGE=1 uv sync --extra tpu --group rlds && "
+            "GIT_LFS_SKIP_SMUDGE=1 uv pip install -e ."
         ),
         project=project,
-        worker="0",
+        worker=worker,
     )
     logger.info("Dependency installation complete")
+
+
+def install_uv(tpu_name: str, zone: str, project: str) -> None:
+    """Install uv into each worker's own home directory (local-disk pods)."""
+    logger.info("Installing uv per worker on TPU %s", tpu_name)
+    ssh_command(
+        tpu_name,
+        zone,
+        (
+            "mkdir -p ~/uv/bin ~/uv/cache && "
+            "test -x ~/uv/bin/uv || curl -LsSf https://astral.sh/uv/install.sh | "
+            "UV_INSTALL_DIR=~/uv/bin sh"
+        ),
+        project=project,
+        worker="all",
+    )
+
+
+def stage_paligemma_weights(tpu_name: str, zone: str, project: str, source_uri: str) -> None:
+    """Put pt_224.npz in each worker's own cache.
+
+    PaliGemmaWeightLoader fetches from a Google-owned bucket that denies anonymous reads,
+    and neither a symlink nor an NFS OPENPI_DATA_HOME works: download.py resolves the
+    symlink then calls relative_to(cache_dir), and get_cache_dir() chmods the cache root
+    on every startup, which fails under per-worker uids. A real file each worker owns is
+    what works.
+    """
+    cache = "~/.cache/openpi/vertex-model-garden-paligemma-us/paligemma"
+    logger.info("Staging PaliGemma weights on every worker of %s", tpu_name)
+    ssh_command(
+        tpu_name,
+        zone,
+        f"mkdir -p {cache} && "
+        f"test -s {cache}/pt_224.npz || gcloud storage cp {source_uri} {cache}/pt_224.npz",
+        project=project,
+        worker="all",
+    )
 
 
 def sync_wandb_credentials(

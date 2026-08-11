@@ -6,6 +6,8 @@ import subprocess
 import time
 from typing import Literal
 
+from openpi.tpu.gcloud import _TERMINAL_TPU_STATES
+from openpi.tpu.gcloud import get_tpu_state_and_health
 from openpi.tpu.gcloud import ssh_command
 from openpi.tpu.manager import is_tpu_preempted
 from openpi.tpu.slack import SlackNotifier
@@ -62,24 +64,35 @@ class JobRunner:
         self._local_session_name = f"tpu-{tpu_name}"
 
     def _build_job_preamble(self) -> str:
-        """Build TPU job environment setup shared by all workers."""
+        """Build TPU job environment setup shared by all workers.
+
+        A pod without a Filestore has no shared uv root, so the environment lives in each
+        worker's own home. Interpolating nfs_mount_path unguarded renders the literal
+        string "None" into the activate path and the job dies at start.
+        """
         nfs = self.nfs_mount_path
         user = self.nfs_user
-        return (
-            'source ~/.bashrc && '
-            f"source {nfs}/{user}/uv/vla/bin/activate && "
-            f'export PATH="{nfs}/{user}/uv/bin:$PATH" && '
-            f'export UV_PROJECT_ENVIRONMENT="{nfs}/{user}/uv/vla" && '
+        uv_root = f"{nfs}/{user}/uv" if nfs else "$HOME/uv"
+        paligemma_source = f"{nfs}/{user}/gemma/2b/pt_224.npz" if nfs else ""
+        preamble = (
+            "source ~/.bashrc && "
+            f"source {uv_root}/vla/bin/activate && "
+            f'export PATH="{uv_root}/bin:$PATH" && '
+            f'export UV_PROJECT_ENVIRONMENT="{uv_root}/vla" && '
             "sudo mkdir -p /tmp/tpu_logs && "
             "sudo chmod -R 777 /tmp/tpu_logs && "
-            # Copy PaliGemma 2B checkpoint from NFS to local cache if missing
-            "PALIGEMMA_CACHE=$HOME/.cache/openpi/vertex-model-garden-paligemma-us/paligemma/pt_224.npz && "
-            'if [ ! -f "$PALIGEMMA_CACHE" ]; then '
-            'mkdir -p "$(dirname "$PALIGEMMA_CACHE")" && '
-            f'cp {nfs}/{user}/gemma/2b/pt_224.npz "$PALIGEMMA_CACHE" || true; '
-            "fi && "
-            "export PLATFORM=tpu"
         )
+        if paligemma_source:
+            # Seed the local cache from NFS. Without a shared filesystem the weights are
+            # staged per worker during setup instead, so there is nothing to copy here.
+            preamble += (
+                "PALIGEMMA_CACHE=$HOME/.cache/openpi/vertex-model-garden-paligemma-us/paligemma/pt_224.npz && "
+                'if [ ! -f "$PALIGEMMA_CACHE" ]; then '
+                'mkdir -p "$(dirname "$PALIGEMMA_CACHE")" && '
+                f'cp {paligemma_source} "$PALIGEMMA_CACHE" || true; '
+                "fi && "
+            )
+        return preamble + ("export PLATFORM=tpu")
 
     def start_job(self, command: str, session_name: str = "job") -> None:
         """Start a job in a tmux session.
@@ -194,6 +207,23 @@ class JobRunner:
             worker="0",
             check=False,
         )
+        # An ssh that fails returns empty stdout, which would read as "stopped" and end the
+        # run. Only an answer of "stopped" from a reachable pod counts as the job ending;
+        # anything else means keep polling.
+        if result.returncode != 0 or not result.stdout.strip():
+            # Unless the pod is gone. "Assume still running" is right for a blip, but on a
+            # preempted pod every probe fails forever, so the monitor never finishes and the
+            # preemption retry it feeds never runs.
+            state, _ = get_tpu_state_and_health(self.tpu_name, self.zone, self.project)
+            if state in _TERMINAL_TPU_STATES:
+                logger.info(
+                    "Session probe on %s failed and the pod is %s; treating the job as ended", self.tpu_name, state
+                )
+                return False
+            logger.info(
+                "Session probe on %s inconclusive (rc=%s); assuming still running", self.tpu_name, result.returncode
+            )
+            return True
         return "running" in result.stdout
 
     def _get_exit_code(self) -> int | None:
