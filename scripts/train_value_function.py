@@ -431,7 +431,7 @@ def init_wandb(
         resume_run = resuming
     if resume_run and not start_new:
         run_id = (wandb_id_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(id=run_id, resume="allow", project=config.project_name)
     else:
         base_name = config.exp_name if config.exp_name else config.name
         run_name = f"{base_name}/{ft_config.name}" if ft_config is not None else base_name
@@ -2229,8 +2229,8 @@ def main(config: _config.TrainConfig):
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
-    # Resolve FineTuneConfig and apply dataset overrides before creating the data loader
-    ft_config = _config.get_fine_tune_config(config.fine_tune) if config.fine_tune is not None else None
+    # The CLI already handed us the FineTuneConfig, with any --fine-tune.* overrides applied.
+    ft_config = config.fine_tune
 
     if ft_config is not None:
         ft_config = dataclasses.replace(ft_config, overwrite = config.overwrite, resume = config.resume)
@@ -2655,10 +2655,19 @@ def main(config: _config.TrainConfig):
             else:
                 batch = raw_batch
 
-        if (step + 1) % config.save_interval == 0 or step + 1 == config.num_train_steps:
+        # Orbax surfaces the SIGTERM that JAX's coordination service broadcasts to every
+        # host, so all processes agree on the same bail-out step. Returns False when
+        # jax.distributed was never initialized, so single-host configs are unaffected.
+        preempted = checkpoint_manager.reached_preemption(step + 1)
+        if preempted or (step + 1) % config.save_interval == 0 or step + 1 == config.num_train_steps:
             with timer.context("checkpoint_save"):
                 state_to_save = training_utils.ActorCriticTrainState(critic=critic_state, policy=policy_state)
                 _checkpoints.save_state(checkpoint_manager, state_to_save, data_loader, step + 1)
+        if preempted:
+            # The save above is async; without this the process dies mid-write.
+            checkpoint_manager.wait_until_finished()
+            logging.info("Preemption signal at step %d: checkpoint committed, exiting.", step + 1)
+            raise SystemExit(0)
 
         # Generate validation plots (all workers participate for FSDP, only worker 0 creates plots/logs)
         # The third disjunct fires once at the resumed step so we can inspect the
@@ -2666,7 +2675,7 @@ def main(config: _config.TrainConfig):
         if (
             (step + 1) % config.plot_interval == 0
             or step + 1 == config.num_train_steps
-            or (step % config.plot_interval == 0 and step == start_step and start_step > 0)
+            # or (step % config.plot_interval == 0 and step == start_step and start_step > 0)
         ):
             with timer.context("validation_plot"):
                 model = nnx.merge(critic_state.model_def, critic_state.params)

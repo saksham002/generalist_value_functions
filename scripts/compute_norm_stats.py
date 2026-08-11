@@ -219,6 +219,12 @@ def main(
         )
         print("Overrode counterfactual_action_store_dir=None for stats computation.")
 
+    # Stats must be computed at the source 60 Hz cadence: _slice_action_diff_norm_stats
+    # applies the [1::2] stride when loading, mapping 30 Hz chunk index t to native 2t+1.
+    if getattr(config.data, "subsample", False):
+        config = dataclasses.replace(config, data = dataclasses.replace(config.data, subsample = False))
+        print("Overrode subsample=False for stats computation.")
+
     data_config = config.data.create(config.assets_dirs, config.model)
 
     # Pull chunks at the config's effective action_horizon (after FineTune overrides)
@@ -261,16 +267,9 @@ def main(
     action_stats = normalize.RunningStats()  # populated only with action[0] -> (D,)
     action_diff_stats: list[normalize.RunningStats] = []  # one RunningStats per timestep -> (H, D)
 
-    # When the underlying dataset emits chunks at the source 60 Hz cadence but the
-    # runtime uses subsample=True (30 Hz), restrict to the [1::2] slice so the
-    # action_diff stats reflect the half-cadence chunks the model actually sees.
-    subsample = bool(getattr(data_config, "subsample", False))
-
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
         state = np.asarray(batch["state"])      # (B, D_state)
         actions = np.asarray(batch["actions"])  # (B, H, D_act)
-        if subsample:
-            actions = actions[:, 1::2, :]
         state_stats.update(state)
         # Use only the first action of the chunk for the absolute-action stats.
         action_stats.update(actions[:, 0, :])

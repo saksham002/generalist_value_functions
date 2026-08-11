@@ -307,7 +307,8 @@ def main(config: _config.TrainConfig):
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
-    ft_config = _config.get_fine_tune_config(config.fine_tune) if config.fine_tune is not None else None
+    # The CLI already handed us the FineTuneConfig, with any --fine-tune.* overrides applied.
+    ft_config = config.fine_tune
     if ft_config is not None:
         ft_config = dataclasses.replace(ft_config, overwrite = config.overwrite, resume = config.resume)
         config = ft_config.apply_overrides(config)
