@@ -21,7 +21,6 @@ from openpi.robocoin_utils.utils import count_subtask_segments
 from openpi.robocoin_utils.utils import decode_episode_images
 from openpi.robocoin_utils.utils import get_obs_and_action
 from openpi.robocoin_utils.utils import predict_values
-from openpi.robocoin_utils.utils import SnapshotConfig
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
@@ -63,40 +62,6 @@ def get_policy_config(name: str) -> BestOfNWrapperConfig:
             f"Unknown policy config '{name}'. Available: {sorted(_POLICY_CONFIGS.keys())}"
         )
     return _POLICY_CONFIGS[name]
-
-
-@dataclasses.dataclass(frozen = True)
-class SnapshotSubtaskConfig:
-    """Subtask-path snapshots for one validation episode.
-
-    Mirrors SnapshotConfig but targets the subtask-prediction path
-    (prompt_mode="task_description_predict_current_subtask"). For ``episode_name``
-    it renders, under the ``snapshot/`` section:
-    - one camera frame per ``snapshot_times`` entry, captured from the paired
-      ``camera_names`` camera and titled with the per-frame predicted and
-      ground-truth subtask traces;
-    - optionally (``include_perplexity``) a static GT-subtask perplexity curve
-      over the whole episode with red vertical lines at subtask boundaries.
-
-    ``snapshot_times`` and ``camera_names`` are indexed together (one camera per
-    snapshot time).
-    """
-
-    episode_name: str
-    snapshot_times: tuple[int, ...]
-    camera_names: tuple[str, ...]
-    include_perplexity: bool = True
-    # When True, only render the snapshot/ outputs for episode_name and skip
-    # the full subtask video, per-frame value predictions, non-matching
-    # trajectories, and the BestOfN counterfactual block.
-    fast_path: bool = False
-
-    def __post_init__(self):
-        if len(self.snapshot_times) != len(self.camera_names):
-            raise ValueError(
-                "snapshot_times and camera_names must be equal length; got "
-                f"{len(self.snapshot_times)} and {len(self.camera_names)}."
-            )
 
 
 @dataclasses.dataclass(frozen = True)
@@ -150,30 +115,37 @@ class EvalConfig:
     # Optional override of the data config's rlds_data_dir (e.g. point at a local
     # mirror of the TFDS data instead of the GCS default baked into the config).
     rlds_data_dir: str | None = None
-    # Directory for the per-episode subtask-snapshot debug .npz (sparse
-    # perplexity samples, subtask boundaries, per-frame value predictions).
-    # Defaults to the legacy /nfs path so TPU runs are unchanged; override to a
-    # local dir on GPU (the /nfs mount is TPU-only). If set empty/None it falls
-    # back to output_dir, and is skipped when that is also unset.
-    snapshot_debug_dir: str | None = "/nfs/aidm_nfs/saksham3/robocoin/snapshot_debug"
-    # Subtask-npz mode (subtask critics only). When set, write one
-    # ``<traj>.npz`` per evaluated trajectory into this dir — holding every
-    # per-frame value prediction, the ground-truth subtask boundaries, and the
+    # Subtask critics only. When set, additionally write one ``<traj>.npz`` per
+    # evaluated trajectory into this dir — holding every per-frame value
+    # prediction, the ground-truth subtask boundaries, and the
     # autoregressively-decoded subtask predictions sampled at
-    # ``subtask_decode_stride`` frame intervals — and skip the per-trajectory
-    # video + snapshot rendering. None → normal (video) path.
+    # ``subtask_decode_stride`` frame intervals. The per-trajectory video is
+    # rendered either way.
     subtask_npz_dir: str | None = None
-    # Frame stride between autoregressive subtask decodes when subtask_npz_dir
-    # is set. Ignored on the normal path (which decodes once per second).
-    subtask_decode_stride: int = 30
-    # Subtask critics only. When True, decode the current subtask via the shared
-    # SubtaskDecoder module (openpi.policies.subtask_decoder) and condition the
-    # per-frame VALUE on that decoded subtask (rebuilding each frame's prompt as
-    # task_description + decoded_subtask + "\n") instead of the ground-truth
-    # subtask cached in the .pkl; the subtask video is then titled with the
-    # decoded subtask. Default False keeps the GT-conditioned value path
-    # byte-identical (uses the in-script decoder only for the title/perplexity).
+    # Frame stride between autoregressive subtask decodes. None decodes once per
+    # second (i.e. fps frames); 1 decodes at every frame instead of forward-filling
+    # between sparse decodes.
+    subtask_decode_stride: int | None = None
+    # Teacher-forced perplexity of the cached ground-truth subtask tokens, scored once
+    # per decoded frame. Diagnostic only: it drives the video's perplexity curve and
+    # never affects values or the decoded subtask. It
+    # costs a second full prefix forward per frame plus a non-JIT'd decode walk, so
+    # disable it when decoding at a small stride. False leaves the perplexities NaN,
+    # which the plotting path already tolerates.
+    score_gt_perplexity: bool = True
+    # LANGUAGE axis (subtask critics only). Selects which subtask conditions the
+    # per-frame value: False uses the ground-truth subtask cached in the .pkl,
+    # True rebuilds each prompt as task_description + decoded_subtask + "\n" from
+    # the SubtaskDecoder output. The subtask is always decoded either way (it
+    # titles the video); this flag only decides whether it feeds the value.
+    # Orthogonal to counterfactual_value_action.
     condition_on_decoded_subtask: bool = False
+    # ACTION axis (action-conditioned critics only). Selects which action the
+    # per-frame Q is evaluated at: False uses the dataset (behaviour) action, True
+    # uses the highest-value cached counterfactual (policy-generated) action, which
+    # requires the counterfactual action store to be joined for this split.
+    # Orthogonal to condition_on_decoded_subtask.
+    counterfactual_value_action: bool = False
     # Number of FSDP devices for the inference mesh. None → jax.device_count()
     # (prior default: pure FSDP, params sharded across devices, inputs
     # replicated). Set to 1 on a GPU node for pure data parallelism: params
@@ -183,22 +155,6 @@ class EvalConfig:
     # Optional wandb run name (used when output_dir is None → wandb logging).
     # Defaults to f"eval_{config_name}" when unset.
     wandb_run_name: str | None = None
-    # Optional extra per-interval value snapshots for one episode (non-subtask path only).
-    # snapshot: SnapshotConfig | None = None
-    snapshot: SnapshotConfig | None = SnapshotConfig(
-        episode_file = "9_0.pkl",
-        shade_intervals = ((800, 900), (1000, 1100), (1200, 1300)),
-        shade_colours = ("r", "r", "g"),
-        snapshot_camera = ("right_wrist_0_rgb", "right_wrist_0_rgb", "right_wrist_0_rgb"),
-    )
-    # Optional subtask-path snapshots (camera frames + static perplexity chart)
-    # for one episode. Only fires on the task_description_predict_current_subtask path.
-    snapshot_subtask: SnapshotSubtaskConfig | None = SnapshotSubtaskConfig(
-        episode_name = "RoboCOIN__Split_aloha_plate_storage.pkl",
-        snapshot_times = (60, 180, 240),
-        camera_names = ("base_0_rgb", "base_0_rgb", "base_0_rgb"),
-        include_perplexity = False,
-    )
 
 
 def _resolve_eval_cache_dir(eval_config: EvalConfig) -> str:
@@ -402,16 +358,6 @@ def _build_subtask_decoder(critic_model) -> dict:
     }
 
 
-def _resolve_eos_id(tokenizer) -> int | None:
-    eos = getattr(tokenizer, "eos_token_id", None)
-    if eos is not None:
-        return int(eos)
-    inner = getattr(tokenizer, "_tokenizer", None)
-    if inner is not None and hasattr(inner, "eos_id"):
-        return int(inner.eos_id())
-    return None
-
-
 def _decode_token_ids(tokenizer, token_ids: list[int]) -> str:
     if hasattr(tokenizer, "decode"):
         return str(tokenizer.decode(token_ids))
@@ -455,43 +401,6 @@ def _run_decode_step(closures, critic_model, prefix_state, token_id, suffix_pos)
     )
 
 
-def _greedy_decode_subtask(
-    closures,
-    critic_model,
-    critic_obs,
-    target_seqs: list[list[int]],
-    max_tokens: int,
-    eos_id: int | None,
-) -> tuple[list[int], float]:
-    """Argmax-decode up to ``max_tokens`` tokens; stop early on EOS or target match.
-
-    Returns (predicted_token_ids, greedy_perplexity).
-    """
-    state = _run_prefix_forward(closures, critic_model, critic_obs)
-    logits = closures["logits"](critic_model, state["last_hidden"])
-    log_probs = jax.nn.log_softmax(logits[0, 0])
-    next_tok = int(np.asarray(jnp.argmax(logits[0, 0])))
-    chosen_logp = float(np.asarray(log_probs[next_tok]))
-    predicted: list[int] = [next_tok]
-    total_neg_logp = -chosen_logp
-    kv_cache = state["kv_cache"]
-    for k in range(1, max_tokens):
-        if eos_id is not None and next_tok == eos_id:
-            break
-        if any(predicted == seq for seq in target_seqs):
-            break
-        state["kv_cache"] = kv_cache
-        hidden, kv_cache = _run_decode_step(closures, critic_model, state, next_tok, k - 1)
-        logits = closures["logits"](critic_model, hidden)
-        log_probs = jax.nn.log_softmax(logits[0, 0])
-        next_tok = int(np.asarray(jnp.argmax(logits[0, 0])))
-        chosen_logp = float(np.asarray(log_probs[next_tok]))
-        total_neg_logp += -chosen_logp
-        predicted.append(next_tok)
-    perplexity = float(np.exp(total_neg_logp / max(1, len(predicted))))
-    return predicted, perplexity
-
-
 def _score_gt_perplexity(
     closures,
     critic_model,
@@ -524,21 +433,6 @@ def _extract_gt_subtask_tokens(frame: dict) -> list[int]:
     if end < start:
         return []
     return [int(t) for t in tokens[start : end + 1]]
-
-
-def _extract_unique_subtask_token_sequences(frames: list[dict]) -> list[list[int]]:
-    """Collect deduplicated ground-truth subtask token slices across the trajectory."""
-    seen: set[tuple[int, ...]] = set()
-    seqs: list[list[int]] = []
-    for f in frames:
-        if "subtask_start_index" not in f or "subtask_end_index" not in f:
-            continue
-        seq = _extract_gt_subtask_tokens(f)
-        key = tuple(seq)
-        if key and key not in seen:
-            seen.add(key)
-            seqs.append(seq)
-    return seqs
 
 
 def _build_critic_obs_for_frame(
@@ -730,129 +624,6 @@ def _subtask_boundary_indices(frames: list[dict]) -> list[int]:
     return boundaries
 
 
-def _render_subtask_snapshots(
-    frames: list[dict],
-    perplexities: list[float | None],
-    predicted_texts: list[str | None],
-    gt_texts: list[str | None],
-    predicted_values: list[float],
-    snapshot: SnapshotSubtaskConfig,
-    episode_name: str,
-    output_dir: str | None,
-) -> dict:
-    """Render per-time camera snapshots, a static value chart, and an optional perplexity chart.
-
-    Camera frames are titled with the predicted / ground-truth subtask traces at
-    that timestep; the value chart shows predicted values over the full episode
-    with red vertical lines at subtask boundaries (no MC returns); the optional
-    perplexity chart has the same boundary markers. All keys live under the
-    ``snapshot/`` section.
-    """
-    import matplotlib.pyplot as plt
-
-    images: dict = {}
-    boundaries = _subtask_boundary_indices(frames)
-
-    from matplotlib.ticker import MaxNLocator
-
-    value_timesteps = np.arange(len(predicted_values))
-    # Width ~3x the camera-image figsize so the value curve sits next to the
-    # snapshot frames at the same vertical height.
-    fig, ax = plt.subplots(figsize = (18, 6))
-    ax.plot(value_timesteps, predicted_values, label = "Predicted Value", color = "blue", linewidth = 2)
-    for boundary in boundaries:
-        ax.axvline(x = boundary, color = "red", linewidth = 1.5, alpha = 0.8)
-    ax.set_xlabel("Timestep", fontsize = 12)
-    ax.set_ylabel("Value", fontsize = 12)
-    ax.legend(fontsize = 11)
-    ax.grid(visible = True, alpha = 0.3)
-    ax.yaxis.set_major_locator(MaxNLocator(nbins = 3))
-    ax.tick_params(axis = "y", labelsize = 18)
-    plt.tight_layout()
-    value_key = f"snapshot/{episode_name}_value"
-    if output_dir is not None:
-        os.makedirs(output_dir, exist_ok = True)
-        out_path = os.path.join(output_dir, f"{value_key.replace('/', '_')}.png")
-        fig.savefig(out_path, dpi = 150, bbox_inches = "tight")
-        plt.close(fig)
-        logger.info(f"Saved subtask value chart to {out_path}")
-        images[value_key] = out_path
-    else:
-        import wandb
-
-        images[value_key] = wandb.Image(fig)
-        plt.close(fig)
-
-    for snapshot_time, camera in zip(snapshot.snapshot_times, snapshot.camera_names, strict = True):
-        if not 0 <= snapshot_time < len(frames):
-            raise ValueError(
-                f"Snapshot time {snapshot_time} out of range for episode {episode_name} "
-                f"({len(frames)} frames)."
-            )
-        image = np.asarray(frames[snapshot_time]["image"][camera])
-        pred_text = predicted_texts[snapshot_time] if predicted_texts[snapshot_time] is not None else "(no prediction)"
-        gt_text = gt_texts[snapshot_time] if gt_texts[snapshot_time] is not None else "(no GT)"
-        fig, ax = plt.subplots(figsize = (6, 6))
-        ax.imshow(image)
-        ax.axis("off")
-        ax.set_title(f"t={snapshot_time}\nPred: {pred_text}\nGT:   {gt_text}", fontsize = 10, wrap = True)
-        plt.tight_layout()
-        plot_key = f"snapshot/{episode_name}_{camera}_f{snapshot_time}"
-        plain_key = f"{plot_key}_plain"
-        if output_dir is not None:
-            os.makedirs(output_dir, exist_ok = True)
-            out_path = os.path.join(output_dir, f"{plot_key.replace('/', '_')}.png")
-            fig.savefig(out_path, dpi = 150, bbox_inches = "tight")
-            plt.close(fig)
-            logger.info(f"Saved subtask snapshot image to {out_path}")
-            images[plot_key] = out_path
-
-            import imageio
-
-            plain_path = os.path.join(output_dir, f"{plain_key.replace('/', '_')}.png")
-            imageio.imwrite(plain_path, image)
-            logger.info(f"Saved plain subtask snapshot image to {plain_path}")
-            images[plain_key] = plain_path
-        else:
-            import wandb
-
-            images[plot_key] = wandb.Image(fig)
-            plt.close(fig)
-            images[plain_key] = wandb.Image(image)
-
-    if snapshot.include_perplexity:
-        perplexity_arr = np.array(
-            [p if p is not None and np.isfinite(p) else np.nan for p in perplexities],
-            dtype = np.float64,
-        )
-        timesteps = np.arange(len(perplexity_arr))
-        fig, ax = plt.subplots(figsize = (10, 6))
-        ax.plot(timesteps, perplexity_arr, color = "purple", linewidth = 2)
-        for boundary in boundaries:
-            ax.axvline(x = boundary, color = "red", linewidth = 1.5, alpha = 0.8)
-        ax.set_xlabel("Timestep", fontsize = 12)
-        ax.set_ylabel("GT Subtask Perplexity", fontsize = 12)
-        ax.grid(visible = True, alpha = 0.3)
-        ax.yaxis.set_major_locator(MaxNLocator(nbins = 3))
-        ax.tick_params(axis = "y", labelsize = 18)
-        plt.tight_layout()
-        plot_key = f"snapshot/{episode_name}_perplexity"
-        if output_dir is not None:
-            os.makedirs(output_dir, exist_ok = True)
-            out_path = os.path.join(output_dir, f"{plot_key.replace('/', '_')}.png")
-            fig.savefig(out_path, dpi = 150, bbox_inches = "tight")
-            plt.close(fig)
-            logger.info(f"Saved subtask perplexity chart to {out_path}")
-            images[plot_key] = out_path
-        else:
-            import wandb
-
-            images[plot_key] = wandb.Image(fig)
-            plt.close(fig)
-
-    return images
-
-
 def _run_subtask_prediction(
     model,
     val_tokenizer,
@@ -885,68 +656,47 @@ def _run_subtask_prediction(
             logger.warning("No cached trajectories found for subtask prediction.")
         return
 
+    # The closures back the teacher-forced GT perplexity only; the subtask decode
+    # itself goes through the shared SubtaskDecoder module below.
     if is_rank0:
-        logger.info("Building subtask decoder closures (gemma_2b/gemma4 KV-cache path).")
+        logger.info("Building GT-perplexity closures (gemma_2b/gemma4 KV-cache path).")
     closures = _build_subtask_decoder(model)
-    eos_id = _resolve_eos_id(val_tokenizer)
     image_keys = tuple(_get_critic_network(model).config.image_keys)
 
-    # When conditioning value on the decoded subtask, drive the decode through
-    # the shared SubtaskDecoder module (same code path as serving / BestOfN).
-    # `predict()` is deterministic + SPMD-lockstep, so calling it on every rank
-    # yields the identical decoded tokens everywhere — which all ranks need to
-    # rebuild the value prompt (predict_values is SPMD). Quiet its per-decode
-    # INFO log on non-rank-0 to avoid 16x spam.
-    decode_module = None
-    if eval_config.condition_on_decoded_subtask:
-        decode_module = SubtaskDecoder(model, val_tokenizer, decode_every = 1, max_tokens = 16)
-        if not is_rank0:
-            logging.getLogger("openpi.policies.subtask_decoder").setLevel(logging.WARNING)
-        elif is_rank0:
-            logger.info(
-                "condition_on_decoded_subtask=True: per-frame value will be conditioned on the "
-                "module-decoded subtask (forward-filled between decode samples); video titled with it."
-            )
+    # Single decode path: the shared SubtaskDecoder module, same code as serving /
+    # BestOfN. `predict()` is deterministic + SPMD-lockstep, so calling it on every
+    # rank yields identical tokens everywhere — which all ranks need when the value
+    # prompt is rebuilt from the decode (predict_values is SPMD). Quiet its
+    # per-decode INFO log on non-rank-0 to avoid 16x spam.
+    decode_module = SubtaskDecoder(model, val_tokenizer, decode_every = 1, max_tokens = 16)
+    if not is_rank0:
+        logging.getLogger("openpi.policies.subtask_decoder").setLevel(logging.WARNING)
+    else:
+        logger.info(
+            "Subtask prompt source: %s | value action source: %s",
+            "decoded" if eval_config.condition_on_decoded_subtask else "ground-truth",
+            "counterfactual" if eval_config.counterfactual_value_action else "dataset",
+        )
 
     rendered: dict[str, object] = {}
 
-    snapshot_cfg = eval_config.snapshot_subtask
-    snapshot_episode = (
-        snapshot_cfg.episode_name.removesuffix(".pkl") if snapshot_cfg is not None else None
-    )
-    snapshot_matched = False
-    fast_path = snapshot_cfg is not None and snapshot_cfg.fast_path
     npz_mode = eval_config.subtask_npz_dir is not None
 
     for traj_idx, frames in split_traj_frames.items():
-        if fast_path and traj_idx != snapshot_episode:
-            continue
         decode_episode_images(frames, image_size)
         repo_id, ep_idx, part_suffix = traj_to_repo_ep[traj_idx]
 
-        # Per-frame value predictions. Used by the regular subtask video's value-
-        # curve subplot AND by the snapshot value chart (always rendered when
-        # snapshot_subtask matches). Runs on every host (SPMD via predict_values'
-        # _jitted_compute_value).
+        # Values are computed once per trajectory, after the decode loop, so that
+        # both input axes are resolved first: the prompt (GT vs decoded subtask)
+        # and the action (dataset vs counterfactual). Runs on every host (SPMD via
+        # predict_values' _jitted_compute_value).
         seg_all_frames = [(traj_idx, i, f) for i, f in enumerate(frames)]
         seg_mc = {traj_idx: [f["mc_return"] for f in frames]}
-        predicted_values: list[float] | None = None
-        if not eval_config.condition_on_decoded_subtask:
-            # GT-conditioned value (cached .pkl prompt). When conditioning on the
-            # decoded subtask instead, value is computed after the decode +
-            # prompt rebuild below.
-            preds, _, _, _, _, _ = predict_values(
-                model, seg_all_frames, seg_mc, action_conditioned, batch_size = batch_size, mesh = mesh,
-            )
-            predicted_values = preds[traj_idx]
-        if not fast_path:
-            mc_returns = [float(np.asarray(v)) for v in seg_mc[traj_idx]]
+        mc_returns = [float(np.asarray(v)) for v in seg_mc[traj_idx]]
 
-        target_seqs = _extract_unique_subtask_token_sequences(frames)
         if is_rank0:
             logger.info(
-                f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}{part_suffix}): "
-                f"{len(frames)} frames, {len(target_seqs)} unique subtask targets."
+                f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}{part_suffix}): {len(frames)} frames."
             )
 
         prefix_text_raw = frames[0]["subtask_1_text"]
@@ -958,19 +708,19 @@ def _run_subtask_prediction(
         )
 
         fps = int(frames[0]["fps"])
-        # npz mode decodes at a fixed frame stride; the normal (video) path
-        # decodes once per second (fps stride) and force-includes the last frame.
-        step = eval_config.subtask_decode_stride if npz_mode else max(1, fps)
+        # Decode once per second unless an explicit stride is given; the last frame
+        # is always sampled so the video's final title reflects a real decode.
+        step = eval_config.subtask_decode_stride if eval_config.subtask_decode_stride is not None else max(1, fps)
         sample_indices = list(range(0, len(frames), step))
-        if not npz_mode and sample_indices and sample_indices[-1] != len(frames) - 1:
+        if sample_indices and sample_indices[-1] != len(frames) - 1:
             sample_indices.append(len(frames) - 1)
 
         perplexities: list[float | None] = [None] * len(frames)
         predicted_texts: list[str | None] = [None] * len(frames)
         gt_texts: list[str | None] = [None] * len(frames)
 
-        # When conditioning value on the decoded subtask, the decoded text per
-        # sample index is needed on EVERY rank (to rebuild the SPMD value prompt).
+        # The decoded text per sample index is needed on EVERY rank so the value
+        # prompt can be rebuilt identically when conditioning on the decode.
         sampled_decoded_text: dict[int, str] = {}
         last_perp: float | None = None
         last_pred: str | None = None
@@ -983,27 +733,19 @@ def _run_subtask_prediction(
             # invoke them in lockstep. Non-rank-0 hosts discard the outputs but
             # still need to participate so cross-host attention/all-gather
             # collectives complete.
-            module_text = None
-            if decode_module is not None:
-                # Module decode is deterministic + lockstep-safe → identical on
-                # every rank; store on all ranks for the value-prompt rebuild.
-                decoded = decode_module.predict(critic_obs)
-                predicted_tokens = decoded["predicted_subtask_tokens"]
-                module_text = decoded["predicted_subtask"]
-                sampled_decoded_text[t] = module_text
-            else:
-                predicted_tokens, _ = _greedy_decode_subtask(
-                    closures, model, critic_obs, target_seqs,
-                    max_tokens = 16, eos_id = eos_id,
-                )
+            # Module decode is deterministic + lockstep-safe → identical on every
+            # rank; stored on all ranks for the value-prompt rebuild.
+            decoded = decode_module.predict(critic_obs)
+            predicted_tokens = decoded["predicted_subtask_tokens"]
+            predicted_text = decoded["predicted_subtask"]
+            sampled_decoded_text[t] = predicted_text
             gt_tokens = _extract_gt_subtask_tokens(frames[t])
             gt_perp = (
                 _score_gt_perplexity(closures, model, critic_obs, gt_tokens)
-                if (gt_tokens and not npz_mode) else float("nan")
+                if (gt_tokens and eval_config.score_gt_perplexity) else float("nan")
             )
             if not is_rank0:
                 continue
-            predicted_text = module_text if module_text is not None else _decode_token_ids(val_tokenizer, predicted_tokens)
             gt_text = _decode_token_ids(val_tokenizer, gt_tokens) if gt_tokens else ""
             logger.info(
                 f"  [t={t}] gt_pp={gt_perp:.4f} pred={predicted_text!r} pred_ids={predicted_tokens} "
@@ -1016,14 +758,15 @@ def _run_subtask_prediction(
             predicted_texts[t] = predicted_text
             gt_texts[t] = gt_text
 
-        # Condition value on the decoded subtask: forward-fill the decoded
-        # subtask across all frames (piecewise-constant between decode samples),
-        # rebuild each frame's prompt as `task_description + decoded_subtask +
-        # "\n"`, and recompute the per-frame value with it. Runs on EVERY rank
-        # (predict_values is SPMD; sampled_decoded_text is identical across ranks).
-        if decode_module is not None:
+        # --- Input axis 1: the language prompt -------------------------------
+        # Ground truth keeps the subtask cached in the .pkl. Decoded forward-fills
+        # the decoded subtask across all frames (piecewise-constant between decode
+        # samples) and rebuilds each prompt as `task_description + subtask + "\n"`.
+        # Runs on EVERY rank (predict_values is SPMD; sampled_decoded_text is
+        # identical across ranks).
+        if eval_config.condition_on_decoded_subtask:
             filled_subtask = ""
-            rebuilt_frames = []
+            value_frames = []
             for i, f in enumerate(frames):
                 if i in sampled_decoded_text:
                     filled_subtask = sampled_decoded_text[i] or ""
@@ -1035,20 +778,34 @@ def _run_subtask_prediction(
                 nf["tokenized_prompt_mask"] = np.asarray(msk)
                 nf["subtask_start_index"] = np.int32(s0)
                 nf["subtask_end_index"] = np.int32(s1)
-                rebuilt_frames.append((traj_idx, i, nf))
-            preds, _, _, preds_cf, _, _ = predict_values(
-                model, rebuilt_frames, seg_mc, action_conditioned, batch_size = batch_size, mesh = mesh,
-            )
-            # Plot the value of the highest-value cached counterfactual action when a
-            # counterfactual store is joined; otherwise fall back to the dataset action.
-            predicted_values = preds_cf[traj_idx] if preds_cf.get(traj_idx) else preds[traj_idx]
+                value_frames.append((traj_idx, i, nf))
+        else:
+            value_frames = seg_all_frames
+
+        preds, _, _, preds_cf, _, _ = predict_values(
+            model, value_frames, seg_mc, action_conditioned, batch_size = batch_size, mesh = mesh,
+        )
+
+        # --- Input axis 2: the action ----------------------------------------
+        # Independent of the prompt axis above: dataset action vs the highest-value
+        # cached counterfactual (policy-generated) action.
+        if eval_config.counterfactual_value_action:
+            if not preds_cf.get(traj_idx):
+                raise ValueError(
+                    f"--counterfactual-value-action set but no counterfactual predictions for {traj_idx}. "
+                    "The cached action store must be joined for this split (it is joined on the split "
+                    "that has a counterfactual_action_store-<split> shard; see the 'skipping join' warning)."
+                )
+            predicted_values = preds_cf[traj_idx]
+        else:
+            predicted_values = preds[traj_idx]
 
         if not is_rank0:
             continue
 
-        # npz mode: persist all per-frame value predictions, GT subtask
-        # boundaries, and the subtask predictions decoded at `step`-frame
-        # intervals; skip the video + snapshot rendering entirely.
+        # Persist all per-frame value predictions, GT subtask boundaries, and the
+        # subtask predictions decoded at `step`-frame intervals. The video below
+        # is rendered either way.
         if npz_mode:
             import io as _io
             from etils import epath
@@ -1076,7 +833,6 @@ def _run_subtask_prediction(
                 f"Saved subtask npz to {npz_path}: {len(predicted_values)} value preds, "
                 f"{len(sample_t)} subtask decodes @ stride {step}."
             )
-            continue
 
         # Forward-fill the per-frame display state so the video shows the most
         # recent decode + perplexity reading on every intermediate frame.
@@ -1096,80 +852,31 @@ def _run_subtask_prediction(
             if gt_texts[t] is not None:
                 last_gt = gt_texts[t]
 
-        if not fast_path:
-            frame_images = [
-                np.stack([
-                    np.asarray(f["image"]["left_wrist_0_rgb"]),
-                    np.asarray(f["image"]["right_wrist_0_rgb"]),
-                    np.asarray(f["image"]["base_0_rgb"]),
-                ])
-                for f in frames
-            ]
+        frame_images = [
+            np.stack([
+                np.asarray(f["image"]["left_wrist_0_rgb"]),
+                np.asarray(f["image"]["right_wrist_0_rgb"]),
+                np.asarray(f["image"]["base_0_rgb"]),
+            ])
+            for f in frames
+        ]
 
-            plot_key = (
-                f"val/{repo_id.removeprefix('RoboCOIN/')}_episode_{ep_idx}{part_suffix}_subtask"
-            )
-            rendered[plot_key] = _render_subtask_video(
-                mc_returns = mc_returns,
-                predicted_values = predicted_values,
-                perplexities = perplexities,
-                predicted_texts = predicted_texts,
-                gt_texts = gt_texts,
-                frame_images = frame_images,
-                fps = fps,
-                ep_idx = ep_idx,
-                subtask_texts = ep_subtasks[traj_idx],
-                output_dir = eval_config.output_dir,
-                plot_key = plot_key,
-                condition_on_decoded = eval_config.condition_on_decoded_subtask,
-            )
-
-        # Reuse this episode's already-computed per-frame perplexities /
-        # predicted / GT subtask traces — no re-decoding.
-        if snapshot_episode is not None and traj_idx == snapshot_episode:
-            snapshot_matched = True
-            # Persist sparse (t, perp) samples + boundaries + per-frame value
-            # predictions so we can iterate on chart style offline without
-            # re-running the eval. Target dir is configurable; falls back to
-            # output_dir, and is skipped entirely if neither is set.
-            debug_dir = eval_config.snapshot_debug_dir or eval_config.output_dir
-            if debug_dir is not None:
-                os.makedirs(debug_dir, exist_ok = True)
-                sparse_t = np.asarray(sample_indices, dtype = np.int32)
-                sparse_perp = np.asarray(
-                    [perplexities[t] if perplexities[t] is not None else np.nan for t in sample_indices],
-                    dtype = np.float64,
-                )
-                debug_path = os.path.join(debug_dir, f"{traj_idx}.npz")
-                np.savez(
-                    debug_path,
-                    t = sparse_t,
-                    perplexity = sparse_perp,
-                    boundaries = np.asarray(_subtask_boundary_indices(frames), dtype = np.int32),
-                    predicted_values = np.asarray(predicted_values, dtype = np.float64),
-                    num_frames = np.int32(len(frames)),
-                )
-                logger.info(f"Saved snapshot debug npz to {debug_path}")
-            else:
-                logger.info("No snapshot_debug_dir / output_dir set; skipping snapshot debug npz.")
-            snapshot_images = _render_subtask_snapshots(
-                frames = frames,
-                perplexities = perplexities,
-                predicted_texts = predicted_texts,
-                gt_texts = gt_texts,
-                predicted_values = predicted_values,
-                snapshot = snapshot_cfg,
-                episode_name = traj_idx,
-                output_dir = eval_config.output_dir,
-            )
-            rendered.update(snapshot_images)
-            logger.info(f"Rendered {len(snapshot_images)} subtask snapshot outputs for {traj_idx}.")
-
-    if is_rank0 and snapshot_cfg is not None and not snapshot_matched and not npz_mode:
-        logger.warning(
-            f"Subtask snapshot episode {snapshot_cfg.episode_name!r} did not match any cached "
-            f"trajectory key; no snapshots rendered. (Long episodes are split into "
-            f"'<key>_p0'/'_p1' — match those keys instead.)"
+        plot_key = (
+            f"val/{repo_id.removeprefix('RoboCOIN/')}_episode_{ep_idx}{part_suffix}_subtask"
+        )
+        rendered[plot_key] = _render_subtask_video(
+            mc_returns = mc_returns,
+            predicted_values = predicted_values,
+            perplexities = perplexities,
+            predicted_texts = predicted_texts,
+            gt_texts = gt_texts,
+            frame_images = frame_images,
+            fps = fps,
+            ep_idx = ep_idx,
+            subtask_texts = ep_subtasks[traj_idx],
+            output_dir = eval_config.output_dir,
+            plot_key = plot_key,
+            condition_on_decoded = eval_config.condition_on_decoded_subtask,
         )
 
     if is_rank0 and eval_config.output_dir is None and rendered:
@@ -1471,6 +1178,10 @@ def main(eval_config: EvalConfig):
             include_repos = config.include_repos,
             save_only = True,
             input_transform = val_input_transform,
+            # Mirrors train_value_function.py's FT path: a fine-tune config targets a
+            # single-repo dataset, so without this every val episode collapses onto one
+            # repo_key and only one trajectory is ever cached.
+            allow_duplicate_repos = eval_config.fine_tune is not None,
         )
         del val_trajectory_dataset
 
@@ -1519,9 +1230,6 @@ def main(eval_config: EvalConfig):
         or getattr(config.data, "subtask_prompt_mode", None)
     )
     subtask_mode = critic_prompt_mode == "task_description_predict_current_subtask"
-    subtask_fast_path = (
-        eval_config.snapshot_subtask is not None and eval_config.snapshot_subtask.fast_path
-    )
     if not subtask_mode:
         train_module.generate_validation_plots_dlimp(
             model = model,
@@ -1533,24 +1241,12 @@ def main(eval_config: EvalConfig):
             output_dir = eval_config.output_dir,
             batch_size = eval_config.batch_size,
             override_prompt = override_prompt,
-            snapshot = eval_config.snapshot,
         )
     else:
-        if eval_config.snapshot is not None:
-            logger.warning(
-                "Subtask mode: --snapshot is only supported on the non-subtask path; ignoring it."
-            )
-        if subtask_fast_path:
-            logger.info(
-                "snapshot_subtask.fast_path enabled: rendering snapshot/ outputs only for "
-                f"{eval_config.snapshot_subtask.episode_name!r}; skipping the per-trajectory "
-                "subtask video, per-frame value predictions, and BestOfN counterfactual."
-            )
-        else:
-            logger.info(
-                "Subtask mode: skipping generate_validation_plots_dlimp; the subtask "
-                "video below carries the camera + value + perplexity subplots."
-            )
+        logger.info(
+            "Subtask mode: skipping generate_validation_plots_dlimp; the subtask "
+            "video below carries the camera + value + perplexity subplots."
+        )
         logger.info(
             "Running subtask prediction (per-second autoregressive decode + GT perplexity)..."
         )
@@ -1566,7 +1262,7 @@ def main(eval_config: EvalConfig):
             mesh = inference_mesh,
         )
 
-    if eval_config.counterfactual_best_of_n and action_conditioned and not subtask_fast_path:
+    if eval_config.counterfactual_best_of_n and action_conditioned:
         logger.info("Running BestOfN counterfactual evaluation...")
         import jax.numpy as jnp
 

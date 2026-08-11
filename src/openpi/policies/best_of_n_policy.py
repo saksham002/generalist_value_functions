@@ -29,9 +29,11 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import signal
 import time
 from typing import Any, Literal
 
+import etils.epath as _epath
 import flax.nnx as nnx
 import jax
 from jax.experimental import multihost_utils as _multihost
@@ -58,6 +60,34 @@ from openpi.training import config as _config
 from openpi.value_functions import base_value_functions as _base_vf
 
 logger = logging.getLogger(__name__)
+
+INFERENCE_ITER_FILENAME = "inference_iter.txt"
+
+
+def inference_iter_uri(checkpoint_dir: str) -> str:
+    """Where the sampling counter lives for a served checkpoint.
+
+    Beside the checkpoint root rather than inside a step directory: the counter belongs to
+    the eval, not to any one step, and a step directory carries a commit marker that must
+    keep describing exactly what training wrote.
+    """
+    return f"{checkpoint_dir.rstrip('/')}/{INFERENCE_ITER_FILENAME}"
+
+
+def _read_inference_iter(path: str | None) -> int:
+    if not path:
+        return 0
+    try:
+        text = _epath.Path(path).read_text().strip()
+    except Exception as e:  # absent on the first launch, which is not an error
+        logger.info("No inference_iter at %s (%s); starting from 0", path, type(e).__name__)
+        return 0
+    try:
+        return int(text)
+    except ValueError:
+        logger.warning("inference_iter at %s is not an int (%r); starting from 0", path, text)
+        return 0
+
 
 # Norm-stat keys the policy's Normalize / Unnormalize transforms reference at
 # inference time. Mirrors LocalPolicy in the sibling repo.
@@ -186,6 +216,8 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         subtask_decode_every: int = 20,
         policy_use_decoded_subtask: bool = False,
         num_steps: int | None = None,
+        inference_iter_path: str | None = None,
+        start_inference_iter: int | None = None,
     ) -> None:
         # Both critic-config and critic-checkpoint must be provided together.
         critic_args_set = (critic_config_name is not None) or (critic_checkpoint_dir is not None)
@@ -527,7 +559,19 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         self._process_index = jax.process_index()
         self._num_processes = jax.process_count()
         self._is_multi_host = self._num_processes > 1
-        self._inference_iter = 0  # bumped in lockstep on every host
+        # Seeded rather than always zero: the flow-matching x_T for call n is
+        # fold_in(rng, num_processes * n), so a server that restarts after preemption and
+        # resumes an eval would otherwise replay the remaining episodes with the noise of
+        # calls 0..k instead of continuing the sequence. Explicit value wins; otherwise the
+        # counter persisted by the preemption handler is picked up.
+        self._inference_iter_path = inference_iter_path
+        if start_inference_iter is not None:
+            self._inference_iter = int(start_inference_iter)
+        else:
+            self._inference_iter = _read_inference_iter(inference_iter_path)
+        if self._inference_iter:
+            logger.info("Starting inference_iter at %d", self._inference_iter)
+        self._install_preemption_handler()
 
         # Mesh used for the FSDP-sharded JIT call. Re-built from `config.fsdp_devices`
         # — defaults to 16 (saved checkpoint topology). With sample_parallel=True
@@ -650,7 +694,13 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             # the client's dynamic subtask.
             critic_prompt_mode = getattr(critic_config.data, "prompt_mode", None)
             self._critic_prompt_mode = critic_prompt_mode
-            if critic_prompt_mode == "task_description_predict_current_subtask" and policy_task_description is not None:
+            # prompt_mode="task_description" trains on the constant task string too (via
+            # plain TokenizePrompt), so it needs the same routing or the critic would be
+            # scored on the client's dynamic subtask instead.
+            if (
+                critic_prompt_mode in ("task_description", "task_description_predict_current_subtask")
+                and policy_task_description is not None
+            ):
                 self._critic_task_description = policy_task_description
                 logger.info(
                     f"Critic prompt_mode={critic_prompt_mode!r}: routing constant "
@@ -986,6 +1036,47 @@ class BestOfNPolicy(_base_policy.BasePolicy):
     # Multi-host coordination internals
     # ---------------------------------------------------------------------
 
+    def _persist_inference_iter(self) -> None:
+        """Write the sampling counter beside the checkpoint, from rank 0 only.
+
+        Every host bumps the counter in lockstep, so one writer is enough and eight racing
+        on the same object is not.
+        """
+        if not self._inference_iter_path or self._process_index != 0:
+            return
+        try:
+            _epath.Path(self._inference_iter_path).write_text(str(self._inference_iter))
+            logger.info("Persisted inference_iter=%d to %s", self._inference_iter, self._inference_iter_path)
+        except Exception as e:
+            logger.error("Failed to persist inference_iter to %s: %s", self._inference_iter_path, e)
+
+    def _install_preemption_handler(self) -> None:
+        """Save the sampling counter when the pod is reclaimed.
+
+        Spot preemption arrives as SIGTERM ahead of the shutdown, the same signal orbax
+        turns into `reached_preemption` on the training side. A server has no step loop to
+        check a flag from, so the write happens in the handler itself and then the previous
+        disposition runs, letting the process die as it otherwise would.
+        """
+        if not self._inference_iter_path:
+            return
+        previous = signal.getsignal(signal.SIGTERM)
+
+        def _handler(signum, frame):
+            logger.warning("SIGTERM at inference_iter=%d; persisting before shutdown", self._inference_iter)
+            self._persist_inference_iter()
+            if callable(previous) and previous not in (signal.SIG_IGN, signal.SIG_DFL):
+                previous(signum, frame)
+            else:
+                raise SystemExit(0)
+
+        try:
+            signal.signal(signal.SIGTERM, _handler)
+        except ValueError:
+            # Only the main thread may install handlers; a server loaded from a worker
+            # thread simply keeps the default disposition.
+            logger.warning("Could not install SIGTERM handler (not main thread); inference_iter will not persist")
+
     def _maybe_decode_subtask(
         self, batched: dict[str, Any], extras: dict[str, Any], *, on_rank0: bool,
     ) -> tuple[bool, dict[str, Any] | None]:
@@ -1044,7 +1135,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         if self._policy_prompt_mode == "task_description":
             policy_task_desc = per_call_task_desc or self._policy_task_description
         critic_task_desc = None
-        if self._critic_prompt_mode == "task_description_predict_current_subtask":
+        if self._critic_prompt_mode in ("task_description", "task_description_predict_current_subtask"):
             critic_task_desc = per_call_task_desc or self._critic_task_description
         # A subtask-decoding critic REQUIRES a task description: without one the
         # extras package drops the decode_critic_* leaves, so rank 0 broadcasts
@@ -1118,7 +1209,11 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         if self._bestofn is not None:
             # subtask_start/end_index default to 0 (ignored unless predict_subtask_ar).
             s_start, s_end = 0, 0
-            if critic_task_desc is not None:
+            if critic_task_desc is not None and self._critic_prompt_mode == "task_description":
+                # Trained with plain TokenizePrompt on the task string; the subtask
+                # tokenizer's prefix separator would not reproduce those token ids.
+                critic_tokens, critic_token_mask = self._critic_tokenizer.tokenize(critic_task_desc, None)
+            elif critic_task_desc is not None:
                 if self._subtask_decoder is not None:
                     # Task-only prefix the AR decoder reads (its NTP training input).
                     decode_tokens, decode_token_mask, _, _ = _transforms._tokenize_robocoin_subtask_prompt(
@@ -1559,6 +1654,8 @@ def create_bestofn_policy(
     subtask_decode_every: int = 20,
     policy_use_decoded_subtask: bool = False,
     num_steps: int | None = None,
+    inference_iter_path: str | None = None,
+    start_inference_iter: int | None = None,
 ) -> BestOfNPolicy:
     """Convenience factory; matches the kwargs the serve_policy CLI exposes."""
     return BestOfNPolicy(
@@ -1586,4 +1683,6 @@ def create_bestofn_policy(
         subtask_decode_every = subtask_decode_every,
         policy_use_decoded_subtask = policy_use_decoded_subtask,
         num_steps = num_steps,
+        inference_iter_path = inference_iter_path,
+        start_inference_iter = start_inference_iter,
     )

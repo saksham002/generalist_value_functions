@@ -166,6 +166,16 @@ class Args:
     # policy's sample_kwargs; only affects the policy-only (BC) sampling path.
     num_steps: int | None = None
 
+    # Sampling-counter continuity across a server restart. The flow-matching x_T for
+    # inference call n is fold_in(rng, num_processes * n), so a restarted server would
+    # otherwise replay a resumed eval with the noise of the calls it already made.
+    # None → read the counter the previous process persisted beside the checkpoint
+    # (0 when absent); an explicit value overrides it.
+    start_inference_iter: int | None = None
+    # Where that counter lives. None → beside the critic checkpoint root, or the policy
+    # checkpoint dir when serving without a critic.
+    inference_iter_path: str | None = None
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -211,6 +221,7 @@ def create_policy(args: Args) -> _policy.BasePolicy:
         # Lazy import: BestOfNPolicy pulls in JAX value-function modules that
         # the policy-only default path doesn't need.
         from openpi.policies.best_of_n_policy import create_bestofn_policy
+        from openpi.policies.best_of_n_policy import inference_iter_uri
 
         if args.critic is not None:
             return create_bestofn_policy(
@@ -237,6 +248,11 @@ def create_policy(args: Args) -> _policy.BasePolicy:
                 subtask_decode_every = args.critic.subtask_decode_every,
                 policy_use_decoded_subtask = args.critic.policy_use_decoded_subtask,
                 num_steps = args.num_steps,
+                start_inference_iter = args.start_inference_iter,
+                inference_iter_path = (
+                    args.inference_iter_path
+                    or inference_iter_uri(args.critic.dir)
+                ),
             )
         # use_bestofn_loader=True without critic: load policy through
         # BestOfNPolicy (which applies the bimanual-EEF action-dim slice)
