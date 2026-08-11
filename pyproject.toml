@@ -89,7 +89,11 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "tensorflow-probability==0.23.0"]
+# av is pinned to the newest release that ships manylinux wheels: lerobot asks for
+# 14.4.0, but PyAV published 14.3.0/14.4.0 as sdist only, so uv compiles it from
+# source and that needs nasm + pkg-config + ffmpeg headers on every TPU worker.
+# 14.2.0 installs from a wheel with ffmpeg bundled, so no system build is required.
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "tensorflow-probability==0.23.0", "av==14.2.0"]
 dependency-metadata = [
     { name = "dlimp", version = "0.0.1", requires-dist = ["tensorflow-cpu==2.15.0", "tensorflow-datasets>=4.9.2"] },
 ]
