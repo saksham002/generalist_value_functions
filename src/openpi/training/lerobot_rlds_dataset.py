@@ -9,11 +9,11 @@ the joint grippers to rebuild the 14D EEF layout. The subtask annotation is a si
 per-step ``subtask`` string, and every demo is an expert/complete trajectory (no
 ``reward`` field, no ``is_partial`` heuristic, no ``has_subtask_annotations``).
 
-Datasets that do carry partial demos annotate them per SUBTASK: ``episode_metadata``
-holds a ``subtask_is_partial`` bool array of length ``num_subtasks``. Setting
-``filter_partial=True`` marks every step of a partial subtask and drops that
-subtask's trailing ``td_n`` (or ``action_chunk_size`` when ``td_n`` is None) steps,
-independently of ``critic_mode``.
+Datasets that do carry partial demos annotate them per SUBTASK, exposed as a per-step
+``is_partial`` bool. Setting ``filter_partial=True`` drops each partial subtask's
+trailing ``td_n`` (or ``action_chunk_size`` when ``td_n`` is None) steps,
+independently of ``critic_mode`` and of ``prompt_mode``, so a truncated subtask never
+anchors a reward.
 
 Supports both behavior cloning (``critic_mode=False``) and value-function training
 (``critic_mode=True``). In critic mode the next-step gathers, action masks and
@@ -192,28 +192,28 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
             "repo_id": traj["traj_metadata"]["episode_metadata"]["repo_id"],
         }
 
-        # Partiality is per-SUBTASK here, not per-episode: episode_metadata carries a
-        # `subtask_is_partial` bool array of length num_subtasks, so every step of a
-        # partial subtask is marked via its `subtask_index`. Unlike Hdf5RldsDataset
-        # there is no heuristic to infer it.
+        # Partiality is per-SUBTASK here, not per-episode. Read the per-STEP `is_partial`
+        # field rather than gathering episode_metadata/subtask_is_partial by subtask_index:
+        # dlimp broadcasts a variable-length episode_metadata array to a FLATTENED
+        # [T * num_subtasks] tile (not [num_subtasks]), which is still rank 1 and so slips
+        # past a rank check, and _subsample_trajectory's per-step stride-2 slice then
+        # reorders it into sip[(2j) % num_subtasks] — wrong for every subtask but the
+        # first. `is_partial` is a genuine [T] field carrying the same values, so it
+        # subsamples correctly and needs no gather. Unlike Hdf5RldsDataset there is no
+        # heuristic to infer it.
         if self._filter_partial:
-            episode_metadata = traj["traj_metadata"]["episode_metadata"]
-            if "subtask_is_partial" not in episode_metadata:
+            if "is_partial" not in traj:
                 raise ValueError(
-                    "filter_partial=True requires episode_metadata/subtask_is_partial, "
+                    "filter_partial=True requires a per-step is_partial field, "
                     "which this dataset does not provide."
                 )
-            if "subtask_index" not in traj:
-                raise ValueError("filter_partial=True requires a per-step subtask_index.")
-            # dlimp broadcasts SCALAR episode_metadata (e.g. fps) to [T], but leaves a
-            # variable-length array like this one as [num_subtasks] — so index it by
-            # subtask_index directly rather than taking a per-step row.
-            subtask_is_partial = tf.cast(episode_metadata["subtask_is_partial"], tf.bool)
-            tf.debugging.assert_rank(
-                subtask_is_partial, 1,
-                message="expected subtask_is_partial of shape [num_subtasks]",
-            )
-            result["is_partial"] = tf.gather(subtask_is_partial, tf.cast(traj["subtask_index"], tf.int32))
+            result["is_partial"] = tf.cast(traj["is_partial"], tf.bool)
+            # task_description overwrote steps_to_subtask_end with the countdown to the
+            # EPISODE end above, so carry the subtask countdown separately for this filter:
+            # partiality is a subtask-level property and its tail must be measured against
+            # the subtask. Other prompt modes already have it under steps_to_subtask_end.
+            if self._prompt_mode == "task_description":
+                result["steps_to_subtask_end_for_partial"] = tf.cast(traj["steps_to_subtask_end"], tf.int32)
 
         # Per-step passthrough used by validation caching (cache_val_episodes sorts
         # frames by _frame_index and keys trajectories by repo_index). Guarded so
@@ -492,7 +492,12 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
         # (no successful subtask end to bootstrap toward or imitate).
         if self._filter_partial:
             window = self._partial_tail_window(tf.cast(traj["fps"], tf.int32))
-            tail = traj["steps_to_subtask_end"] < window
+            steps_key = (
+                "steps_to_subtask_end_for_partial"
+                if self._prompt_mode == "task_description"
+                else "steps_to_subtask_end"
+            )
+            tail = traj[steps_key] < window
             mask = tf.logical_and(mask, tf.logical_not(tf.logical_and(tail, traj["is_partial"])))
         return tf.nest.map_structure(lambda x: tf.boolean_mask(x, mask), traj)
 
@@ -524,6 +529,11 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
         # Mirror _apply_frame_transforms_to_trajectory.
         if self._filter_partial:
             window = self._partial_tail_window(tf.cast(frame["fps"], tf.int32))
-            tail = frame["steps_to_subtask_end"] < window
+            steps_key = (
+                "steps_to_subtask_end_for_partial"
+                if self._prompt_mode == "task_description"
+                else "steps_to_subtask_end"
+            )
+            tail = frame[steps_key] < window
             keep = tf.logical_and(keep, tf.logical_not(tf.logical_and(tail, frame["is_partial"])))
         return keep

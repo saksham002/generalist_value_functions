@@ -1544,8 +1544,9 @@ class LeRobotRldsDataConfig(DataConfigFactory):
     # ship eef_sim_pose_*; EEF-native ones are unaffected and pass through as-is.
     use_eef: bool = False
     filter_n: int | None = None
-    # Requires episode_metadata/subtask_is_partial; drops the trailing td_n (or
-    # action_horizon when td_n is None) steps of every partial subtask.
+    # Requires a per-step is_partial field; drops the trailing td_n (or
+    # action_horizon when td_n is None) steps of every partial subtask, in every
+    # prompt_mode (unlike filter_n, which counts to episode end under task_description).
     filter_partial: bool = False
     # Requires episode_metadata/is_adversarial; drops every episode carrying the flag.
     filter_adversarial: bool = False
@@ -4878,7 +4879,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             repo_id = "lego",
             rlds_data_dir = "gs://saksham-euw4/datasets",
             datasets = (
-                rlds_dataset.RLDSDataset(name = "lego", version = "1.0.0", weight = 1.0),
+                rlds_dataset.RLDSDataset(name = "lego", version = "2.0.0", weight = 1.0),
             ),
             assets = AssetsConfig(
                 assets_dir = "gs://saksham-euw4/datasets/lego",
@@ -4890,10 +4891,11 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             use_chunk_wise_delta = True,
             use_quantile_norm = True,
             filter_partial = True,
+            filter_adversarial = True,
             shuffle_buffer_size = 50_000,
             mask_boundary_actions = False,
             subsample = True,
-            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/lego_pi05_subtask/",
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/lego_pi05_task_baseline/",
             max_token_len = 160,
             prompt_mode = "task_description_predict_current_subtask",
         ),
@@ -8559,7 +8561,7 @@ _CONFIGS = [
         fsdp_devices = 16,
         action_horizon = 60,
     ),
-    # Identical to lego_pi05_task except adversarial episodes are dropped and the
+    # Identical to the task description config except adversarial episodes are dropped and the
     # schedule is shortened to 40k steps (decay included).
     TrainConfig(
         name = "lego_pi05_task_description_baseline",
