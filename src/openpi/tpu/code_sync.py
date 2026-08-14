@@ -30,9 +30,7 @@ def sync_code(
     """
     targets = list(workers) if workers is not None else [0]
     if len(targets) == 1:
-        sync_code_to_worker(
-            local_dir, tpu_name, zone, remote_dir, project, worker=targets[0], dry_run=dry_run
-        )
+        sync_code_to_worker(local_dir, tpu_name, zone, remote_dir, project, worker=targets[0], dry_run=dry_run)
         return
 
     logger.info("Syncing code to %d workers of %s in parallel", len(targets), tpu_name)
@@ -41,7 +39,13 @@ def sync_code(
         futures = {
             pool.submit(
                 sync_code_to_worker,
-                local_dir, tpu_name, zone, remote_dir, project, worker=w, dry_run=dry_run,
+                local_dir,
+                tpu_name,
+                zone,
+                remote_dir,
+                project,
+                worker=w,
+                dry_run=dry_run,
             ): w
             for w in targets
         }
@@ -143,12 +147,74 @@ def sync_code_to_worker(
     logger.info("Code sync complete")
 
 
+def uv_location(nfs_mount_path: str | None, nfs_user: str = "saksham3") -> tuple[str, str]:
+    """Where a pod's uv environment lives, and which workers must build it.
+
+    The single source of truth for this decision: a shared filesystem means one environment
+    built once, no filesystem means one per worker in its own home. Everything that installs
+    or inspects the environment resolves it here so the two can never disagree.
+    """
+    if nfs_mount_path:
+        root = f"{nfs_mount_path}/{nfs_user}/uv" if nfs_user else f"{nfs_mount_path}/uv"
+        return root, "0"
+    # No shared filesystem: every worker builds its own environment in its own home,
+    # which also sidesteps the per-worker uid mismatch that breaks chmod on NFS.
+    return "$HOME/uv", "all"
+
+
+def uv_environment_ready(
+    tpu_name: str,
+    zone: str,
+    project: str,
+    *,
+    nfs_mount_path: str | None,
+    nfs_user: str = "saksham3",
+) -> bool:
+    """Whether the uv binary and the project venv are both already in place."""
+    uv_root, worker = uv_location(nfs_mount_path, nfs_user)
+    result = ssh_command(
+        tpu_name,
+        zone,
+        f"test -x {uv_root}/bin/uv && test -f {uv_root}/vla/bin/activate",
+        project=project,
+        worker=worker,
+        check=False,
+        timeout=180,
+    )
+    return result.returncode == 0
+
+
+def ensure_uv_environment(
+    tpu_name: str,
+    zone: str,
+    remote_dir: str,
+    project: str,
+    *,
+    nfs_mount_path: str | None,
+    nfs_user: str = "saksham3",
+    force: bool = False,
+) -> None:
+    """Provision the uv environment if it is not already there.
+
+    A shared filesystem is not the same as a *provisioned* one: a filer that has never been
+    used by this project has no uv and no venv, and assuming otherwise made an NFS pod fail
+    at the first command that needed either. Presence is therefore what decides whether to
+    build, and the build itself is the same work in both cases — only its location differs.
+    """
+    if not force and uv_environment_ready(tpu_name, zone, project, nfs_mount_path=nfs_mount_path, nfs_user=nfs_user):
+        logger.info("uv environment already present on %s", tpu_name)
+        return
+    install_uv(tpu_name, zone, project, nfs_mount_path=nfs_mount_path, nfs_user=nfs_user)
+    install_deps(tpu_name, zone, remote_dir, project, nfs_mount_path, nfs_user=nfs_user)
+
+
 def install_deps(
     tpu_name: str,
     zone: str,
     remote_dir: str,
     project: str,
     nfs_mount_path: str | None = "/nfs/aidm_nfs",
+    nfs_user: str = "saksham3",
 ) -> None:
     """Install Python dependencies on TPU using uv.
 
@@ -158,16 +224,10 @@ def install_deps(
         remote_dir: Remote directory containing pyproject.toml
         project: GCP project ID
         nfs_mount_path: NFS mount path (e.g. /nfs/aidm_nfs)
+        nfs_user: Owner directory on the NFS mount
     """
     logger.info("Installing dependencies on TPU %s", tpu_name)
-    if nfs_mount_path:
-        uv_root = f"{nfs_mount_path}/saksham3/uv"
-        worker = "0"
-    else:
-        # No shared filesystem: every worker builds its own environment in its own home,
-        # which also sidesteps the per-worker uid mismatch that breaks chmod on NFS.
-        uv_root = "$HOME/uv"
-        worker = "all"
+    uv_root, worker = uv_location(nfs_mount_path, nfs_user)
 
     ssh_command(
         tpu_name,
@@ -188,19 +248,31 @@ def install_deps(
     logger.info("Dependency installation complete")
 
 
-def install_uv(tpu_name: str, zone: str, project: str) -> None:
-    """Install uv into each worker's own home directory (local-disk pods)."""
-    logger.info("Installing uv per worker on TPU %s", tpu_name)
+def install_uv(
+    tpu_name: str,
+    zone: str,
+    project: str,
+    *,
+    nfs_mount_path: str | None = None,
+    nfs_user: str = "saksham3",
+) -> None:
+    """Install uv where this pod's environment lives.
+
+    On a local-disk pod that is each worker's own home; on a shared filesystem it is the one
+    location every worker reads. The install itself is identical either way.
+    """
+    uv_root, worker = uv_location(nfs_mount_path, nfs_user)
+    logger.info("Installing uv at %s on TPU %s (worker=%s)", uv_root, tpu_name, worker)
     ssh_command(
         tpu_name,
         zone,
         (
-            "mkdir -p ~/uv/bin ~/uv/cache && "
-            "test -x ~/uv/bin/uv || curl -LsSf https://astral.sh/uv/install.sh | "
-            "UV_INSTALL_DIR=~/uv/bin sh"
+            f"mkdir -p {uv_root}/bin {uv_root}/cache && "
+            f"test -x {uv_root}/bin/uv || curl -LsSf https://astral.sh/uv/install.sh | "
+            f"UV_INSTALL_DIR={uv_root}/bin sh"
         ),
         project=project,
-        worker="all",
+        worker=worker,
     )
 
 
@@ -218,8 +290,7 @@ def stage_paligemma_weights(tpu_name: str, zone: str, project: str, source_uri: 
     ssh_command(
         tpu_name,
         zone,
-        f"mkdir -p {cache} && "
-        f"test -s {cache}/pt_224.npz || gcloud storage cp {source_uri} {cache}/pt_224.npz",
+        f"mkdir -p {cache} && test -s {cache}/pt_224.npz || gcloud storage cp {source_uri} {cache}/pt_224.npz",
         project=project,
         worker="all",
     )

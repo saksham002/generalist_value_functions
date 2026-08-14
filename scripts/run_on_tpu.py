@@ -28,6 +28,7 @@ Example usage:
 import dataclasses
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -39,8 +40,7 @@ import tyro
 
 from openpi.tpu import buckets
 from openpi.tpu.buckets import localize_command
-from openpi.tpu.code_sync import install_deps
-from openpi.tpu.code_sync import install_uv
+from openpi.tpu.code_sync import ensure_uv_environment
 from openpi.tpu.code_sync import stage_paligemma_weights
 from openpi.tpu.code_sync import sync_code
 from openpi.tpu.code_sync import sync_wandb_credentials
@@ -106,6 +106,14 @@ class TPUJobConfig:
     """Checkpoint root to seed this run from on its FIRST launch, e.g. a previous run's
     region bucket. The newest committed checkpoint under it is copied into wherever this
     launch actually writes. Across preemption retries the carry happens automatically."""
+
+    post_launch_hook: str = ""
+    """Command run locally right after the job starts on a pod, and again after every
+    preemption retry, since each retry is a fresh pod that needs the same treatment. It is
+    launched in the background so job monitoring is never blocked, and receives the pod's
+    identity through the environment: TPU_NAME, TPU_ZONE, TPU_PROJECT, TPU_WORKER_COUNT and
+    TPU_COMMAND (the localized command, so the hook can read the flags the run actually
+    uses). Anything the hook needs to know about the run is in those five variables."""
 
     nfs_user: str = "saksham3"
     """NFS username (e.g. 'saksham3', 'jeffyu'). Determines venv and default working_dir."""
@@ -318,6 +326,52 @@ def checkpoint_root_of(command: str) -> str | None:
     return f"{base.group(1).rstrip('/')}/{config_name}/{exp_name}"
 
 
+# Matches the fine-tune selector but not its override flags: `--fine-tune <name>` and
+# `--fine-tune=<name>` are separated by whitespace or '=', whereas
+# `--fine-tune.data-factory.rlds-data-dir` continues with a '.'.
+_FINE_TUNE_IN_COMMAND = re.compile(r"--fine-tune[=\s]+([\w.-]+)")
+
+
+def fine_tune_name_of(command: str) -> str | None:
+    """The fine-tune config a training command selects, or None for a plain run."""
+    match = _FINE_TUNE_IN_COMMAND.search(command)
+    return match.group(1) if match else None
+
+
+def run_post_launch_hook(config: TPUJobConfig, tpu_name: str, tpu_config) -> None:
+    """Start the post-launch hook for the pod the job was just started on.
+
+    Runs per attempt rather than per launch: a preemption retry puts the job on a fresh
+    pod whose local state starts empty, so whatever the hook sets up has to be redone
+    there. Failure is logged and never propagated — a hook is an accompaniment to the run,
+    not a precondition for it.
+    """
+    if not config.post_launch_hook:
+        return
+    env = {
+        **os.environ,
+        "TPU_NAME": tpu_name,
+        "TPU_ZONE": tpu_config.zone,
+        "TPU_PROJECT": tpu_config.project,
+        "TPU_WORKER_COUNT": str(get_worker_count(config.tpu_type)),
+        "TPU_COMMAND": config.command,
+    }
+    logger.info("Starting post-launch hook on %s: %s", tpu_name, config.post_launch_hook)
+    try:
+        # shell=True is deliberate: the hook is operator-supplied, exactly like the
+        # training command this script already runs.
+        subprocess.Popen(
+            config.post_launch_hook,
+            shell=True,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        logger.warning("Could not start post-launch hook: %s", e)
+
+
 def adjust_mesh_flags(command: str, tpu_config) -> str:
     """Make the FSDP axis expressible on the pod that was actually allocated.
 
@@ -401,10 +455,29 @@ def consume_done_marker(marker: str | None) -> bool:
 
 
 def command_with_done_marker(command: str, marker: str | None) -> str:
-    """Append marker creation so only a successful command records completion."""
+    """Append marker creation so only a successful command records completion.
+
+    Written by one worker only. The command runs on every worker, and GCS rate-limits
+    mutation of a *single* object, so N workers creating the same marker at the same
+    instant means one succeeds and the rest get HTTP 429 — which fails their half of the
+    chain and reports a finished run as a failure. The worker index comes from the
+    hostname's ``-w-<index>`` suffix; TPU_WORKER_ID is not set in the ssh environment.
+    A hostname without that suffix is a single host, which therefore writes it too.
+
+    The marker tail is one brace group: ``&&`` binds only to the first command of a
+    ``;``-separated list, so an ungrouped tail runs even when the command fails — a crash
+    then reports itself finished. ``-n "$h"`` guards the single-host branch for the same
+    reason: if the failed chain skipped the hostname assignment, both ``$w`` and ``$h``
+    are empty and ``[ "$w" = "$h" ]`` alone would match.
+    """
     if not marker:
         return command
-    return f"{command} && gcloud storage cp /dev/null {marker}"
+    return (
+        f"{command} && "
+        f"{{ h=$(hostname); w=${{h##*-w-}}; "
+        f'if [ -n "$h" ] && {{ [ "$w" = 0 ] || [ "$w" = "$h" ]; }}; then '
+        f"gcloud storage cp /dev/null {marker}; fi; }}"
+    )
 
 
 def preemption_retry_available(config: TPUJobConfig, retry_count: int) -> bool:
@@ -506,6 +579,25 @@ def run_job(config: TPUJobConfig) -> int:
                 notifier.notify_error(tpu_name, f"checkpoint carry failed: {e}", config.command)
                 mark_setup_finished(tpu_name, tpu_config)
                 return 1
+
+            # A fine-tune writes under <root>/<ft-name>, which the carry above never
+            # reaches: it only moves the newest step directly under the root it is given.
+            # Carrying just the base means a re-raced pod restores the pretrained weights
+            # and silently discards every fine-tune step taken so far — the run looks
+            # healthy while repeating hours of work.
+            fine_tune = fine_tune_name_of(config.command)
+            if fine_tune:
+                try:
+                    buckets.carry_checkpoints(f"{source_root}/{fine_tune}", f"{current_root}/{fine_tune}")
+                except NotImplementedError as e:
+                    # Cross-continent: refusing the copy is correct, but it is not worth
+                    # failing a launch that can still resume from the base checkpoint.
+                    logger.warning("Could not carry fine-tune progress for %s: %s", fine_tune, e)
+                except Exception as e:
+                    logger.error("Failed to carry fine-tune checkpoints for %s: %s", fine_tune, e)
+                    notifier.notify_error(tpu_name, f"fine-tune carry failed: {e}", config.command)
+                    mark_setup_finished(tpu_name, tpu_config)
+                    return 1
         previous_checkpoint_root = current_root or previous_checkpoint_root
 
         if not verify_setup(tpu_name, tpu_config, nfs_user=config.nfs_user):
@@ -513,9 +605,9 @@ def run_job(config: TPUJobConfig) -> int:
             try:
                 setup_tpu(tpu_name, tpu_config)
                 if not tpu_config.uses_nfs:
-                    # Each worker needs its own uv and its own copy of the PaliGemma
-                    # weights; neither can be shared without a filesystem.
-                    install_uv(tpu_name, tpu_config.zone, tpu_config.project)
+                    # Without a shared filesystem each worker needs its own copy of the
+                    # PaliGemma weights. uv is handled with the rest of the environment,
+                    # after the code is synced, by the same path both pod types take.
                     stage_paligemma_weights(tpu_name, tpu_config.zone, tpu_config.project, PALIGEMMA_WEIGHTS_URI)
             except Exception as e:
                 # A spot pod can vanish mid-setup, and every remaining ssh then hangs to its
@@ -545,17 +637,19 @@ def run_job(config: TPUJobConfig) -> int:
                     tpu_config.project,
                     workers=sync_workers,
                 )
-                # Dependencies first: on a local-disk pod the venv does not exist yet, and
-                # the gemma helper installs into it. On NFS the venv is pre-built, which is
-                # why the old order happened to work there.
-                if config.install_deps or not tpu_config.uses_nfs:
-                    install_deps(
-                        tpu_name,
-                        tpu_config.zone,
-                        config.working_dir,
-                        tpu_config.project,
-                        tpu_config.nfs_mount_path if tpu_config.uses_nfs else None,
-                    )
+                # Dependencies first: the gemma helper installs into the venv, so it has to
+                # exist by now. Whether the pod has a shared filesystem decides only *where*
+                # that environment lives — not whether this step runs. A filer that was
+                # never provisioned has no uv and no venv, so presence is what is checked.
+                ensure_uv_environment(
+                    tpu_name,
+                    tpu_config.zone,
+                    config.working_dir,
+                    tpu_config.project,
+                    nfs_mount_path=tpu_config.nfs_mount_path if tpu_config.uses_nfs else None,
+                    nfs_user=config.nfs_user,
+                    force=config.install_deps,
+                )
                 sync_gemma_helper(config, tpu_name, tpu_config, workers=sync_workers)
                 install_gemma_helper(config, tpu_name, tpu_config, nfs_user=config.nfs_user)
                 sync_wandb_credentials(tpu_name, tpu_config.zone, tpu_config.project)
@@ -601,6 +695,8 @@ def run_job(config: TPUJobConfig) -> int:
             logger.error("Failed to start job: %s", e)
             notifier.notify_error(tpu_name, f"Failed to start job: {e}", config.command)
             return 1
+
+        run_post_launch_hook(config, tpu_name, tpu_config)
 
         if config.local_tmux and runner.create_local_tmux_session():
             logger.info(

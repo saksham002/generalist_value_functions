@@ -167,6 +167,30 @@ def find_gs_uris(command: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
+# One bucket per continent holds the datasets and counterfactual-action stores, rather than
+# one per region: a dataset is read by pods in whichever zone the race wins, so replicating
+# it per region would mean many copies of the same tens of GB, while an inter-region read
+# within a continent is cheap. Writes stay regional — those are per-run and not shared.
+_HUB_REGION_BY_CONTINENT = {"us": "us-central2", "eu": "europe-west4"}
+
+# Flags naming such a shared read location: a key containing "data" or "store" and ending
+# in "dir" (--data.rlds-data-dir, --fine-tune.data-factory.counterfactual-action-store-dir,
+# --data.assets.assets-dir). Deliberately excludes --checkpoint-base-dir and
+# --assets-base-dir, which are per-run writes and belong in the pod's own region.
+_SHARED_DIR_ARG = re.compile(r"--([\w.-]*(?:data|store)[\w.-]*dir)[=\s]+(gs://[^\s'\"]+)")
+
+
+def shared_dir_uris(command: str) -> set[str]:
+    """URIs passed as a data/store directory argument."""
+    return {match.group(2).rstrip("/") for match in _SHARED_DIR_ARG.finditer(command)}
+
+
+def hub_bucket_for(region: str, *, resource_owner: str) -> str | None:
+    """The continent-wide bucket a shared read should resolve to, or None if unmapped."""
+    hub_region = _HUB_REGION_BY_CONTINENT.get(continent_of(region))
+    return canonical_bucket_for_region(hub_region, resource_owner=resource_owner) if hub_region else None
+
+
 _STEP_IN_COMMAND = re.compile(r"--(?:[\w.-]+\.)?step[=\s]+(\d+)")
 
 
@@ -293,19 +317,26 @@ def localize_command(command: str, tpu_config: TPUConfigWithType) -> tuple[str, 
       checkpoint directory, and rejected otherwise, so an arbitrary prefix is never dragged
       across regions by accident.
 
+    Data and store directories resolve to their continent's hub bucket instead of the pod's
+    own regional one (see ``_HUB_REGION_BY_CONTINENT``). Only the replacement differs; which
+    URIs are redirected, copied or refused is decided exactly as it is for everything else.
+
     Returns the rewritten command and a map of original URI to replacement.
     """
     region = region_from_zone(tpu_config.zone)
     destination = ensure_regional_bucket(region, resource_owner=tpu_config.resource_owner)
+    hub = hub_bucket_for(region, resource_owner=tpu_config.resource_owner)
+    shared_dirs = shared_dir_uris(command)
     training = is_train_command(command)
     declared_writes = write_uris(command)
     rewrites: dict[str, str] = {}
 
     for uri in find_gs_uris(command):
         source_bucket, path = split_uri(uri)
-        if source_bucket == destination:
+        bucket_for_uri = hub if (hub is not None and uri in shared_dirs) else destination
+        if source_bucket == bucket_for_uri:
             continue
-        target = f"gs://{destination}/{path}" if path else f"gs://{destination}"
+        target = f"gs://{bucket_for_uri}/{path}" if path else f"gs://{bucket_for_uri}"
 
         if training:
             # A declared write destination, or a path that does not exist yet: redirect it

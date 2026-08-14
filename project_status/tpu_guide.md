@@ -204,6 +204,32 @@ nothing about checkpoints, which keeps it usable for non-training jobs.
 **`--retry-on-preemption` requires `--spot`** and now says so rather than failing
 obscurely: a reserved launch has no way to re-acquire capacity once its pod is gone.
 
+**Value-function runs on spot pods must pass the val-cache sync hook.** Add:
+
+```bash
+    --post-launch-hook "$PWD/scripts/sync_val_cache_workers.sh"
+```
+
+`--post-launch-hook` runs a local command after the job starts on a pod, and again after
+every preemption retry, with `TPU_NAME`, `TPU_ZONE`, `TPU_PROJECT`, `TPU_WORKER_COUNT` and
+`TPU_COMMAND` in its environment. It runs in the background and its failure never affects
+the run.
+
+The hook it exists for: `sync_val_cache_workers.sh` waits for the validation-episode cache
+to be built and copies it to every worker, staging through a same-region GCS object. It is
+a no-op unless the run's `validation-cache-dir` is a `/home` path — which is the case that
+breaks. Validation plotting is a collective over the mesh, only the host running JAX
+process 0 populates the cache, and on a per-worker path the others find nothing, take the
+"no valid frames" early return, and never enter the collective. The hosts that did enter
+wait for peers that never arrive and the runtime halts the core with *"an unexpected peer
+shows up in the launch group"*, killing a healthy run at its first plot step. A cache on
+`/nfs` is shared and needs none of this, so the hook exits immediately there.
+
+Every preemption lands the run on a pod with empty local disks, so this has to happen per
+attempt, not once per launch — which is why it is a hook rather than a setup step. Which
+worker builds the cache is not predictable (observed on workers 0, 1, 5 and 6 across pods),
+so the hook finds the populated one rather than assuming worker 0.
+
 **The RSS guard never retries.** A daemon thread probes every worker every 300 s; over
 `host_ram_gb x 0.95` it kills the run, notifies and returns 1. Relaunching would
 reproduce the same memory profile.

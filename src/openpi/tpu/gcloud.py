@@ -105,6 +105,23 @@ _KILLED_RETURNCODE = 137
 # reports no state at all, which counts the same way.
 _TERMINAL_TPU_STATES = (None, "PREEMPTED", "TERMINATED", "DELETING")
 
+# "The API did not answer", which is not a statement about the pod. Deliberately outside
+# _TERMINAL_TPU_STATES: an unreachable control plane once read as a deleted pod, so a
+# lapsed credential looked exactly like a preemption and killed runs whose pods were
+# healthy — including one that had already finished training.
+TPU_STATE_UNKNOWN = "UNKNOWN"
+
+# gcloud says this, and only this, when the resource genuinely is not there.
+_NOT_FOUND_MARKERS = ("not_found", "was not found", "could not be found")
+
+
+def _describe_failure_state(result: subprocess.CompletedProcess[str]) -> str | None:
+    """Map a failed describe onto a state: absent (None) or unreachable (UNKNOWN)."""
+    lowered = (result.stderr or "").lower()
+    if any(marker in lowered for marker in _NOT_FOUND_MARKERS):
+        return None
+    return TPU_STATE_UNKNOWN
+
 
 def is_transient_failure(returncode: int, stderr: str | None) -> bool:
     """Whether a failed gcloud call is worth simply running again."""
@@ -277,15 +294,19 @@ def get_tpu_state(name: str, zone: str, project: str = DEFAULT_PROJECT) -> str |
         project: GCP project ID
 
     Returns:
-        TPU state string (e.g., "READY", "PREEMPTED"), or None if not found
+        TPU state string (e.g., "READY", "PREEMPTED"), None if the pod does not exist, or
+        ``TPU_STATE_UNKNOWN`` if the call itself failed and the pod's state is unknown.
     """
-    result = run_gcloud(
-        ["compute", "tpus", "tpu-vm", "describe", name, "--zone", zone, "--format=value(state)"],
-        project=project,
-        check=False,
-    )
+    try:
+        result = run_gcloud(
+            ["compute", "tpus", "tpu-vm", "describe", name, "--zone", zone, "--format=value(state)"],
+            project=project,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return TPU_STATE_UNKNOWN
     if result.returncode != 0:
-        return None
+        return _describe_failure_state(result)
     return result.stdout.strip()
 
 
@@ -451,10 +472,13 @@ def get_tpu_state_and_health(tpu_name: str, zone: str, project: str) -> tuple[st
             timeout=180,
         )
     except subprocess.TimeoutExpired:
-        logger.warning("describe %s in %s timed out; treating state as unknown", tpu_name, zone)
-        return None, None
+        logger.warning("describe %s in %s timed out; state is unknown", tpu_name, zone)
+        return TPU_STATE_UNKNOWN, None
     if result.returncode != 0:
-        return None, None
+        state = _describe_failure_state(result)
+        if state == TPU_STATE_UNKNOWN:
+            logger.warning("describe %s in %s failed; state is unknown, not assuming the pod is gone", tpu_name, zone)
+        return state, None
     parts = result.stdout.strip().split()
     state = parts[0] if parts else None
     health = parts[1] if len(parts) > 1 else None

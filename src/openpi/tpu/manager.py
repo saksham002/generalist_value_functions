@@ -20,6 +20,8 @@ from openpi.tpu.config import get_tpu_user
 from openpi.tpu.config import resolve_from_pod
 from openpi.tpu.config import spot_race_configs
 from openpi.tpu.config import with_discovered_nfs
+from openpi.tpu.gcloud import _TERMINAL_TPU_STATES
+from openpi.tpu.gcloud import TPU_STATE_UNKNOWN
 from openpi.tpu.gcloud import create_queued_resource
 from openpi.tpu.gcloud import delete_queued_resource
 from openpi.tpu.gcloud import delete_tpu_vm
@@ -416,12 +418,26 @@ def is_tpu_preempted(tpu_name: str, zone: str, project: str) -> bool:
     GCP removes the resource, it does not leave a tombstone. Treating only the PREEMPTED
     string as preemption means a deleted pod falls through to the generic failure path and
     skips the retry that exists for exactly this case.
+
+    The same applies to the states a pod passes through on its way out: a preemption is
+    observed as DELETING for as long as the teardown takes, and whether the poll lands
+    during that window or after it is a matter of timing, not of what happened.
+
+    What does *not* count is a failure to ask. ``TPU_STATE_UNKNOWN`` means the control
+    plane did not answer — expired credentials, a network blip — which says nothing about
+    the pod. Reading that as "gone" declared preemptions against healthy pods and ended
+    runs that were still training, so an unknown state leaves the caller polling.
     """
     state = get_tpu_state(tpu_name, zone, project)
-    if state is None:
-        logger.info("TPU %s no longer exists in %s; treating as preempted", tpu_name, zone)
+    if state == TPU_STATE_UNKNOWN:
+        logger.warning(
+            "TPU %s in %s: state unknown (control plane unreachable); not treating as preempted", tpu_name, zone
+        )
+        return False
+    if state in _TERMINAL_TPU_STATES:
+        logger.info("TPU %s in %s is %s; treating as preempted", tpu_name, zone, state or "gone")
         return True
-    return state == "PREEMPTED"
+    return False
 
 
 def _prepare_candidate(name: str, config: TPUConfigWithType, cancel: threading.Event) -> None:
@@ -544,13 +560,20 @@ def race_spot_tpu(
                 # Both verdicts are permanent for this race: more waiting cannot grant quota,
                 # and a zone that does not offer the shape will never start offering it.
                 kind = classify_create_failure(create_failure_reason(error))
-                if kind in ("quota", "unsupported"):
+                # Only a zone that cannot offer the shape at all is permanently out: no
+                # amount of waiting makes a v6e-32 appear where the accelerator is not
+                # available. Quota is different — it is exceeded because someone's pods
+                # currently hold it, and it frees the moment those are deleted, so a
+                # quota-capped zone stays in the race and is re-submitted like any other.
+                if kind == "unsupported":
                     logger.info("Dropping %s: %s, retrying will not clear it", config.zone, kind)
                     dropped.add(config.zone)
+                elif kind == "quota":
+                    logger.info("%s is quota-capped for now; keeping it in the race", config.zone)
 
             live = [(name, config) for zone, (name, config) in candidates.items() if zone not in dropped]
             if not live:
-                raise RuntimeError(f"No zone can supply {tpu_type}: every candidate is quota-capped or unsupported")
+                raise RuntimeError(f"No zone can supply {tpu_type}: every candidate is unsupported")
 
             for name, config in live:
                 if not _is_tpu_usable(name, config):

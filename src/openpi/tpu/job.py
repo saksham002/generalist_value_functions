@@ -181,6 +181,13 @@ class JobRunner:
                         exit_code=exit_code,
                         output_tail=output_tail,
                     )
+                # No exit code means the pod stopped answering rather than the job
+                # reporting a result. The session probe treats a terminal pod as "job
+                # ended", so a preemption arrives here looking like a plain failure —
+                # and reporting it as one skips the retry that exists for exactly this.
+                if exit_code is None and is_tpu_preempted(self.tpu_name, self.zone, self.project):
+                    logger.warning("TPU %s is gone and left no exit code; treating as preempted", self.tpu_name)
+                    return JobStatus(state="preempted", output_tail=output_tail)
                 logger.warning("Job failed with exit code %s", exit_code)
                 return JobStatus(
                     state="failed",
