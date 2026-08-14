@@ -309,6 +309,10 @@ def run_worker(args: WorkerArgs) -> None:
 
     # Create builder once and reuse for metadata queries and dataset loading
     source_builder = tfds.builder(dataset_cfg.name, data_dir=data_config.rlds_data_dir, version=dataset_cfg.version)
+    logger.info(
+        f"Source dataset resolved to {source_builder.data_dir} "
+        f"(rlds_data_dir={data_config.rlds_data_dir}, name={dataset_cfg.name}, version={dataset_cfg.version})"
+    )
     split_info = source_builder.info.splits[args.split]
     total_episodes = split_info.num_examples
     shard_lengths = split_info.shard_lengths
