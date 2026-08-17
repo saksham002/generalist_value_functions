@@ -140,6 +140,11 @@ class EvalConfig:
     # titles the video); this flag only decides whether it feeds the value.
     # Orthogonal to counterfactual_value_action.
     condition_on_decoded_subtask: bool = False
+    # Force the standard validation plots even for a subtask critic, whose
+    # prompt_mode would otherwise route to the subtask video and run the
+    # autoregressive decode at every sampled frame. Use to score the cached
+    # ground-truth-subtask prompts with no decoding at all.
+    disable_subtask_decoding: bool = False
     # ACTION axis (action-conditioned critics only). Selects which action the
     # per-frame Q is evaluated at: False uses the dataset (behaviour) action, True
     # uses the highest-value cached counterfactual (policy-generated) action, which
@@ -1108,7 +1113,6 @@ def main(eval_config: EvalConfig):
     data_config = config.data.create(config.assets_dirs, config.model)
     action_horizon = config.action_horizon or config.model.action_horizon
     val_tokenizer = config.data._get_critic_tokenizer(config.model)
-    assert val_tokenizer is not None, "RoboCOIN evaluation requires a critic tokenizer."
 
     val_input_transform = _transforms.compose([
         *data_config.repack_transforms.inputs,
@@ -1229,7 +1233,10 @@ def main(eval_config: EvalConfig):
         getattr(config.data, "prompt_mode", None)
         or getattr(config.data, "subtask_prompt_mode", None)
     )
-    subtask_mode = critic_prompt_mode == "task_description_predict_current_subtask"
+    subtask_mode = (
+        critic_prompt_mode == "task_description_predict_current_subtask"
+        and not eval_config.disable_subtask_decoding
+    )
     if not subtask_mode:
         train_module.generate_validation_plots_dlimp(
             model = model,

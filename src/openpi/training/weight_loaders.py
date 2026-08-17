@@ -151,6 +151,48 @@ class PaliGemmaSiglipOnlyWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen = True)
+class ResNet50ImageNetWeightLoader(WeightLoader):
+    """Loads torchvision ImageNet ResNet-50 conv weights into the shared trunk of a ResNetValueNetwork.
+
+    The npz is produced by ``scripts/convert_torchvision_resnet50.py`` and keyed by ResNet50Trunk
+    parameter paths (``stem_conv/kernel``, ``layers/layer1/block0/conv1/kernel``, ...). The
+    ``encoder`` subtree of the value network(s) (``q_network`` / ``target_q_network`` or
+    ``network`` / ``target_network``) receives a copy; GroupNorm, spatial embeddings and the
+    readout keep their random init. Any npz leaf that does not exist in the model with the same
+    shape is an error, since the npz is generated for exactly this trunk layout.
+    """
+
+    params_path: str = "gs://saksham-euw4/checkpoints/resnet50_imagenet_v2/resnet50_gn.npz"
+
+    def load(self, params: at.Params) -> at.Params:
+        path = download.maybe_download(self.params_path)
+        with path.open("rb") as f:
+            trunk_params = dict(np.load(f, allow_pickle = False))
+
+        network_names = [name for name in ("q_network", "target_q_network", "network", "target_network") if name in params]
+        if not network_names:
+            raise ValueError(
+                f"ResNet50ImageNetWeightLoader expects a value-function param tree, got top-level keys {sorted(params)}"
+            )
+        flat_ref = flax.traverse_util.flatten_dict(params, sep = "/")
+        loaded: dict[str, np.ndarray] = {}
+        for network_name in network_names:
+            if "encoder" not in params[network_name]:
+                raise ValueError(f"{network_name} has no `encoder` subtree; is it a ResNetValueNetwork?")
+            for key, value in trunk_params.items():
+                full_key = f"{network_name}/encoder/{key}"
+                ref = flat_ref.get(full_key)
+                if ref is None or tuple(ref.shape) != tuple(value.shape):
+                    raise ValueError(
+                        f"ResNet50ImageNetWeightLoader: {full_key} missing from the model or shape mismatch "
+                        f"(npz {value.shape} vs model {None if ref is None else ref.shape})"
+                    )
+                loaded[full_key] = copy.deepcopy(value)
+        logger.info("ResNet50ImageNetWeightLoader: loaded %d trunk leaves into %s", len(loaded), network_names)
+        return _merge_params(flax.traverse_util.unflatten_dict(loaded, sep = "/"), params, missing_regex = ".*")
+
+
+@dataclasses.dataclass(frozen = True)
 class Gemma3WeightLoader(WeightLoader):
     """Loads transformer + SigLIP weights from a Gemma 3 checkpoint.
 

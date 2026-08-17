@@ -56,6 +56,7 @@ import openpi.value_functions.heads as _heads
 import openpi.value_functions.networks.ensemble as _ensemble_network
 import openpi.value_functions.networks.mlp as _mlp_network
 import openpi.value_functions.networks.paligemma as _paligemma_network
+import openpi.value_functions.networks.resnet as _resnet_network
 import openpi.value_functions.value_function as _value_function
 import openpi.value_functions.value_transforms as _value_transforms
 
@@ -260,11 +261,20 @@ class DecodeRoboCoinPromptBytes:
         return data
 
 
+def _critic_subtask_id_transforms(network_config) -> list[_transforms.DataTransformFn]:
+    """Decode the prompt strings and map the subtask to a categorical id for ResNet critics with a vocab."""
+    if isinstance(network_config, _resnet_network.ResNetNetworkConfig) and network_config.subtask_vocab is not None:
+        return [DecodeRoboCoinPromptBytes(), _transforms.SubtaskTextToId(vocab = network_config.subtask_vocab)]
+    return []
+
+
 @dataclasses.dataclass(frozen=True)
 class AddValidationVariants:
     """Add validation variants (random actions + optional negative-text prompt)."""
 
-    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer
+    # None for critics without a text pathway (e.g. the ResNet network); the negative-prompt
+    # variant is skipped in that case.
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.Gemma3Tokenizer | _tokenizer.Gemma4Tokenizer | None
     use_quantile_norm: bool = False
     # When True (default), produce a negative-prompt variant via the RoboCOIN-specific
     # `generate_negative_subtask_text` heuristic; requires "subtask_1" to be present.
@@ -282,7 +292,7 @@ class AddValidationVariants:
         if "_frame_index" in data:
             frame_index = int(np.asarray(data["_frame_index"]).item())
 
-        if self.include_negative and "subtask_1" in data:
+        if self.include_negative and self.tokenizer is not None and "subtask_1" in data:
             subtask_text = _robocoin_utils.decode_text(data["subtask_1"])
             negative_subtask_text = _robocoin_utils.generate_negative_subtask_text(subtask_text)
             negative_tokens, negative_mask = self.tokenizer.tokenize(negative_subtask_text, state = None)
@@ -1193,6 +1203,7 @@ class RoboCoinRldsDataConfig(DataConfigFactory):
                     tokenize_transform,
                 ]
             )
+        transforms.extend(_critic_subtask_id_transforms(self._get_critic_network_config(model_config)))
         return _transforms.Group(inputs = transforms, outputs = [])
 
     @override
@@ -1413,6 +1424,7 @@ class Hdf5RldsDataConfig(DataConfigFactory):
                     tokenize_transform,
                 ]
             )
+        transforms.extend(_critic_subtask_id_transforms(self._get_critic_network_config(model_config)))
         return _transforms.Group(inputs = transforms, outputs = [])
 
     @override
@@ -1632,6 +1644,7 @@ class LeRobotRldsDataConfig(DataConfigFactory):
                     tokenize_transform,
                 ]
             )
+        transforms.extend(_critic_subtask_id_transforms(self._get_critic_network_config(model_config)))
         return _transforms.Group(inputs = transforms, outputs = [])
 
     @override
@@ -2003,6 +2016,7 @@ class RLDSRoboCasaDataConfig(DataConfigFactory):
                 tokenizer = critic_network_config.get_tokenizer()
                 model_inputs.append(DecodeRoboCoinPromptBytes())
                 model_inputs.append(_transforms.TokenizePrompt(tokenizer))
+            model_inputs.extend(_critic_subtask_id_transforms(critic_network_config))
             model_transforms = _transforms.Group(inputs = model_inputs)
 
             asset_id = self.assets.asset_id
@@ -4895,7 +4909,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             shuffle_buffer_size = 50_000,
             mask_boundary_actions = False,
             subsample = True,
-            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/lego_pi05_task_baseline/",
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/lego_pi05_subtask/",
             max_token_len = 160,
             prompt_mode = "task_description_predict_current_subtask",
         ),
@@ -4917,7 +4931,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         action_horizon = 60,
         num_train_steps = 20_000,
         save_interval = 2_500,
-        plot_interval = 10_000,
+        plot_interval = 50_000,
         keep_period = 10_000,
         lr_schedule = _optimizer.CosineDecaySchedule(
             warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
@@ -5252,6 +5266,19 @@ def get_fine_tune_config(name: str) -> FineTuneConfig:
 # =============================================================================
 
 # Use `get_config` if you need to get a config by name in your code.
+# Categorical subtask vocabulary of the real_shirt_hang HDF5 dataset (per-frame `subtask_1`
+# strings, verified against the local shards). "dummy" marks frames without a subtask
+# annotation and is kept as an explicit category so those frames still train the critic.
+_REAL_SHIRT_HANG_SUBTASK_VOCAB: tuple[str, ...] = (
+    "Grasp the hanger",
+    "Lift the hanger off the rod",
+    "Pass hanger from right to left arm",
+    "Hook one side of the shirt onto the hanger",
+    "Hook the other side of the shirt onto the hanger",
+    "Place the hanger on the rod",
+    "dummy",
+)
+
 _CONFIGS = [
     #
     # Inference Aloha configs.
@@ -6523,6 +6550,208 @@ _CONFIGS = [
         include_repos = ("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_cql_rlds/",
     ),
+    # =========================================================================
+    # RoboCOIN pre-training arms of the objective x prompt ablation. Each differs
+    # from robocoin_bimanual_paligemma_cql_rlds_subtask_ar (TD + subtask, above) in
+    # exactly the way its sim_bimanual_assembly counterpart differs from
+    # sim_bimanual_assembly_paligemma_td_bon_subtask_ar. Data pipeline, schedule,
+    # batch size, held-out repos and PaliGemma init are shared with the base.
+    # =========================================================================
+    # SARSA: bootstraps off the DATASET's next action instead of the best of N
+    # policy candidates, so there is no BestOfN policy and no action bounds / CQL
+    # term. Prompt side is unchanged from the base (AR subtask + next-token loss).
+    TrainConfig(
+        name = "robocoin_bimanual_paligemma_sarsa_subtask_ar",
+        model = _value_function.SARSAValueFunctionConfig(
+            network_config = _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                max_token_len = 96,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = True,
+            ),
+            head_config = _heads.RegressionHeadConfig(),
+            action_horizon = 50,
+            discount = 0.999,
+            tau = 0.005,
+            next_token_loss_weight = 0.1,
+        ),
+        weight_loader = weight_loaders.PaliGemmaWeightLoader(),
+        data = RoboCoinRldsDataConfig(
+            rlds_data_dir = "gs://saksham-euw4/robocoin_bimanual",
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/robocoin_bimanual/norm_stats",
+                asset_id = "embodiment_wise",
+            ),
+            datasets = (rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
+            discount = 0.999,
+            td_n = 50,
+            use_eef = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            state_dim = 14,
+            max_token_len = 96,
+            subtask_prompt_mode = "task_description_predict_current_subtask",
+        ),
+        num_train_steps = 230_000,
+        batch_size = 256,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 1e-5,
+            decay_steps = 230_000,
+            decay_lr = 1e-6,
+        ),
+        optimizer = _optimizer.AdamW(weight_decay = 1e-6),
+        num_workers = 0,
+        log_interval = 100,
+        plot_interval = 50_000,
+        save_interval = 50_000,
+        fsdp_devices = 16,
+        action_horizon = 50,
+        num_val_trajectories = 10,
+        include_repos = ("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_sarsa_subtask_ar/",
+    ),
+    # Monte-Carlo on the task description: regresses the discounted return to the subtask
+    # end, so there is no bootstrap at all -- no target network (tau), no discount on the
+    # model (the return is built in the data pipeline) and no BestOfN policy, hence no
+    # counterfactual action store either. Prompt matches the td_bon_task_description arm,
+    # discount included, so the two differ only in objective.
+    TrainConfig(
+        name = "robocoin_bimanual_paligemma_mc_task_description",
+        model = _value_function.MCValueFunctionConfig(
+            network_config = _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                max_token_len = 48,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = False,
+            ),
+            head_config = _heads.RegressionHeadConfig(),
+            action_horizon = 50,
+            next_token_loss_weight = 0.0,
+        ),
+        weight_loader = weight_loaders.PaliGemmaWeightLoader(),
+        data = RoboCoinRldsDataConfig(
+            rlds_data_dir = "gs://saksham-euw4/robocoin_bimanual",
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/robocoin_bimanual/norm_stats",
+                asset_id = "embodiment_wise",
+            ),
+            datasets = (rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
+            discount = 0.9995,
+            td_n = 50,
+            use_eef = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            state_dim = 14,
+            max_token_len = 48,
+            subtask_prompt_mode = "task_description",
+        ),
+        num_train_steps = 230_000,
+        batch_size = 256,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 1e-5,
+            decay_steps = 230_000,
+            decay_lr = 1e-6,
+        ),
+        optimizer = _optimizer.AdamW(weight_decay = 1e-6),
+        num_workers = 0,
+        log_interval = 100,
+        plot_interval = 50_000,
+        save_interval = 50_000,
+        fsdp_devices = 16,
+        action_horizon = 50,
+        num_val_trajectories = 10,
+        include_repos = ("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_mc_task_description/",
+    ),
+    # TD on the task description only: same CQL/BestOfN objective as the base, but the
+    # prompt carries no subtask, so the AR subtask head and its next-token loss are off
+    # and the token budget halves. Mirrors sim_bimanual_assembly_paligemma_td_bon_task_description,
+    # including its longer-horizon discount (0.9995 vs the base's 0.999).
+    TrainConfig(
+        name = "robocoin_bimanual_paligemma_td_bon_task_description",
+        model = _value_function.CQLValueFunctionConfig(
+            q_network_config = _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                max_token_len = 48,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = False,
+            ),
+            q_head_config = _heads.RegressionHeadConfig(),
+            next_token_loss_weight = 0.0,
+            action_horizon = 50,
+            discount = 0.9995,
+            tau = 0.005,
+            action_bounds = ActionBounds.from_uniform(-1.25, 1.25, action_dim = 14, is_normalized = True),
+            cql_alpha = 0.0,
+        ),
+        policy = _best_of_n.BestOfNWrapperConfig(
+            action_dim = 14,
+            action_horizon = 50,
+            base_model_config = None,
+            num_samples = 8,
+            use_target_value = True,
+        ),
+        policy_extraction = _policy_extraction.NoopPolicyConfig(),
+        weight_loader = weight_loaders.PaliGemmaWeightLoader(),
+        data = RoboCoinRldsDataConfig(
+            rlds_data_dir = "gs://saksham-euw4/robocoin_bimanual",
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/robocoin_bimanual/norm_stats",
+                asset_id = "embodiment_wise",
+            ),
+            datasets = (rlds_dataset.RLDSDataset(name = "robocoin", version = "1.0.0", weight = 1.0),),
+            discount = 0.9995,
+            td_n = 50,
+            use_eef = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/robocoin_bimanual_pi05_rlds",
+            state_dim = 14,
+            max_token_len = 48,
+            subtask_prompt_mode = "task_description",
+        ),
+        num_train_steps = 230_000,
+        batch_size = 256,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 1e-5,
+            decay_steps = 230_000,
+            decay_lr = 1e-6,
+        ),
+        optimizer = _optimizer.AdamW(weight_decay = 1e-6),
+        num_workers = 0,
+        log_interval = 100,
+        plot_interval = 50_000,
+        save_interval = 50_000,
+        fsdp_devices = 16,
+        action_horizon = 50,
+        num_val_trajectories = 10,
+        include_repos = ("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_td_bon_task_description/",
+    ),
     # SARSA critic on sim_bimanual_assembly straight from PaliGemma: bootstrapped targets
     # anchored on the subtask countdown, with the AR subtask head and its next-token loss
     # enabled.
@@ -7112,6 +7341,83 @@ _CONFIGS = [
         num_val_trajectories = 3,
         include_repos = (),
         validation_cache_dir = "/data/user_data/saksham3/real_shirt_hang/validation_cache/gemma300m_scratch/",
+    ),
+    # ResNet-50 sibling of real_shirt_hang_paligemma_cql_rlds_gemma300m_scratch: ImageNet-pretrained
+    # ResNet-50 per camera (ResNet50ImageNetWeightLoader) + spatial embeddings + MLP readout, with
+    # categorical subtask prediction / conditioning over _REAL_SHIRT_HANG_SUBTASK_VOCAB. The
+    # next_token_loss_weight weights the subtask cross-entropy of the predictor head. Data,
+    # BestOfN Bellman backup and optimizer are identical to the gemma300m_scratch config.
+    TrainConfig(
+        name = "real_shirt_hang_resnet_cql_rlds_subtask",
+        model = _value_function.CQLValueFunctionConfig(
+            q_network_config = _resnet_network.ResNetNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                num_subtask_categories = len(_REAL_SHIRT_HANG_SUBTASK_VOCAB),
+                subtask_vocab = _REAL_SHIRT_HANG_SUBTASK_VOCAB,
+            ),
+            q_head_config = _heads.RegressionHeadConfig(),
+            next_token_loss_weight = 0.1,
+            action_horizon = 60,
+            discount = 0.999,
+            tau = 0.005,
+            action_bounds = ActionBounds.from_uniform(-1.25, 1.25, action_dim = 14, is_normalized = True),
+            cql_alpha = 0.0,
+        ),
+        policy = _best_of_n.BestOfNWrapperConfig(
+            action_dim = 14,
+            action_horizon = 60,
+            base_model_config = None,
+            num_samples = 8,
+            use_target_value = True,
+        ),
+        policy_extraction = _policy_extraction.NoopPolicyConfig(),
+        weight_loader = weight_loaders.ResNet50ImageNetWeightLoader(),
+        data = Hdf5RldsDataConfig(
+            repo_id = "real_shirt_hang",
+            rlds_data_dir = "/data/group_data/rl/saksham3/hdf5",
+            datasets = (rlds_dataset.RLDSDataset(name = "real_shirt_hang", version = "1.0.0", weight = 1.0),),
+            assets = AssetsConfig(
+                assets_dir = "/data/group_data/rl/saksham3/hdf5/real_shirt_hang",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            use_eef = True,
+            state_dim = 14,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 100_000,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "/data/group_data/rl/saksham3/robocoin/cached_actions/real_shirt_hang_pi05",
+            max_token_len = 96,
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        num_train_steps = 20_000,
+        batch_size = 128,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 1e-5,
+            decay_steps = 20_000,
+            decay_lr = 1e-6,
+        ),
+        optimizer = _optimizer.AdamW(weight_decay = 1e-6),
+        num_workers = 0,
+        log_interval = 100,
+        plot_interval = 10_000,
+        save_interval = 10_000,
+        fsdp_devices = 16,
+        action_horizon = 60,
+        num_val_trajectories = 3,
+        include_repos = (),
+        validation_cache_dir = "/data/user_data/saksham3/real_shirt_hang/validation_cache/resnet_cql_rlds_subtask/",
     ),
     # Same as real_shirt_hang_paligemma_cql_rlds_gemma300m_scratch but with the
     # default prompt_mode="subtask": the per-frame current subtask is fed directly
@@ -8476,7 +8782,7 @@ _CONFIGS = [
         data = LeRobotRldsDataConfig(
             repo_id = "lego",
             rlds_data_dir = "gs://saksham-usc2/datasets",
-            datasets = (rlds_dataset.RLDSDataset(name = "lego", version = "1.0.0", weight = 1.0),),
+            datasets = (rlds_dataset.RLDSDataset(name = "lego", version = "2.0.0", weight = 1.0),),
             assets = AssetsConfig(
                 assets_dir = "gs://saksham-usc2/datasets/lego",
                 asset_id = "norm_stats",
@@ -8486,24 +8792,25 @@ _CONFIGS = [
             use_quantile_norm = True,
             filter_n = 8,
             filter_partial = True,
+            filter_adversarial = True,
             shuffle_buffer_size = 50_000,
             mask_boundary_actions = False,
             prompt_mode = "subtask",
         ),
         weight_loader = weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps = 70_000,
+        num_train_steps = 40_000,
         batch_size = 256,
         lr_schedule = _optimizer.CosineDecaySchedule(
             warmup_steps = 1000,
             peak_lr = 5e-5,
-            decay_steps = 70_000,
+            decay_steps = 40_000,
             decay_lr = 5e-6,
         ),
         optimizer = _optimizer.AdamW(),
         num_workers = 0,
         log_interval = 100,
         save_interval = 5_000,
-        keep_period = 25_000,
+        keep_period = 20_000,
         fsdp_devices = 16,
         action_horizon = 60,
     ),

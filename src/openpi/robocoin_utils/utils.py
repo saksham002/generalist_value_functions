@@ -131,8 +131,10 @@ def _jitted_compute_value(
     model_to_use: _value_fn.BaseValueFunction,
     obs: _model.Observation,
     act: _model.Actions | None,
-) -> jnp.ndarray:
-    return model_to_use.compute_value(obs, act, take_min_over_ensemble = True)
+) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+    """Returns (values, attn_scores); attn_scores is None for networks without per-modality attention."""
+    out = model_to_use.compute_value(obs, act, take_min_over_ensemble = True)
+    return out if isinstance(out, tuple) else (out, None)
 
 
 @nnx.jit
@@ -154,7 +156,11 @@ def _jitted_compute_value_best_cached(
     kv_cache, prefix_mask, subtask_mask = model_to_use.compute_prefix_cache(obs)
     expanded_obs = expand_observation(obs, num_samples)
     flat_actions = actions.reshape(actions.shape[0] * num_samples, actions.shape[2], actions.shape[3])
-    repeated_kv_cache = jax.tree.map(lambda x: jnp.repeat(x, num_samples, axis = 1), kv_cache)
+    # gemma_2b KV caches stack layers with batch at axis 1; networks with a plain feature cache
+    # (e.g. ResNet image features) declare `prefix_cache_batch_axis`.
+    network = getattr(model_to_use, "q_network", None) or getattr(model_to_use, "network", None)
+    kv_batch_axis = getattr(network, "prefix_cache_batch_axis", 1)
+    repeated_kv_cache = jax.tree.map(lambda x: jnp.repeat(x, num_samples, axis = kv_batch_axis), kv_cache)
     repeated_prefix_mask = jnp.repeat(prefix_mask, num_samples, axis = 0)
     repeated_subtask_mask = None if subtask_mask is None else jnp.repeat(subtask_mask, num_samples, axis = 0)
     out = model_to_use.compute_value(
@@ -308,6 +314,10 @@ def get_obs_and_action(
         action = stack_frames(frame_dicts, actions_key)
         action_mask = stack_frames(frame_dicts, action_mask_key)
 
+    # Ground-truth categorical subtask id (ResNet critics); like the positive prompt it is
+    # shared by every prefix variant.
+    subtask_id = stack_frames(frame_dicts, "subtask_id")
+
     obs = _model.Observation(
         images=images_dict,
         image_masks=image_masks_dict,
@@ -317,6 +327,7 @@ def get_obs_and_action(
         action_mask=action_mask,
         subtask_start_index=subtask_start_index,
         subtask_end_index=subtask_end_index,
+        subtask_id=subtask_id,
     )
 
     return obs, action
@@ -364,7 +375,7 @@ def count_subtask_segments(frames: list[dict], prefix: str = "") -> tuple[int, i
 _CACHE_KEYS = {
     "state", "image", "image_mask", "actions", "action_mask",
     "tokenized_prompt", "tokenized_prompt_mask",
-    "subtask_start_index", "subtask_end_index",
+    "subtask_start_index", "subtask_end_index", "subtask_id",
     "tokenized_negative_prompt", "tokenized_negative_prompt_mask",
     "negative_subtask_1_text", "random_actions", "counterfactual_actions",
     "mc_return", "include_subtask", "fps",
@@ -820,7 +831,8 @@ def predict_values(
 
         for i, (ep_idx, _, _) in enumerate(batch_frames):
             all_predictions[ep_idx].append(float(pred_values_np[i]))
-            all_attn_scores[ep_idx].append(attn_np[i])
+            if attn_np is not None:
+                all_attn_scores[ep_idx].append(attn_np[i])
             if pred_values_neg_np is not None:
                 all_predictions_neg[ep_idx].append(float(pred_values_neg_np[i]))
             if pred_values_random_np is not None:

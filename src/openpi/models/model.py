@@ -122,6 +122,9 @@ class Observation(Generic[ArrayT]):
     # Index of the last current-subtask token within tokenized_prompt.
     subtask_end_index: at.Int[ArrayT, "*b"] | None = None
 
+    # Categorical subtask id (ResNet value network); None when the network predicts it.
+    subtask_id: at.Int[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -153,6 +156,7 @@ class Observation(Generic[ArrayT]):
             action_mask=data.get("action_mask"),
             subtask_start_index=data.get("subtask_start_index"),
             subtask_end_index=data.get("subtask_end_index"),
+            subtask_id=data.get("subtask_id"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -235,6 +239,7 @@ def preprocess_observation(
         action_mask=observation.action_mask,
         subtask_start_index=observation.subtask_start_index,
         subtask_end_index=observation.subtask_end_index,
+        subtask_id=observation.subtask_id,
     )
 
 

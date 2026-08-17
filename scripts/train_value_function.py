@@ -447,6 +447,11 @@ def init_wandb(
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
+def _cast_param(param, dtype):
+    """Cast a param's value; nnx layers created with use_bias=False hold Param(None) biases, left as is."""
+    return param if param.value is None else param.replace(param.value.astype(dtype))
+
+
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
@@ -489,19 +494,19 @@ def init_train_state(
         params = nnx_utils.state_map(
             params,
             config.freeze_filter,
-            lambda p: p.replace(p.value.astype(jnp.bfloat16)),
+            lambda p: _cast_param(p, jnp.bfloat16),
         )
         weight_dtype = jnp.dtype(model_config.weight_dtype) if hasattr(model_config, "weight_dtype") else jnp.float32
         target_dtype = jnp.dtype(model_config.target_dtype) if hasattr(model_config, "target_dtype") else jnp.float32
         params = nnx_utils.state_map(
             params,
             config.trainable_filter,
-            lambda p: p.replace(p.value.astype(weight_dtype)),
+            lambda p: _cast_param(p, weight_dtype),
         )
         params = nnx_utils.state_map(
             params,
             nnx_utils.PathRegex(".*target_(q_)?(network|head)/.*"),
-            lambda p: p.replace(p.value.astype(target_dtype)),
+            lambda p: _cast_param(p, target_dtype),
         )
 
         return training_utils.TrainState(
@@ -535,7 +540,7 @@ def init_train_state(
         policy_params = nnx_utils.state_map(
             policy_params,
             config.freeze_filter,
-            lambda p: p.replace(p.value.astype(jnp.bfloat16)),
+            lambda p: _cast_param(p, jnp.bfloat16),
         )
         return training_utils.TrainState(
             step=0,
@@ -2299,7 +2304,6 @@ def main(config: _config.TrainConfig):
         # (val_dataset_dir override, AddValidationVariants(include_negative=True)).
         action_horizon = config.action_horizon or config.model.action_horizon
         val_tokenizer = config.data._get_critic_tokenizer(config.model)
-        assert val_tokenizer is not None, "RoboCasa validation requires a critic tokenizer."
         import dataclasses as _dc
         # RoboCasa data_transforms / model_transforms expect decoded uint8 arrays, so
         # decode upstream rather than carrying raw JPEG bytes through.
@@ -2342,7 +2346,6 @@ def main(config: _config.TrainConfig):
     elif data_config.rlds_dataset_class in ("robocoin", "hdf5", "lerobot"):
         action_horizon = config.action_horizon or config.model.action_horizon
         val_tokenizer = config.data._get_critic_tokenizer(config.model)
-        assert val_tokenizer is not None, "RoboCOIN/HDF5 validation variants require a critic tokenizer."
         # Build a val-only data_config that (a) optionally points at val_dataset_dir
         # (a smaller variant of the same dataset) and (b) leaves images compressed.
         # `decode_images=False` keeps cam_X as the raw JPEG/PNG bytes coming out

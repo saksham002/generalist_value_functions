@@ -252,6 +252,13 @@ def test_expand_observation_none_fields():
     assert expanded.state.shape == (10, 3)
     assert expanded.tokenized_prompt is None
     assert expanded.tokenized_prompt_mask is None
+    assert expanded.subtask_id is None
+
+
+def test_expand_observation_subtask_id():
+    obs = _model.Observation(images={}, image_masks={}, state=jnp.ones((2, 3)), subtask_id=jnp.array([4, 6]))
+    expanded = best_of_n.expand_observation(obs, 3)
+    assert expanded.subtask_id.tolist() == [4, 4, 4, 6, 6, 6]
 
 
 def test_config_delegates_properties():

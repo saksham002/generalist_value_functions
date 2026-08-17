@@ -508,6 +508,48 @@ class TokenizeRoboCoinSubtaskPrompt(DataTransformFn):
         }
 
 
+def normalize_subtask_text(text: str) -> str:
+    """Canonical form for matching subtask strings against a vocabulary (whitespace / trailing period)."""
+    return text.strip().rstrip(".").strip()
+
+
+@dataclasses.dataclass(frozen = True)
+class SubtaskTextToId(DataTransformFn):
+    """Map the frame's subtask string to an int32 ``subtask_id`` via a fixed vocabulary.
+
+    Reads ``subtask_text`` when present and non-empty (prompt modes that keep the task
+    description in ``prompt``), otherwise ``prompt`` (subtask-only prompt modes). Unknown
+    strings raise so a vocabulary mismatch fails loudly instead of training on garbage ids.
+    """
+
+    vocab: tuple[str, ...]
+
+    def __post_init__(self):
+        lookup = {normalize_subtask_text(text): index for index, text in enumerate(self.vocab)}
+        if len(lookup) != len(self.vocab):
+            raise ValueError(f"vocab has duplicate entries after normalization: {self.vocab}")
+        object.__setattr__(self, "_lookup", lookup)
+
+    @staticmethod
+    def _as_str(value) -> str:
+        if not isinstance(value, str | bytes):
+            value = value.item()
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        return value
+
+    def __call__(self, data: DataDict) -> DataDict:
+        text = self._as_str(data["subtask_text"]) if "subtask_text" in data else ""
+        if not text:
+            if "prompt" not in data:
+                raise ValueError("SubtaskTextToId requires subtask_text or prompt")
+            text = self._as_str(data["prompt"])
+        key = normalize_subtask_text(text)
+        if key not in self._lookup:
+            raise ValueError(f"Unknown subtask {text!r}; vocab = {self.vocab}")
+        return {**data, "subtask_id": np.int32(self._lookup[key])}
+
+
 @dataclasses.dataclass(frozen=True)
 class TokenizeFASTInputs(DataTransformFn):
     tokenizer: _tokenizer.FASTTokenizer

@@ -42,6 +42,8 @@ def _extract_observations_from_batch(batch: dict) -> tuple[_model.Observation, _
     next_subtask_start_index = batch.get("next_subtask_start_index", subtask_start_index)
     subtask_end_index = batch.get("subtask_end_index")
     next_subtask_end_index = batch.get("next_subtask_end_index", subtask_end_index)
+    subtask_id = batch.get("subtask_id")
+    next_subtask_id = batch.get("next_subtask_id", subtask_id)
 
     observation = _model.Observation(
         images = images,
@@ -52,6 +54,7 @@ def _extract_observations_from_batch(batch: dict) -> tuple[_model.Observation, _
         action_mask = batch.get("action_mask"),
         subtask_start_index = jnp.asarray(subtask_start_index) if subtask_start_index is not None else None,
         subtask_end_index = jnp.asarray(subtask_end_index) if subtask_end_index is not None else None,
+        subtask_id = jnp.asarray(subtask_id) if subtask_id is not None else None,
     )
     next_observation = _model.Observation(
         images = next_images,
@@ -62,6 +65,7 @@ def _extract_observations_from_batch(batch: dict) -> tuple[_model.Observation, _
         action_mask = batch.get("next_action_mask"),
         subtask_start_index = jnp.asarray(next_subtask_start_index) if next_subtask_start_index is not None else None,
         subtask_end_index = jnp.asarray(next_subtask_end_index) if next_subtask_end_index is not None else None,
+        subtask_id = jnp.asarray(next_subtask_id) if next_subtask_id is not None else None,
     )
     return observation, next_observation
 

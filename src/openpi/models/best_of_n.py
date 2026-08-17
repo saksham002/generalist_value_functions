@@ -795,6 +795,8 @@ class BestOfNWrapper(_model.BaseModel):
             # gemma_2b stacks layers with batch at axis 1.
             paligemma_variant = getattr(getattr(network, "config", None), "paligemma_variant", "")
             kv_batch_axis = 0 if "gemma4" in paligemma_variant else 1
+            # Networks with a non-KV prefix cache (e.g. ResNet image features) declare their batch axis.
+            kv_batch_axis = getattr(network, "prefix_cache_batch_axis", kv_batch_axis)
             repeated_kv_cache = jax.tree.map(
                 lambda x: jnp.repeat(x, n, axis = kv_batch_axis), raw_kv_cache
             )
@@ -940,4 +942,5 @@ def expand_observation(observation: _model.Observation, num_samples: int) -> _mo
         action_mask=_repeat(observation.action_mask),
         subtask_start_index=_repeat(observation.subtask_start_index),
         subtask_end_index=_repeat(observation.subtask_end_index),
+        subtask_id=_repeat(observation.subtask_id),
     )

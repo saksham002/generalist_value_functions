@@ -92,3 +92,24 @@ def test_model_restore():
 
     actions = model.sample_actions(key, _model.wrap_observation_as_transition(obs), num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+
+
+def test_observation_subtask_id_round_trip():
+    import numpy as np
+
+    obs = _model.Observation.from_dict({"state": np.ones((2, 3), dtype = np.float32), "subtask_id": np.array([1, 2])})
+    assert obs.subtask_id.tolist() == [1, 2]
+    assert obs.to_dict()["subtask_id"].tolist() == [1, 2]
+    assert _model.Observation.from_dict({"state": np.ones((2, 3), dtype = np.float32)}).subtask_id is None
+
+    preprocessed = _model.preprocess_observation(
+        None,
+        _model.Observation(
+            images = {key: jax.numpy.zeros((2, 8, 8, 3)) for key in _model.IMAGE_KEYS},
+            image_masks = {},
+            state = jax.numpy.ones((2, 3)),
+            subtask_id = jax.numpy.array([0, 1]),
+        ),
+        image_resolution = (8, 8),
+    )
+    assert preprocessed.subtask_id.tolist() == [0, 1]

@@ -680,11 +680,18 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             # path tokenizes a live prompt (see _prepare_inputs_rank0), so the
             # BestOfNWrapper can recognize a null-prompt step and skip value-based
             # selection.
-            _null_tokens, _ = self._critic_tokenizer.tokenize("null", None)
-            self._critic_null_prompt_tokens = np.asarray(_null_tokens)
+            # A critic without a text pathway (ResNet network, get_tokenizer() -> None)
+            # detects the null prompt on the raw string instead and predicts its own
+            # categorical subtask id from the images.
+            if self._critic_tokenizer is not None:
+                _null_tokens, _ = self._critic_tokenizer.tokenize("null", None)
+                self._critic_null_prompt_tokens = np.asarray(_null_tokens)
+            else:
+                self._critic_null_prompt_tokens = None
+                logger.info("Critic has no tokenizer; prompt tokens are zero placeholders for the critic.")
             # Critic prompt token length (determines the dummy shape we
             # broadcast on participating workers).
-            self._critic_max_token_len = critic_network_config.max_token_len
+            self._critic_max_token_len = getattr(critic_network_config, "max_token_len", self._critic_max_token_len)
 
             # Auto-route the constant task description into critic tokenization
             # when the critic was trained with prompt_mode="task_description_predict_current_subtask".
@@ -1206,7 +1213,26 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             batched["image_mask"] = {k: jnp.array([True]) for k in batched.get("image", {})}
 
         extras: dict[str, Any] = {}
-        if self._bestofn is not None:
+        if self._bestofn is not None and self._critic_tokenizer is None:
+            # Tokenizer-free critic (ResNet): keep the broadcast package shape-stable with
+            # zero token placeholders and detect the null prompt on the raw string.
+            null_prompt = isinstance(prompt_str, str) and prompt_str.strip().lower() == "null"
+            extras["critic_tokens"] = jnp.zeros((1, self._critic_max_token_len), dtype = jnp.int32)
+            extras["critic_token_mask"] = jnp.zeros((1, self._critic_max_token_len), dtype = jnp.bool_)
+            extras["subtask_start_index"] = jnp.zeros((1,), dtype = jnp.int32)
+            extras["subtask_end_index"] = jnp.zeros((1,), dtype = jnp.int32)
+            extras["critic_is_null_prompt"] = jnp.asarray(null_prompt, dtype = jnp.bool_)
+            if self._expect_critic_images:
+                if critic_image_dict is None:
+                    raise ValueError(
+                        "expect_critic_images=True but obs has no 'critic_image' dict. "
+                        "The eval client must populate critic_image with the critic-pipeline images."
+                    )
+                extras["critic_images"] = {
+                    k: jnp.asarray(v)[None, ...].astype(jnp.float32) / 127.5 - 1.0
+                    for k, v in critic_image_dict.items()
+                }
+        elif self._bestofn is not None:
             # subtask_start/end_index default to 0 (ignored unless predict_subtask_ar).
             s_start, s_end = 0, 0
             if critic_task_desc is not None and self._critic_prompt_mode == "task_description":

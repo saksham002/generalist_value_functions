@@ -37,10 +37,16 @@ from openpi.value_functions.networks.ensemble import EnsembleNetworkConfig
 from openpi.value_functions.networks.mlp import MLPNetworkConfig
 from openpi.value_functions.networks.mlp import MultiMLPNetworkConfig
 from openpi.value_functions.networks.paligemma import PaliGemmaNetworkConfig
+from openpi.value_functions.networks.resnet import ResNetNetworkConfig
 
 # =============================================================================
 # Single-Transition Value Functions
 # =============================================================================
+
+
+# Image-based network configs share the PaliGemma conventions: `create(rng, action_horizon = ...)`
+# and a `dtype` field that determines the value function's weight dtype.
+_IMAGE_NETWORK_CONFIGS = (PaliGemmaNetworkConfig, ResNetNetworkConfig)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -51,7 +57,7 @@ class ValueFunctionConfig(BaseValueFunctionConfig):
     the objective and any objective-specific parameters.
     """
 
-    network_config: MLPNetworkConfig | PaliGemmaNetworkConfig
+    network_config: MLPNetworkConfig | PaliGemmaNetworkConfig | ResNetNetworkConfig
     head_config: HeadConfig
 
     # Number of actions in the action chunk. None means V(s), not Q(s,a).
@@ -64,7 +70,7 @@ class ValueFunctionConfig(BaseValueFunctionConfig):
     @property
     def weight_dtype(self) -> str:
         """Dtype for model weights, derived from the network config."""
-        if isinstance(self.network_config, PaliGemmaNetworkConfig):
+        if isinstance(self.network_config, _IMAGE_NETWORK_CONFIGS):
             return self.network_config.dtype
         return "float32"
 
@@ -103,9 +109,9 @@ class MCValueFunctionConfig(ValueFunctionConfig):
         rng = jax.random.key(rng) if isinstance(rng, int) else rng
         net_rng, head_rng = jax.random.split(rng)
 
-        # PaliGemmaNetworkConfig receives action_horizon at creation time instead of
+        # PaliGemmaNetworkConfig / ResNetNetworkConfig receive action_horizon at creation time instead of
         # storing it as a config field. MLPNetworkConfig keeps it in its own config.
-        if isinstance(self.network_config, PaliGemmaNetworkConfig):
+        if isinstance(self.network_config, _IMAGE_NETWORK_CONFIGS):
             network = self.network_config.create(net_rng, action_horizon = self.action_horizon)
         else:
             network = self.network_config.create(net_rng)
@@ -135,7 +141,7 @@ class SARSAValueFunctionConfig(ValueFunctionConfig):
         rng = jax.random.key(rng) if isinstance(rng, int) else rng
         net_rng, head_rng = jax.random.split(rng, 2)
 
-        if isinstance(self.network_config, PaliGemmaNetworkConfig):
+        if isinstance(self.network_config, _IMAGE_NETWORK_CONFIGS):
             network = self.network_config.create(net_rng, action_horizon = self.action_horizon)
             target_network = self.network_config.create(net_rng, action_horizon = self.action_horizon)
         else:
@@ -236,7 +242,7 @@ class SACValueFunctionConfig(ValueFunctionConfig):
         rng = jax.random.key(rng) if isinstance(rng, int) else rng
         net_rng, head_rng = jax.random.split(rng, 2)
 
-        if isinstance(self.network_config, PaliGemmaNetworkConfig):
+        if isinstance(self.network_config, _IMAGE_NETWORK_CONFIGS):
             network = self.network_config.create(net_rng, action_horizon = self.action_horizon)
             target_network = self.network_config.create(net_rng, action_horizon = self.action_horizon)
         else:
@@ -650,7 +656,7 @@ class CQLValueFunctionConfig(BaseValueFunctionConfig):
     Supports any network config implementing the create/feature_dim protocol.
     """
 
-    q_network_config: MLPNetworkConfig | PaliGemmaNetworkConfig | EnsembleNetworkConfig
+    q_network_config: MLPNetworkConfig | PaliGemmaNetworkConfig | ResNetNetworkConfig | EnsembleNetworkConfig
     q_head_config: HeadConfig | EnsembleHeadConfig
 
     # Number of actions in the action chunk. None means V(s), not Q(s,a).
@@ -678,7 +684,7 @@ class CQLValueFunctionConfig(BaseValueFunctionConfig):
     @property
     def weight_dtype(self) -> str:
         """Dtype for model weights, derived from the network config."""
-        if isinstance(self.q_network_config, PaliGemmaNetworkConfig):
+        if isinstance(self.q_network_config, _IMAGE_NETWORK_CONFIGS):
             return self.q_network_config.dtype
         return "float32"
 
@@ -687,7 +693,7 @@ class CQLValueFunctionConfig(BaseValueFunctionConfig):
         rng = jax.random.key(rng) if isinstance(rng, int) else rng
         net_rng, head_rng = jax.random.split(rng, 2)
 
-        if isinstance(self.q_network_config, PaliGemmaNetworkConfig):
+        if isinstance(self.q_network_config, _IMAGE_NETWORK_CONFIGS):
             q_network = self.q_network_config.create(net_rng, action_horizon = self.action_horizon)
             target_q_network = self.q_network_config.create(net_rng, action_horizon = self.action_horizon)
         else:

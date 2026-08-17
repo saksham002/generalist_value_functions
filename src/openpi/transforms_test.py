@@ -239,3 +239,17 @@ def test_extract_prompt_from_task():
 
     with pytest.raises(ValueError, match="task_index=2 not found in task mapping"):
         transform({"task_index": 2})
+
+
+def test_subtask_text_to_id():
+    transform = _transforms.SubtaskTextToId(vocab = ("Grasp the hanger", "Place the hanger on the rod", "dummy"))
+
+    assert transform({"prompt": "task", "subtask_text": b"Grasp the hanger."})["subtask_id"] == 0
+    assert transform({"prompt": np.array(b"Place the hanger on the rod")})["subtask_id"] == 1
+    # Empty subtask_text (task-description prompt modes) falls back to prompt.
+    assert transform({"prompt": "dummy", "subtask_text": ""})["subtask_id"] == 2
+    assert transform({"prompt": "dummy"})["subtask_id"].dtype == np.int32
+    with pytest.raises(ValueError, match = "Unknown subtask"):
+        transform({"prompt": "Lift the hanger"})
+    with pytest.raises(ValueError, match = "duplicate"):
+        _transforms.SubtaskTextToId(vocab = ("a", "a."))

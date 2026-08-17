@@ -7,6 +7,7 @@ from openpi.training import rlds_dataset
 from openpi.value_functions import heads as _heads
 from openpi.value_functions import value_function as _value_function
 from openpi.value_functions.networks import paligemma as _paligemma_network
+from openpi.value_functions.networks import resnet as _resnet_network
 
 
 def _make_norm_stats():
@@ -99,3 +100,44 @@ def test_real_hang_pi05_filter_intervention_only_pads_actions(monkeypatch):
     assert pad_transform.model_action_dim == 32
     assert pad_transform.action_dim_offset == 14
     assert pad_transform.pad_state is False
+
+
+def test_resnet_critic_gets_subtask_id_transforms(monkeypatch):
+    monkeypatch.setattr(
+        _config.RoboCoinRldsDataConfig, "_load_norm_stats", lambda self, assets_dir, asset_id: _make_norm_stats()
+    )
+    data_config_factory = _config.RoboCoinRldsDataConfig(
+        rlds_data_dir = "gs://saksham-euw4/robocoin_bimanual",
+        datasets = (rlds_dataset.RLDSDataset(name = "robocoin_bimanual", version = "1.0.0", weight = 1.0),),
+        use_eef = True,
+        td_n = 50,
+        use_chunk_wise_delta = True,
+        use_quantile_norm = True,
+    )
+
+    def make_model_config(**network_overrides):
+        return _value_function.CQLValueFunctionConfig(
+            q_network_config = _resnet_network.ResNetNetworkConfig(
+                state_dim = 14, num_cameras = 3, action_dim = 14, no_state = True, **network_overrides
+            ),
+            q_head_config = _heads.RegressionHeadConfig(),
+            action_horizon = 50,
+        )
+
+    with_vocab = make_model_config(num_subtask_categories = 2, subtask_vocab = ("a", "b"))
+    assert with_vocab.weight_dtype == "float32"
+    data_config = data_config_factory.create(pathlib.Path("."), with_vocab)
+    assert [type(t).__name__ for t in data_config.model_transforms.inputs] == [
+        "DecodeRoboCoinPromptBytes", "SubtaskTextToId",
+    ]
+
+    data_config = data_config_factory.create(pathlib.Path("."), make_model_config())
+    assert list(data_config.model_transforms.inputs) == []
+
+
+def test_real_shirt_hang_resnet_config_loads():
+    config = _config.get_config("real_shirt_hang_resnet_cql_rlds_subtask")
+    network_config = config.model.q_network_config
+    assert isinstance(network_config, _resnet_network.ResNetNetworkConfig)
+    assert network_config.num_subtask_categories == len(network_config.subtask_vocab) == 7
+    assert config.model.next_token_loss_weight > 0
