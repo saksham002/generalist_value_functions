@@ -2573,7 +2573,15 @@ def main(config: _config.TrainConfig):
     # Fine-tune mode loads pretrained weights from a different dataset, so
     # advancing the new data iterator by ``start_step`` batches has no resume
     # semantics — skip the fast-forward and iterate only the fine-tune range.
-    skip_fast_forward = config.fine_tune is not None
+    #
+    # TEMPORARY: unconditionally skip the fast-forward for pre-training resumes too.
+    # Every preemption on the RoboCOIN spot runs otherwise pays start_step full data
+    # loads (JPEG decode, transforms, CF-store join) before the first real step —
+    # ~1 h at 33k steps, growing linearly — for a batch order that is not actually
+    # reproducible across restarts (sharded/prefetched shuffle buffer, per-frame
+    # random subtask sampling). Revert to ``config.fine_tune is not None`` once
+    # spot preemption stops dominating wall-clock.
+    skip_fast_forward = True
     if start_step > 0 and not skip_fast_forward:
         logging.info(f"Resuming with data-loader fast-forward through step {start_step}")
     loop_range = (

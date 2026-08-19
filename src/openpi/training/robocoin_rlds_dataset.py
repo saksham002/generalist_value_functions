@@ -101,10 +101,6 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
                 "variable_horizon=True requires td_n == action_chunk_size, "
                 f"got td_n={td_n}, action_chunk_size={action_chunk_size}"
             )
-        assert not (critic_mode and subtask_prompt_mode == "task_description"), (
-            "critic_mode=True is incompatible with subtask_prompt_mode='task_description'"
-        )
-
         self._split = split
         self._use_eef = use_eef
         self._td_n = td_n
@@ -209,8 +205,28 @@ class RoboCoinRldsDataset(rlds_dataset.BaseRldsDataset):
             "subtask_3": traj["subtask_3"],
             "subtask_4": traj["subtask_4"],
             "subtask_5": traj["subtask_5"],
-            "steps_to_subtask_end": traj["steps_to_subtask_end"],
-            "first_null_index": traj["first_null_index"],
+            # task_description has no subtasks: count down to the EPISODE end instead, so
+            # mc_return / termination / next_action_mask measure distance to task
+            # completion, matching the prompt. Mirrors Hdf5RldsDataset. The per-subtask
+            # field is [T, 5]; the episode countdown is broadcast across all five slots so
+            # frame_transforms' sampled_idx gather is unchanged (every slot is equally valid).
+            "steps_to_subtask_end": (
+                tf.repeat(
+                    tf.cast(traj["_len"] - 1 - traj["_frame_index"], tf.int32)[:, None], 5, axis = 1,
+                )
+                if self._subtask_prompt_mode == "task_description"
+                else traj["steps_to_subtask_end"]
+            ),
+            # Under task_description every frame is a valid sample regardless of subtask
+            # annotation coverage: an episode with first_null_index=0 (no annotated
+            # subtasks) would otherwise be masked out entirely by include_subtask, and one
+            # with first_null_index=1 confines sampled_idx to slot 0. All five slots carry the
+            # same episode countdown, so declaring all five valid is exact, not a fudge.
+            "first_null_index": (
+                tf.fill(tf.shape(traj["first_null_index"]), tf.cast(5, traj["first_null_index"].dtype))
+                if self._subtask_prompt_mode == "task_description"
+                else traj["first_null_index"]
+            ),
             "fps": fps,
             "repo_id": repo_id,
             "task_description": task_description,
