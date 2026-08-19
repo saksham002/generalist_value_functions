@@ -1,23 +1,25 @@
-"""TPU configuration.
+"""TPU configuration: what a pod IS, and where a job puts things on it.
 
 Almost nothing here is configuration. Zone, NFS, accelerator and runtime are facts about
 a pod, so they are discovered (:mod:`openpi.tpu.discovery`) rather than declared, and the
 zones a spot pod may be raced in come from live quota (:mod:`openpi.tpu.quota`).
 
-Only three things must be declared, because they are inputs to *creating* a pod that does
+Only two things must be declared, because they are inputs to *creating* a pod that does
 not exist yet and so cannot be read off one:
 
 - ``runtime_version`` per family — a pod built with the wrong runtime boots but cannot run
   the job, and fails much later looking unrelated;
-- the accelerator string per family — v5e alone renames ``v5e-N`` to ``v5litepod-N``;
-- ``host_ram_gb`` per family — the RSS guard's ceiling has to be per-family.
+- the accelerator string per family — v5e alone renames ``v5e-N`` to ``v5litepod-N``.
 
-Resolution has two entry points, matching the two ways a pod comes to exist:
+Three dataclasses, each with one lifetime:
 
-- :func:`resolve_from_pod` — the pod already exists (any reserved pod, or a spot pod that
-  won a race). Everything is read off it. Raises if it does not exist.
-- :func:`spot_race_configs` — the pod does not exist yet. Zones come from live quota; NFS
-  is attached afterwards with :func:`with_discovered_nfs` once the winner is real.
+- :class:`TPUUserConfig` — policy owned by a person: storage namespaces, home directory.
+- :class:`PodConfig` — facts about one pod, holding its user by composition rather than
+  copying the user's fields in. A function that needs a zone no longer receives a bucket
+  registry.
+- :class:`RemoteLayout` — every path a job touches on the pod, derived once from whether
+  that pod has a shared filesystem. This is the single answer to "where does X live",
+  which used to be re-derived independently in four modules.
 """
 
 from collections.abc import Mapping
@@ -25,23 +27,22 @@ import dataclasses
 
 from openpi.tpu import discovery
 from openpi.tpu import quota
+from openpi.tpu.gcloud import DEFAULT_PROJECT
 
 _SUPPORTED_TPU_FAMILIES = frozenset({"v4", "v5e", "v6e"})
 
 # Single-user repo: existing call sites pass only a TPU type, so resolution needs a default.
+# DEFAULT_PROJECT is re-exported from gcloud rather than restated, so the two cannot drift.
 DEFAULT_TPU_USER = "saksham"
-DEFAULT_PROJECT = "cmu-aidm-v2"
+__all__ = ["DEFAULT_PROJECT"]
 
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class TPUFamilySpec:
-    """The irreducible per-family facts needed to create and police a pod."""
-
-    family: str
-    runtime_version: str
-    host_ram_gb: int
-    accelerator_device_glob: str
-    """Device nodes a running job holds; differs between v4/v6e and v5e."""
+# The one per-family fact that cannot be discovered, because it is an input to creating a
+# pod that does not exist yet. A live pod reports its own runtime and that reading wins.
+FAMILY_RUNTIME_VERSIONS: dict[str, str] = {
+    "v4": "tpu-ubuntu2204-base",
+    "v5e": "v2-alpha-tpuv5-lite",
+    "v6e": "v2-alpha-tpuv6e",
+}
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -54,67 +55,10 @@ class TPUUserConfig:
     gcs_buckets_by_region: Mapping[str, str]
     ssh_user: str | None = None
 
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class TPUConfigWithType:
-    """A concrete TPU shape bound to a user, a zone, and whatever storage it has."""
-
-    family: str
-    zone: str
-    project: str
-    is_spot: bool
-    runtime_version: str
-    nfs_server: str | None
-    nfs_mount_path: str | None
-    user: str
-    resource_owner: str
-    nfs_directory: str
-    remote_home: str
-    gcs_bucket: str
-    gcs_bucket_region: str
-    ssh_user: str | None
-    tpu_type: str
-    accelerator_type: str
-
     @property
-    def uses_nfs(self) -> bool:
-        """Whether this pod has an NFS filesystem; False means local-disk mode."""
-        return self.nfs_server is not None and self.nfs_mount_path is not None
-
-    @property
-    def gcloud_accelerator_type(self) -> str:
-        """Accelerator string accepted by ``gcloud compute tpus``."""
-        return self.accelerator_type
-
-    @property
-    def host_ram_gb(self) -> int:
-        return TPU_FAMILY_SPECS[self.family].host_ram_gb
-
-    @property
-    def accelerator_device_glob(self) -> str:
-        return TPU_FAMILY_SPECS[self.family].accelerator_device_glob
-
-
-TPU_FAMILY_SPECS: dict[str, TPUFamilySpec] = {
-    "v4": TPUFamilySpec(
-        family="v4",
-        runtime_version="tpu-ubuntu2204-base",
-        host_ram_gb=400,
-        accelerator_device_glob="/dev/accel*",
-    ),
-    "v5e": TPUFamilySpec(
-        family="v5e",
-        runtime_version="v2-alpha-tpuv5-lite",
-        host_ram_gb=188,
-        accelerator_device_glob="/dev/vfio/*",
-    ),
-    "v6e": TPUFamilySpec(
-        family="v6e",
-        runtime_version="v2-alpha-tpuv6e",
-        host_ram_gb=708,
-        accelerator_device_glob="/dev/accel*",
-    ),
-}
+    def remote_login(self) -> str:
+        """The login name the pod knows this user by, taken from their home directory."""
+        return self.remote_home.rstrip("/").rsplit("/", 1)[-1]
 
 
 TPU_USERS: dict[str, TPUUserConfig] = {
@@ -131,6 +75,128 @@ TPU_USERS: dict[str, TPUUserConfig] = {
 }
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class RemoteLayout:
+    """Every path a job uses on one pod, decided by whether that pod has a filer.
+
+    A pod in a region with a Filestore shares one tree across workers; a pod without one
+    keeps everything in each worker's own home. That single boolean used to be consulted
+    separately in ``run_on_tpu`` (working dir, sync fan-out), ``code_sync`` (uv root),
+    ``setup`` (which steps run) and ``job`` (the preamble), each with its own default for
+    the NFS user. It is answered once, here.
+    """
+
+    uses_nfs: bool
+    nfs_mount_path: str | None
+    nfs_user: str
+    worker_count: int
+
+    @property
+    def base(self) -> str:
+        """Root the job's own trees hang off."""
+        return f"{self.nfs_mount_path}/{self.nfs_user}" if self.uses_nfs else "~"
+
+    @property
+    def working_dir(self) -> str:
+        return f"{self.base}/batch_value_learning"
+
+    @property
+    def gemma_dir(self) -> str:
+        return f"{self.base}/helper/gemma"
+
+    @property
+    def uv_root(self) -> str:
+        # "~" does not expand inside every context this is interpolated into, and the uv
+        # root is referenced from shells that do not go through a login path.
+        return f"{self.base}/uv" if self.uses_nfs else "$HOME/uv"
+
+    @property
+    def venv(self) -> str:
+        return f"{self.uv_root}/vla"
+
+    @property
+    def shared_workers(self) -> str:
+        """Worker spec for work that only needs doing once on a shared filesystem."""
+        return "0" if self.uses_nfs else "all"
+
+    @property
+    def sync_workers(self) -> list[int] | None:
+        """Workers rsync must run against; None means "worker 0 is enough"."""
+        return None if self.uses_nfs else list(range(self.worker_count))
+
+    # Per-worker local paths. Identical on both pod kinds: each is deliberately outside the
+    # shared tree, because every worker needs its own copy or its own answer.
+    paligemma_cache_dir = "~/.cache/openpi/vertex-model-garden-paligemma-us/paligemma"
+    log_file = "~/tpu_job_output.log"
+    exit_code_file = "~/tpu_job_exit_code"
+    certificate_file = "~/tpu_run_id"
+
+    def localize_path(self, path: str) -> str:
+        """Rewrite an NFS path for a pod that has no NFS, or return it unchanged.
+
+        A command written for a filer pod carries absolute paths under the mount point —
+        a validation cache directory, say. Landing that command on a local-disk pod would
+        have it write into a directory that does not exist and cannot be created. The
+        NFS-relative tail is preserved and re-rooted at the worker's own home, so the same
+        command means the same thing on both pod kinds.
+        """
+        if self.uses_nfs or not path.startswith(discovery.DEFAULT_NFS_MOUNT_PATH):
+            return path
+        tail = path[len(discovery.DEFAULT_NFS_MOUNT_PATH) :].lstrip("/")
+        # Drop the leading <nfs_user> component: on a local-disk pod the home directory
+        # already scopes the path to this user, so keeping it nests a redundant level.
+        head, separator, rest = tail.partition("/")
+        if separator and head == self.nfs_user:
+            tail = rest
+        return f"~/{tail}" if tail else "~"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class PodConfig:
+    """One TPU pod: its shape, where it lives, what storage it has, and whose it is."""
+
+    tpu_type: str
+    family: str
+    accelerator_type: str
+    zone: str
+    project: str
+    is_spot: bool
+    runtime_version: str
+    nfs_server: str | None
+    nfs_mount_path: str | None
+    user_key: str
+    user: TPUUserConfig
+
+    @property
+    def uses_nfs(self) -> bool:
+        """Whether this pod has an NFS filesystem; False means local-disk mode."""
+        return self.nfs_server is not None and self.nfs_mount_path is not None
+
+    @property
+    def region(self) -> str:
+        return region_from_zone(self.zone)
+
+    @property
+    def gcs_bucket(self) -> str:
+        """The bucket this pod's writes belong in, whether or not it exists yet."""
+        return self.user.gcs_buckets_by_region.get(self.region) or canonical_bucket_for_region(
+            self.region, resource_owner=self.user.resource_owner
+        )
+
+    @property
+    def worker_count(self) -> int:
+        return get_worker_count(self.tpu_type)
+
+    def layout(self, nfs_user: str | None = None) -> RemoteLayout:
+        """Where a job's files live on this pod."""
+        return RemoteLayout(
+            uses_nfs=self.uses_nfs,
+            nfs_mount_path=self.nfs_mount_path,
+            nfs_user=nfs_user or self.user.nfs_directory,
+            worker_count=self.worker_count,
+        )
+
+
 def _parse_tpu_type(tpu_type: str) -> tuple[str, int]:
     """Parse the family and numeric shape component of a TPU type."""
     family, separator, size_text = tpu_type.partition("-")
@@ -140,11 +206,11 @@ def _parse_tpu_type(tpu_type: str) -> tuple[str, int]:
     return family, int(size_text)
 
 
-def get_family_spec(family: str) -> TPUFamilySpec:
+def runtime_version_for(family: str) -> str:
     try:
-        return TPU_FAMILY_SPECS[family]
+        return FAMILY_RUNTIME_VERSIONS[family]
     except KeyError:
-        raise ValueError(f"Unknown TPU family {family!r}. Known: {sorted(TPU_FAMILY_SPECS)}") from None
+        raise ValueError(f"Unknown TPU family {family!r}. Known: {sorted(FAMILY_RUNTIME_VERSIONS)}") from None
 
 
 def accelerator_type_for(tpu_type: str) -> str:
@@ -197,30 +263,20 @@ def _build_config(
     nfs_server: str | None,
     nfs_mount_path: str | None,
     user: str,
-) -> TPUConfigWithType:
+) -> PodConfig:
     family, _ = _parse_tpu_type(tpu_type)
-    user_config = get_tpu_user(user)
-    bucket_region = region_from_zone(zone)
-    gcs_bucket = user_config.gcs_buckets_by_region.get(bucket_region) or canonical_bucket_for_region(
-        bucket_region, resource_owner=user_config.resource_owner
-    )
-    return TPUConfigWithType(
+    return PodConfig(
+        tpu_type=tpu_type,
         family=family,
+        accelerator_type=accelerator_type_for(tpu_type),
         zone=zone,
         project=project,
         is_spot=is_spot,
         runtime_version=runtime_version,
         nfs_server=nfs_server,
         nfs_mount_path=nfs_mount_path,
-        user=user,
-        resource_owner=user_config.resource_owner,
-        nfs_directory=user_config.nfs_directory,
-        remote_home=user_config.remote_home,
-        gcs_bucket=gcs_bucket,
-        gcs_bucket_region=bucket_region,
-        ssh_user=user_config.ssh_user,
-        tpu_type=tpu_type,
-        accelerator_type=accelerator_type_for(tpu_type),
+        user_key=user,
+        user=get_tpu_user(user),
     )
 
 
@@ -230,24 +286,32 @@ def resolve_from_pod(
     user: str = DEFAULT_TPU_USER,
     project: str = DEFAULT_PROJECT,
     tpu_type: str | None = None,
-) -> TPUConfigWithType:
+    zone: str | None = None,
+) -> PodConfig:
     """Resolve a config entirely from a pod that already exists.
 
-    Zone comes from Cloud Asset Inventory, accelerator and runtime from ``describe``, and
-    NFS from the region's Filestore instances disambiguated against this pod's own mount
-    table. Nothing is assumed from the pod's name.
+    Pass ``zone`` whenever it is known. Pod names are unique only WITHIN a zone, and the
+    same name can exist in several (spot races reuse low indices per zone). When it is not
+    known, :func:`discovery.find_pod` raises on an ambiguous name rather than silently
+    picking whichever zone the inventory happened to list first.
+
+    Zone comes from Cloud Asset Inventory, accelerator, runtime and spot-ness from
+    ``describe``, and NFS from the region's Filestore instances disambiguated against this
+    pod's own mount table. Nothing is assumed from the pod's name.
 
     Raises:
-        ValueError: If no pod of that name exists in the project.
+        ValueError: If no pod of that name exists in the project, or the name is ambiguous.
     """
-    located = discovery.find_pod(tpu_name, project=project)
-    if located is None:
-        raise ValueError(
-            f"TPU {tpu_name!r} does not exist in project {project!r}. "
-            "Non-spot launches target an existing pod; create it first or use a spot launch."
-        )
+    if zone is None:
+        located = discovery.find_pod(tpu_name, project=project)
+        if located is None:
+            raise ValueError(
+                f"TPU {tpu_name!r} does not exist in project {project!r}. "
+                "Non-spot launches target an existing pod; create it first or use a spot launch."
+            )
+        zone = located.zone
 
-    described = discovery.describe_pod(tpu_name, located.zone, project)
+    described = discovery.describe_pod(tpu_name, zone, project)
     resolved_type = tpu_type or _tpu_type_from_accelerator(described.accelerator_type, tpu_name)
     nfs_server, nfs_mount_path = discovery.nfs_for_zone(
         described.zone, project, disambiguate_with=described, ssh_user=get_tpu_user(user).ssh_user
@@ -256,8 +320,10 @@ def resolve_from_pod(
         tpu_type=resolved_type,
         zone=described.zone,
         project=project,
-        is_spot=False,
-        runtime_version=described.runtime_version or get_family_spec(_parse_tpu_type(resolved_type)[0]).runtime_version,
+        # Read off the pod rather than assumed: a spot pod adopted by a reserved launch used
+        # to carry is_spot=False and be relabelled afterwards by whichever caller noticed.
+        is_spot=bool(described.spot),
+        runtime_version=described.runtime_version or runtime_version_for(_parse_tpu_type(resolved_type)[0]),
         nfs_server=nfs_server,
         nfs_mount_path=nfs_mount_path,
         user=user,
@@ -279,7 +345,8 @@ def spot_race_configs(
     *,
     user: str = DEFAULT_TPU_USER,
     project: str = DEFAULT_PROJECT,
-) -> tuple[TPUConfigWithType, ...]:
+    region: str | None = None,
+) -> tuple[PodConfig, ...]:
     """Resolve one config per zone with live spot quota for ``tpu_type``.
 
     NFS is left unresolved: a pod that does not exist yet has no mount table, and probing
@@ -287,19 +354,22 @@ def spot_race_configs(
     :func:`with_discovered_nfs` on the winner instead.
     """
     family, size = _parse_tpu_type(tpu_type)
-    spec = get_family_spec(family)
     # One Asset Inventory call establishes which zones actually hold TPUs today; that is
     # the evidence that distinguishes a usable zone from one the default quota merely
     # mentions.
-    occupied = frozenset(pod.zone for pod in discovery.list_all_tpus(project) if pod.zone)
-    zones = quota.spot_quota_zones(family, size, project=project, occupied_zones=occupied)
+    occupied = frozenset(
+        pod.zone
+        for pod in discovery.list_all_tpus(project)
+        if pod.zone and (region is None or pod.zone.startswith(region))
+    )
+    zones = quota.spot_quota_zones(family, size, project=project, occupied_zones=occupied, region=region)
     return tuple(
         _build_config(
             tpu_type=tpu_type,
             zone=zone,
             project=project,
             is_spot=True,
-            runtime_version=spec.runtime_version,
+            runtime_version=runtime_version_for(family),
             nfs_server=None,
             nfs_mount_path=None,
             user=user,
@@ -308,21 +378,12 @@ def spot_race_configs(
     )
 
 
-def with_discovered_nfs(
-    config: TPUConfigWithType,
-    *,
-    pod: discovery.DiscoveredPod | None = None,
-) -> TPUConfigWithType:
+def with_discovered_nfs(config: PodConfig, *, pod: discovery.DiscoveredPod | None = None) -> PodConfig:
     """Attach the NFS a now-existing pod should mount, or leave it in local-disk mode."""
     nfs_server, nfs_mount_path = discovery.nfs_for_zone(
-        config.zone, config.project, disambiguate_with=pod, ssh_user=config.ssh_user
+        config.zone, config.project, disambiguate_with=pod, ssh_user=config.user.ssh_user
     )
     return dataclasses.replace(config, nfs_server=nfs_server, nfs_mount_path=nfs_mount_path)
-
-
-def resolve_is_spot(*, config_is_spot: bool, spot_override: bool | None) -> bool:
-    """Resolve a tri-state launch override against the deployment default."""
-    return config_is_spot if spot_override is None else spot_override
 
 
 def get_tpu_name_prefix(tpu_type: str, *, resource_owner: str, is_spot: bool) -> str:
@@ -330,34 +391,6 @@ def get_tpu_name_prefix(tpu_type: str, *, resource_owner: str, is_spot: bool) ->
     family, size = _parse_tpu_type(tpu_type)
     capacity_suffix = "-spot" if is_spot else ""
     return f"{family}-{resource_owner}{capacity_suffix}-{size}"
-
-
-def infer_tpu_type_from_name(tpu_name: str) -> str:
-    """Recover a TPU type from a managed or historical resource name.
-
-    Only a naming convenience: authoritative type comes from the pod's acceleratorType.
-    """
-    parts = tpu_name.split("-")
-    if len(parts) in (2, 3) and parts[1].isdigit() and (len(parts) == 2 or parts[2].isdigit()):
-        family, size = parts[:2]
-        _parse_tpu_type(f"{family}-{size}")
-        return f"{family}-{size}"
-
-    if len(parts) < 3:
-        raise ValueError(f"Could not infer TPU type from {tpu_name!r}")
-
-    family, owner, *tail = parts
-    if tail and tail[0] == "spot":
-        tail = tail[1:]
-    size = tail[0] if tail else ""
-    index_tokens = tail[1:]
-    valid_index = not index_tokens or (len(index_tokens) == 1 and index_tokens[0].isdigit())
-    if not owner or not size.isdigit() or not valid_index:
-        raise ValueError(f"Could not infer TPU type from {tpu_name!r}")
-
-    tpu_type = f"{family}-{size}"
-    _parse_tpu_type(tpu_type)
-    return tpu_type
 
 
 def get_tpu_type_prefix(tpu_type: str) -> str:
@@ -368,9 +401,12 @@ def get_tpu_type_prefix(tpu_type: str) -> str:
 def get_worker_count(tpu_type: str) -> int:
     """Return the number of TPU hosts represented by an accelerator shape.
 
-    v5e and v6e shape numbers count chips, with four chips per host. v4 shape numbers
-    count TensorCores, with eight TensorCores per host.
+    v5e and v6e shape numbers count chips, with four chips per host, except that a v6e
+    slice of up to eight chips (v6e-1/-4/-8) is a single host. v4 shape numbers count
+    TensorCores, with eight TensorCores per host.
     """
     family, size = _parse_tpu_type(tpu_type)
+    if family == "v6e" and size <= 8:
+        return 1
     units_per_host = 8 if family == "v4" else 4
     return max(1, size // units_per_host)

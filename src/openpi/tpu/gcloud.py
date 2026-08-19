@@ -1,4 +1,9 @@
-"""Low-level gcloud command wrappers for TPU operations."""
+"""Low-level gcloud command wrappers.
+
+Every external call in this package funnels through :func:`run_gcloud`, which is what
+makes retry policy, timeout policy and credential-expiry detection single-sourced — and
+what makes the layers above it testable by substituting one function.
+"""
 
 import json
 import logging
@@ -243,27 +248,6 @@ def list_queued_resources(
     return json.loads(result.stdout)
 
 
-def describe_tpu(name: str, zone: str, project: str = DEFAULT_PROJECT) -> dict | None:
-    """Get TPU VM details.
-
-    Args:
-        name: TPU VM name
-        zone: GCP zone
-        project: GCP project ID
-
-    Returns:
-        TPU VM dictionary, or None if not found
-    """
-    result = run_gcloud(
-        ["compute", "tpus", "tpu-vm", "describe", name, "--zone", zone, "--format=json"],
-        project=project,
-        check=False,
-    )
-    if result.returncode != 0:
-        return None
-    return json.loads(result.stdout)
-
-
 def describe_queued_resource(name: str, zone: str, project: str = DEFAULT_PROJECT) -> dict | None:
     """Get queued resource details.
 
@@ -392,62 +376,6 @@ def delete_tpu_vm(name: str, zone: str, project: str = DEFAULT_PROJECT) -> subpr
     )
 
 
-def ssh_with_retries(
-    tpu_name: str,
-    zone: str,
-    command: str,
-    *,
-    project: str = DEFAULT_PROJECT,
-    worker: str = "all",
-    attempts: int = 6,
-    delay: float = 20.0,
-    timeout: float | None = 600,
-) -> subprocess.CompletedProcess[str]:
-    """Run an ssh command, retrying while the pod converges.
-
-    A pod reporting READY does not mean every worker accepts ssh yet; convergence takes
-    tens of seconds to minutes after creation. ``--worker=all`` is all-or-nothing — gcloud
-    exits non-zero if any single worker fails — so one lagging worker out of eight fails a
-    call that would succeed moments later. Every setup-phase command is therefore retried
-    rather than treated as fatal on first attempt.
-
-    Each attempt is individually timeout-capped, so retrying can never turn into a hang.
-    """
-    last: subprocess.CompletedProcess[str] | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            last = ssh_command(
-                tpu_name,
-                zone,
-                command,
-                project=project,
-                worker=worker,
-                check=False,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired as e:
-            logger.warning("ssh to %s timed out (attempt %d/%d)", tpu_name, attempt, attempts)
-            last = subprocess.CompletedProcess(e.cmd, 124, "", "timeout")
-        if last.returncode == 0:
-            if attempt > 1:
-                logger.info("ssh to %s succeeded on attempt %d", tpu_name, attempt)
-            return last
-        if attempt < attempts:
-            logger.info(
-                "ssh to %s failed (rc=%s, attempt %d/%d); workers may still be coming up, retrying in %.0fs",
-                tpu_name,
-                last.returncode,
-                attempt,
-                attempts,
-                delay,
-            )
-            time.sleep(delay)
-    raise RuntimeError(
-        f"ssh to {tpu_name} in {zone} failed {attempts} times (last rc={last.returncode if last else '?'}): "
-        f"{(last.stderr or '')[:300] if last else ''}"
-    )
-
-
 def get_tpu_state_and_health(tpu_name: str, zone: str, project: str) -> tuple[str | None, str | None]:
     """Return ``(state, health)`` for a TPU, or ``(None, None)`` if it cannot be determined.
 
@@ -536,79 +464,3 @@ def ssh_command(
 
     # The pod is still there, so the failure is worth the usual retries.
     return run_gcloud(args, project=project, check=check, timeout=timeout)
-
-
-def scp_to_tpu(
-    local_path: str | Path,
-    tpu_name: str,
-    remote_path: str,
-    zone: str,
-    *,
-    project: str = DEFAULT_PROJECT,
-    worker: str = "0",
-) -> subprocess.CompletedProcess[str]:
-    """Copy a file to a TPU.
-
-    Args:
-        local_path: Local file path
-        tpu_name: TPU VM name
-        remote_path: Remote destination path
-        zone: GCP zone
-        project: GCP project ID
-        worker: Worker to copy to (default "0" for shared NFS)
-
-    Returns:
-        CompletedProcess result
-    """
-    return run_gcloud(
-        [
-            "compute",
-            "tpus",
-            "tpu-vm",
-            "scp",
-            str(local_path),
-            f"{_apply_ssh_user(tpu_name)}:{remote_path}",
-            "--zone",
-            zone,
-            f"--worker={worker}",
-        ],
-        project=project,
-    )
-
-
-def scp_from_tpu(
-    tpu_name: str,
-    remote_path: str,
-    local_path: str | Path,
-    zone: str,
-    *,
-    project: str = DEFAULT_PROJECT,
-    worker: str = "0",
-) -> subprocess.CompletedProcess[str]:
-    """Copy a file from a TPU.
-
-    Args:
-        tpu_name: TPU VM name
-        remote_path: Remote file path
-        local_path: Local destination path
-        zone: GCP zone
-        project: GCP project ID
-        worker: Worker to copy from
-
-    Returns:
-        CompletedProcess result
-    """
-    return run_gcloud(
-        [
-            "compute",
-            "tpus",
-            "tpu-vm",
-            "scp",
-            f"{_apply_ssh_user(tpu_name)}:{remote_path}",
-            str(local_path),
-            "--zone",
-            zone,
-            f"--worker={worker}",
-        ],
-        project=project,
-    )

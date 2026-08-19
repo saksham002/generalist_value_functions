@@ -1,9 +1,16 @@
-"""TPU setup operations for NFS mount and shared environment verification."""
+"""Preparing a pod to run a job: workers up, filesystem mounted, permissions sane.
+
+Nothing here claims or releases a pod. Occupancy is the run certificate's job
+(:mod:`openpi.tpu.certificate`), which is taken the moment a pod is assigned and therefore
+already covers the whole setup window — the separate setup marker this module used to keep
+covered a strictly smaller one and could disagree with it.
+"""
 
 import logging
 import time
 
-from openpi.tpu.config import TPUConfigWithType
+from openpi.tpu.config import PodConfig
+from openpi.tpu.config import RemoteLayout
 from openpi.tpu.gcloud import ssh_command
 
 logger = logging.getLogger(__name__)
@@ -11,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 def wait_for_workers(
     tpu_name: str,
-    config: TPUConfigWithType,
+    config: PodConfig,
     *,
     attempts: int = 5,
     delay: float = 60.0,
@@ -60,116 +67,29 @@ def wait_for_workers(
     )
 
 
-# Written on every worker while a launcher is setting a pod up, and removed when it is
-# done. A pod being set up has no python running yet, so a second launcher's idle check
-# reads it as free and claims it; the two then race on apt and ssh and both fail.
-SETUP_MARKER_PATH = "$HOME/.openpi_setup_in_progress"
-
-
-def try_claim_setup(tpu_name: str, config: TPUConfigWithType) -> bool:
-    """Atomically claim a pod for setup. Returns whether this caller won it.
-
-    `mkdir` without -p fails when the directory exists, so the check and the claim are a
-    single operation. Checking first and touching afterwards leaves a window of seconds —
-    long enough for two launchers sweeping at the same moment to both see the pod as free,
-    which is exactly how two jobs ended up on one TPU.
-    """
-    result = ssh_command(
-        tpu_name,
-        config.zone,
-        f"mkdir {SETUP_MARKER_PATH} 2>/dev/null && echo CLAIMED || echo TAKEN",
-        project=config.project,
-        worker="0",
-        check=False,
-        timeout=180,
-    )
-    if result.returncode != 0:
-        logger.info("Could not claim %s (ssh rc=%s); treating as taken", tpu_name, result.returncode)
-        return False
-    won = "CLAIMED" in result.stdout
-    logger.info("Claim on %s: %s", tpu_name, "won" if won else "already held by another launcher")
-    return won
-
-
-def mark_setup_started(tpu_name: str, config: TPUConfigWithType) -> None:
-    """Ensure the claim exists on every worker, for visibility during setup."""
-    logger.info("Claiming %s for setup (marker on all workers)", tpu_name)
-    ssh_command(
-        tpu_name,
-        config.zone,
-        f"mkdir -p {SETUP_MARKER_PATH}",
-        project=config.project,
-        worker="all",
-        check=False,
-    )
-
-
-def mark_setup_finished(tpu_name: str, config: TPUConfigWithType) -> None:
-    """Release a setup claim. Best effort: a failure here must not mask a setup error."""
-    try:
-        ssh_command(
-            tpu_name,
-            config.zone,
-            f"rm -rf {SETUP_MARKER_PATH}",
-            project=config.project,
-            worker="all",
-            check=False,
-        )
-    except Exception as e:
-        logger.warning("Could not clear the setup marker on %s: %s", tpu_name, e)
-
-
-def setup_in_progress(tpu_name: str, config: TPUConfigWithType) -> bool:
-    """Whether any worker is currently being set up by some launcher.
-
-    Checked across all workers, and a marker on a single one is enough: setup touches
-    every worker, so a partial answer still means someone else got there first.
-    """
-    try:
-        result = ssh_command(
-            tpu_name,
-            config.zone,
-            f"ls -d {SETUP_MARKER_PATH} 2>/dev/null",
-            project=config.project,
-            worker="all",
-            check=False,
-            timeout=180,
-        )
-    except Exception as e:
-        # Cannot prove the pod is free, so treat it as taken rather than collide.
-        logger.warning("Could not read the setup marker on %s (%s); assuming busy", tpu_name, e)
-        return True
-    return ".openpi_setup_in_progress" in result.stdout
-
-
-def setup_tpu(tpu_name: str, config: TPUConfigWithType) -> None:
+def setup_tpu(tpu_name: str, config: PodConfig, layout: RemoteLayout) -> None:
     """Full TPU setup.
 
-    A pod in a region with a Filestore mounts it and shares one environment. A pod
-    without one runs entirely out of each worker's own home directory, so the NFS steps
-    are skipped rather than dereferencing a null mount path.
+    A pod in a region with a Filestore mounts it and shares one environment. A pod without
+    one runs entirely out of each worker's own home directory, so the NFS steps are skipped
+    rather than dereferencing a null mount path.
     """
     logger.info("Setting up TPU %s (%s)", tpu_name, "NFS" if config.uses_nfs else "local disk")
     # Everything below assumes every worker is reachable; wait for that once, here.
     wait_for_workers(tpu_name, config)
-    mark_setup_started(tpu_name, config)
-    try:
-        kill_unattended_upgrades(tpu_name, config)
-        if config.uses_nfs:
-            mount_nfs(tpu_name, config)
-        else:
-            install_host_packages(tpu_name, config)
-        fix_tpu_logs_permissions(tpu_name, config.zone, config.project)
-        if config.uses_nfs:
-            # Only meaningful for a shared cache; per-worker homes are already owned.
-            fix_val_cache_permissions(tpu_name, config.zone, config.project, config.nfs_mount_path)
-    finally:
-        # Cleared even when setup fails, so a failed attempt does not wedge the pod.
-        mark_setup_finished(tpu_name, config)
+    kill_unattended_upgrades(tpu_name, config)
+    if config.uses_nfs:
+        mount_nfs(tpu_name, config)
+    else:
+        install_host_packages(tpu_name, config)
+    fix_tpu_logs_permissions(tpu_name, config.zone, config.project)
+    if config.uses_nfs:
+        # Only meaningful for a shared tree; per-worker homes are already owned.
+        ensure_nfs_user_tree_writable(tpu_name, config, layout)
     logger.info("TPU %s setup complete", tpu_name)
 
 
-def kill_unattended_upgrades(tpu_name: str, config: TPUConfigWithType) -> None:
+def kill_unattended_upgrades(tpu_name: str, config: PodConfig) -> None:
     """Stop the apt machinery that holds the dpkg lock on a freshly created VM.
 
     Stopping is not enough on its own: the timers restart the service between the kill and
@@ -190,7 +110,7 @@ def kill_unattended_upgrades(tpu_name: str, config: TPUConfigWithType) -> None:
     )
 
 
-def install_host_packages(tpu_name: str, config: TPUConfigWithType) -> None:
+def install_host_packages(tpu_name: str, config: PodConfig) -> None:
     """Install the host packages a local-disk pod needs (no nfs-common)."""
     logger.info("Installing host packages on TPU %s", tpu_name)
     ssh_command(
@@ -202,13 +122,8 @@ def install_host_packages(tpu_name: str, config: TPUConfigWithType) -> None:
     )
 
 
-def mount_nfs(tpu_name: str, config: TPUConfigWithType) -> None:
-    """Mount NFS on all workers of a TPU.
-
-    Args:
-        tpu_name: TPU VM name
-        config: TPU configuration
-    """
+def mount_nfs(tpu_name: str, config: PodConfig) -> None:
+    """Mount NFS on all workers of a TPU."""
     zone = config.zone
     project = config.project
     nfs_server = config.nfs_server
@@ -224,13 +139,7 @@ def mount_nfs(tpu_name: str, config: TPUConfigWithType) -> None:
     )
 
     logger.info("Creating mount directory %s on TPU %s", mount_path, tpu_name)
-    ssh_command(
-        tpu_name,
-        zone,
-        f"sudo mkdir -p -m 777 {mount_path}",
-        project=project,
-        worker="all",
-    )
+    ssh_command(tpu_name, zone, f"sudo mkdir -p -m 777 {mount_path}", project=project, worker="all")
 
     logger.info("Mounting NFS %s to %s on TPU %s", nfs_server, mount_path, tpu_name)
     ssh_command(
@@ -245,12 +154,8 @@ def mount_nfs(tpu_name: str, config: TPUConfigWithType) -> None:
 def fix_tpu_logs_permissions(tpu_name: str, zone: str, project: str) -> None:
     """Fix /tmp/tpu_logs permissions on all workers.
 
-    TPU logs directory is often created by root or another user, causing permission errors.
-
-    Args:
-        tpu_name: TPU VM name
-        zone: GCP zone
-        project: GCP project ID
+    The TPU logs directory is often created by root or another user, causing permission
+    errors when the job starts.
     """
     logger.info("Fixing TPU logs permissions on %s", tpu_name)
     ssh_command(
@@ -262,79 +167,71 @@ def fix_tpu_logs_permissions(tpu_name: str, zone: str, project: str) -> None:
     )
 
 
-def fix_val_cache_permissions(tpu_name: str, zone: str, project: str, nfs_mount_path: str) -> None:
-    """Fix permissions on validation episode cache directories.
+# Top-level directories under the user's NFS root that jobs create into at runtime. Every
+# entry is guaranteed to exist and be world-writable on every worker before the job starts,
+# so a job's first os.makedirs() beneath one of them cannot hit a foreign-owned parent.
+NFS_USER_SUBDIRS = ("robocoin", "lego", "sim_bimanual_assembly", "sim_xarm_packing", "helper", "gemma")
 
-    These directories may end up root-owned after sudo rm cleanup, preventing
-    the training script from writing new cache files.
 
-    Args:
-        tpu_name: TPU VM name
-        zone: GCP zone
-        project: GCP project ID
-        nfs_mount_path: NFS mount path (e.g. /nfs/aidm_nfs)
+def ensure_nfs_user_tree_writable(tpu_name: str, config: PodConfig, layout: RemoteLayout) -> None:
+    """Guarantee the user's NFS tree is creatable-into by every worker of this pod.
+
+    The uid a login name maps to differs per worker (2001, 2004, 2006, 2010 on one v4 pod)
+    and per filer, so a directory made by one worker — or on another region's filer by
+    another pod — is routinely owned by a uid the current worker cannot write as.
+    ``chmod`` on the directory does not help when the *parent* is the foreign-owned one:
+    ``os.makedirs`` fails at the first missing component. The only robust move is to create
+    the parents with ``sudo`` and open them, on every worker, before anything runs.
+
+    Runs on all workers (idempotent), and never fails setup: a filer with an unusual layout
+    should surface as the job's own error, not as an unrunnable pod.
     """
-    logger.info("Fixing val episode cache permissions on %s", tpu_name)
+    root = layout.base
+    subdirs = " ".join(f"{root}/{name}" for name in NFS_USER_SUBDIRS)
+    logger.info("Ensuring NFS user tree %s is world-writable on %s", root, tpu_name)
     ssh_command(
         tpu_name,
-        zone,
-        f"sudo chmod -R 777 {nfs_mount_path}/saksham3/robocoin/val_episodes_cache* 2>/dev/null || true",
-        project=project,
+        config.zone,
+        (
+            f"sudo mkdir -p {root} {subdirs} 2>/dev/null; "
+            # -R on the top-level dirs only, not the whole tree: recursing a filer holding
+            # tens of GB of caches on every launch is slow for no gain — the leaves that
+            # matter are the ones a job is about to create.
+            f"sudo chmod 777 {root} {subdirs} 2>/dev/null; "
+            f"sudo chmod -R 777 {root}/robocoin/val_episodes_cache* 2>/dev/null; "
+            "true"
+        ),
+        project=config.project,
         worker="all",
+        check=False,
     )
 
 
-def verify_setup(tpu_name: str, config: TPUConfigWithType, nfs_user: str = "saksham3") -> bool:
-    """Verify that TPU setup is complete.
+def verify_setup(tpu_name: str, config: PodConfig) -> bool:
+    """Whether this pod has already been prepared.
 
-    Checks that NFS is mounted and the shared TPU environment is available.
-
-    Args:
-        tpu_name: TPU VM name
-        config: TPU configuration
-        nfs_user: NFS username whose venv to verify
-
-    Returns:
-        True if setup is verified, False otherwise
+    A local-disk pod has no mount to check, but it is not therefore ready: its readiness is
+    that every worker has its own uv. Returning True there would skip the step that
+    installs it, and the first command needing uv fails with "command not found".
     """
-    zone = config.zone
-    project = config.project
-    mount_path = config.nfs_mount_path
-
-    # A local-disk pod has no mount to check, but it is not therefore ready: its readiness
-    # is that every worker has its own uv. Returning True here would skip the setup step
-    # that installs it, and the first command needing uv fails with "command not found".
-    if not config.uses_nfs:
-        # check=False: "uv is missing" is the normal answer on a fresh pod and must read as
-        # "not set up yet", not as an exception that escapes this function.
-        result = ssh_command(
-            tpu_name,
-            zone,
-            "test -x $HOME/uv/bin/uv",
-            project=project,
-            worker="all",
-            check=False,
-        )
-        if result.returncode == 0:
-            logger.info("TPU %s local-disk setup verified: uv present on every worker", tpu_name)
-            return True
-        logger.info("TPU %s local-disk setup incomplete: uv missing on some worker", tpu_name)
-        return False
+    if config.uses_nfs:
+        probe = f"mountpoint -q {config.nfs_mount_path}"
+        worker = "0"
+        ready, missing = "NFS mounted", "NFS not mounted"
+    else:
+        probe = "test -x $HOME/uv/bin/uv"
+        worker = "all"
+        ready, missing = "uv present on every worker", "uv missing on some worker"
 
     try:
-        result = ssh_command(
-            tpu_name,
-            zone,
-            f"mountpoint -q {mount_path}",
-            project=project,
-            worker="0",
-            check=False,
-        )
-        if result.returncode == 0:
-            logger.info("TPU %s setup verified: NFS mounted", tpu_name)
-            return True
-        logger.info("TPU %s setup incomplete: NFS not mounted", tpu_name)
-        return False
+        # check=False: "not set up yet" is the normal answer on a fresh pod and must read as
+        # False, not as an exception that escapes this function.
+        result = ssh_command(tpu_name, config.zone, probe, project=config.project, worker=worker, check=False)
     except Exception as e:
         logger.warning("Failed to verify TPU %s setup: %s", tpu_name, e)
         return False
+    if result.returncode == 0:
+        logger.info("TPU %s setup verified: %s", tpu_name, ready)
+        return True
+    logger.info("TPU %s setup incomplete: %s", tpu_name, missing)
+    return False

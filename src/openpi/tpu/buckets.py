@@ -1,26 +1,20 @@
-"""Keep writes in the pod's own region, and reads on its own continent.
+"""GCS primitives for keeping a run's data near the pod that is using it.
 
-Storage egress drives zone economics: same-region is free, inter-region within a
-continent is $0.02/GiB, and crossing continents is $0.05/GiB. A 43 GB checkpoint written
-across regions therefore costs ~$0.86 every save.
+Storage egress drives zone economics: same-region is free, inter-region within a continent
+is $0.02/GiB, and crossing continents is $0.05/GiB. A 43 GB checkpoint written across
+regions therefore costs ~$0.86 every save.
 
-So when a race places a pod somewhere new:
-
-- **writes** are redirected into that region's bucket, created if it does not exist;
-- **reads** are left alone when the source is on the same continent, and redirected to a
-  same-continent replica when it is not.
-
-A fine-tune's base checkpoint is a read that the run cannot start without, so it is
-copied into the destination bucket and the path rewritten to match.
+This module is only the mechanism — bucket lookup, existence tests, committed-checkpoint
+discovery and copying. The *policy* about which URI belongs where lives in
+:mod:`openpi.tpu.launch`, where it can be decided from a parsed command rather than
+re-derived from a string at each call site.
 """
 
 import logging
 import re
 import subprocess
 
-from openpi.tpu.config import TPUConfigWithType
 from openpi.tpu.config import canonical_bucket_for_region
-from openpi.tpu.config import region_from_zone
 from openpi.tpu.gcloud import run_gcloud
 
 logger = logging.getLogger(__name__)
@@ -29,6 +23,13 @@ _GCS_TIMEOUT_SECONDS = 300
 _COPY_TIMEOUT_SECONDS = 7200
 
 _GCS_URI = re.compile(r"^gs://(?P<bucket>[^/]+)/?(?P<path>.*)$")
+
+# Inter-continent egress, used to put a number on a refusal rather than an adjective.
+CROSS_CONTINENT_USD_PER_GIB = 0.05
+
+# Written by train_value_function.py / train.py next to the checkpoint steps; read back on
+# resume, so a carried checkpoint without it fails at init_wandb.
+WANDB_ID_FILENAME = "wandb_id.txt"
 
 
 def _run(args: list[str], *, timeout: int) -> subprocess.CompletedProcess:
@@ -104,107 +105,12 @@ def ensure_regional_bucket(region: str, *, resource_owner: str) -> str:
     return bucket
 
 
-def redirect_write_uri(uri: str, *, bucket: str) -> str:
-    """Point a write destination at ``bucket``, preserving its path."""
-    _, path = split_uri(uri)
-    return f"gs://{bucket}/{path}" if path else f"gs://{bucket}"
-
-
-def copy_prefix(source_uri: str, destination_uri: str) -> None:
-    """Copy a GCS prefix, routing cross-continent transfers through local disk.
-
-    Bucket-to-bucket copies across continents are billed at the higher egress rate and are
-    explicitly avoided in this project, so those go source -> local -> destination.
-    """
-    source_bucket, _ = split_uri(source_uri)
-    destination_bucket, _ = split_uri(destination_uri)
-    source_region = bucket_region(source_bucket)
-    destination_region = bucket_region(destination_bucket)
-    if source_region is None:
-        raise ValueError(f"Source bucket gs://{source_bucket} does not exist")
-    if destination_region is None:
-        raise ValueError(f"Destination bucket gs://{destination_bucket} does not exist")
-
-    if continent_of(source_region) != continent_of(destination_region):
-        raise NotImplementedError(
-            f"Cross-continent copy {source_uri} -> {destination_uri} "
-            f"({source_region} -> {destination_region}) must be staged through local disk; "
-            "do it explicitly rather than as a side effect of a launch."
-        )
-
-    logger.info("Copying %s -> %s (%s -> %s)", source_uri, destination_uri, source_region, destination_region)
-    result = _run(["gcloud", "storage", "rsync", "-r", source_uri, destination_uri], timeout=_COPY_TIMEOUT_SECONDS)
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to copy {source_uri} -> {destination_uri}: {result.stderr.strip()}")
-
-
-_GS_URI_IN_COMMAND = re.compile(r"gs://[A-Za-z0-9._\-]+(?:/[^\s'\"]*)?")
-
-# Commands whose GCS arguments are structured: the checkpoint dir is an output to redirect,
-# and the data paths are reads that must already exist near the pod rather than be copied.
-TRAIN_ENTRYPOINTS = ("train.py", "train_value_function.py")
-
-# Flags whose value is a destination the run writes to. Identified by name rather than by
-# whether the path exists: a checkpoint base dir is shared across runs, so it usually does
-# exist, and testing existence would misread a write as a read.
-WRITE_FLAGS = ("--checkpoint-base-dir", "--assets-base-dir", "--done-marker")
-
-
-def write_uris(command: str) -> set[str]:
-    """URIs that appear as the value of a known write flag."""
-    found: set[str] = set()
-    for flag in WRITE_FLAGS:
-        for match in re.finditer(rf"{re.escape(flag)}[=\s]+(gs://[^\s'\"]+)", command):
-            found.add(match.group(1).rstrip("/"))
-    return found
-
-
-def find_gs_uris(command: str) -> tuple[str, ...]:
-    """Every distinct gs:// URI appearing in a command, in order of first appearance."""
-    seen: dict[str, None] = {}
-    for match in _GS_URI_IN_COMMAND.finditer(command):
-        seen.setdefault(match.group(0).rstrip("/"), None)
-    return tuple(seen)
-
-
-# One bucket per continent holds the datasets and counterfactual-action stores, rather than
-# one per region: a dataset is read by pods in whichever zone the race wins, so replicating
-# it per region would mean many copies of the same tens of GB, while an inter-region read
-# within a continent is cheap. Writes stay regional — those are per-run and not shared.
-_HUB_REGION_BY_CONTINENT = {"us": "us-central2", "eu": "europe-west4"}
-
-# Flags naming such a shared read location: a key containing "data" or "store" and ending
-# in "dir" (--data.rlds-data-dir, --fine-tune.data-factory.counterfactual-action-store-dir,
-# --data.assets.assets-dir). Deliberately excludes --checkpoint-base-dir and
-# --assets-base-dir, which are per-run writes and belong in the pod's own region.
-_SHARED_DIR_ARG = re.compile(r"--([\w.-]*(?:data|store)[\w.-]*dir)[=\s]+(gs://[^\s'\"]+)")
-
-
-def shared_dir_uris(command: str) -> set[str]:
-    """URIs passed as a data/store directory argument."""
-    return {match.group(2).rstrip("/") for match in _SHARED_DIR_ARG.finditer(command)}
-
-
-def hub_bucket_for(region: str, *, resource_owner: str) -> str | None:
-    """The continent-wide bucket a shared read should resolve to, or None if unmapped."""
-    hub_region = _HUB_REGION_BY_CONTINENT.get(continent_of(region))
-    return canonical_bucket_for_region(hub_region, resource_owner=resource_owner) if hub_region else None
-
-
-_STEP_IN_COMMAND = re.compile(r"--(?:[\w.-]+\.)?step[=\s]+(\d+)")
-
-
-def steps_named_in(command: str) -> set[int]:
-    """Checkpoint steps the command explicitly selects (``--step``, ``--critic.step``, ...).
-
-    Used to bound what a localize copies: a checkpoint root can hold many steps, including
-    odd-numbered preemption saves, and a launch only ever restores the ones it names.
-    """
-    return {int(m.group(1)) for m in _STEP_IN_COMMAND.finditer(command)}
-
-
-def is_train_command(command: str) -> bool:
-    return any(entrypoint in command for entrypoint in TRAIN_ENTRYPOINTS)
+def prefix_size_bytes(uri: str) -> int:
+    """Total size in bytes of every object under a GCS prefix (0 for an empty prefix)."""
+    result = _run(["gcloud", "storage", "du", "-s", uri.rstrip("/")], timeout=_GCS_TIMEOUT_SECONDS)
+    if result.returncode != 0 or not result.stdout.strip():
+        return 0
+    return int(result.stdout.split()[0])
 
 
 def uri_exists(uri: str) -> bool:
@@ -216,20 +122,56 @@ def is_checkpoint_dir(uri: str) -> bool:
     return uri_exists(f"{uri.rstrip('/')}/commit_success.txt")
 
 
-def is_object(uri: str) -> bool:
-    """A single object rather than a prefix: listing it returns exactly itself."""
-    result = _run(["gcloud", "storage", "ls", uri], timeout=_GCS_TIMEOUT_SECONDS)
+def copy_prefix(source_uri: str, destination_uri: str, *, allow_cross_continent: bool = False) -> None:
+    """Copy a GCS prefix.
+
+    Bucket-to-bucket copies across continents are billed at the higher egress rate, so they
+    are refused unless the caller opts in with ``allow_cross_continent``. Cost is the
+    caller's decision, made explicitly, rather than inferred from size — an earlier
+    threshold assumed a value-function checkpoint is a few hundred MB, but a PaliGemma
+    critic with optimizer state is ~40 GiB, so it blocked exactly the carry it was meant to
+    permit.
+    """
+    source_bucket, _ = split_uri(source_uri)
+    destination_bucket, _ = split_uri(destination_uri)
+    source_region = bucket_region(source_bucket)
+    destination_region = bucket_region(destination_bucket)
+    if source_region is None:
+        raise ValueError(f"Source bucket gs://{source_bucket} does not exist")
+    if destination_region is None:
+        raise ValueError(f"Destination bucket gs://{destination_bucket} does not exist")
+
+    if continent_of(source_region) != continent_of(destination_region):
+        gibibytes = prefix_size_bytes(source_uri) / 2**30
+        if not allow_cross_continent:
+            raise PermissionError(
+                f"Cross-continent copy {source_uri} -> {destination_uri} "
+                f"({source_region} -> {destination_region}, {gibibytes:.1f} GiB) refused: "
+                "pass --allow-cross-continent-checkpoint-transfer to the launcher to permit it "
+                f"(~${gibibytes * CROSS_CONTINENT_USD_PER_GIB:.2f})."
+            )
+        logger.warning(
+            "Cross-continent copy %s -> %s (%s -> %s): %.2f GiB (~$%.2f), explicitly allowed",
+            source_uri,
+            destination_uri,
+            source_region,
+            destination_region,
+            gibibytes,
+            gibibytes * CROSS_CONTINENT_USD_PER_GIB,
+        )
+
+    logger.info("Copying %s -> %s (%s -> %s)", source_uri, destination_uri, source_region, destination_region)
+    result = _run(["gcloud", "storage", "rsync", "-r", source_uri, destination_uri], timeout=_COPY_TIMEOUT_SECONDS)
     if result.returncode != 0:
-        return False
-    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    return lines == [uri.rstrip("/")]
+        raise RuntimeError(f"Failed to copy {source_uri} -> {destination_uri}: {result.stderr.strip()}")
 
 
 def latest_checkpoint(checkpoint_root: str) -> str | None:
     """Newest committed checkpoint directly under ``checkpoint_root``, or None.
 
     Only committed ones count: a directory without commit_success.txt is a torn write and
-    resuming from it is worse than starting over.
+    resuming from it is worse than starting over. Steps are not necessarily round — the
+    preemption path in train_value_function.py saves at whatever step SIGTERM landed on.
     """
     result = _run(["gcloud", "storage", "ls", f"{checkpoint_root.rstrip('/')}/"], timeout=_GCS_TIMEOUT_SECONDS)
     if result.returncode != 0:
@@ -246,39 +188,11 @@ def latest_checkpoint(checkpoint_root: str) -> str | None:
     return None
 
 
-def committed_steps(checkpoint_root: str) -> list[int]:
-    """Every committed step directly under ``checkpoint_root``, ascending.
-
-    Both the commit marker and a params/ subtree are required, so a root is never reported
-    as offering a step that no restore could use.
-
-    Steps are not necessarily round: the preemption path in train_value_function.py saves
-    at whatever step SIGTERM landed on, which is why roots can carry entries like 15293
-    alongside the usual save-interval multiples.
-    """
-    result = _run(["gcloud", "storage", "ls", f"{checkpoint_root.rstrip('/')}/"], timeout=_GCS_TIMEOUT_SECONDS)
-    if result.returncode != 0:
-        return []
-    steps: list[int] = []
-    for line in result.stdout.splitlines():
-        tail = line.strip().rstrip("/").rsplit("/", 1)[-1]
-        if not tail.isdigit():
-            continue
-        step_uri = f"{checkpoint_root.rstrip('/')}/{tail}"
-        if is_checkpoint_dir(step_uri) and uri_exists(f"{step_uri}/params/"):
-            steps.append(int(tail))
-    return sorted(steps)
-
-
-def carry_checkpoints(source_root: str, destination_root: str) -> str | None:
+def carry_checkpoints(source_root: str, destination_root: str, *, allow_cross_continent: bool = False) -> str | None:
     """Copy the newest committed checkpoint from one region's bucket to another.
 
-    A spot run that is preempted and re-raced can land in a different region, where
-    localization points its writes at that region's bucket — an empty one. Without this
-    the run silently restarts from step 0 while its progress sits in the old bucket.
-
     Returns the destination path copied to, or None when there was nothing to carry or the
-    destination already has newer progress.
+    destination already has equal or newer progress.
     """
     if source_root.rstrip("/") == destination_root.rstrip("/"):
         return None
@@ -295,152 +209,24 @@ def carry_checkpoints(source_root: str, destination_root: str) -> str | None:
 
     destination = f"{destination_root.rstrip('/')}/{step}"
     logger.info("Carrying checkpoint %s -> %s", source, destination)
-    copy_prefix(source, destination)
+    copy_prefix(source, destination, allow_cross_continent=allow_cross_continent)
+
+    # The trainer resumes its wandb run from <root>/wandb_id.txt whenever a checkpoint
+    # exists, so a carried step without the id file fails at init_wandb. Keep an existing
+    # destination id: the run may already have been logged from this region.
+    source_wandb_id = f"{source_root.rstrip('/')}/{WANDB_ID_FILENAME}"
+    destination_wandb_id = f"{destination_root.rstrip('/')}/{WANDB_ID_FILENAME}"
+    if uri_exists(source_wandb_id) and not uri_exists(destination_wandb_id):
+        logger.info("Carrying %s -> %s", source_wandb_id, destination_wandb_id)
+        result = _run(["gcloud", "storage", "cp", source_wandb_id, destination_wandb_id], timeout=_GCS_TIMEOUT_SECONDS)
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to copy {source_wandb_id} -> {destination_wandb_id}: {result.stderr.strip()}")
     return destination
 
 
-def localize_command(command: str, tpu_config: TPUConfigWithType) -> tuple[str, dict[str, str]]:
-    """Rewrite a command's GCS buckets for the region its pod actually landed in.
-
-    Spot allocation can place a pod in any US or EU zone, so a command written against
-    one bucket would otherwise read and write across regions for the whole run.
-
-    What happens to each URI depends on what it is:
-
-    - already in the destination bucket: untouched;
-    - a training command's output directory: the bucket prefix is swapped, nothing copied,
-      because the run creates that content itself;
-    - a training command's read paths: swapped only if the same-region replica exists,
-      otherwise an error naming what to replicate — silently copying a dataset as a side
-      effect of a launch is exactly the cost this is meant to avoid;
-    - any other command's URI: copied wholesale when it is a single object or a committed
-      checkpoint directory, and rejected otherwise, so an arbitrary prefix is never dragged
-      across regions by accident.
-
-    Data and store directories resolve to their continent's hub bucket instead of the pod's
-    own regional one (see ``_HUB_REGION_BY_CONTINENT``). Only the replacement differs; which
-    URIs are redirected, copied or refused is decided exactly as it is for everything else.
-
-    Returns the rewritten command and a map of original URI to replacement.
-    """
-    region = region_from_zone(tpu_config.zone)
-    destination = ensure_regional_bucket(region, resource_owner=tpu_config.resource_owner)
-    hub = hub_bucket_for(region, resource_owner=tpu_config.resource_owner)
-    shared_dirs = shared_dir_uris(command)
-    training = is_train_command(command)
-    declared_writes = write_uris(command)
-    rewrites: dict[str, str] = {}
-
-    for uri in find_gs_uris(command):
-        source_bucket, path = split_uri(uri)
-        bucket_for_uri = hub if (hub is not None and uri in shared_dirs) else destination
-        if source_bucket == bucket_for_uri:
-            continue
-        target = f"gs://{bucket_for_uri}/{path}" if path else f"gs://{bucket_for_uri}"
-
-        if training:
-            # A declared write destination, or a path that does not exist yet: redirect it
-            # and copy nothing, because the run produces that content itself.
-            if uri in declared_writes or not uri_exists(uri):
-                rewrites[uri] = target
-                continue
-
-            # An existing path is a read. Inter-region reads within a continent are cheap
-            # relative to duplicating a dataset, so leave those alone; only a
-            # cross-continent read is worth redirecting, and only to a replica that exists.
-            source_region = bucket_region(source_bucket)
-            if source_region is None:
-                raise ValueError(f"Read source gs://{source_bucket} does not exist")
-            if continent_of(source_region) == continent_of(region):
-                logger.info("Leaving %s alone: same continent as %s", uri, region)
-                continue
-            if not uri_exists(target):
-                raise ValueError(
-                    f"{uri} is in {source_region}, the pod is in {region}, and there is no "
-                    f"same-continent replica at {target}. Replicate it first; a launch will "
-                    "not copy a dataset for you."
-                )
-            rewrites[uri] = target
-            continue
-
-        if is_object(uri) or is_checkpoint_dir(uri):
-            copy_prefix(uri, target)
-            rewrites[uri] = target
-            continue
-
-        # A checkpoint ROOT: the commit marker lives one level down, in each step. Serving
-        # needs this shape — a critic is loaded by an orbax CheckpointManager rooted here
-        # and selected by step, so the command cannot name a step directory instead. Copy
-        # the committed steps individually rather than the prefix, which both skips torn
-        # writes and keeps the step layout the manager expects.
-        steps = committed_steps(uri)
-        # A root can hold far more than the launch needs (10k + 20k + odd preemption
-        # saves). Copy only the steps the command actually selects; fall back to all of
-        # them when it names none, since then any of them may be restored.
-        named = steps_named_in(command)
-        if named:
-            wanted = sorted(set(steps) & named)
-            if wanted:
-                steps = wanted
-        if steps:
-            logger.info("Localizing checkpoint root %s: copying committed steps %s", uri, steps)
-            for step in steps:
-                copy_prefix(f"{uri.rstrip('/')}/{step}", f"{target.rstrip('/')}/{step}")
-            rewrites[uri] = target
-            continue
-
-        raise ValueError(
-            f"Refusing to localize {uri}: it is neither a single object, a committed "
-            "checkpoint directory, nor a root containing committed steps, so copying it "
-            "could move an arbitrary amount of data. Replicate it explicitly if that is "
-            "what you want."
-        )
-
-    localized = command
-    for original, replacement in rewrites.items():
-        localized = localized.replace(original, replacement)
-    if rewrites:
-        logger.info("Localized %d GCS path(s) for %s: %s", len(rewrites), region, rewrites)
-    return localized, rewrites
+def marker_exists(marker: str) -> bool:
+    return uri_exists(marker)
 
 
-def localize_paths(
-    tpu_config: TPUConfigWithType,
-    *,
-    checkpoint_base_dir: str | None = None,
-    read_uris: tuple[str, ...] = (),
-    fine_tune_base_dir: str | None = None,
-) -> dict[str, str]:
-    """Rewrite a launch's GCS paths for the region a pod actually landed in.
-
-    Returns a mapping of original URI to rewritten URI; unchanged paths are omitted.
-    Reads on the pod's own continent are deliberately left alone — inter-region reads
-    within a continent are cheap relative to the cost of duplicating a dataset.
-    """
-    region = region_from_zone(tpu_config.zone)
-    bucket = ensure_regional_bucket(region, resource_owner=tpu_config.resource_owner)
-    rewrites: dict[str, str] = {}
-
-    if checkpoint_base_dir is not None:
-        redirected = redirect_write_uri(checkpoint_base_dir, bucket=bucket)
-        if redirected != checkpoint_base_dir:
-            rewrites[checkpoint_base_dir] = redirected
-
-    if fine_tune_base_dir is not None:
-        redirected = redirect_write_uri(fine_tune_base_dir, bucket=bucket)
-        if redirected != fine_tune_base_dir:
-            copy_prefix(fine_tune_base_dir, redirected)
-            rewrites[fine_tune_base_dir] = redirected
-
-    for uri in read_uris:
-        source_bucket, _ = split_uri(uri)
-        source_region = bucket_region(source_bucket)
-        if source_region is None:
-            raise ValueError(f"Read source gs://{source_bucket} does not exist")
-        if continent_of(source_region) == continent_of(region):
-            continue
-        redirected = redirect_write_uri(uri, bucket=bucket)
-        copy_prefix(uri, redirected)
-        rewrites[uri] = redirected
-
-    return rewrites
+def remove_marker(marker: str) -> None:
+    _run(["gcloud", "storage", "rm", marker], timeout=_GCS_TIMEOUT_SECONDS)

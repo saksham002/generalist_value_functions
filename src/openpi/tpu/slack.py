@@ -1,4 +1,11 @@
-"""Slack notification utilities for TPU jobs."""
+"""Slack notifications for the three events a launcher cannot resolve on its own.
+
+A job starting is worth knowing because it is the handshake that the launch worked; a
+preemption and an expired gcloud credential are worth knowing because both need a person.
+Everything else the launcher does — a run finishing, a step failing, memory climbing — is
+visible in the log it already writes, and paging on it trained the reader to ignore the
+channel. Credential expiry is sent from :mod:`openpi.tpu.gcloud`, where it is detected.
+"""
 
 import logging
 import os
@@ -83,113 +90,16 @@ class SlackNotifier:
             logger.warning("Failed to send Slack webhook: %s", e)
             return False
 
-    def notify_started(self, tpu_name: str, tpu_type: str, command: str) -> bool:
-        """Notify that a job has started.
-
-        Args:
-            tpu_name: TPU VM name
-            tpu_type: TPU type (e.g., "v6e-8")
-            command: Command being run
-
-        Returns:
-            True if notification was sent
-        """
-        message = f":rocket: *TPU Job Started*\nTPU: {tpu_name} | Type: {tpu_type}\nCommand: `{command}`"
-        return self.send(message)
-
-    def notify_error(self, tpu_name: str, error: str, command: str) -> bool:
-        """Notify that a job encountered an error.
-
-        Args:
-            tpu_name: TPU VM name
-            error: Error message
-            command: Command that failed
-
-        Returns:
-            True if notification was sent
-        """
-        message = f":x: *TPU Job Error*\nTPU: {tpu_name}\nError: {error}\nCommand: `{command}`"
-        return self.send(message)
-
-    def notify_preemption(
-        self,
-        tpu_name: str,
-        command: str,
-        retry_count: int,
-        max_retries: int | None,
-    ) -> bool:
-        """Notify that a TPU was preempted.
-
-        Args:
-            tpu_name: TPU VM name
-            command: Command that was interrupted
-            retry_count: Current retry attempt number
-            max_retries: Maximum number of retries (None for infinite)
-
-        Returns:
-            True if notification was sent
-        """
-        retry_info = f"retry {retry_count}"
-        if max_retries is not None:
-            retry_info += f"/{max_retries}"
-
-        message = (
-            f":warning: *TPU Preempted* ({retry_info})\n"
-            f"TPU: {tpu_name}\n"
-            f"Creating new TPU and retrying...\n"
-            f"Command: `{command}`"
+    def notify_started(self, tpu_name: str, tpu_type: str, zone: str, run_id: str, command: str) -> bool:
+        """A job has just been started on a pod."""
+        return self.send(
+            f":rocket: *TPU job started*\n"
+            f"• pod: {tpu_name} ({tpu_type}, {zone})\n"
+            f"• run: `{run_id}`\n"
+            f"• command: `{command}`"
         )
-        return self.send(message)
 
-    def notify_completion(
-        self,
-        tpu_name: str,
-        command: str,
-        duration_seconds: float,
-        *,
-        success: bool,
-        output_tail: str = "",
-    ) -> bool:
-        """Notify that a job completed.
-
-        Args:
-            tpu_name: TPU VM name
-            command: Command that completed
-            duration_seconds: How long the job ran
-            success: Whether the job succeeded
-            output_tail: Last lines of output (included in failure messages)
-
-        Returns:
-            True if notification was sent
-        """
-        duration_str = _format_duration(duration_seconds)
-
-        if success:
-            emoji = ":white_check_mark:"
-            title = "Job Completed"
-        else:
-            emoji = ":x:"
-            title = "Job Failed"
-
-        message = f"{emoji} *{title}*\nTPU: {tpu_name} | Duration: {duration_str}\nCommand: `{command}`"
-
-        # Include error output for failed jobs
-        if not success and output_tail:
-            # Truncate to last 500 chars to fit Slack message limits
-            truncated = output_tail[-500:] if len(output_tail) > 500 else output_tail
-            message += f"\n```\n{truncated}\n```"
-
-        return self.send(message)
-
-
-def _format_duration(seconds: float) -> str:
-    """Format duration in human-readable form."""
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    if seconds < 3600:
-        minutes = int(seconds / 60)
-        secs = int(seconds % 60)
-        return f"{minutes}m {secs}s"
-    hours = int(seconds / 3600)
-    minutes = int((seconds % 3600) / 60)
-    return f"{hours}h {minutes}m"
+    def notify_preemption(self, tpu_name: str, run_id: str, retry_count: int, max_retries: int | None) -> bool:
+        """A pod was preempted out from under a running job."""
+        budget = f"{retry_count}" if max_retries is None else f"{retry_count}/{max_retries}"
+        return self.send(f":warning: *TPU preempted* (retry {budget})\n• pod: {tpu_name}\n• run: `{run_id}`")

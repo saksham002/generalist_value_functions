@@ -85,11 +85,23 @@ def list_all_tpus(project: str) -> tuple[DiscoveredPod, ...]:
 
 
 def find_pod(tpu_name: str, *, project: str) -> DiscoveredPod | None:
-    """Locate one pod by name without being told its zone."""
-    for pod in list_all_tpus(project):
-        if pod.name == tpu_name:
-            return pod
-    return None
+    """Locate one pod by name without being told its zone.
+
+    Pod names are unique only WITHIN a zone, so the same name can exist in several at
+    once — spot races reuse low indices per zone. Returning the first match made a launch
+    silently target a pod on another continent, so an ambiguous name is an error the
+    caller has to resolve by passing a zone.
+    """
+    matches = [pod for pod in list_all_tpus(project) if pod.name == tpu_name]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        zones = ", ".join(sorted(pod.zone for pod in matches))
+        raise ValueError(
+            f"TPU {tpu_name!r} exists in more than one zone ({zones}); pass an explicit zone "
+            "rather than letting the inventory order decide which pod is meant."
+        )
+    return matches[0]
 
 
 def describe_pod(tpu_name: str, zone: str, project: str) -> DiscoveredPod:

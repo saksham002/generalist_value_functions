@@ -43,7 +43,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-for required in TPU_TYPE TRAIN_COMMAND; do
+# --tpu-type is optional: without it run_on_tpu.py races every shape in its
+# DEFAULT_SPOT_TPU_TYPES (v4-64, v5e-64, v6e-32) and keeps whichever lands first.
+for required in TRAIN_COMMAND; do
     if [ -z "${!required}" ]; then
         echo "missing required arg: --$(echo "$required" | tr 'A-Z_' 'a-z-')" >&2
         exit 2
@@ -52,7 +54,7 @@ done
 
 log() { echo "[$(date -Is)] $*"; }
 
-log "spot launch: tpu_type=$TPU_TYPE"
+log "spot launch: tpu_type=${TPU_TYPE:-any (v4-64|v5e-64|v6e-32)}"
 log "command: $TRAIN_COMMAND"
 # Logged because they decide where checkpoints come from and when the run is considered
 # finished; without them the log cannot explain what the launcher actually did.
@@ -64,11 +66,11 @@ cd "$REPO_DIR" || exit 1
 source "$VENV"
 
 ARGS=(
-    --tpu-type "$TPU_TYPE"
     --spot
     --retry-on-preemption
     --command "$TRAIN_COMMAND"
 )
+[ -n "$TPU_TYPE" ] && ARGS+=(--tpu-type "$TPU_TYPE")
 [ -n "$DONE_MARKER" ] && ARGS+=(--done-marker "$DONE_MARKER")
 [ ${#EXTRA_ARGS[@]} -gt 0 ] && ARGS+=("${EXTRA_ARGS[@]}")
 

@@ -119,6 +119,7 @@ def spot_quota_zones(
     *,
     project: str,
     occupied_zones: "frozenset[str] | None" = None,
+    region: str | None = None,
 ) -> tuple[str, ...]:
     """Return zones worth racing for a ``size``-core pod of ``family``.
 
@@ -128,20 +129,39 @@ def spot_quota_zones(
 
     - it carries an **explicit** per-zone quota override (someone provisioned it), or
     - it currently holds a TPU (``occupied_zones``), which is direct evidence it works.
+
+    ``region`` (e.g. ``"europe-west4"``) restricts the result to zones with that prefix.
+    Use it when the job's data lives in one region and a pod anywhere else would read it
+    across regions -- the race then never lands outside, rather than winning a distant
+    zone and paying egress for the whole run.
     """
     limits = _fetch_quota_limits(family, project)
     overrides = _fetch_quota_overrides(family, project)
     permitted = overrides | (occupied_zones or frozenset())
+
+    def _in_region(zone: str) -> bool:
+        return region is None or zone.startswith(region + "-") or zone == region
+
     zones = tuple(
         sorted(
-            zone for zone, limit in limits.items() if limit >= size and _continent_allowed(zone) and zone in permitted
+            zone
+            for zone, limit in limits.items()
+            if limit >= size and _continent_allowed(zone) and zone in permitted and _in_region(zone)
         )
     )
     if not zones:
+        where = f"in region {region!r}" if region else "in US/EU"
         raise ValueError(
-            f"No eligible zone for {family}-{size}: quota fits in "
-            f"{sum(1 for z, v in limits.items() if v >= size and _continent_allowed(z))} US/EU zones, "
-            f"but none is quota-overridden or currently occupied"
+            f"No eligible zone for {family}-{size} {where}: quota fits in "
+            f"{sum(1 for z, v in limits.items() if v >= size and _continent_allowed(z) and _in_region(z))} zones "
+            f"there, but none is quota-overridden or currently occupied"
         )
-    logger.info("Spot quota for %s-%d: %d eligible zones %s", family, size, len(zones), zones)
+    logger.info(
+        "Spot quota for %s-%d%s: %d eligible zones %s",
+        family,
+        size,
+        f" in {region}" if region else "",
+        len(zones),
+        zones,
+    )
     return zones
