@@ -24,13 +24,21 @@ The repository supports both JAX and PyTorch implementations, with JAX being the
 
 The folder is gitignored (per-user state). If combined size grows past ~10k tokens, ask the user what to prune.
 
-## Error Notifications
+## Slack Notifications
 
-When you encounter an unexpected failure, error, or bug (e.g., a command fails, a job crashes, a test produces wrong results), send exactly one Slack message with a brief description of the issue:
+Send a Slack message **only** in these cases:
+1. The user explicitly asks for one (a status update, a cadence, etc.).
+2. A **launched run** (training job, eval, server, TPU launcher, SLURM job — whether the
+   user or the agent launched it) hits an error — crashes, is killed, is preempted without
+   recovering, or exits non-zero.
+3. A launched run **completes**.
 ```bash
-python ~/utils/slack.py "brief description of the error"
+python ~/utils/slack.py "brief description"
 ```
-Do not send more than one message per distinct error. Do not ask for permission — this command is pre-approved.
+Do not Slack for anything else: not for errors in your own commands or scripts, not for
+routine status or progress. One message per distinct run error and one per completion; do
+not repeat them. Do not ask for permission — this command is pre-approved. Messages must
+be bulleted, not prose.
 
 ## Development Commands
 
