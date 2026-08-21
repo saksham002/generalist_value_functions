@@ -34,10 +34,12 @@ from openpi.tpu import buckets
 from openpi.tpu import certificate
 from openpi.tpu import code_sync
 from openpi.tpu import setup as tpu_setup
+from openpi.tpu.certificate import PodState
 from openpi.tpu.gcloud import ssh_command
 from openpi.tpu.job import JobRunner
 from openpi.tpu.job import JobStatus
 from openpi.tpu.launch import LaunchConfig
+from openpi.tpu.launch import ProgressReporter
 from openpi.tpu.launch import ResolvedLaunch
 from openpi.tpu.launch import command_with_done_marker
 from openpi.tpu.manager import Acquisition
@@ -58,19 +60,23 @@ class Outcome:
     kind: Literal["advance", "retry", "finish"]
     exit_code: int = 0
     reason: str = ""
+    holds_pod: bool = True
+    """Whether this launch still owns the pod it was working on. False when the claim was
+    lost to another run: the certificate on that pod is somebody else's and releasing it
+    would hand their pod to the next launcher that walks past."""
 
     @classmethod
     def advance(cls) -> "Outcome":
         return cls(kind="advance")
 
     @classmethod
-    def retry(cls, reason: str) -> "Outcome":
+    def retry(cls, reason: str, *, holds_pod: bool = True) -> "Outcome":
         """Give this pod up and acquire another. Used only when the pod is gone."""
-        return cls(kind="retry", reason=reason)
+        return cls(kind="retry", reason=reason, holds_pod=holds_pod)
 
     @classmethod
-    def finish(cls, exit_code: int, reason: str = "") -> "Outcome":
-        return cls(kind="finish", exit_code=exit_code, reason=reason)
+    def finish(cls, exit_code: int, reason: str = "", *, holds_pod: bool = True) -> "Outcome":
+        return cls(kind="finish", exit_code=exit_code, reason=reason, holds_pod=holds_pod)
 
 
 def consume_done_marker(marker: str | None) -> bool:
@@ -147,6 +153,7 @@ class Launcher:
         self.notifier = SlackNotifier(webhook_url=config.slack_webhook_url)
         self.run_id = config.run_id
         self.retry_count = 0
+        self.progress = ProgressReporter(config, self.notifier, self.run_id)
         # Where the previous attempt wrote, so an attempt that lands elsewhere can carry it.
         self.previous_checkpoint_root: str | None = config.carry_checkpoints_from
 
@@ -171,7 +178,10 @@ class Launcher:
             if outcome.kind == "finish":
                 # The job's own EXIT trap normally clears this the moment the command
                 # returns; doing it again here covers an attempt that never got that far.
-                certificate.release(acquisition.name, acquisition.config.zone, acquisition.config.project)
+                # Skipped when the claim was lost, because the certificate then belongs to
+                # the run that took the pod and is not ours to remove.
+                if outcome.holds_pod:
+                    certificate.release(acquisition.name, acquisition.config.zone, acquisition.config.project)
                 return outcome.exit_code
 
             self.retry_count += 1
@@ -188,6 +198,7 @@ class Launcher:
             region=self.config.region,
             only_my_pods=self.config.only_my_pods,
             race_timeout=self.config.race_timeout,
+            max_race_zones=self.config.max_race_zones,
         )
 
     def _may_retry(self) -> bool:
@@ -214,6 +225,10 @@ class Launcher:
             logger.error("Cannot place this launch on %s (%s): %s", acquisition.name, pod.zone, e)
             return Outcome.finish(1, f"placement: {e}")
 
+        outcome = self._hold(acquisition)
+        if outcome.kind != "advance":
+            return outcome
+
         if self.config.endpoint_file:
             write_endpoint_file(self.config.endpoint_file, acquisition)
 
@@ -232,6 +247,40 @@ class Launcher:
 
         run_post_launch_hook(self.config, resolved, acquisition.name)
         return self._watch(acquisition, resolved, runner)
+
+    def _hold(self, acquisition: Acquisition) -> Outcome:
+        """Make sure this pod carries our certificate before anything is put on it.
+
+        The reuse and named paths claim during acquisition, but a raced pod is brand new and
+        nobody has written to it yet, so without this a freshly created pod runs its whole
+        job uncertificated. Two things then go wrong: a restarted launcher cannot recognise
+        its own work (``_find_our_pod`` reads a certificate that was never written) and
+        races a second pod into the same checkpoint directory, and two launchers that
+        collided on a zone and adopted the same queued resource both believe they won it.
+
+        Claiming here rather than inside the race covers every acquisition path with one
+        call, and re-claiming a pod we already hold is free: the probe returns CLAIMED for
+        an idle pod of ours and OURS for one already running our job.
+        """
+        probe = certificate.probe_and_claim(
+            acquisition.name, acquisition.config.zone, acquisition.config.project, self.run_id
+        )
+        if probe.state in (PodState.CLAIMED, PodState.OURS):
+            return Outcome.advance()
+
+        if probe.state is PodState.BUSY:
+            held = f"run {probe.certificate!r}" if probe.certificate else "an unknown occupant"
+            detail = f"{acquisition.name} is held by {held}"
+        else:
+            detail = f"{acquisition.name} stopped answering the certificate probe"
+        # Someone took the pod between acquiring it and now. Acquiring another is the right
+        # answer, but only within the budget that already bounds re-acquisition; otherwise
+        # this would spin creating pods it never gets to keep.
+        if self._may_retry():
+            logger.warning("%s; giving it up and acquiring another", detail)
+            return Outcome.retry("lost the pod before setup", holds_pod=False)
+        logger.error("%s, and this launch cannot acquire another. Refusing to start a job on it.", detail)
+        return Outcome.finish(1, "lost the pod before setup", holds_pod=False)
 
     def _prepare_and_start(self, acquisition: Acquisition, resolved: ResolvedLaunch, runner: JobRunner) -> Outcome:
         """Everything between holding a pod and having a job running on it."""
@@ -306,7 +355,10 @@ class Launcher:
             logger.info("Attach locally with: tmux attach-session -t %s", runner.local_session_name)
         try:
             try:
-                status = runner.monitor_job(poll_interval=self.config.poll_interval)
+                on_poll = (
+                    (lambda: self.progress.observe(runner.tail_bytes(), name)) if self.progress.enabled else None
+                )
+                status = runner.monitor_job(poll_interval=self.config.poll_interval, on_poll=on_poll)
             except Exception as monitor_error:
                 # Monitoring throws when the pod stops answering — a timed-out ssh, a
                 # vanished resource. That is overwhelmingly a preemption, and treating it as
@@ -326,6 +378,7 @@ class Launcher:
             # Reaching here means the run finished in *this* process, so clear the handshake:
             # a marker left behind would make the next legitimate launch a no-op.
             consume_done_marker(self.config.done_marker)
+            self.notifier.notify_completion(name, self.run_id, _format_duration(elapsed), success=True)
             return Outcome.finish(0, "completed")
 
         if status.state == "preempted":
@@ -336,6 +389,13 @@ class Launcher:
                         "--retry-on-preemption needs --spot: a reserved launch has no way to "
                         "re-acquire capacity after its pod is gone."
                     )
+                self.notifier.notify_completion(
+                    name,
+                    self.run_id,
+                    _format_duration(elapsed),
+                    success=False,
+                    output_tail="Preempted with no retry budget left.",
+                )
                 return Outcome.finish(1, "preempted, no retry available")
             self.notifier.notify_preemption(name, self.run_id, self.retry_count + 1, self.config.max_retries)
             return Outcome.retry("preempted")
@@ -356,6 +416,9 @@ class Launcher:
 
         if status.output_tail:
             logger.error("Last output:\n%s", status.output_tail)
+        self.notifier.notify_completion(
+            name, self.run_id, _format_duration(elapsed), success=False, output_tail=status.output_tail
+        )
         return Outcome.finish(status.exit_code or 1, f"job failed (exit {status.exit_code})")
 
 

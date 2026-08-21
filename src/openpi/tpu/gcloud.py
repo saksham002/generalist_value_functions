@@ -8,10 +8,10 @@ what makes the layers above it testable by substituting one function.
 import json
 import logging
 import os
-from pathlib import Path
 import subprocess
-import sys
 import time
+
+from openpi.tpu.slack import SlackNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -69,12 +69,11 @@ def alert_on_auth_failure(stderr: str | None, *, context: str = "") -> bool:
         f"TPU launcher cannot continue until you re-authenticate: {_REAUTH_COMMAND}"
     )
     try:
-        subprocess.run(
-            [sys.executable, str(Path.home() / "utils" / "slack.py"), message],
-            capture_output=True,
-            timeout=60,
-            check=False,
-        )
+        # In-process rather than shelling out to a helper script: the subprocess this
+        # replaced pointed at ~/utils/slack.py, which does not exist on every launcher host,
+        # and its failure was swallowed — so the one alert that always needs a human was
+        # silently dropped. One mechanism, the same credentials as every other notification.
+        SlackNotifier().send(message)
     except Exception as e:
         logger.warning("Could not send auth-failure Slack alert: %s", e)
     return True

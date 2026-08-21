@@ -97,11 +97,18 @@ def sync_code_to_worker(
         f"gcloud compute tpus tpu-vm ssh {_apply_ssh_user(tpu_name)} "
         f"--zone={config.zone} --project={config.project} --worker={worker} --"
     )
+    # No -t: preserving mtimes calls utime() on the destination, which requires
+    # *ownership*, not write permission. Per-worker uid mappings mean a file synced
+    # by an earlier pod is routinely owned by a different uid on this one, so the
+    # copy succeeds and then rsync exits 23 ("some files/attrs were not
+    # transferred") purely over timestamps. --omit-dir-times covered directories
+    # only. Without mtimes, --checksum is what keeps the transfer incremental.
     rsync_args = [
         "rsync",
-        "-rltvz",  # recursive, links, times, verbose, compress (no perms/owner/group)
+        "-rlvz",  # recursive, links, verbose, compress (no times/perms/owner/group)
+        "--checksum",
         "--progress",
-        "--omit-dir-times",  # avoid "failed to set times" errors on NFS
+        "--omit-dir-times",
         "--filter=:- .gitignore",
         "--exclude=.git",
         "--exclude=.venv",
@@ -153,7 +160,9 @@ def sync_gemma_helper(local_dir: str | Path, tpu_name: str, config: PodConfig, l
         )
         rsync_args = [
             "rsync",
-            "-rltvz",
+            # See sync_code_to_worker: -t fails on NFS under per-worker uid mappings.
+            "-rlvz",
+            "--checksum",
             "--omit-dir-times",
             "--exclude=.git",
             "--exclude=.venv",

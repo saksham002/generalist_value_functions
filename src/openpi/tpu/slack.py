@@ -1,4 +1,4 @@
-"""Slack notifications for the three events a launcher cannot resolve on its own.
+"""Slack notifications for the events a launcher cannot resolve on its own.
 
 A job starting is worth knowing because it is the handshake that the launch worked; a
 preemption and an expired gcloud credential are worth knowing because both need a person.
@@ -103,3 +103,26 @@ class SlackNotifier:
         """A pod was preempted out from under a running job."""
         budget = f"{retry_count}" if max_retries is None else f"{retry_count}/{max_retries}"
         return self.send(f":warning: *TPU preempted* (retry {budget})\n• pod: {tpu_name}\n• run: `{run_id}`")
+
+    def notify_completion(
+        self, tpu_name: str, run_id: str, duration: str, *, success: bool, output_tail: str = ""
+    ) -> bool:
+        """A run reached its end, either way.
+
+        The launcher used to notify only on start and preemption, on the reasoning that a
+        finish is visible in the log it already writes. That holds for an attended run; it
+        does not for one left on a launcher host, where nobody is reading the log and the
+        two things worth knowing are exactly "it finished" and "it died". The failing tail
+        is carried with the message so the common case needs no ssh at all.
+        """
+        headline = ":white_check_mark: *Run completed*" if success else ":x: *Run failed*"
+        message = f"{headline}\n• pod: {tpu_name}\n• run: `{run_id}`\n• duration: {duration}"
+        if not success and output_tail:
+            # Slack rejects very long messages, and the useful part of a traceback is its end.
+            message += f"\n```\n{output_tail[-500:]}\n```"
+        return self.send(message)
+
+    def notify_progress(self, tpu_name: str, run_id: str, percent: int, detail: str = "") -> bool:
+        """A run crossed a progress milestone. See ``--progress-pattern``."""
+        suffix = f" ({detail})" if detail else ""
+        return self.send(f":bar_chart: *{percent}% complete*{suffix}\n• pod: {tpu_name}\n• run: `{run_id}`")

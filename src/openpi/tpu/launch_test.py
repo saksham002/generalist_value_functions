@@ -6,16 +6,22 @@ the parts that decide *how to ask GCP* need a live project.
 """
 
 import dataclasses
+import subprocess
 
 import pytest
 
 from openpi.tpu import certificate
 from openpi.tpu import quota
 from openpi.tpu.config import RemoteLayout
+from openpi.tpu.config import get_tpu_name_prefix
+from openpi.tpu.config import get_tpu_type_prefix
 from openpi.tpu.launch import CommandPlan
 from openpi.tpu.launch import LaunchConfig
+from openpi.tpu.launch import ProgressReporter
 from openpi.tpu.launch import UriRole
 from openpi.tpu.launch import command_with_done_marker
+from openpi.tpu.manager import AllocationRequest
+from openpi.tpu.manager import may_reclaim
 
 TRAIN_COMMAND = (
     "python scripts/train_value_function.py my_config --resume "
@@ -137,23 +143,45 @@ def test_done_marker_tail_only_runs_after_success() -> None:
     assert command_with_done_marker("true", None) == "true"
 
 
-def test_a_zone_needs_corroborating_evidence_not_just_quota(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The project default grant covers zones that have never served capacity."""
-    limits = {"us-central2-b": 64, "europe-west4-a": 64, "asia-east1-c": 64}
+def test_every_us_eu_zone_with_fitting_quota_is_raced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Corroboration orders candidates; it no longer excludes them.
+
+    Excluding on it could never bootstrap a zone: being raced required occupancy and
+    occupancy required being raced.
+    """
+    limits = {"us-central2-b": 64, "europe-west4-a": 2048, "us-east1-d": 1536, "asia-east1-c": 1536}
     monkeypatch.setattr(quota, "_fetch_quota_limits", lambda family, project: limits)
     monkeypatch.setattr(quota, "_fetch_quota_overrides", lambda family, project: frozenset({"us-central2-b"}))
 
-    assert quota.spot_quota_zones("v4", 64, project="p") == ("us-central2-b",)
-    # A zone that currently holds a pod is direct evidence it works.
-    occupied = frozenset({"europe-west4-a"})
-    assert quota.spot_quota_zones("v4", 64, project="p", occupied_zones=occupied) == (
-        "europe-west4-a",
-        "us-central2-b",
-    )
-    # asia-east1-c has quota and would be occupied, but is off-continent.
-    assert "asia-east1-c" not in quota.spot_quota_zones(
-        "v4", 64, project="p", occupied_zones=frozenset({"asia-east1-c", "europe-west4-a"})
-    )
+    zones = quota.spot_quota_zones("v4", 64, project="p")
+    # The overridden zone leads despite the smallest grant; off-continent is still excluded.
+    assert zones == ("us-central2-b", "europe-west4-a", "us-east1-d")
+    assert "asia-east1-c" not in zones
+
+
+def test_a_zone_holding_a_pod_is_ordered_ahead_of_an_uncorroborated_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    limits = {"us-east1-d": 1536, "europe-west4-a": 1536}
+    monkeypatch.setattr(quota, "_fetch_quota_limits", lambda family, project: limits)
+    monkeypatch.setattr(quota, "_fetch_quota_overrides", lambda family, project: frozenset())
+
+    occupied = frozenset({"us-east1-d"})
+    assert quota.spot_quota_zones("v4", 64, project="p", occupied_zones=occupied)[0] == "us-east1-d"
+
+
+def test_max_zones_caps_the_blast_radius(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each candidate holds quota in a shared project until a winner is picked."""
+    limits = {f"us-west1-{c}": 1536 for c in "abc"} | {"europe-west4-a": 2048}
+    monkeypatch.setattr(quota, "_fetch_quota_limits", lambda family, project: limits)
+    monkeypatch.setattr(quota, "_fetch_quota_overrides", lambda family, project: frozenset({"europe-west4-a"}))
+
+    assert quota.spot_quota_zones("v4", 64, project="p", max_zones=2) == ("europe-west4-a", "us-west1-a")
+
+
+def test_a_shape_too_big_for_every_grant_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(quota, "_fetch_quota_limits", lambda family, project: {"us-east1-d": 32})
+    monkeypatch.setattr(quota, "_fetch_quota_overrides", lambda family, project: frozenset())
+    with pytest.raises(ValueError, match="no zone there has spot quota"):
+        quota.spot_quota_zones("v4", 64, project="p")
 
 
 def test_region_filter_scopes_the_race(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -308,3 +336,220 @@ def test_mesh_flag_is_added_only_for_v6e(stub_gcs) -> None:
     )
     assert LaunchConfig(command=TRAIN_COMMAND).resolve(v6e).command.endswith("--fsdp-devices=8")
     assert "--fsdp-devices" not in LaunchConfig(command=TRAIN_COMMAND).resolve(_pod("europe-west4-a")).command
+
+
+# --- Race naming ------------------------------------------------------------------------
+# Two launches racing the same shape at the same moment must never name their candidates
+# identically: candidates are torn down by name, so a shared name means one launch deletes
+# the other's winner.
+
+
+def _request(command: str) -> AllocationRequest:
+    return AllocationRequest(run_id=LaunchConfig(command=command).run_id, tpu_type="v5e-64", spot=True)
+
+
+def test_two_runs_racing_one_shape_get_different_name_prefixes() -> None:
+    first = _request(TRAIN_COMMAND)
+    second = _request(TRAIN_COMMAND.replace("--exp-name run7", "--exp-name run8"))
+    prefixes = {
+        get_tpu_name_prefix("v5e-64", resource_owner="saksham", is_spot=True, run_token=request.name_token)
+        for request in (first, second)
+    }
+    assert len(prefixes) == 2
+
+
+def test_the_name_token_survives_a_re_race_into_another_region() -> None:
+    """A relaunched run must count indices in the namespace its earlier attempt used."""
+    european = _request(TRAIN_COMMAND)
+    american = _request(TRAIN_COMMAND.replace("saksham-euw4", "saksham-usc2"))
+    assert european.name_token == american.name_token
+
+
+def test_a_raced_name_stays_recognisable_to_reuse_and_cleanup() -> None:
+    """The token goes before the index, so the checks that find a pod later still match."""
+    prefix = get_tpu_name_prefix("v5e-64", resource_owner="saksham", is_spot=True, run_token="abc12345")
+    name = f"{prefix}-0"
+    # _find_idle_pod and cleanup_preempted both key on the family prefix.
+    assert name.startswith(get_tpu_type_prefix("v5e-64"))
+    # Ownership, and therefore the right to reclaim, is a substring test on the name.
+    assert "saksham" in name
+    assert name == "v5e-saksham-spot-64-abc12345-0"
+
+
+def test_an_untokenised_prefix_is_unchanged() -> None:
+    """Callers that do not scope by run keep the name they had."""
+    assert get_tpu_name_prefix("v6e-32", resource_owner="saksham", is_spot=True) == "v6e-saksham-spot-32"
+
+
+# --- Progress milestones -----------------------------------------------------------------
+
+
+def _reporter(pattern: str, every: int = 20):
+    return ProgressReporter(
+        LaunchConfig(command=TRAIN_COMMAND, progress_pattern=pattern, progress_every=every),
+        _RecordingNotifier(),
+        "run-abc12345",
+    )
+
+
+class _RecordingNotifier:
+    def __init__(self) -> None:
+        self.milestones: list[int] = []
+
+    def notify_progress(self, tpu_name: str, run_id: str, percent: int, detail: str = "") -> bool:
+        self.milestones.append(percent)
+        return True
+
+
+def test_progress_is_disabled_without_a_pattern() -> None:
+    assert not _reporter("").enabled
+    assert _reporter(r"(\d+)%\|").enabled
+
+
+def test_two_groups_read_as_current_over_total() -> None:
+    assert _reporter(r"step (\d+)/(\d+)").percent_from("step 5000/20000") == pytest.approx(25.0)
+
+
+def test_one_group_reads_as_a_percent() -> None:
+    assert _reporter(r"(\d+)%\|").percent_from("  45%|####      | 9/20") == pytest.approx(45.0)
+
+
+def test_the_last_match_in_the_tail_wins() -> None:
+    """A log tail holds several updates; only the most recent says where the job is."""
+    tail = "10%|# | 1/10\r 20%|## | 2/10\r 30%|### | 3/10"
+    assert _reporter(r"(\d+)%\|").percent_from(tail) == pytest.approx(30.0)
+
+
+def test_a_tail_with_no_progress_reports_nothing() -> None:
+    assert _reporter(r"(\d+)%\|").percent_from("Traceback (most recent call last):") is None
+
+
+def test_milestones_never_repeat_or_go_backwards() -> None:
+    """A preemption retry resumes from a checkpoint; it must not replay what it passed."""
+    reporter = _reporter(r"(\d+)%\|")
+    for tail in ("21%|", "25%|", "44%|", "41%|", "9%|"):
+        reporter.observe(tail, "pod-0")
+    assert reporter.notifier.milestones == [20, 40]
+
+
+def test_a_resumed_run_announces_only_where_it_lands() -> None:
+    reporter = _reporter(r"(\d+)%\|")
+    reporter.observe("83%|", "pod-0")
+    assert reporter.notifier.milestones == [80]
+
+
+def test_division_by_a_zero_total_is_not_fatal() -> None:
+    assert _reporter(r"step (\d+)/(\d+)").percent_from("step 0/0") is None
+
+
+def test_a_spot_launch_may_name_several_shapes() -> None:
+    request = AllocationRequest(run_id="r-1", tpu_type="v5e-64,v6e-32", spot=True)
+    assert request.shapes == ("v5e-64", "v6e-32")
+    assert request.single_shape is None
+
+
+def test_one_shape_still_reads_as_one() -> None:
+    request = AllocationRequest(run_id="r-1", tpu_type="v5e-64", spot=True)
+    assert request.shapes == ("v5e-64",)
+    assert request.single_shape == "v5e-64"
+
+
+# --- The certificate probe's shell ---------------------------------------------------
+# Exercised against a stubbed pgrep rather than a pod: the failure this pins cost every
+# reuse attempt in a launch session, and it is invisible to reading the Python.
+
+
+def _run_probe(tmp_path, pgrep_stdout: str, pgrep_exit: int, run_id: str = "run-abc12345") -> dict[str, str]:
+    """Run the real probe command under sh with pgrep stubbed, and parse what it printed."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "pgrep"
+    stub.write_text(f"#!/bin/sh\nprintf '{pgrep_stdout}'\nexit {pgrep_exit}\n")
+    stub.chmod(0o755)
+    result = subprocess.run(
+        ["sh", "-c", certificate.probe_command(run_id)],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(tmp_path)},
+        check=False,
+    )
+    return dict(
+        line.split("=", 1) for line in result.stdout.splitlines() if line.startswith(("PYS=", "CERT="))
+    )
+
+
+def test_an_idle_pod_is_claimable(tmp_path) -> None:
+    """`pgrep -c` prints its count AND exits non-zero when that count is zero.
+
+    An `|| echo 0` fallback therefore fired as well, making pys "0\\n0" -- which is not
+    equal to "0", so the probe reported the pod busy. Every idle pod read as BUSY, reuse
+    could never succeed, and a reclaim was aimed at pods doing nothing wrong.
+    """
+    fields = _run_probe(tmp_path, pgrep_stdout="0\\n", pgrep_exit=1)
+    assert fields["PYS"].strip() == "0"
+    assert fields["CERT"] == "run-abc12345"
+
+
+def test_a_pod_running_python_is_not_claimed(tmp_path) -> None:
+    fields = _run_probe(tmp_path, pgrep_stdout="3\\n", pgrep_exit=0)
+    assert fields["PYS"].strip() == "3"
+    assert fields["CERT"] == ""
+    assert not (tmp_path / "tpu_run_id").exists()
+
+
+def test_an_existing_certificate_is_never_overwritten(tmp_path) -> None:
+    (tmp_path / "tpu_run_id").write_text("someone-elses-run\n")
+    fields = _run_probe(tmp_path, pgrep_stdout="0\\n", pgrep_exit=1)
+    assert fields["CERT"].strip() == "someone-elses-run"
+    assert (tmp_path / "tpu_run_id").read_text().strip() == "someone-elses-run"
+
+
+def test_a_certificate_holder_is_never_reclaimed() -> None:
+    """Between a claim and its job starting, a pod runs no python for several minutes.
+
+    Judging by processes alone read that as idle and took the pod from the run setting up
+    on it, deleting its certificate and writing another.
+    """
+    held = certificate.PodProbe(state=certificate.PodState.BUSY, certificate="someone-elses-run")
+    assert not may_reclaim(held, owned=True, reclaim_owned=True)
+
+
+def test_stale_processes_with_no_certificate_may_be_reclaimed() -> None:
+    stale = certificate.PodProbe(state=certificate.PodState.BUSY, python_processes=3)
+    assert may_reclaim(stale, owned=True, reclaim_owned=True)
+    # Ownership still gates it: never kill work on a pod that is not ours.
+    assert not may_reclaim(stale, owned=False, reclaim_owned=True)
+    assert not may_reclaim(stale, owned=True, reclaim_owned=False)
+
+
+def test_an_unreachable_pod_is_never_reclaimed() -> None:
+    unreachable = certificate.PodProbe(state=certificate.PodState.UNREACHABLE)
+    assert not may_reclaim(unreachable, owned=True, reclaim_owned=True)
+
+
+def test_a_startup_progress_bar_does_not_latch_the_reporter() -> None:
+    """A job's own startup bars finish at 100%, and taking one silences every real milestone.
+
+    Observed live: `Fetching 2 files: 100%|##########| 2/2` during weight download was read
+    as the run being complete, after which the monotonic rule suppressed everything.
+    """
+    reporter = _reporter(r"(\d+)%\|")
+    reporter.observe("Fetching 2 files: 100%|##########| 2/2 [00:02<00:00,  1.26s/it]", "pod-0")
+    assert reporter.notifier.milestones == []
+    # A real reading afterwards still works.
+    reporter.observe("24%|##        |", "pod-0")
+    assert reporter.notifier.milestones == [20]
+
+
+def test_the_step_pattern_ignores_small_startup_bars() -> None:
+    """The training bar's total has five or more digits; a startup bar's does not."""
+    reporter = _reporter(r"(\d+)/(\d{5,}) \[")
+    assert reporter.percent_from("Fetching 2 files: 100%|###| 2/2 [00:02<00:00]") is None
+    assert reporter.percent_from(" 24%|##  | 56175/230000 [01:02<03:04]") == pytest.approx(24.42, abs=0.01)
+
+
+def test_a_run_resuming_high_still_reports() -> None:
+    """The guard must not suppress a legitimate late-stage resume."""
+    reporter = _reporter(r"(\d+)/(\d{5,}) \[")
+    reporter.observe(" 96%|####| 220000/230000 [01:02<03:04]", "pod-0")
+    assert reporter.notifier.milestones == [80]

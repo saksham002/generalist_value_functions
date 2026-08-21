@@ -11,6 +11,7 @@ to be honoured everywhere except preempted-resource cleanup.
 
 import concurrent.futures
 import dataclasses
+import hashlib
 import logging
 import threading
 import time
@@ -72,11 +73,30 @@ class AllocationRequest:
     region: str | None = None
     only_my_pods: bool = False
     race_timeout: float = 21600
+    max_race_zones: int | None = None
 
     @property
     def shapes(self) -> tuple[str, ...]:
-        """Shapes this request will accept, widest-first for an untyped spot launch."""
-        return (self.tpu_type,) if self.tpu_type else DEFAULT_SPOT_TPU_TYPES
+        """Shapes this request will accept, widest-first for an untyped spot launch.
+
+        Comma-separated so a launch can name the shapes it will take without having to
+        accept every default. Capacity for any one shape is scarce and bursty, and the
+        zones that can serve them barely overlap, so being able to say "v5e-64 or v6e-32"
+        is the difference between racing two zones and racing six.
+        """
+        if not self.tpu_type:
+            return DEFAULT_SPOT_TPU_TYPES
+        return tuple(shape.strip() for shape in self.tpu_type.split(",") if shape.strip())
+
+    @property
+    def single_shape(self) -> str | None:
+        """The one shape this request names, or None when it names none or several.
+
+        Reserved and named acquisitions look a pod up *by* its shape, so they need exactly
+        one; only the spot race can hold several in flight at once.
+        """
+        shapes = self.shapes
+        return shapes[0] if self.tpu_type and len(shapes) == 1 else None
 
     @property
     def resource_owner(self) -> str:
@@ -84,6 +104,18 @@ class AllocationRequest:
 
     def in_region(self, zone: str | None) -> bool:
         return self.region is None or bool(zone and zone.startswith(self.region))
+
+    @property
+    def name_token(self) -> str:
+        """The per-run component of a raced pod's name; see :func:`get_tpu_name_prefix`.
+
+        The run id's trailing digest is used rather than its label: it is already the part
+        that identifies the run, it is eight characters, and it is stable across a re-race
+        into another region — so a relaunched run counts indices in the same namespace its
+        earlier attempt did instead of opening a second one.
+        """
+        token = self.run_id.rsplit("-", 1)[-1][:8]
+        return token if token.isalnum() else hashlib.sha256(self.run_id.encode()).hexdigest()[:8]
 
 
 class RaceArbiter:
@@ -281,8 +313,13 @@ def acquire(request: AllocationRequest) -> Acquisition:
             "--tpu-type is required for a reserved (non-spot) launch: a reserved pod is looked "
             f"up by shape. Pass --tpu-type, or use --spot to race any of {DEFAULT_SPOT_TPU_TYPES}."
         )
-    logger.info("Looking for an available %s TPU...", request.tpu_type)
-    reused = _find_idle_pod(request.tpu_type, request)
+    if request.single_shape is None:
+        raise ValueError(
+            f"A reserved launch takes exactly one --tpu-type, not {list(request.shapes)}: it looks a pod "
+            "up by shape rather than creating one. Several shapes only make sense with --spot."
+        )
+    logger.info("Looking for an available %s TPU...", request.single_shape)
+    reused = _find_idle_pod(request.single_shape, request)
     if reused is None:
         raise RuntimeError(
             f"No idle {request.tpu_type} TPU exists. Reserved launches target an existing pod; "
@@ -342,7 +379,9 @@ def _acquire_named(request: AllocationRequest) -> Acquisition:
     same TPU makes one of the two fail on the accelerator lock.
     """
     logger.info("Using specified TPU: %s", request.tpu_name)
-    config = resolve_from_pod(request.tpu_name, user=request.user, project=request.project, tpu_type=request.tpu_type)
+    config = resolve_from_pod(
+        request.tpu_name, user=request.user, project=request.project, tpu_type=request.single_shape
+    )
     probe = certificate.probe_and_claim(request.tpu_name, config.zone, request.project, request.run_id)
     if probe.state is PodState.UNREACHABLE:
         raise RuntimeError(
@@ -376,6 +415,24 @@ def _acquire_spot(request: AllocationRequest) -> Acquisition:
 
     logger.info("Allocating spot %s across every zone with quota...", request.tpu_type or f"any of {request.shapes}")
     return race_spot_tpu_any(request)
+
+
+def may_reclaim(probe: certificate.PodProbe, *, owned: bool, reclaim_owned: bool) -> bool:
+    """Whether a busy pod may have its processes killed and be taken over.
+
+    The certificate check is the important one. Reclaiming exists for *stale processes* left
+    on a pod nobody holds. A pod carrying a certificate is held by a live launcher, and for
+    the several minutes between a claim and the job actually starting there is no python
+    running on it at all -- so judging by processes alone reads a pod mid-setup as idle and
+    takes it from the run installing onto it, deleting that run's certificate and writing
+    another. Two launchers then set up on one pod, which is the exact outcome the
+    certificate exists to prevent.
+    """
+    if not reclaim_owned or not owned:
+        return False
+    if probe.state is certificate.PodState.UNREACHABLE:
+        return False
+    return probe.certificate is None
 
 
 def _find_idle_pod(
@@ -435,7 +492,9 @@ def _find_idle_pod(
         if probe.state is PodState.OURS:
             logger.info("TPU %s already carries this run's certificate; attaching", pod.name)
             return Acquisition(name=pod.name, config=config, resumed=True)
-        if probe.state is PodState.UNREACHABLE or not reclaim_owned or not owned:
+        if not may_reclaim(probe, owned=owned, reclaim_owned=reclaim_owned):
+            if probe.certificate is not None:
+                logger.info("%s carries run %r's certificate; leaving it alone", pod.name, probe.certificate)
             continue
 
         # Never kill this user's own work. Anything else on their pod is stale or foreign
@@ -617,9 +676,17 @@ def race_spot_tpu(
     guarantees exactly one of them keeps a pod.
     """
     arbiter = arbiter or RaceArbiter()
-    configs = spot_race_configs(tpu_type, user=request.user, project=request.project, region=request.region)
+    configs = spot_race_configs(
+        tpu_type,
+        user=request.user,
+        project=request.project,
+        region=request.region,
+        max_zones=request.max_race_zones,
+    )
     prefix_of = {
-        config.zone: get_tpu_name_prefix(tpu_type, resource_owner=config.user.resource_owner, is_spot=True)
+        config.zone: get_tpu_name_prefix(
+            tpu_type, resource_owner=config.user.resource_owner, is_spot=True, run_token=request.name_token
+        )
         for config in configs
     }
     # Name each candidate from what is actually free in its own zone. Using the list

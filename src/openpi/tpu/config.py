@@ -346,6 +346,7 @@ def spot_race_configs(
     user: str = DEFAULT_TPU_USER,
     project: str = DEFAULT_PROJECT,
     region: str | None = None,
+    max_zones: int | None = None,
 ) -> tuple[PodConfig, ...]:
     """Resolve one config per zone with live spot quota for ``tpu_type``.
 
@@ -362,7 +363,9 @@ def spot_race_configs(
         for pod in discovery.list_all_tpus(project)
         if pod.zone and (region is None or pod.zone.startswith(region))
     )
-    zones = quota.spot_quota_zones(family, size, project=project, occupied_zones=occupied, region=region)
+    zones = quota.spot_quota_zones(
+        family, size, project=project, occupied_zones=occupied, region=region, max_zones=max_zones
+    )
     return tuple(
         _build_config(
             tpu_type=tpu_type,
@@ -386,11 +389,24 @@ def with_discovered_nfs(config: PodConfig, *, pod: discovery.DiscoveredPod | Non
     return dataclasses.replace(config, nfs_server=nfs_server, nfs_mount_path=nfs_mount_path)
 
 
-def get_tpu_name_prefix(tpu_type: str, *, resource_owner: str, is_spot: bool) -> str:
-    """Return the user- and capacity-scoped prefix used for TPU resource names."""
+def get_tpu_name_prefix(tpu_type: str, *, resource_owner: str, is_spot: bool, run_token: str = "") -> str:
+    """Return the prefix used for TPU resource names, scoped to user, capacity and run.
+
+    ``run_token`` is what keeps two launches racing the same shape at the same moment from
+    naming their candidates identically. Without it both compute the same
+    ``<prefix>-<highest index + 1>`` in every zone they share — the index is a read of what
+    exists, not an atomic reservation — and then one launch's ``_cleanup_losers`` deletes the
+    other's winner, because candidates are matched by name and a name says nothing about who
+    created it. With a per-run token the indices are counted per run and the names simply
+    cannot coincide.
+
+    Only the *index* is scoped. Everything that identifies a pod for reuse still reads:
+    the family prefix leads the name and the resource owner remains a substring of it.
+    """
     family, size = _parse_tpu_type(tpu_type)
     capacity_suffix = "-spot" if is_spot else ""
-    return f"{family}-{resource_owner}{capacity_suffix}-{size}"
+    prefix = f"{family}-{resource_owner}{capacity_suffix}-{size}"
+    return f"{prefix}-{run_token}" if run_token else prefix
 
 
 def get_tpu_type_prefix(tpu_type: str) -> str:

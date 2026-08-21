@@ -35,6 +35,7 @@ import hashlib
 import logging
 from pathlib import Path
 import re
+from typing import Protocol
 
 from openpi.tpu import buckets
 from openpi.tpu.config import DEFAULT_PROJECT
@@ -249,9 +250,10 @@ class LaunchConfig:
     """Command to run on the TPU."""
 
     tpu_type: str | None = None
-    """TPU type (e.g. 'v6e-8', 'v5e-128'). Optional for a spot launch: with none given, the
-    race spans every shape in ``DEFAULT_SPOT_TPU_TYPES`` and keeps whichever lands first. A
-    reserved launch still requires it, since a reserved pod is looked up by shape."""
+    """TPU type (e.g. 'v6e-8', 'v5e-128'), or a comma-separated list of them for a spot
+    launch ('v5e-64,v6e-32'), which races all of them and keeps whichever lands first. With
+    none given the race spans every shape in ``DEFAULT_SPOT_TPU_TYPES``. A reserved launch
+    requires exactly one, since a reserved pod is looked up by shape rather than created."""
 
     tpu_name: str | None = None
     """Specific TPU name to use. If not specified, finds or creates one."""
@@ -307,9 +309,10 @@ class LaunchConfig:
     """Local code directory to sync from."""
 
     local_gemma_dir: str = dataclasses.field(
-        default_factory=lambda: str(Path.home() / "projects/AIRe/robocoin/helper/gemma")
+        default_factory=lambda: str(Path(__file__).resolve().parents[4] / "gemma")
     )
-    """Local Gemma helper checkout to sync from."""
+    """Local Gemma helper checkout to sync from. Defaults to a sibling of the repo, so a
+    launcher host only has to clone the two repos next to each other."""
 
     retry_on_preemption: bool = False
     """Whether to re-acquire capacity and replay the command if the TPU is preempted."""
@@ -322,6 +325,28 @@ class LaunchConfig:
 
     poll_interval: int = 30
     """Seconds between job status checks."""
+
+    progress_pattern: str = ""
+    r"""Regex matched against the tail of the job's log to extract how far along it is.
+
+    Empty disables progress reporting. The launcher deliberately has no built-in notion of
+    what progress means — it knows only "a regex yielding numbers", so the same mechanism
+    serves a trainer, an eval sweep or a data job without any of them being named here.
+
+    One capture group is read as a percentage; two are read as (current, total). A tqdm bar
+    is matched by ``--progress-pattern '(\d+)%\|'``, and an explicit step counter by
+    something like ``'step (\d+)/(\d+)'``."""
+
+    progress_every: int = 20
+    """Percent between progress notifications. Milestones only ever move forward, so a
+    resumed or re-raced run that starts partway through reports the milestone it lands on
+    once, rather than replaying the ones below it."""
+
+    max_race_zones: int | None = None
+    """Cap on how many zones one race may open queued resources in at once. None races
+    every US/EU zone whose quota fits the shape, ordered known-good first. Each candidate
+    holds quota in a shared project until a winner is picked, so cap it when colleagues are
+    competing for the same shape."""
 
     race_timeout: int = 21600
     """Seconds a spot race may ride the queue. Stockouts last hours, so this is large:
@@ -493,6 +518,72 @@ def _adjust_mesh_flags(command: str, pod: PodConfig) -> str:
     hosts = pod.worker_count
     logger.info("Setting --fsdp-devices=%d for %s (mesh [4, %d, 1])", hosts, pod.tpu_type, hosts)
     return f"{command} --fsdp-devices={hosts}"
+
+
+class ProgressSink(Protocol):
+    """Anything that can be told a run reached a milestone."""
+
+    def notify_progress(self, tpu_name: str, run_id: str, percent: int, detail: str = "") -> bool: ...
+
+
+class ProgressReporter:
+    """Turns a regex over the job's log into milestone notifications.
+
+    Milestones are monotonic and held per launch rather than per attempt: ``--resume`` on a
+    run that is already 80% through, or a preemption that re-races onto a fresh pod, must
+    not replay every milestone below where it restarts. Only an increase is ever announced.
+    """
+
+    def __init__(self, config: "LaunchConfig", notifier: "ProgressSink", run_id: str):
+        self.every = max(1, config.progress_every)
+        self.pattern = re.compile(config.progress_pattern) if config.progress_pattern else None
+        self.notifier = notifier
+        self.run_id = run_id
+        self.highest_milestone = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.pattern is not None
+
+    def percent_from(self, text: str) -> float | None:
+        """The last match's progress as a percent, or None if the tail shows none.
+
+        The *last* match, not the first: the tail of a log holds several updates and only
+        the most recent one describes where the job is now.
+        """
+        matches = self.pattern.findall(text) if self.pattern else []
+        if not matches:
+            return None
+        last = matches[-1]
+        try:
+            if isinstance(last, tuple):
+                if len(last) < 2:
+                    return float(last[0])
+                current, total = float(last[0]), float(last[1])
+                return 100.0 * current / total if total > 0 else None
+            return float(last)
+        except (TypeError, ValueError):
+            return None
+
+    def observe(self, text: str, tpu_name: str) -> None:
+        percent = self.percent_from(text)
+        if percent is None:
+            return
+        if percent >= 100.0 and self.highest_milestone == 0:
+            # A job's startup prints progress bars of its own -- weight downloads, dataset
+            # preparation -- and a finished one reads as 100%. Taking that as the run's
+            # progress latches the reporter at its ceiling, after which the monotonic rule
+            # silences every real milestone. A launch whose work was already complete would
+            # have been short-circuited by the done marker before reaching a pod, so a first
+            # reading of 100% is somebody else's bar rather than ours.
+            logger.info("Ignoring a 100%% reading before any progress was seen; not this run's bar")
+            return
+        milestone = int(min(percent, 100.0) // self.every) * self.every
+        if milestone <= self.highest_milestone or milestone <= 0:
+            return
+        self.highest_milestone = milestone
+        logger.info("Run %s reached %d%%", self.run_id, milestone)
+        self.notifier.notify_progress(tpu_name, self.run_id, milestone, f"{percent:.1f}% observed")
 
 
 def command_with_done_marker(command: str, marker: str | None) -> str:

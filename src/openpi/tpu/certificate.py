@@ -84,6 +84,36 @@ def validate_run_id(run_id: str) -> str:
     return run_id
 
 
+def probe_command(run_id: str, *, claim: bool = True) -> str:
+    """The one shell command the probe runs. Separated so it can be exercised directly.
+
+    Its behaviour depends on shell subtleties that no amount of reading reliably catches --
+    the count-and-exit-non-zero one below cost every reuse attempt for a day -- so it is
+    worth being able to run it against a stub instead of a pod.
+    """
+    write = (
+        f'if ( set -o noclobber; echo "{run_id}" > {CERTIFICATE_FILE} ) 2>/dev/null; '
+        f'then echo "CERT={run_id}"; else echo "CERT=$(cat {CERTIFICATE_FILE} 2>/dev/null)"; fi'
+        if claim
+        else f'echo "CERT=$(cat {CERTIFICATE_FILE} 2>/dev/null)"'
+    )
+    # The certificate is read first and the claim attempted only when nothing holds the pod,
+    # so a pod running someone else's job is never written to.
+    # `pgrep -c` prints its count AND exits non-zero when the count is zero, so an
+    # `|| echo 0` fallback appends a second line and yields "0\n0" on an idle pod. That is
+    # not equal to "0", so the probe took the "python is running" branch, reported an empty
+    # certificate, and every genuinely idle pod read as BUSY -- which made reuse impossible
+    # and sent a reclaim (pkill -9 python) at pods that were doing nothing wrong.
+    return (
+        f"held=$(cat {CERTIFICATE_FILE} 2>/dev/null); "
+        f"pys=$(pgrep -c python 2>/dev/null || true); pys=${{pys:-0}}; "
+        f'echo "PYS=$pys"; '
+        f'if [ -n "$held" ]; then echo "CERT=$held"; '
+        f'elif [ "$pys" != 0 ]; then echo "CERT="; '
+        f"else {write}; fi"
+    )
+
+
 def probe_and_claim(tpu_name: str, zone: str, project: str, run_id: str, *, claim: bool = True) -> PodProbe:
     """Read the certificate, count python processes, and claim the pod if it is free.
 
@@ -97,21 +127,7 @@ def probe_and_claim(tpu_name: str, zone: str, project: str, run_id: str, *, clai
     merely walked past.
     """
     validate_run_id(run_id)
-    write = (
-        f'if ( set -o noclobber; echo "{run_id}" > {CERTIFICATE_FILE} ) 2>/dev/null; '
-        f'then echo "CERT={run_id}"; else echo "CERT=$(cat {CERTIFICATE_FILE} 2>/dev/null)"; fi'
-        if claim
-        else f'echo "CERT=$(cat {CERTIFICATE_FILE} 2>/dev/null)"'
-    )
-    # The certificate is read first and the claim attempted only when nothing holds the pod,
-    # so a pod running someone else's job is never written to.
-    command = (
-        f"held=$(cat {CERTIFICATE_FILE} 2>/dev/null); pys=$(pgrep -c python 2>/dev/null || echo 0); "
-        f'echo "PYS=$pys"; '
-        f'if [ -n "$held" ]; then echo "CERT=$held"; '
-        f'elif [ "$pys" != 0 ]; then echo "CERT="; '
-        f"else {write}; fi"
-    )
+    command = probe_command(run_id, claim=claim)
     try:
         result = ssh_command(tpu_name, zone, command, project=project, worker="0", check=False)
     except Exception as e:

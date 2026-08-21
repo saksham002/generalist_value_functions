@@ -1,5 +1,6 @@
 """Starting a job on a pod and watching it until it ends."""
 
+from collections.abc import Callable
 import dataclasses
 import logging
 import subprocess
@@ -19,6 +20,14 @@ logger = logging.getLogger(__name__)
 JobState = Literal["running", "completed", "failed", "preempted"]
 
 SESSION_NAME = "job"
+
+# Liveness probes are one-line questions, and the answer is only useful while the round is
+# still running. Inheriting the 900s default meant a single probe against a pod that had
+# just been preempted burned 900s x 3 retries before the loop got back to its (cheap,
+# control-plane) preemption check -- 45 minutes during which the run looked alive and no
+# retry could start. Preemption is detected by `describe`, never by ssh; ssh only has to
+# fail fast enough to let that check run.
+PROBE_TIMEOUT_SECONDS = 60
 
 
 @dataclasses.dataclass
@@ -77,17 +86,7 @@ class JobRunner:
             check=False,
         )
 
-        cert = certificate.CERTIFICATE_FILE
-        full_command = (
-            f"{self._build_preamble()} && "
-            f"cd {self.layout.working_dir} && "
-            f"trap 'rm -f {cert}' EXIT && "
-            f"( {command} ) 2>&1 | tee {self.layout.log_file}; "
-            f"job_exit_code=${{PIPESTATUS[0]}}; "
-            f"rm -f {cert}; "
-            f"echo ${{job_exit_code}} > {self.layout.exit_code_file}; "
-            f"exit ${{job_exit_code}}"
-        )
+        full_command = f"{self._build_preamble()} && cd {self.layout.working_dir} && {self.build_job_body(command)}"
 
         escaped_command = full_command.replace("'", "'\\''")
         ssh_command(
@@ -99,8 +98,35 @@ class JobRunner:
         )
         logger.info("Job started in tmux session '%s'", SESSION_NAME)
 
-    def monitor_job(self, poll_interval: float = 30) -> JobStatus:
-        """Watch a running job until it completes, fails, or its pod disappears."""
+    def build_job_body(self, command: str) -> str:
+        """The half of the job line that survives the command, separated so it can be run.
+
+        Every clause here is load-bearing and none of it is obvious:
+        ``${PIPESTATUS[0]}`` takes the *command's* status rather than ``tee``'s, which is
+        always 0; the ``trap`` covers a shell killed by a signal, where the explicit
+        ``rm -f`` after the pipeline never runs; and the exit code is recorded after the
+        certificate is dropped so a finished pod is free even if the write fails.
+
+        Note this needs bash: ``PIPESTATUS`` is not POSIX and is empty under dash.
+        """
+        cert = certificate.CERTIFICATE_FILE
+        return (
+            f"trap 'rm -f {cert}' EXIT && "
+            f"( {command} ) 2>&1 | tee {self.layout.log_file}; "
+            f"job_exit_code=${{PIPESTATUS[0]}}; "
+            f"rm -f {cert}; "
+            f"echo ${{job_exit_code}} > {self.layout.exit_code_file}; "
+            f"exit ${{job_exit_code}}"
+        )
+
+    def monitor_job(self, poll_interval: float = 30, on_poll: Callable[[], None] | None = None) -> JobStatus:
+        """Watch a running job until it completes, fails, or its pod disappears.
+
+        ``on_poll`` runs once per round while the job is still going, which is how progress
+        reporting rides the existing cadence instead of opening a second polling loop. It is
+        told nothing about the job and its failure never propagates: whatever it does is an
+        accompaniment to the run, not a condition for it.
+        """
         logger.info("Monitoring job in session '%s'", SESSION_NAME)
 
         while True:
@@ -125,6 +151,12 @@ class JobRunner:
                 logger.warning("Job failed with exit code %s", exit_code)
                 return JobStatus(state="failed", exit_code=exit_code, output_tail=output_tail)
 
+            if on_poll is not None:
+                try:
+                    on_poll()
+                except Exception as e:
+                    logger.debug("Poll hook failed: %s", e)
+
             time.sleep(poll_interval)
 
     def _is_session_running(self) -> bool:
@@ -135,6 +167,7 @@ class JobRunner:
             project=self.config.project,
             worker="0",
             check=False,
+            timeout=PROBE_TIMEOUT_SECONDS,
         )
         # An ssh that fails returns empty stdout, which would read as "stopped" and end the
         # run. Only an answer of "stopped" from a reachable pod counts as the job ending.
@@ -160,12 +193,32 @@ class JobRunner:
             project=self.config.project,
             worker="0",
             check=False,
+            timeout=PROBE_TIMEOUT_SECONDS,
         )
         code_str = result.stdout.strip()
         try:
             return int(code_str) if code_str else None
         except ValueError:
             return None
+
+    def tail_bytes(self, count: int = 2000) -> str:
+        """The last ``count`` bytes of the job log.
+
+        Bytes rather than lines, because a progress bar rewrites a single line with carriage
+        returns and never emits a newline — ``tail -n`` on such a log returns either almost
+        nothing or the entire file, whereas its last few hundred bytes always hold the most
+        recent update.
+        """
+        result = ssh_command(
+            self.tpu_name,
+            self.config.zone,
+            f"tail -c {count} {self.layout.log_file} 2>/dev/null || echo ''",
+            project=self.config.project,
+            worker="0",
+            check=False,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+        return result.stdout
 
     def get_output(self, lines: int = 50) -> str:
         """Recent job output, from the persistent log or a tmux pane capture."""
@@ -176,6 +229,7 @@ class JobRunner:
             project=self.config.project,
             worker="0",
             check=False,
+            timeout=PROBE_TIMEOUT_SECONDS,
         )
         if result.stdout.strip():
             return result.stdout

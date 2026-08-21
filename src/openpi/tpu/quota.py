@@ -120,48 +120,61 @@ def spot_quota_zones(
     project: str,
     occupied_zones: "frozenset[str] | None" = None,
     region: str | None = None,
+    max_zones: int | None = None,
 ) -> tuple[str, ...]:
-    """Return zones worth racing for a ``size``-core pod of ``family``.
+    """Return zones worth racing for a ``size``-chip pod of ``family``.
 
-    Quota alone over-reports badly: the project default grant covers dozens of zones it
-    has never used, so racing all of them creates queued resources that wait forever. A
-    zone qualifies when its quota fits the shape, it is in the US or EU, and either
+    Every US/EU zone whose quota fits the shape is raced. Quota does over-report — the
+    project default grant names dozens of zones and some cannot serve the accelerator at
+    all — but the race answers that empirically, and better than any pre-filter can guess:
+    a zone that does not offer the shape fails its create with "unsupported" and is dropped
+    for good, a stocked-out zone waits in the queue, and a quota-capped one stays in until
+    somebody's pods free it. All three are already classified at create time.
 
-    - it carries an **explicit** per-zone quota override (someone provisioned it), or
-    - it currently holds a TPU (``occupied_zones``), which is direct evidence it works.
+    Corroboration — an explicit per-zone override, or a TPU currently in the zone — now
+    only *orders* candidates, putting known-good zones first. Excluding on it was a dead
+    end: a zone had to be occupied to be raced and raced to become occupied, so a zone
+    holding nothing but the default grant could never enter the race however long you
+    waited, and a manual quota override was the only way in. That cost 27 of 29 eligible
+    v5e zones and 15 of 19 v6e ones.
 
     ``region`` (e.g. ``"europe-west4"``) restricts the result to zones with that prefix.
     Use it when the job's data lives in one region and a pod anywhere else would read it
     across regions -- the race then never lands outside, rather than winning a distant
     zone and paying egress for the whole run.
+
+    ``max_zones`` caps how many candidates one race may open at once. Each candidate is a
+    queued resource holding quota in a shared project until a winner is picked, so an
+    uncapped race across every zone is considerate only when nobody else is competing for
+    the same shape.
     """
     limits = _fetch_quota_limits(family, project)
     overrides = _fetch_quota_overrides(family, project)
-    permitted = overrides | (occupied_zones or frozenset())
+    corroborated = overrides | (occupied_zones or frozenset())
 
     def _in_region(zone: str) -> bool:
         return region is None or zone.startswith(region + "-") or zone == region
 
-    zones = tuple(
-        sorted(
-            zone
-            for zone, limit in limits.items()
-            if limit >= size and _continent_allowed(zone) and zone in permitted and _in_region(zone)
-        )
-    )
+    eligible = [
+        zone for zone, limit in limits.items() if limit >= size and _continent_allowed(zone) and _in_region(zone)
+    ]
+    # Known-good zones first, then the largest grants. Ordering only matters when the race
+    # is capped, and then it should spend its slots where capacity is most likely to exist.
+    eligible.sort(key=lambda zone: (0 if zone in corroborated else 1, -limits[zone], zone))
+    zones = tuple(eligible[:max_zones] if max_zones else eligible)
+
     if not zones:
         where = f"in region {region!r}" if region else "in US/EU"
         raise ValueError(
-            f"No eligible zone for {family}-{size} {where}: quota fits in "
-            f"{sum(1 for z, v in limits.items() if v >= size and _continent_allowed(z) and _in_region(z))} zones "
-            f"there, but none is quota-overridden or currently occupied"
+            f"No eligible zone for {family}-{size} {where}: no zone there has spot quota for {size} chips."
         )
     logger.info(
-        "Spot quota for %s-%d%s: %d eligible zones %s",
+        "Spot quota for %s-%d%s: %d eligible zones (%d corroborated) %s",
         family,
         size,
         f" in {region}" if region else "",
         len(zones),
+        sum(1 for zone in zones if zone in corroborated),
         zones,
     )
     return zones
