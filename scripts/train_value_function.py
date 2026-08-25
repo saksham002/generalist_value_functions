@@ -2115,7 +2115,7 @@ def generate_validation_plots_dlimp(
                 f"Traj {seg_key} (repo {repo_id_raw}, episode {ep_idx}{part_suffix}): "
                 f"running predictions on {len(seg_all_frames)} frames"
             )
-            preds, preds_neg, preds_random, preds_cf, preds_shuffled, attn = predict_values(
+            preds, preds_neg, preds_random, preds_cf, preds_shuffled, attn, _ = predict_values(
                 model, seg_all_frames, seg_ep_mc_returns, action_conditioned,
                 batch_size = batch_size,
             )

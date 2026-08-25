@@ -13,6 +13,9 @@ import numpy as np
 import openpi.value_functions.base_value_functions as _value_fn
 from openpi.models import model as _model
 from openpi.value_functions.networks.base_networks import BaseValueNetwork
+from openpi.value_functions.networks.paligemma import NUM_PATCHES_PER_IMAGE
+from openpi.value_functions.networks.paligemma import compute_rope_positions
+from openpi.value_functions.networks.paligemma import make_attn_mask
 
 
 RLDS_TO_STANDARD_CAMERA_MAP = {
@@ -147,8 +150,9 @@ def _jitted_compute_value_best_cached(
 
     ``actions`` is ``[b, num_samples, action_horizon, action_dim]``. The prefix
     KV cache (images + prompt + state) is computed once per frame, then all
-    ``num_samples`` candidates are scored against the shared cache and the
-    per-frame max over candidates is returned (shape ``[b]``).
+    ``num_samples`` candidates are scored against the shared cache. Every candidate's
+    value is returned (shape ``[b, num_samples]``) so callers can reduce with max or pick
+    one at random; the npz analysis needs the full set.
     """
     from openpi.models.best_of_n import expand_observation
 
@@ -169,7 +173,31 @@ def _jitted_compute_value_best_cached(
         prefix_cache = (repeated_kv_cache, repeated_prefix_mask, repeated_subtask_mask),
     )
     val = out[0] if isinstance(out, tuple) else out
-    return jnp.max(val.reshape(actions.shape[0], num_samples), axis = 1)
+    return val.reshape(actions.shape[0], num_samples)
+
+
+@nnx.jit
+def _jitted_compute_value_categorical_subtask(
+    model_to_use: _value_fn.BaseValueFunction,
+    obs: _model.Observation,
+    act: _model.Actions | None,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Value and resolved subtask id for a categorical-subtask critic, in one trunk pass.
+
+    ``compute_prefix_cache`` already resolves the subtask id — ground truth when
+    ``obs.subtask_id`` is set, the predictor's argmax when it is None — and returns the
+    image features alongside it. Feeding that tuple straight back as ``prefix_cache``
+    skips the (3-camera) encoder on the value pass, so the reported id is by construction
+    the one the value was conditioned on.
+    """
+    image_features, subtask_id, _ = model_to_use.compute_prefix_cache(obs)
+    out = model_to_use.compute_value(
+        obs, act,
+        take_min_over_ensemble = True,
+        prefix_cache = (image_features, subtask_id, None),
+    )
+    val = out[0] if isinstance(out, tuple) else out
+    return val, subtask_id
 
 
 def stack_frames(frame_dicts: list[dict], key: str) -> jax.Array | None:
@@ -716,6 +744,7 @@ def predict_values(
     dict[str, list[float]],
     dict[str, list[float]],
     dict[str, list[np.ndarray]],
+    dict[str, list[np.ndarray]],
 ]:
     """Run batched value function inference on collected validation frames.
 
@@ -741,7 +770,13 @@ def predict_values(
             all_predictions_counterfactual,
             all_predictions_shuffled,
             all_attn_scores,
+            all_counterfactual_candidate_values,
         ).
+
+    ``all_counterfactual_candidate_values`` holds the per-frame ``[num_samples]`` vector of
+    cached-action values (empty when the store was not joined). The counterfactual
+    prediction itself stays the per-frame max; keeping the full vector lets the npz
+    analysis reduce with max or a random pick without a second pass over the episode.
     """
     all_predictions: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_predictions_neg: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
@@ -749,6 +784,9 @@ def predict_values(
     all_predictions_counterfactual: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_predictions_shuffled: dict[str, list[float]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
     all_attn_scores: dict[str, list[np.ndarray]] = {ep_idx: [] for ep_idx in ep_mc_returns.keys()}
+    all_counterfactual_candidate_values: dict[str, list[np.ndarray]] = {
+        ep_idx: [] for ep_idx in ep_mc_returns.keys()
+    }
 
     # Opt-in data-parallel sharding of each batched forward. When a mesh is
     # given, the (padded) batch is split along DATA_AXIS across all devices;
@@ -814,15 +852,18 @@ def predict_values(
             pred_values_random_np, _ = jax.device_get(_jitted_compute_value(model, obs_random, act_random))
 
         pred_values_counterfactual_np = None
+        candidate_values_np = None
         if action_conditioned and "counterfactual_actions" in frame_dicts[0]:
             obs_counterfactual, act_counterfactual = get_obs_and_action(
                 frame_dicts, prefix = "counterfactual_", action_conditioned = True
             )
             # act_counterfactual is [b, num_samples, ah, ad]; score all cached
-            # candidates against a shared prefix cache and keep the per-frame max.
-            pred_values_counterfactual_np = jax.device_get(
+            # candidates against a shared prefix cache, keep every candidate's value and
+            # reduce to the per-frame max for the reported prediction.
+            candidate_values_np = jax.device_get(
                 _jitted_compute_value_best_cached(model, obs_counterfactual, act_counterfactual)
             )
+            pred_values_counterfactual_np = np.max(candidate_values_np, axis = 1)
 
         pred_values_shuffled_np = None
         if "shuffled_actions" in frame_dicts[0]:
@@ -839,15 +880,702 @@ def predict_values(
                 all_predictions_random[ep_idx].append(float(pred_values_random_np[i]))
             if pred_values_counterfactual_np is not None:
                 all_predictions_counterfactual[ep_idx].append(float(pred_values_counterfactual_np[i]))
+                all_counterfactual_candidate_values[ep_idx].append(np.asarray(candidate_values_np[i]))
             if pred_values_shuffled_np is not None:
                 all_predictions_shuffled[ep_idx].append(float(pred_values_shuffled_np[i]))
 
     total_predictions = sum(len(preds) for preds in all_predictions.values())
     logger.info(f"Computed {total_predictions} predictions")
 
-    return all_predictions, all_predictions_neg, all_predictions_random, all_predictions_counterfactual, all_predictions_shuffled, all_attn_scores
+    return (
+        all_predictions, all_predictions_neg, all_predictions_random,
+        all_predictions_counterfactual, all_predictions_shuffled, all_attn_scores,
+        all_counterfactual_candidate_values,
+    )
 
 
+
+
+@nnx.jit
+def _jitted_compute_value_best_cached_categorical(
+    model_to_use: _value_fn.BaseValueFunction,
+    obs: _model.Observation,
+    actions: _model.Actions,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Every cached counterfactual action's value, plus the resolved subtask id.
+
+    The categorical twin of ``_jitted_compute_value_best_cached``: the encoder runs once
+    per frame and all ``num_samples`` candidates are scored against the shared image
+    features, so the subtask id resolved for the frame (ground truth or argmax) conditions
+    every candidate identically. Returns ``[b, num_samples]``; the caller reduces.
+    """
+    from openpi.models.best_of_n import expand_observation
+
+    num_samples = actions.shape[1]
+    image_features, subtask_id, _ = model_to_use.compute_prefix_cache(obs)
+    expanded_obs = expand_observation(obs, num_samples)
+    flat_actions = actions.reshape(actions.shape[0] * num_samples, actions.shape[2], actions.shape[3])
+    repeated_features = jnp.repeat(image_features, num_samples, axis = 0)
+    repeated_subtask_id = jnp.repeat(subtask_id, num_samples, axis = 0)
+    out = model_to_use.compute_value(
+        expanded_obs, flat_actions,
+        take_min_over_ensemble = True,
+        prefix_cache = (repeated_features, repeated_subtask_id, None),
+    )
+    val = out[0] if isinstance(out, tuple) else out
+    return val.reshape(actions.shape[0], num_samples), subtask_id
+
+
+def predict_values_categorical_subtask(
+    model: _value_fn.BaseValueFunction,
+    all_frames: list[tuple],
+    ep_keys,
+    action_conditioned: bool,
+    *,
+    use_predicted_subtask: bool,
+    use_counterfactual_actions: bool = False,
+    batch_size: int = 64,
+    mesh: "jax.sharding.Mesh | None" = None,
+) -> tuple[dict[str, list[float]], dict[str, list[int]], dict[str, list[np.ndarray]]]:
+    """Batched value inference for critics whose subtask conditioning is a categorical id.
+
+    Unlike the PaliGemma path there is nothing to decode autoregressively: the subtask
+    enters the network after the encoder, so a single forward yields both the value and
+    the predicted subtask id. ``use_predicted_subtask`` drops ``subtask_id`` from the
+    observation, which is what makes the network fall back to its own argmax.
+
+    Returns (values, resolved subtask ids, per-frame cached-action value vectors) keyed by
+    episode. The value is the per-frame max when ``use_counterfactual_actions`` is set; the
+    candidate vectors are empty otherwise.
+    """
+    all_predictions: dict[str, list[float]] = {ep_key: [] for ep_key in ep_keys}
+    all_subtask_ids: dict[str, list[int]] = {ep_key: [] for ep_key in ep_keys}
+    all_candidate_values: dict[str, list[np.ndarray]] = {ep_key: [] for ep_key in ep_keys}
+
+    data_sharding = None
+    if mesh is not None:
+        from openpi.training import sharding as _sharding
+        data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(_sharding.DATA_AXIS))
+
+    for batch_start in range(0, len(all_frames), batch_size):
+        batch_frames = all_frames[batch_start : batch_start + batch_size]
+        frame_dicts = [f[2] for f in batch_frames]
+        # Same trailing-batch padding rationale as predict_values: a unique trailing
+        # length would specialise another compiled program in the XLA cache.
+        if len(frame_dicts) < batch_size:
+            frame_dicts = frame_dicts + [frame_dicts[-1]] * (batch_size - len(frame_dicts))
+
+        action_prefix = "counterfactual_" if use_counterfactual_actions else ""
+        if use_counterfactual_actions and "counterfactual_actions" not in frame_dicts[0]:
+            raise ValueError(
+                "use_counterfactual_actions requested but the cached frames carry no "
+                "counterfactual_actions (was the cached action store joined for this split?)."
+            )
+        obs, act = get_obs_and_action(
+            frame_dicts,
+            prefix = action_prefix,
+            action_conditioned = action_conditioned or use_counterfactual_actions,
+        )
+        if use_predicted_subtask:
+            obs = dataclasses.replace(obs, subtask_id = None)
+        elif obs.subtask_id is None:
+            raise ValueError(
+                "Ground-truth subtask conditioning requested but the cached frames carry no "
+                "subtask_id (was the cache written by a config with a subtask_vocab?)."
+            )
+
+        if data_sharding is not None:
+            obs = jax.device_put(obs, data_sharding)
+            if act is not None:
+                act = jax.device_put(act, data_sharding)
+
+        candidate_values_np = None
+        if use_counterfactual_actions:
+            candidate_values_np, subtask_ids_np = jax.device_get(
+                _jitted_compute_value_best_cached_categorical(model, obs, act)
+            )
+            pred_values_np = np.max(candidate_values_np, axis = 1)
+        else:
+            pred_values_np, subtask_ids_np = jax.device_get(
+                _jitted_compute_value_categorical_subtask(model, obs, act)
+            )
+
+        for i, (ep_key, _, _) in enumerate(batch_frames):
+            all_predictions[ep_key].append(float(pred_values_np[i]))
+            all_subtask_ids[ep_key].append(int(subtask_ids_np[i]))
+            if candidate_values_np is not None:
+                all_candidate_values[ep_key].append(np.asarray(candidate_values_np[i]))
+
+    total_predictions = sum(len(preds) for preds in all_predictions.values())
+    logger.info(
+        f"Computed {total_predictions} predictions "
+        f"({'predicted' if use_predicted_subtask else 'ground-truth'} subtask conditioning, "
+        f"{'max over cached actions' if use_counterfactual_actions else 'dataset action'})"
+    )
+
+    return all_predictions, all_subtask_ids, all_candidate_values
+
+
+
+def critic_network(model) -> BaseValueNetwork:
+    """The value network behind a critic: SARSA/MC store it as ``network``, CQL as ``q_network``."""
+    network = getattr(model, "network", None) or getattr(model, "q_network", None)
+    if network is None:
+        raise ValueError("Critic model exposes neither .network nor .q_network.")
+    return network
+
+
+# =============================================================================
+# Subtask prediction: one seam over the two critic families
+#
+# A subtask critic predicts the current subtask either as free text (PaliGemma decodes it
+# autoregressively) or as a categorical id (ResNet argmaxes a classifier head). Everything
+# downstream of that — accuracy, npz, gradients, video — is identical, so the difference is
+# confined to `predict_values_with_subtasks` and its two implementations below. The decode
+# machinery that only the autoregressive implementation needs lives here with it.
+# =============================================================================
+
+
+def _build_subtask_decoder(critic_model) -> dict:
+    """Return JIT'd {prefix_forward, decode_step, logits, is_gemma4} closures.
+
+    Mirrors SubtaskPredictorPolicy._build_subtask_predictor_closures from
+    src/openpi/policies/subtask_predictor_policy.py: the prefix includes the
+    state token (via `_embed_prefix` / `_build_gemma4_prefix_cache_inputs`),
+    matching the production serving path that's known to decode correctly.
+    Earlier I dropped state based on the training-time cumsum analysis (suffix
+    tokens never attend to state at training); empirically that change was
+    inert (predictions stayed identical) and the real bug was the image dtype
+    in `_build_critic_obs_for_frame`. Keep this aligned with production.
+    """
+    net = critic_network(critic_model)
+    is_gemma4 = "gemma4" in getattr(getattr(net, "config", None), "paligemma_variant", "")
+
+    if not is_gemma4:
+        @nnx.jit
+        def _prefix_forward(model, observation):
+            n = critic_network(model)
+            obs = _model.preprocess_observation(
+                None, observation, train = False, image_resolution = n._image_size,
+            )
+            prefix_tokens_list, prefix_mask_list, prefix_ar_mask_list = n._embed_prefix(obs)
+            prefix_tokens = jnp.concatenate(prefix_tokens_list, axis = 1)
+            prefix_mask = jnp.concatenate(prefix_mask_list, axis = 1)
+            prefix_ar_mask = jnp.array(prefix_ar_mask_list)
+            prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask, suffix_mask = None)
+            text_start = n._num_cameras * NUM_PATCHES_PER_IMAGE
+            text_len = obs.tokenized_prompt.shape[1]
+            positions = compute_rope_positions(
+                prefix_mask,
+                shift_start_index = text_start + text_len,
+                subtask_start_index = None,
+                subtask_end_index = None,
+            )
+            (hidden,), kv_cache = n.PaliGemma.llm(
+                [prefix_tokens], mask = prefix_attn_mask, positions = positions,
+            )
+            last_text_pos = text_start + jnp.sum(
+                obs.tokenized_prompt_mask.astype(jnp.int32), axis = 1,
+            ) - 1
+            last_hidden = jnp.take_along_axis(hidden, last_text_pos[:, None, None], axis = 1)
+            return last_hidden, kv_cache, prefix_mask, last_text_pos
+
+        def _decode_step(model, token_id, kv_cache, prefix_mask, last_text_pos, suffix_pos_so_far):
+            # Not JIT'd: each step appends 1 to kv_cache, so shapes change every call.
+            n = critic_network(model)
+            tok_arr = jnp.asarray(token_id, dtype = jnp.int32).reshape(1, 1)
+            tok_embed = n.PaliGemma.llm(tok_arr, method = "embed")
+            to_prefix = prefix_mask[:, None, :]
+            to_suffix = jnp.ones((1, 1, suffix_pos_so_far + 1), dtype = jnp.bool_)
+            mask = jnp.concatenate([to_prefix, to_suffix], axis = -1)
+            position = (last_text_pos + suffix_pos_so_far + 1).reshape(1, 1)
+            (hidden,), kv_cache = n.PaliGemma.llm(
+                [tok_embed], mask = mask, positions = position, kv_cache = kv_cache,
+            )
+            return hidden, kv_cache
+    else:
+        @nnx.jit
+        def _prefix_forward(model, observation):
+            n = critic_network(model)
+            obs = _model.preprocess_observation(
+                None, observation, train = False, image_resolution = n._image_size,
+            )
+            prefix_inputs = n._build_gemma4_prefix_cache_inputs(obs)
+            (hidden,), kv_cache = n.PaliGemma.llm(
+                [prefix_inputs["tokens"]],
+                mask = prefix_inputs["attn_mask"],
+                positions = prefix_inputs["positions"],
+                kv_cache = prefix_inputs["empty_kv_cache"],
+                adarms_cond = [None],
+                per_layer_input = prefix_inputs["per_layer_input"],
+            )
+            prefix_mask = prefix_inputs["input_mask"]
+            num_soft = n._num_soft_tokens_per_image
+            tokens_per_block = num_soft + 4
+            text_start = 1 + n._num_cameras * tokens_per_block
+            last_text_pos = text_start + jnp.sum(
+                obs.tokenized_prompt_mask.astype(jnp.int32), axis = 1,
+            ) - 1
+            last_hidden = jnp.take_along_axis(hidden, last_text_pos[:, None, None], axis = 1)
+            return (
+                last_hidden, kv_cache, prefix_mask, last_text_pos,
+                jnp.asarray(prefix_inputs["prefix_len"]),
+                jnp.asarray(prefix_inputs["cache_size"]),
+            )
+
+        @nnx.jit(static_argnames = ("suffix_pos_so_far", "prefix_len", "cache_size"))
+        def _decode_step(
+            model, token_id, kv_cache, prefix_mask, last_text_pos,
+            prefix_len, cache_size, suffix_pos_so_far,
+        ):
+            n = critic_network(model)
+            tok_arr = jnp.asarray(token_id, dtype = jnp.int32).reshape(1, 1)
+            tok_embed = n.PaliGemma.llm(tok_arr, method = "embed")
+            per_layer_input = None
+            if n._gemma4_per_layer_input_dim > 0:
+                per_layer_input = n.PaliGemma.llm(
+                    tok_embed, tok_arr, method = "encode_per_layer_input",
+                )
+            suffix_pad_len = cache_size - prefix_len
+            prefix_portion = prefix_mask[:, None, :]
+            suffix_arange = jnp.arange(suffix_pad_len)
+            suffix_portion = (suffix_arange < (suffix_pos_so_far + 1))[None, None, :]
+            attn_mask = jnp.concatenate([prefix_portion, suffix_portion], axis = -1)
+            position = (last_text_pos + suffix_pos_so_far + 1).reshape(1, 1)
+            (hidden,), kv_cache = n.PaliGemma.llm(
+                [tok_embed],
+                mask = attn_mask,
+                positions = position,
+                kv_cache = kv_cache,
+                adarms_cond = [None],
+                per_layer_input = per_layer_input,
+            )
+            return hidden, kv_cache
+
+    @nnx.jit
+    def _logits_from_hidden(model, hidden):
+        return critic_network(model).decode(hidden)
+
+    return {
+        "prefix_forward": _prefix_forward,
+        "decode_step": _decode_step,
+        "logits": _logits_from_hidden,
+        "is_gemma4": is_gemma4,
+    }
+
+
+def _decode_token_ids(tokenizer, token_ids: list[int]) -> str:
+    if hasattr(tokenizer, "decode"):
+        return str(tokenizer.decode(token_ids))
+    inner = getattr(tokenizer, "_tokenizer", None)
+    if inner is not None:
+        return str(inner.decode(token_ids))
+    return " ".join(str(t) for t in token_ids)
+
+
+def _run_prefix_forward(closures, critic_model, obs):
+    out = closures["prefix_forward"](critic_model, obs)
+    if closures["is_gemma4"]:
+        last_hidden, kv_cache, prefix_mask, last_text_pos, prefix_len, cache_size = out
+        return {
+            "last_hidden": last_hidden,
+            "kv_cache": kv_cache,
+            "prefix_mask": prefix_mask,
+            "last_text_pos": last_text_pos,
+            "prefix_len": int(np.asarray(prefix_len)),
+            "cache_size": int(np.asarray(cache_size)),
+        }
+    last_hidden, kv_cache, prefix_mask, last_text_pos = out
+    return {
+        "last_hidden": last_hidden,
+        "kv_cache": kv_cache,
+        "prefix_mask": prefix_mask,
+        "last_text_pos": last_text_pos,
+    }
+
+
+def _run_decode_step(closures, critic_model, prefix_state, token_id, suffix_pos):
+    if closures["is_gemma4"]:
+        return closures["decode_step"](
+            critic_model, token_id, prefix_state["kv_cache"],
+            prefix_state["prefix_mask"], prefix_state["last_text_pos"],
+            prefix_state["prefix_len"], prefix_state["cache_size"], suffix_pos,
+        )
+    return closures["decode_step"](
+        critic_model, token_id, prefix_state["kv_cache"],
+        prefix_state["prefix_mask"], prefix_state["last_text_pos"], suffix_pos,
+    )
+
+
+def _score_gt_perplexity(
+    closures,
+    critic_model,
+    critic_obs,
+    gt_token_ids: list[int],
+) -> float:
+    """Teacher-forced perplexity of the cached ground-truth subtask tokens."""
+    if not gt_token_ids:
+        return float("nan")
+    state = _run_prefix_forward(closures, critic_model, critic_obs)
+    logits = closures["logits"](critic_model, state["last_hidden"])
+    log_probs = jax.nn.log_softmax(logits[0, 0])
+    total_neg_logp = -float(np.asarray(log_probs[gt_token_ids[0]]))
+    kv_cache = state["kv_cache"]
+    for k in range(1, len(gt_token_ids)):
+        prev = gt_token_ids[k - 1]
+        state["kv_cache"] = kv_cache
+        hidden, kv_cache = _run_decode_step(closures, critic_model, state, prev, k - 1)
+        logits = closures["logits"](critic_model, hidden)
+        log_probs = jax.nn.log_softmax(logits[0, 0])
+        total_neg_logp += -float(np.asarray(log_probs[gt_token_ids[k]]))
+    return float(np.exp(total_neg_logp / len(gt_token_ids)))
+
+
+def _extract_gt_subtask_tokens(frame: dict) -> list[int]:
+    """Slice the cached ``tokenized_prompt`` between subtask_{start,end}_index."""
+    tokens = np.asarray(frame["tokenized_prompt"]).tolist()
+    start = int(np.asarray(frame["subtask_start_index"]))
+    end = int(np.asarray(frame["subtask_end_index"]))
+    if end < start:
+        return []
+    return [int(t) for t in tokens[start : end + 1]]
+
+
+def _build_critic_obs_for_frame(
+    frame: dict,
+    prefix_tokens: np.ndarray,
+    prefix_mask: np.ndarray,
+    image_keys: tuple[str, ...],
+) -> _model.Observation:
+    """Single-frame Observation with prefix-only prompt and no subtask indices.
+
+    Routes via `Observation.from_dict` so the uint8 -> float32 [-1, 1] image
+    cast fires (the Observation constructor itself does NOT do this cast, and
+    `preprocess_observation` only resizes / augments — it doesn't convert
+    dtype). Skipping the cast feeds raw [0, 255] into the SigLIP encoder and
+    completely OODs the model.
+    """
+    image_dict: dict = {}
+    image_mask_dict: dict = {}
+    for k in image_keys:
+        img = np.asarray(frame["image"][k])
+        image_dict[k] = jnp.asarray(img)[None, ...]
+        image_mask_dict[k] = jnp.array([True], dtype = jnp.bool_)
+    return _model.Observation.from_dict({
+        "image": image_dict,
+        "image_mask": image_mask_dict,
+        "state": jnp.asarray(np.asarray(frame["state"]))[None, ...],
+        "tokenized_prompt": jnp.asarray(prefix_tokens)[None, :],
+        "tokenized_prompt_mask": jnp.asarray(prefix_mask)[None, :],
+    })
+
+
+def subtask_boundary_indices(frames: list[dict]) -> list[int]:
+    """Frame indices where the cached ground-truth subtask changes.
+
+    Reads whichever ground-truth form the cache carries: the categorical ``subtask_id``
+    written by ``SubtaskTextToId``, else the tokenized subtask span. This is a property of
+    the cache, not of the critic, so both critic families come through here — and both get
+    boundaries at full frame resolution regardless of the decode stride, which is what the
+    boundary-MAE metric needs.
+    """
+    boundaries: list[int] = []
+    prev = None
+    for i, f in enumerate(frames):
+        if "subtask_id" in f:
+            current = int(np.asarray(f["subtask_id"]))
+        elif "subtask_start_index" in f and "subtask_end_index" in f:
+            current = tuple(_extract_gt_subtask_tokens(f))
+        else:
+            continue
+        if prev is not None and current != prev:
+            boundaries.append(i)
+        prev = current
+    return boundaries
+
+
+def subtask_segment_labels(boundaries: list[int], gt_texts: list[str | None], num_frames: int) -> list[str]:
+    """``"<subtask> - [start, end)"`` per ground-truth segment, for the video's caption list."""
+    starts = [0, *boundaries]
+    labels = []
+    for idx, start in enumerate(starts):
+        end = starts[idx + 1] if idx + 1 < len(starts) else num_frames
+        labels.append(f"{gt_texts[start] or ''} - [{start}, {end})")
+    return labels
+
+@dataclasses.dataclass(frozen = True)
+class SubtaskPredictions:
+    """Per-frame subtask predictions and values for one trajectory, family-agnostic.
+
+    ``perplexities`` is NaN wherever the critic family has no teacher-forced perplexity
+    (the categorical head has none) or scoring was disabled. ``predicted_ids`` / ``gt_ids``
+    are None for text-decoding critics, whose subtasks are not drawn from a fixed vocab.
+    ``value_frames`` are the frames as actually scored, so a caller taking gradients
+    differentiates against the same prompt the value used.
+    """
+
+    values: list[float]
+    candidate_values: list[np.ndarray]
+    predicted_texts: list[str | None]
+    gt_texts: list[str | None]
+    perplexities: list[float | None]
+    sample_indices: list[int]
+    value_frames: list[dict]
+    predicted_ids: list[int] | None = None
+    gt_ids: list[int] | None = None
+
+
+def _sample_indices_for(num_frames: int, stride: int | None, fps: int) -> list[int]:
+    """Frames the subtask prediction is reported at; the last frame is always included."""
+    step = stride if stride is not None else max(1, fps)
+    indices = list(range(0, num_frames, step))
+    if indices and indices[-1] != num_frames - 1:
+        indices.append(num_frames - 1)
+    return indices
+
+
+
+# Decode machinery is built once per (model, tokenizer) and reused across trajectories.
+# `_build_subtask_decoder` and `SubtaskDecoder` both define freshly `nnx.jit`-decorated
+# closures, so rebuilding them per trajectory would retrace the prefix forward — minutes of
+# recompilation per episode on a PaliGemma critic.
+_DECODER_CACHE: dict[tuple[int, int], tuple] = {}
+
+
+def _decoder_for(model, tokenizer, *, is_rank0: bool) -> tuple:
+    key = (id(model), id(tokenizer))
+    if key not in _DECODER_CACHE:
+        from openpi.policies.subtask_decoder import SubtaskDecoder
+
+        if is_rank0:
+            logger.info("Building subtask decode + GT-perplexity closures (once per process).")
+        _DECODER_CACHE[key] = (
+            _build_subtask_decoder(model),
+            SubtaskDecoder(model, tokenizer, decode_every = 1, max_tokens = 16),
+        )
+        if not is_rank0:
+            # Quiet the per-decode INFO log on non-rank-0 ranks, which decode in lockstep
+            # but discard the result.
+            logging.getLogger("openpi.policies.subtask_decoder").setLevel(logging.WARNING)
+    return _DECODER_CACHE[key]
+
+
+def _predict_with_decoded_subtask(
+    model, frames, traj_key, *, tokenizer, sample_indices, use_predicted_subtask,
+    use_counterfactual_actions, action_conditioned, score_gt_perplexity, batch_size, mesh,
+    is_rank0,
+) -> SubtaskPredictions:
+    """Autoregressive-text implementation (PaliGemma).
+
+    Decodes the subtask at each sampled frame, optionally rebuilds every prompt as
+    ``task_description + decoded_subtask + "\n"``, then scores values once. The decode and
+    the perplexity scoring are JIT'd SPMD collectives, so every rank drives them in lockstep
+    and only the logging is gated to rank 0.
+    """
+    import openpi.transforms as _transforms
+
+    network = critic_network(model)
+    image_keys = tuple(network.config.image_keys)
+    closures, decode_module = _decoder_for(model, tokenizer, is_rank0 = is_rank0)
+
+    prefix_text = decode_text(frames[0]["subtask_1_text"])
+    prefix_tokens, prefix_mask, _, _ = _transforms._tokenize_robocoin_subtask_prompt(
+        tokenizer, prefix_text, "", append_newline = False,
+    )
+
+    predicted_texts: list[str | None] = [None] * len(frames)
+    gt_texts: list[str | None] = [None] * len(frames)
+    perplexities: list[float | None] = [None] * len(frames)
+    for sample_pos, t in enumerate(sample_indices):
+        critic_obs = _build_critic_obs_for_frame(frames[t], prefix_tokens, prefix_mask, image_keys)
+        decoded = decode_module.predict(critic_obs)
+        gt_tokens = _extract_gt_subtask_tokens(frames[t])
+        gt_perp = (
+            _score_gt_perplexity(closures, model, critic_obs, gt_tokens)
+            if (gt_tokens and score_gt_perplexity) else float("nan")
+        )
+        predicted_texts[t] = decoded["predicted_subtask"]
+        gt_texts[t] = _decode_token_ids(tokenizer, gt_tokens) if gt_tokens else ""
+        perplexities[t] = gt_perp
+        if is_rank0:
+            logger.info(
+                f"  [t={t}] gt_pp={gt_perp:.4f} pred={predicted_texts[t]!r} "
+                f"pred_ids={decoded['predicted_subtask_tokens']} gt={gt_texts[t]!r} "
+                f"gt_ids={gt_tokens} (sample {sample_pos + 1}/{len(sample_indices)})"
+            )
+
+    # Forward-fill the decode across the frames between samples, then rebuild the prompts.
+    # Identical on every rank (the decode is deterministic), which matters because the value
+    # pass below is SPMD over the frames these prompts produce.
+    if use_predicted_subtask:
+        filled = ""
+        value_frames = []
+        for i, f in enumerate(frames):
+            if predicted_texts[i] is not None:
+                filled = predicted_texts[i] or ""
+            tok, msk, s0, s1 = _transforms._tokenize_robocoin_subtask_prompt(
+                tokenizer, prefix_text, filled, append_newline = True,
+            )
+            frame = dict(f)
+            frame["tokenized_prompt"] = np.asarray(tok)
+            frame["tokenized_prompt_mask"] = np.asarray(msk)
+            frame["subtask_start_index"] = np.int32(s0)
+            frame["subtask_end_index"] = np.int32(s1)
+            value_frames.append(frame)
+    else:
+        value_frames = list(frames)
+
+    indexed = [(traj_key, i, f) for i, f in enumerate(value_frames)]
+    mc_returns = {traj_key: [f["mc_return"] for f in frames]}
+    preds, _, _, preds_cf, _, _, candidates = predict_values(
+        model, indexed, mc_returns, action_conditioned, batch_size = batch_size, mesh = mesh,
+    )
+    if use_counterfactual_actions and not preds_cf.get(traj_key):
+        raise ValueError(
+            f"Counterfactual actions requested but none were cached for {traj_key}. The cached "
+            "action store must be joined for this split (see the 'skipping join' warning)."
+        )
+    values = preds_cf[traj_key] if use_counterfactual_actions else preds[traj_key]
+
+    return SubtaskPredictions(
+        values = values,
+        candidate_values = candidates.get(traj_key) or [],
+        predicted_texts = predicted_texts,
+        gt_texts = gt_texts,
+        perplexities = perplexities,
+        sample_indices = sample_indices,
+        value_frames = value_frames,
+    )
+
+
+def _predict_with_categorical_subtask(
+    model, frames, traj_key, *, sample_indices, use_predicted_subtask,
+    use_counterfactual_actions, action_conditioned, batch_size, mesh,
+) -> SubtaskPredictions:
+    """Categorical-id implementation (ResNet).
+
+    The classifier head reads the shared image features, so one forward per frame yields the
+    value and the subtask id together. There is no autoregressive decode and no teacher-forced
+    perplexity, so perplexity stays NaN.
+    """
+    network = critic_network(model)
+    vocab = network.config.subtask_vocab
+    if vocab is None:
+        raise ValueError("Categorical subtask evaluation requires subtask_vocab on the network config.")
+
+    indexed = [(traj_key, i, f) for i, f in enumerate(frames)]
+    values, resolved_ids, candidates = predict_values_categorical_subtask(
+        model, indexed, {traj_key}, action_conditioned,
+        use_predicted_subtask = use_predicted_subtask,
+        use_counterfactual_actions = use_counterfactual_actions,
+        batch_size = batch_size, mesh = mesh,
+    )
+
+    if use_predicted_subtask:
+        predicted_ids = resolved_ids[traj_key]
+    else:
+        # The value used the ground-truth id, so the predictor's argmax needs its own pass.
+        # It reads the image features alone, so it scores the dataset action whatever the
+        # action axis is set to -- rescoring every cached candidate would cost double and
+        # return the same ids.
+        _, predicted_only, _ = predict_values_categorical_subtask(
+            model, indexed, {traj_key}, action_conditioned,
+            use_predicted_subtask = True,
+            use_counterfactual_actions = False,
+            batch_size = batch_size, mesh = mesh,
+        )
+        predicted_ids = predicted_only[traj_key]
+
+    gt_ids = [int(np.asarray(f["subtask_id"])) for f in frames]
+    return SubtaskPredictions(
+        values = values[traj_key],
+        candidate_values = candidates.get(traj_key) or [],
+        predicted_texts = [vocab[i] for i in predicted_ids],
+        gt_texts = [vocab[i] for i in gt_ids],
+        perplexities = [float("nan")] * len(frames),
+        sample_indices = sample_indices,
+        value_frames = list(frames),
+        predicted_ids = predicted_ids,
+        gt_ids = gt_ids,
+    )
+
+
+def _uses_categorical_subtask(model, tokenizer) -> bool:
+    """Whether this critic predicts the subtask as a categorical id rather than as text.
+
+    Two independent signals have to agree: ``uses_subtask_id`` on the network config (only
+    the categorical config declares it) and the presence of a critic tokenizer (only a
+    text-decoding critic has one, since ``_get_critic_tokenizer`` returns None otherwise).
+
+    The cross-check is what makes the ``getattr`` default safe. On its own, a categorical
+    config that forgot to declare ``uses_subtask_id`` would silently fall through to the
+    text path; because such a critic also has no tokenizer, the disagreement is caught here
+    and raised instead.
+    """
+    config = critic_network(model).config
+    declares_id = bool(getattr(config, "uses_subtask_id", False))
+    has_tokenizer = tokenizer is not None
+    if declares_id and has_tokenizer:
+        raise ValueError(
+            f"{type(config).__name__} declares uses_subtask_id but a critic tokenizer was "
+            "supplied: the subtask is either a categorical id or decoded text, not both."
+        )
+    if not declares_id and not has_tokenizer:
+        raise ValueError(
+            f"{type(config).__name__} supplies no critic tokenizer and does not declare "
+            "uses_subtask_id, so the subtask family is ambiguous. A categorical critic must "
+            "expose uses_subtask_id = True; a text-decoding one must supply its tokenizer."
+        )
+    return declares_id
+
+
+def predict_values_with_subtasks(
+    model,
+    frames: list[dict],
+    traj_key: str,
+    *,
+    tokenizer,
+    stride: int | None,
+    use_predicted_subtask: bool,
+    use_counterfactual_actions: bool,
+    action_conditioned: bool,
+    score_gt_perplexity: bool = True,
+    batch_size: int = 64,
+    mesh = None,
+    is_rank0: bool = True,
+) -> SubtaskPredictions:
+    """Per-frame values and subtask predictions for one trajectory, either critic family.
+
+    The family is chosen by ``_uses_categorical_subtask``, which cross-checks the config
+    against the tokenizer so a mis-declared critic fails loudly rather than running down the
+    wrong path.
+
+    ``use_predicted_subtask`` selects the critic's own subtask over the cached ground truth;
+    ``use_counterfactual_actions`` evaluates at the best cached policy action instead of the
+    dataset action. The two are independent, as is the caller's decision to take gradients.
+    """
+    fps = int(frames[0]["fps"])
+    sample_indices = _sample_indices_for(len(frames), stride, fps)
+
+    if _uses_categorical_subtask(model, tokenizer):
+        return _predict_with_categorical_subtask(
+            model, frames, traj_key,
+            sample_indices = sample_indices,
+            use_predicted_subtask = use_predicted_subtask,
+            use_counterfactual_actions = use_counterfactual_actions,
+            action_conditioned = action_conditioned,
+            batch_size = batch_size, mesh = mesh,
+        )
+    return _predict_with_decoded_subtask(
+        model, frames, traj_key,
+        tokenizer = tokenizer,
+        sample_indices = sample_indices,
+        use_predicted_subtask = use_predicted_subtask,
+        use_counterfactual_actions = use_counterfactual_actions,
+        action_conditioned = action_conditioned,
+        score_gt_perplexity = score_gt_perplexity,
+        batch_size = batch_size, mesh = mesh, is_rank0 = is_rank0,
+    )
 
 
 @nnx.jit

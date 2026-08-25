@@ -12,24 +12,21 @@ import numpy as np
 
 from openpi.models.best_of_n import BestOfNWrapper
 from openpi.models.best_of_n import BestOfNWrapperConfig
-import openpi.models.model as _model
-from openpi.policies.subtask_decoder import SubtaskDecoder
 from openpi.robocoin_utils.load_model_utils import load_critic
 from openpi.robocoin_utils.load_model_utils import load_train_module
 from openpi.robocoin_utils.utils import cache_val_episodes
 from openpi.robocoin_utils.utils import count_subtask_segments
 from openpi.robocoin_utils.utils import decode_episode_images
 from openpi.robocoin_utils.utils import get_obs_and_action
-from openpi.robocoin_utils.utils import predict_values
+from openpi.robocoin_utils.utils import predict_values_with_subtasks
+from openpi.robocoin_utils.utils import subtask_boundary_indices
+from openpi.robocoin_utils.utils import subtask_segment_labels
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.sharding as _sharding
 import openpi.transforms as _transforms
 import openpi.value_functions.base_value_functions as _base_vf
-from openpi.value_functions.networks.paligemma import NUM_PATCHES_PER_IMAGE
-from openpi.value_functions.networks.paligemma import compute_rope_positions
-from openpi.value_functions.networks.paligemma import make_attn_mask
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +148,12 @@ class EvalConfig:
     # requires the counterfactual action store to be joined for this split.
     # Orthogonal to condition_on_decoded_subtask.
     counterfactual_value_action: bool = False
+    # GRADIENT axis. When True, the subtask npz additionally carries per-frame
+    # ``||grad_a Q(s, a)||^2`` at whichever action the value was read at. Costs one
+    # backward pass per batch, so it is opt-in and orthogonal to the other two axes;
+    # it needs an action-conditioned critic and only has an effect with
+    # --subtask-npz-dir set (that is the sink it writes to).
+    action_grad_norm: bool = False
     # Number of FSDP devices for the inference mesh. None → jax.device_count()
     # (prior default: pure FSDP, params sharded across devices, inputs
     # replicated). Set to 1 on a GPU node for pure data parallelism: params
@@ -222,251 +225,6 @@ def _split_trajectory_frames(
             ep_subtasks[key] = segments
 
     return split_traj_frames, traj_to_repo_ep, ep_subtasks
-
-
-# =============================================================================
-# Subtask predictor for `task_description_predict_current_subtask` critics.
-# Per-second autoregressive decode (max 16 tokens or until the emitted token list
-# matches a subtask present in the trajectory) plus teacher-forced perplexity of
-# the cached ground-truth subtask. KV-cached; gemma_2b uses bidirectional prefix
-# + causal suffix, gemma4 stays causal throughout (the network builds it that
-# way). Closure structure mirrors SubtaskPredictorPolicy._build_subtask_predictor_closures
-# but inlined here so the policy file stays untouched.
-# =============================================================================
-
-
-def _build_subtask_decoder(critic_model) -> dict:
-    """Return JIT'd {prefix_forward, decode_step, logits, is_gemma4} closures.
-
-    Mirrors SubtaskPredictorPolicy._build_subtask_predictor_closures from
-    src/openpi/policies/subtask_predictor_policy.py: the prefix includes the
-    state token (via `_embed_prefix` / `_build_gemma4_prefix_cache_inputs`),
-    matching the production serving path that's known to decode correctly.
-    Earlier I dropped state based on the training-time cumsum analysis (suffix
-    tokens never attend to state at training); empirically that change was
-    inert (predictions stayed identical) and the real bug was the image dtype
-    in `_build_critic_obs_for_frame`. Keep this aligned with production.
-    """
-    net = _get_critic_network(critic_model)
-    is_gemma4 = "gemma4" in getattr(getattr(net, "config", None), "paligemma_variant", "")
-
-    if not is_gemma4:
-        @nnx.jit
-        def _prefix_forward(model, observation):
-            n = _get_critic_network(model)
-            obs = _model.preprocess_observation(
-                None, observation, train = False, image_resolution = n._image_size,
-            )
-            prefix_tokens_list, prefix_mask_list, prefix_ar_mask_list = n._embed_prefix(obs)
-            prefix_tokens = jnp.concatenate(prefix_tokens_list, axis = 1)
-            prefix_mask = jnp.concatenate(prefix_mask_list, axis = 1)
-            prefix_ar_mask = jnp.array(prefix_ar_mask_list)
-            prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask, suffix_mask = None)
-            text_start = n._num_cameras * NUM_PATCHES_PER_IMAGE
-            text_len = obs.tokenized_prompt.shape[1]
-            positions = compute_rope_positions(
-                prefix_mask,
-                shift_start_index = text_start + text_len,
-                subtask_start_index = None,
-                subtask_end_index = None,
-            )
-            (hidden,), kv_cache = n.PaliGemma.llm(
-                [prefix_tokens], mask = prefix_attn_mask, positions = positions,
-            )
-            last_text_pos = text_start + jnp.sum(
-                obs.tokenized_prompt_mask.astype(jnp.int32), axis = 1,
-            ) - 1
-            last_hidden = jnp.take_along_axis(hidden, last_text_pos[:, None, None], axis = 1)
-            return last_hidden, kv_cache, prefix_mask, last_text_pos
-
-        def _decode_step(model, token_id, kv_cache, prefix_mask, last_text_pos, suffix_pos_so_far):
-            # Not JIT'd: each step appends 1 to kv_cache, so shapes change every call.
-            n = _get_critic_network(model)
-            tok_arr = jnp.asarray(token_id, dtype = jnp.int32).reshape(1, 1)
-            tok_embed = n.PaliGemma.llm(tok_arr, method = "embed")
-            to_prefix = prefix_mask[:, None, :]
-            to_suffix = jnp.ones((1, 1, suffix_pos_so_far + 1), dtype = jnp.bool_)
-            mask = jnp.concatenate([to_prefix, to_suffix], axis = -1)
-            position = (last_text_pos + suffix_pos_so_far + 1).reshape(1, 1)
-            (hidden,), kv_cache = n.PaliGemma.llm(
-                [tok_embed], mask = mask, positions = position, kv_cache = kv_cache,
-            )
-            return hidden, kv_cache
-    else:
-        @nnx.jit
-        def _prefix_forward(model, observation):
-            n = _get_critic_network(model)
-            obs = _model.preprocess_observation(
-                None, observation, train = False, image_resolution = n._image_size,
-            )
-            prefix_inputs = n._build_gemma4_prefix_cache_inputs(obs)
-            (hidden,), kv_cache = n.PaliGemma.llm(
-                [prefix_inputs["tokens"]],
-                mask = prefix_inputs["attn_mask"],
-                positions = prefix_inputs["positions"],
-                kv_cache = prefix_inputs["empty_kv_cache"],
-                adarms_cond = [None],
-                per_layer_input = prefix_inputs["per_layer_input"],
-            )
-            prefix_mask = prefix_inputs["input_mask"]
-            num_soft = n._num_soft_tokens_per_image
-            tokens_per_block = num_soft + 4
-            text_start = 1 + n._num_cameras * tokens_per_block
-            last_text_pos = text_start + jnp.sum(
-                obs.tokenized_prompt_mask.astype(jnp.int32), axis = 1,
-            ) - 1
-            last_hidden = jnp.take_along_axis(hidden, last_text_pos[:, None, None], axis = 1)
-            return (
-                last_hidden, kv_cache, prefix_mask, last_text_pos,
-                jnp.asarray(prefix_inputs["prefix_len"]),
-                jnp.asarray(prefix_inputs["cache_size"]),
-            )
-
-        @nnx.jit(static_argnames = ("suffix_pos_so_far", "prefix_len", "cache_size"))
-        def _decode_step(
-            model, token_id, kv_cache, prefix_mask, last_text_pos,
-            prefix_len, cache_size, suffix_pos_so_far,
-        ):
-            n = _get_critic_network(model)
-            tok_arr = jnp.asarray(token_id, dtype = jnp.int32).reshape(1, 1)
-            tok_embed = n.PaliGemma.llm(tok_arr, method = "embed")
-            per_layer_input = None
-            if n._gemma4_per_layer_input_dim > 0:
-                per_layer_input = n.PaliGemma.llm(
-                    tok_embed, tok_arr, method = "encode_per_layer_input",
-                )
-            suffix_pad_len = cache_size - prefix_len
-            prefix_portion = prefix_mask[:, None, :]
-            suffix_arange = jnp.arange(suffix_pad_len)
-            suffix_portion = (suffix_arange < (suffix_pos_so_far + 1))[None, None, :]
-            attn_mask = jnp.concatenate([prefix_portion, suffix_portion], axis = -1)
-            position = (last_text_pos + suffix_pos_so_far + 1).reshape(1, 1)
-            (hidden,), kv_cache = n.PaliGemma.llm(
-                [tok_embed],
-                mask = attn_mask,
-                positions = position,
-                kv_cache = kv_cache,
-                adarms_cond = [None],
-                per_layer_input = per_layer_input,
-            )
-            return hidden, kv_cache
-
-    @nnx.jit
-    def _logits_from_hidden(model, hidden):
-        return _get_critic_network(model).decode(hidden)
-
-    return {
-        "prefix_forward": _prefix_forward,
-        "decode_step": _decode_step,
-        "logits": _logits_from_hidden,
-        "is_gemma4": is_gemma4,
-    }
-
-
-def _decode_token_ids(tokenizer, token_ids: list[int]) -> str:
-    if hasattr(tokenizer, "decode"):
-        return str(tokenizer.decode(token_ids))
-    inner = getattr(tokenizer, "_tokenizer", None)
-    if inner is not None:
-        return str(inner.decode(token_ids))
-    return " ".join(str(t) for t in token_ids)
-
-
-def _run_prefix_forward(closures, critic_model, obs):
-    out = closures["prefix_forward"](critic_model, obs)
-    if closures["is_gemma4"]:
-        last_hidden, kv_cache, prefix_mask, last_text_pos, prefix_len, cache_size = out
-        return {
-            "last_hidden": last_hidden,
-            "kv_cache": kv_cache,
-            "prefix_mask": prefix_mask,
-            "last_text_pos": last_text_pos,
-            "prefix_len": int(np.asarray(prefix_len)),
-            "cache_size": int(np.asarray(cache_size)),
-        }
-    last_hidden, kv_cache, prefix_mask, last_text_pos = out
-    return {
-        "last_hidden": last_hidden,
-        "kv_cache": kv_cache,
-        "prefix_mask": prefix_mask,
-        "last_text_pos": last_text_pos,
-    }
-
-
-def _run_decode_step(closures, critic_model, prefix_state, token_id, suffix_pos):
-    if closures["is_gemma4"]:
-        return closures["decode_step"](
-            critic_model, token_id, prefix_state["kv_cache"],
-            prefix_state["prefix_mask"], prefix_state["last_text_pos"],
-            prefix_state["prefix_len"], prefix_state["cache_size"], suffix_pos,
-        )
-    return closures["decode_step"](
-        critic_model, token_id, prefix_state["kv_cache"],
-        prefix_state["prefix_mask"], prefix_state["last_text_pos"], suffix_pos,
-    )
-
-
-def _score_gt_perplexity(
-    closures,
-    critic_model,
-    critic_obs,
-    gt_token_ids: list[int],
-) -> float:
-    """Teacher-forced perplexity of the cached ground-truth subtask tokens."""
-    if not gt_token_ids:
-        return float("nan")
-    state = _run_prefix_forward(closures, critic_model, critic_obs)
-    logits = closures["logits"](critic_model, state["last_hidden"])
-    log_probs = jax.nn.log_softmax(logits[0, 0])
-    total_neg_logp = -float(np.asarray(log_probs[gt_token_ids[0]]))
-    kv_cache = state["kv_cache"]
-    for k in range(1, len(gt_token_ids)):
-        prev = gt_token_ids[k - 1]
-        state["kv_cache"] = kv_cache
-        hidden, kv_cache = _run_decode_step(closures, critic_model, state, prev, k - 1)
-        logits = closures["logits"](critic_model, hidden)
-        log_probs = jax.nn.log_softmax(logits[0, 0])
-        total_neg_logp += -float(np.asarray(log_probs[gt_token_ids[k]]))
-    return float(np.exp(total_neg_logp / len(gt_token_ids)))
-
-
-def _extract_gt_subtask_tokens(frame: dict) -> list[int]:
-    """Slice the cached ``tokenized_prompt`` between subtask_{start,end}_index."""
-    tokens = np.asarray(frame["tokenized_prompt"]).tolist()
-    start = int(np.asarray(frame["subtask_start_index"]))
-    end = int(np.asarray(frame["subtask_end_index"]))
-    if end < start:
-        return []
-    return [int(t) for t in tokens[start : end + 1]]
-
-
-def _build_critic_obs_for_frame(
-    frame: dict,
-    prefix_tokens: np.ndarray,
-    prefix_mask: np.ndarray,
-    image_keys: tuple[str, ...],
-) -> _model.Observation:
-    """Single-frame Observation with prefix-only prompt and no subtask indices.
-
-    Routes via `Observation.from_dict` so the uint8 -> float32 [-1, 1] image
-    cast fires (the Observation constructor itself does NOT do this cast, and
-    `preprocess_observation` only resizes / augments — it doesn't convert
-    dtype). Skipping the cast feeds raw [0, 255] into the SigLIP encoder and
-    completely OODs the model.
-    """
-    image_dict: dict = {}
-    image_mask_dict: dict = {}
-    for k in image_keys:
-        img = np.asarray(frame["image"][k])
-        image_dict[k] = jnp.asarray(img)[None, ...]
-        image_mask_dict[k] = jnp.array([True], dtype = jnp.bool_)
-    return _model.Observation.from_dict({
-        "image": image_dict,
-        "image_mask": image_mask_dict,
-        "state": jnp.asarray(np.asarray(frame["state"]))[None, ...],
-        "tokenized_prompt": jnp.asarray(prefix_tokens)[None, :],
-        "tokenized_prompt_mask": jnp.asarray(prefix_mask)[None, :],
-    })
 
 
 def _render_subtask_video(
@@ -615,18 +373,35 @@ def _render_subtask_video(
     return wandb.Video(video_array, fps = fps, format = "gif")
 
 
-def _subtask_boundary_indices(frames: list[dict]) -> list[int]:
-    """Frame indices where the GT current-subtask token sequence changes."""
-    boundaries: list[int] = []
-    prev: tuple[int, ...] | None = None
-    for i, f in enumerate(frames):
-        if "subtask_start_index" not in f or "subtask_end_index" not in f:
-            continue
-        seq = tuple(_extract_gt_subtask_tokens(f))
-        if prev is not None and seq != prev:
-            boundaries.append(i)
-        prev = seq
-    return boundaries
+def _action_grad_sq_norms(
+    model,
+    frames: list[dict],
+    chosen_actions: list[np.ndarray] | None,
+    *,
+    strip_subtask_id: bool,
+    batch_size: int,
+) -> list[float]:
+    """Per-frame ``||grad_a Q(s, a)||^2`` at the action the reported value was computed at.
+
+    ``chosen_actions`` overrides each frame's ``actions`` (used when the value came from
+    the best cached counterfactual, so the gradient is taken where the value was read);
+    None differentiates at the dataset action. ``strip_subtask_id`` drops the ground-truth
+    id so a categorical critic resolves its own, matching the value pass.
+    """
+    grads: list[float] = []
+    for batch_start in range(0, len(frames), batch_size):
+        batch = frames[batch_start : batch_start + batch_size]
+        if chosen_actions is not None:
+            batch = [
+                {**f, "actions": chosen_actions[batch_start + i]} for i, f in enumerate(batch)
+            ]
+        padded = batch + [batch[-1]] * (batch_size - len(batch))
+        obs, act = get_obs_and_action(padded, prefix = "", action_conditioned = True)
+        if strip_subtask_id:
+            obs = dataclasses.replace(obs, subtask_id = None)
+        grad_sq_norm, _ = jax.device_get(_jitted_action_grad_sq_norm(model, obs, act))
+        grads.extend(float(g) for g in np.asarray(grad_sq_norm)[: len(batch)])
+    return grads
 
 
 def _run_subtask_prediction(
@@ -639,223 +414,161 @@ def _run_subtask_prediction(
     action_conditioned: bool,
     mesh = None,
 ) -> None:
-    """Render per-trajectory subtask-prediction videos.
+    """Render per-trajectory subtask-prediction videos and, optionally, per-episode npz.
 
-    Only fires when the critic was trained with
-    ``prompt_mode == "task_description_predict_current_subtask"``. The decoder
-    closures (`prefix_forward` / `decode_step` / `logits`) are JIT'd and
-    SPMD-sharded across every host, so EVERY rank must drive the same JIT call
-    sequence in lockstep — otherwise non-rank-0 hosts sit at the downstream
-    multihost barrier while rank 0 deadlocks waiting for cross-host collectives
-    that never fire (mirrors SubtaskPredictorPolicy._run_subtask_predictor_lockstep).
-    Per-frame text decoding, video rendering, and wandb.log are gated to rank 0.
+    Fires when the critic was trained with
+    ``prompt_mode == "task_description_predict_current_subtask"``, for either critic family:
+    ``predict_values_with_subtasks`` hides whether the subtask arrives as decoded text or as
+    a classifier argmax, so accuracy, the gradient pass, the npz and the video exist once
+    here rather than once per family.
 
-    Stride between decoded frames is one per second (= ``fps`` cache frames).
+    Everything that issues JIT'd SPMD collectives — the subtask prediction, the value pass
+    and the gradient pass — runs on EVERY rank in lockstep; otherwise non-rank-0 hosts wait
+    at the next barrier for collectives that never fire. Only logging, the npz write and
+    rendering are gated to rank 0.
     """
     is_rank0 = jax.process_index() == 0
 
     traj_frames = _load_cached_trajectories(cache_dir)
-    split_traj_frames, traj_to_repo_ep, ep_subtasks = _split_trajectory_frames(traj_frames)
+    split_traj_frames, traj_to_repo_ep, _ = _split_trajectory_frames(traj_frames)
     if not split_traj_frames:
         if is_rank0:
             logger.warning("No cached trajectories found for subtask prediction.")
         return
 
-    # The closures back the teacher-forced GT perplexity only; the subtask decode
-    # itself goes through the shared SubtaskDecoder module below.
-    if is_rank0:
-        logger.info("Building GT-perplexity closures (gemma_2b/gemma4 KV-cache path).")
-    closures = _build_subtask_decoder(model)
-    image_keys = tuple(_get_critic_network(model).config.image_keys)
+    npz_mode = eval_config.subtask_npz_dir is not None
+    grad_mode = npz_mode and eval_config.action_grad_norm and action_conditioned
 
-    # Single decode path: the shared SubtaskDecoder module, same code as serving /
-    # BestOfN. `predict()` is deterministic + SPMD-lockstep, so calling it on every
-    # rank yields identical tokens everywhere — which all ranks need when the value
-    # prompt is rebuilt from the decode (predict_values is SPMD). Quiet its
-    # per-decode INFO log on non-rank-0 to avoid 16x spam.
-    decode_module = SubtaskDecoder(model, val_tokenizer, decode_every = 1, max_tokens = 16)
-    if not is_rank0:
-        logging.getLogger("openpi.policies.subtask_decoder").setLevel(logging.WARNING)
-    else:
+    if is_rank0:
         logger.info(
-            "Subtask prompt source: %s | value action source: %s",
-            "decoded" if eval_config.condition_on_decoded_subtask else "ground-truth",
-            "counterfactual" if eval_config.counterfactual_value_action else "dataset",
+            "Subtask critic (%s) | subtask source: %s | value action source: %s | action grad: %s",
+            "categorical id" if val_tokenizer is None else "decoded text",
+            "predicted" if eval_config.condition_on_decoded_subtask else "ground-truth",
+            "max over cached actions" if eval_config.counterfactual_value_action else "dataset",
+            "on" if grad_mode else "off",
         )
+        if eval_config.action_grad_norm and not npz_mode:
+            logger.warning("--action-grad-norm set without --subtask-npz-dir: nothing to write it to.")
+        if eval_config.action_grad_norm and not action_conditioned:
+            logger.warning("--action-grad-norm set on a state-only critic: no action to differentiate.")
 
     rendered: dict[str, object] = {}
-
-    npz_mode = eval_config.subtask_npz_dir is not None
 
     for traj_idx, frames in split_traj_frames.items():
         decode_episode_images(frames, image_size)
         repo_id, ep_idx, part_suffix = traj_to_repo_ep[traj_idx]
-
-        # Values are computed once per trajectory, after the decode loop, so that
-        # both input axes are resolved first: the prompt (GT vs decoded subtask)
-        # and the action (dataset vs counterfactual). Runs on every host (SPMD via
-        # predict_values' _jitted_compute_value).
-        seg_all_frames = [(traj_idx, i, f) for i, f in enumerate(frames)]
-        seg_mc = {traj_idx: [f["mc_return"] for f in frames]}
-        mc_returns = [float(np.asarray(v)) for v in seg_mc[traj_idx]]
+        mc_returns = [float(np.asarray(f["mc_return"])) for f in frames]
+        fps = int(frames[0]["fps"])
 
         if is_rank0:
             logger.info(
                 f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}{part_suffix}): {len(frames)} frames."
             )
 
-        prefix_text_raw = frames[0]["subtask_1_text"]
-        if isinstance(prefix_text_raw, bytes):
-            prefix_text_raw = prefix_text_raw.decode("utf-8")
-        prefix_text = str(prefix_text_raw)
-        prefix_tokens, prefix_mask, _, _ = _transforms._tokenize_robocoin_subtask_prompt(
-            val_tokenizer, prefix_text, "", append_newline = False,
+        result = predict_values_with_subtasks(
+            model, frames, traj_idx,
+            tokenizer = val_tokenizer,
+            stride = eval_config.subtask_decode_stride,
+            use_predicted_subtask = eval_config.condition_on_decoded_subtask,
+            use_counterfactual_actions = eval_config.counterfactual_value_action,
+            action_conditioned = action_conditioned,
+            score_gt_perplexity = eval_config.score_gt_perplexity,
+            batch_size = batch_size,
+            mesh = mesh,
+            is_rank0 = is_rank0,
         )
 
-        fps = int(frames[0]["fps"])
-        # Decode once per second unless an explicit stride is given; the last frame
-        # is always sampled so the video's final title reflects a real decode.
-        step = eval_config.subtask_decode_stride if eval_config.subtask_decode_stride is not None else max(1, fps)
-        sample_indices = list(range(0, len(frames), step))
-        if sample_indices and sample_indices[-1] != len(frames) - 1:
-            sample_indices.append(len(frames) - 1)
-
-        perplexities: list[float | None] = [None] * len(frames)
-        predicted_texts: list[str | None] = [None] * len(frames)
-        gt_texts: list[str | None] = [None] * len(frames)
-
-        # The decoded text per sample index is needed on EVERY rank so the value
-        # prompt can be rebuilt identically when conditioning on the decode.
-        sampled_decoded_text: dict[int, str] = {}
-        last_perp: float | None = None
-        last_pred: str | None = None
-        last_gt: str | None = None
-        for sample_pos, t in enumerate(sample_indices):
-            critic_obs = _build_critic_obs_for_frame(
-                frames[t], prefix_tokens, prefix_mask, image_keys,
+        # The gradient is taken at the action the value was read at — the best cached
+        # candidate under --counterfactual-value-action, else the dataset action — and
+        # against the prompt the value used (``value_frames``).
+        action_grad: list[float] = []
+        if grad_mode:
+            chosen_actions = None
+            if result.candidate_values:
+                chosen_actions = [
+                    np.asarray(f["counterfactual_actions"])[int(np.argmax(result.candidate_values[i]))]
+                    for i, f in enumerate(result.value_frames)
+                ]
+            action_grad = _action_grad_sq_norms(
+                model, result.value_frames, chosen_actions,
+                strip_subtask_id = eval_config.condition_on_decoded_subtask,
+                batch_size = batch_size,
             )
-            # Both calls below issue JIT'd SPMD collectives; every rank must
-            # invoke them in lockstep. Non-rank-0 hosts discard the outputs but
-            # still need to participate so cross-host attention/all-gather
-            # collectives complete.
-            # Module decode is deterministic + lockstep-safe → identical on every
-            # rank; stored on all ranks for the value-prompt rebuild.
-            decoded = decode_module.predict(critic_obs)
-            predicted_tokens = decoded["predicted_subtask_tokens"]
-            predicted_text = decoded["predicted_subtask"]
-            sampled_decoded_text[t] = predicted_text
-            gt_tokens = _extract_gt_subtask_tokens(frames[t])
-            gt_perp = (
-                _score_gt_perplexity(closures, model, critic_obs, gt_tokens)
-                if (gt_tokens and eval_config.score_gt_perplexity) else float("nan")
-            )
-            if not is_rank0:
-                continue
-            gt_text = _decode_token_ids(val_tokenizer, gt_tokens) if gt_tokens else ""
-            logger.info(
-                f"  [t={t}] gt_pp={gt_perp:.4f} pred={predicted_text!r} pred_ids={predicted_tokens} "
-                f"gt={gt_text!r} gt_ids={gt_tokens} (sample {sample_pos + 1}/{len(sample_indices)})"
-            )
-            last_perp = gt_perp
-            last_pred = predicted_text
-            last_gt = gt_text
-            perplexities[t] = gt_perp
-            predicted_texts[t] = predicted_text
-            gt_texts[t] = gt_text
 
-        # --- Input axis 1: the language prompt -------------------------------
-        # Ground truth keeps the subtask cached in the .pkl. Decoded forward-fills
-        # the decoded subtask across all frames (piecewise-constant between decode
-        # samples) and rebuilds each prompt as `task_description + subtask + "\n"`.
-        # Runs on EVERY rank (predict_values is SPMD; sampled_decoded_text is
-        # identical across ranks).
-        if eval_config.condition_on_decoded_subtask:
-            filled_subtask = ""
-            value_frames = []
-            for i, f in enumerate(frames):
-                if i in sampled_decoded_text:
-                    filled_subtask = sampled_decoded_text[i] or ""
-                tok, msk, s0, s1 = _transforms._tokenize_robocoin_subtask_prompt(
-                    val_tokenizer, prefix_text, filled_subtask, append_newline = True,
-                )
-                nf = dict(f)
-                nf["tokenized_prompt"] = np.asarray(tok)
-                nf["tokenized_prompt_mask"] = np.asarray(msk)
-                nf["subtask_start_index"] = np.int32(s0)
-                nf["subtask_end_index"] = np.int32(s1)
-                value_frames.append((traj_idx, i, nf))
-        else:
-            value_frames = seg_all_frames
-
-        preds, _, _, preds_cf, _, _ = predict_values(
-            model, value_frames, seg_mc, action_conditioned, batch_size = batch_size, mesh = mesh,
-        )
-
-        # --- Input axis 2: the action ----------------------------------------
-        # Independent of the prompt axis above: dataset action vs the highest-value
-        # cached counterfactual (policy-generated) action.
-        if eval_config.counterfactual_value_action:
-            if not preds_cf.get(traj_idx):
-                raise ValueError(
-                    f"--counterfactual-value-action set but no counterfactual predictions for {traj_idx}. "
-                    "The cached action store must be joined for this split (it is joined on the split "
-                    "that has a counterfactual_action_store-<split> shard; see the 'skipping join' warning)."
-                )
-            predicted_values = preds_cf[traj_idx]
-        else:
-            predicted_values = preds[traj_idx]
+        boundaries = subtask_boundary_indices(frames)
 
         if not is_rank0:
             continue
 
-        # Persist all per-frame value predictions, GT subtask boundaries, and the
-        # subtask predictions decoded at `step`-frame intervals. The video below
-        # is rendered either way.
-        if npz_mode:
-            import io as _io
-            from etils import epath
-
-            sample_t = np.asarray(sample_indices, dtype = np.int32)
-            predicted_subtasks = np.asarray([predicted_texts[t] or "" for t in sample_indices])
-            gt_subtasks = np.asarray([gt_texts[t] or "" for t in sample_indices])
-            npz_path = f"{eval_config.subtask_npz_dir.rstrip('/')}/{traj_idx}.npz"
-            # Serialize to bytes, then write via epath so a gs:// subtask_npz_dir
-            # works as well as local/NFS (np.savez can't write to gs:// directly).
-            _buf = _io.BytesIO()
-            np.savez(
-                _buf,
-                predicted_values = np.asarray(predicted_values, dtype = np.float64),
-                subtask_boundaries = np.asarray(_subtask_boundary_indices(frames), dtype = np.int32),
-                subtask_pred_t = sample_t,
-                predicted_subtasks = predicted_subtasks,
-                gt_subtasks = gt_subtasks,
-                num_frames = np.int32(len(frames)),
-            )
-            _out = epath.Path(npz_path)
-            _out.parent.mkdir(parents = True, exist_ok = True)
-            _out.write_bytes(_buf.getvalue())
-            logger.info(
-                f"Saved subtask npz to {npz_path}: {len(predicted_values)} value preds, "
-                f"{len(sample_t)} subtask decodes @ stride {step}."
-            )
-
-        # Forward-fill the per-frame display state so the video shows the most
-        # recent decode + perplexity reading on every intermediate frame.
+        # Forward-fill the display state so frames between samples show the most recent
+        # reading. A per-frame critic fills every slot already, making this a no-op there.
+        predicted_texts = list(result.predicted_texts)
+        gt_texts = list(result.gt_texts)
+        perplexities = list(result.perplexities)
+        last_pred = last_gt = None
+        last_perp = float("nan")
         for t in range(len(frames)):
-            if perplexities[t] is None:
-                perplexities[t] = last_perp if last_perp is not None else float("nan")
             if predicted_texts[t] is None:
                 predicted_texts[t] = last_pred
             if gt_texts[t] is None:
                 gt_texts[t] = last_gt
-            # Track-the-leader for frames before the first sample (rare; happens only
-            # if sample_indices is empty, which shouldn't occur).
-            if perplexities[t] is not None and not np.isnan(perplexities[t]):
-                last_perp = perplexities[t]
-            if predicted_texts[t] is not None:
-                last_pred = predicted_texts[t]
-            if gt_texts[t] is not None:
-                last_gt = gt_texts[t]
+            if perplexities[t] is None:
+                perplexities[t] = last_perp
+            last_pred, last_gt, last_perp = predicted_texts[t], gt_texts[t], perplexities[t]
+
+        # Predicted-vs-GT agreement over the sampled frames. Exact match after
+        # `normalize_subtask_text`; for a categorical critic the texts are vocab entries, so
+        # this is identical to comparing ids, and for a decoding critic it is stricter —
+        # free-form text can miss by a word where an argmax cannot.
+        scored = [t for t in result.sample_indices if predicted_texts[t] is not None and gt_texts[t]]
+        if scored:
+            num_correct = sum(
+                1 for t in scored
+                if _transforms.normalize_subtask_text(predicted_texts[t]).casefold()
+                == _transforms.normalize_subtask_text(gt_texts[t]).casefold()
+            )
+            logger.info(
+                f"  Subtask accuracy ({len(scored)} sampled frames): "
+                f"{num_correct}/{len(scored)} = {num_correct / len(scored):.3f}"
+            )
+        else:
+            logger.warning("  Subtask accuracy: no sampled frame carried a GT subtask.")
+
+        if npz_mode:
+            import io as _io
+
+            from etils import epath
+
+            payload = {
+                "predicted_values": np.asarray(result.values, dtype = np.float64),
+                # [num_frames, num_samples] when the cached action store was joined, so the
+                # analysis can take max or a random candidate without re-running the eval.
+                "candidate_values": np.asarray(result.candidate_values, dtype = np.float64),
+                "action_grad_sq_norm": np.asarray(action_grad, dtype = np.float64),
+                "mc_returns": np.asarray(mc_returns, dtype = np.float64),
+                "subtask_boundaries": np.asarray(boundaries, dtype = np.int32),
+                "subtask_pred_t": np.asarray(result.sample_indices, dtype = np.int32),
+                "predicted_subtasks": np.asarray([predicted_texts[t] or "" for t in result.sample_indices]),
+                "gt_subtasks": np.asarray([gt_texts[t] or "" for t in result.sample_indices]),
+                "num_frames": np.int32(len(frames)),
+            }
+            # Only a categorical critic has ids; a decoding one has no fixed vocab to index.
+            if result.predicted_ids is not None:
+                payload["predicted_subtask_ids"] = np.asarray(result.predicted_ids, dtype = np.int32)
+                payload["gt_subtask_ids"] = np.asarray(result.gt_ids, dtype = np.int32)
+
+            npz_path = f"{eval_config.subtask_npz_dir.rstrip('/')}/{traj_idx}.npz"
+            # Serialize to bytes, then write via epath so a gs:// subtask_npz_dir works as
+            # well as local/NFS (np.savez can't write to gs:// directly).
+            _buf = _io.BytesIO()
+            np.savez(_buf, **payload)
+            _out = epath.Path(npz_path)
+            _out.parent.mkdir(parents = True, exist_ok = True)
+            _out.write_bytes(_buf.getvalue())
+            logger.info(
+                f"Saved subtask npz to {npz_path}: {len(result.values)} value preds, "
+                f"{len(result.sample_indices)} subtask predictions."
+            )
 
         frame_images = [
             np.stack([
@@ -866,19 +579,17 @@ def _run_subtask_prediction(
             for f in frames
         ]
 
-        plot_key = (
-            f"val/{repo_id.removeprefix('RoboCOIN/')}_episode_{ep_idx}{part_suffix}_subtask"
-        )
+        plot_key = f"val/{repo_id.removeprefix('RoboCOIN/')}_episode_{ep_idx}{part_suffix}_subtask"
         rendered[plot_key] = _render_subtask_video(
             mc_returns = mc_returns,
-            predicted_values = predicted_values,
+            predicted_values = result.values,
             perplexities = perplexities,
             predicted_texts = predicted_texts,
             gt_texts = gt_texts,
             frame_images = frame_images,
             fps = fps,
             ep_idx = ep_idx,
-            subtask_texts = ep_subtasks[traj_idx],
+            subtask_texts = subtask_segment_labels(boundaries, gt_texts, len(frames)),
             output_dir = eval_config.output_dir,
             plot_key = plot_key,
             condition_on_decoded = eval_config.condition_on_decoded_subtask,
