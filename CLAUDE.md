@@ -12,9 +12,49 @@ openpi is Physical Intelligence's open-source repository for Vision-Language-Act
 
 The repository supports both JAX and PyTorch implementations, with JAX being the primary framework and PyTorch support validated on LIBERO benchmark.
 
+## Execution Environment
+
+**This is a local machine (WSL2 on a laptop), not a cluster.** There is no SLURM, no
+`srun`/`sbatch`, and no Babel. Anything in older notes referring to Babel, `/data/user_data`,
+or `~/dev/batch_value_learning` describes a machine that is no longer in use.
+
+| Fact | Value |
+| ---- | ----- |
+| Repo | `/home/saksham/projects/robot_learning/generalist_value_functions` |
+| Platform | WSL2 (`Linux 6.6.x-microsoft-standard-WSL2`) |
+| gcloud account | `saksham3@andrew.cmu.edu` (already authenticated) |
+| gcloud project | `cmu-aidm-v2` — full access to TPUs, GCS and Cloud Quotas |
+| Write buckets | `gs://saksham-euw4`, `-usc1`, `-usc2`, `-use1`, `-use5` |
+
+**All real compute is remote.** This machine has no GPU worth training on; it is the place
+the TPU launcher runs *from*, not the place jobs run. `scripts/run_on_tpu.py` only needs
+`tyro` and `requests` locally — the heavy dependencies (JAX, TensorFlow) are installed on
+the pod, never here.
+
+**A launch must outlive the shell that started it.** WSL2 stops when Windows sleeps or
+restarts, which kills any launcher running under it. Use `tmux` at minimum; for a multi-day
+run prefer a launcher host that is not this laptop. See "Persistent launching" below.
+
+**Resource limits:** 32 GB RAM on the laptop, shared with other Windows apps; WSL2 sees ~7 GB
+and 8 CPUs. Default-parallelism `gcloud storage cp` of many shards plus a multiprocess decode
+crashed WSL and killed every process (2026-08-25). Use single-process/single-thread copies
+(`CLOUDSDK_STORAGE_PROCESS_COUNT=1 CLOUDSDK_STORAGE_THREAD_COUNT=1`), small worker pools
+(<= 2-3), `nice`, and check `free -m` first. See `~/.claude/CLAUDE.md`.
+
+**Known gaps on this machine** (fix before a launch, do not assume they are present):
+- No project virtualenv. `/data/user_data/saksham3/vla` was Babel's and does not exist here.
+- No `uv` on PATH.
+- No Gemma helper checkout at `~/projects/AIRe/robocoin/helper/gemma`. `code_sync.sync_gemma_helper`
+  raises `FileNotFoundError` without it, so a launch fails during preparation.
+- `~/.netrc` (wandb credentials) IS present and is what gets synced to the pod.
+- `~/utils/slack.py` and `~/.config/tpu-launcher.env` ARE present, so the Slack command
+  below works from here.
+
 ## Project Status / Session Context
 
-**Always read every file in `project_status/` at the start of a session** — those files give you the current branch's goal, what's running, recent experiments, and the user's open TODOs. They are intentionally brief (combined budget ~10k tokens).
+**Always read `project_status/tpu_guide.md` at the start of a session** — everything TPU-related lives there and it is the one file you are expected to have read before acting.
+
+The other files in `project_status/` (`current_focus.md`, `experiments.md`, `todos.md`, `overview.md`) hold the branch goal, recent experiments and open TODOs. Read them when the task calls for that context rather than by default. The folder is intentionally brief (combined budget ~10k tokens).
 
 **Update them whenever appropriate**:
 - `current_focus.md`: when the branch goal, scope, or blockers change.
@@ -28,13 +68,24 @@ The folder is gitignored (per-user state). If combined size grows past ~10k toke
 
 Send a Slack message **only** in these cases:
 1. The user explicitly asks for one (a status update, a cadence, etc.).
-2. A **launched run** (training job, eval, server, TPU launcher, SLURM job — whether the
+2. A **launched run** (training job, eval, server, TPU launcher — whether the
    user or the agent launched it) hits an error — crashes, is killed, is preempted without
    recovering, or exits non-zero.
 3. A launched run **completes**.
 ```bash
 python ~/utils/slack.py "brief description"
 ```
+This is a standalone script that shares no code with the repo, so it works from any
+directory. It reads `SLACK_BOT_TOKEN` / `SLACK_USER_ID` from the environment, falling back
+to `~/.config/tpu-launcher.env`; both are present here. To confirm the token without
+messaging anyone: `curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN"
+https://slack.com/api/auth.test`.
+
+The launcher's own notifications are a **different path** — `SlackNotifier` in
+`src/openpi/tpu/slack.py`, reading the same env file on the `tpu-launcher` VM, which has no
+`~/utils/slack.py` and needs none. This script working locally says nothing about whether
+the launcher can Slack, or vice versa.
+
 Do not Slack for anything else: not for errors in your own commands or scripts, not for
 routine status or progress. One message per distinct run error and one per completion; do
 not repeat them. Do not ask for permission — this command is pre-approved. Messages must
@@ -43,11 +94,15 @@ be bulleted, not prose.
 ## Development Commands
 
 ### Environment Setup
-```bash
-# Activate the project virtualenv (required before running Python directly)
-source /data/user_data/saksham3/vla/bin/activate
 
-# Install dependencies (uses uv package manager)
+There is **no project virtualenv on this machine yet** — the `/data/user_data/saksham3/vla`
+path in older notes was Babel's. Create one in the repo before running anything heavier than
+the launcher:
+
+```bash
+# Install uv first if `which uv` is empty
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 
@@ -55,22 +110,29 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 git submodule update --init --recursive
 ```
 
-**Note**: The virtualenv is already sourced in `~/.bashrc`, so `python` can be used directly instead of `uv run` for running scripts.
+**The TPU launcher needs far less than this.** `scripts/run_on_tpu.py` imports only stdlib
+plus `tyro` and `requests`, so a throwaway venv with those two runs a launch without
+installing JAX locally. Prefer that over a full `uv sync` when the only goal is to launch.
 
 ### Testing
 
-**Always source the project virtualenv before running tests** — the Bash tool's shell does not always pick up `~/.bashrc`, so the venv may not be active by default. Run `source /data/user_data/saksham3/vla/bin/activate` (or chain it with `&&` in the test command) before any `pytest` / `python` invocation.
+**Always activate the project venv before running tests** — the Bash tool's shell does not
+reliably pick up `~/.bashrc`, and the default `python` here is a miniconda 3.13 that has none
+of the project's dependencies (the repo targets 3.11). Chain the activation into the command:
 
 ```bash
 # Run all non-manual tests
-source /data/user_data/saksham3/vla/bin/activate && pytest --strict-markers -m "not manual"
+source .venv/bin/activate && pytest --strict-markers -m "not manual"
 
 # Run specific test file
-source /data/user_data/saksham3/vla/bin/activate && pytest src/openpi/models/model_test.py
+source .venv/bin/activate && pytest src/openpi/models/model_test.py
 
 # Run single test
-source /data/user_data/saksham3/vla/bin/activate && pytest src/openpi/models/model_test.py::test_name
+source .venv/bin/activate && pytest src/openpi/models/model_test.py::test_name
 ```
+
+The TPU launcher tests are the exception — `src/openpi/tpu/launch_test.py` needs only
+`pytest`, `tyro` and `requests`, and touches no GCP.
 
 ### Code Quality
 ```bash
@@ -426,33 +488,30 @@ When working with PyTorch models:
 - Run IDs stored in `<checkpoint_dir>/wandb_id.txt` for resume
 - Set project name via `TrainConfig.project_name`
 
-### Running on Cluster
-If the user asks to run on the cluster (e.g., for GPU access, legacy D4RL with mujoco-py, etc.):
+### Persistent launching (no SLURM)
 
-1. **Sync local changes to the cluster** (run this locally first):
-   ```bash
-   rsync -avz --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' --exclude '.git' --exclude 'wandb' \
-       /Users/maxsobolmark/dev/batch_value_learning/ babel:~/dev/batch_value_learning/
-   ```
+Launchers run on the **`tpu-launcher` GCE VM**, not on this machine — see
+`project_status/tpu_guide.md` for the commands, unit names and log paths. WSL2 stops when
+Windows sleeps, which kills any launcher running here; the jobs survive on their pods but
+nothing watches them for preemption.
 
-2. **Run training via srun** (directly from local machine):
-   ```bash
-   ssh babel "srun -p debug --mem=64GB --gres=gpu:L40S:1 --time=2:00:00 bash -c 'source /home/jsobolma/bashrc_max && export PATH=\$HOME/.local/bin:\$PATH && export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/home/jsobolma/.mujoco/mujoco210/bin:/usr/lib/nvidia && cd ~/dev/batch_value_learning && uv run python scripts/train_value_function.py YOUR_CONFIG --num_train_steps 100 --no-wandb_enabled'"
-   ```
+`scripts/launch_preemptible.sh` is a SLURM wrapper and is dead: it `sbatch`es, hardcodes
+Babel paths, and there is no scheduler. Its only job was holding a long-lived process,
+which the systemd units now do.
 
-3. **The code is located at**: `~/dev/batch_value_learning`
+The launcher is the disposable part: `--done-marker` makes a relaunch a no-op once the
+work has finished, and the run certificate lets a restarted launcher re-attach to its own
+in-flight job instead of starting a duplicate. That is what makes moving launchers between
+hosts safe.
 
-4. **Legacy D4RL Setup**:
-   - The cluster has MuJoCo 2.1 installed at `~/.mujoco/mujoco210`
-   - Need to install `cython<3` for mujoco-py compatibility: `uv pip install "cython<3"`
-   - Install d4rl dependencies: `uv pip install gym==0.23.1 && uv pip install "d4rl @ git+https://github.com/Farama-Foundation/D4RL.git" --no-deps && uv pip install "mujoco-py<2.2,>=2.1"`
-   - A pre-compiled mujoco_py .so file exists in the `parl` conda env and can be copied if build fails
+**Never redirect `run_on_tpu.py` output to a log file** (`> run.log 2>&1`). That ties the
+run to the local session; use the systemd journal, `tmux`, or the Bash tool's
+`run_in_background=true`.
 
 ### Running on TPU Pods
 
 **All TPU-related information lives in `project_status/tpu_guide.md`** — pods and
-chip layout, per-family runtime versions and accelerator types, the spot-pod
-creator and its knobs, NFS/uid pitfalls, PaliGemma weight caching, launching via
-`scripts/launch_preemptible.sh` (spot) or `scripts/run_on_tpu.py` (non-spot), job
-logs, busy checks, and recovering wedged pods. Read it before doing anything on a
-TPU.
+chip layout, per-family runtime versions and accelerator types, the spot race and
+its knobs, NFS/uid pitfalls, PaliGemma weight caching, launching via
+`scripts/run_on_tpu.py` (spot and reserved alike), job logs, busy checks, and
+recovering wedged pods. Read it before doing anything on a TPU.
