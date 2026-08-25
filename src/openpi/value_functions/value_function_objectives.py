@@ -116,7 +116,11 @@ def mc_objective(
         features, aux = network_out
     else:
         features, aux = network_out, {}
-    loss = _compute_value_loss(head, features, transition.mc_return)
+    # Captured before the auxiliary next-token term is folded in. Subtracting it back
+    # out afterwards would be equivalent only up to floating point, and would silently
+    # go wrong the moment another auxiliary term joins the sum.
+    value_loss = _compute_value_loss(head, features, transition.mc_return)
+    loss = value_loss
     next_token_embeddings = aux.get("next_token_embeddings")
     next_token_loss = None
     if next_token_embeddings is not None:
@@ -132,6 +136,7 @@ def mc_objective(
     td_error = pred - transition.mc_return
 
     info = {
+        "value_loss": value_loss,
         "predicted_value": pred,
         "target_value": transition.mc_return,
         "td_error": td_error,
@@ -186,7 +191,11 @@ def sarsa_objective(
         features, aux = network_out
     else:
         features, aux = network_out, {}
-    loss = _compute_value_loss(head, features, target)
+    # Captured before the auxiliary next-token term is folded in. Subtracting it back
+    # out afterwards would be equivalent only up to floating point, and would silently
+    # go wrong the moment another auxiliary term joins the sum.
+    value_loss = _compute_value_loss(head, features, target)
+    loss = value_loss
     next_token_embeddings = aux.get("next_token_embeddings")
     next_token_loss = None
     if next_token_embeddings is not None:
@@ -204,6 +213,7 @@ def sarsa_objective(
     mc_loss = jnp.square(pred - transition.mc_return)
 
     info = {
+        "value_loss": value_loss,
         "predicted_value": pred,
         "target_value": target,
         "next_value": target_value,
@@ -767,7 +777,11 @@ def cql_objective(
     assert target.shape == transition.reward.shape, (
         f"Expected target shape {transition.reward.shape}, got {target.shape}"
     )
-    q_loss = _compute_value_loss(q_head, q_features, target)
+    # Captured before the auxiliary next-token term is folded in. Subtracting it back
+    # out afterwards would be equivalent only up to floating point, and would silently
+    # go wrong the moment another auxiliary term joins the sum.
+    value_loss = _compute_value_loss(q_head, q_features, target)
+    q_loss = value_loss
     next_token_embeddings = aux.get("next_token_embeddings")
     next_token_loss = None
     if next_token_embeddings is not None:
@@ -786,6 +800,7 @@ def cql_objective(
     if cql_alpha == 0:
         cql_loss = jnp.zeros_like(q_loss)
         info = {
+            "value_loss": value_loss,
             "q_mean": jnp.mean(q_pred_for_logging),
             "q_std": jnp.std(q_pred_for_logging),
             "target_mean": jnp.mean(target),
@@ -936,6 +951,7 @@ def cql_objective(
 
     info.update(
         {
+            "value_loss": value_loss,
             "q_mean": jnp.mean(q_pred_for_logging),
             "q_std": jnp.std(q_pred_for_logging),
             "target_mean": jnp.mean(target),

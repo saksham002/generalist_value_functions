@@ -790,6 +790,14 @@ def value_function_train_step(
         next_token_loss_arr = value_info.pop("next_token_loss")
         value_stats["next_token_loss"] = jnp.mean(next_token_loss_arr)
 
+    # The value error on its own, with the weighted next-token auxiliary term excluded.
+    # The headline loss mixes the two, so it is not comparable between runs that set
+    # different next_token_loss_weight -- which is exactly the comparison these runs exist
+    # to make. Popped rather than left in place because it is per-sample, and anything
+    # still in value_info downstream is cast with float().
+    if "value_loss" in value_info:
+        value_stats["value_loss"] = jnp.mean(value_info.pop("value_loss"))
+
     # Variable-horizon only: MC loss is inherently high at short sampled horizons, which
     # does not imply inaccurate values at the longer horizons we ultimately use. Log MC
     # loss restricted to samples whose sampled horizon k is at least half the action chunk
