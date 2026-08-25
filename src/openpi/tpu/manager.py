@@ -654,6 +654,13 @@ def cleanup_preempted(tpu_type: str, *, project: str, region: str | None = None)
                 logger.warning("Failed to delete suspended queued resource %s: %s", name, e)
 
 
+# Submitting a candidate is one gcloud invocation, and gcloud is a Python process of its own
+# -- 29 zones x 3 shapes at once is ~90 of them on a 2 vCPU / 2 GB launcher host. Submissions
+# only have to outpace the poll loop, not finish together, so a small pool costs nothing:
+# every zone still gets its queued resource, just over a few seconds rather than all at once.
+_MAX_RACE_SUBMIT_THREADS = 8
+
+
 def _prepare_candidate(name: str, config: PodConfig, arbiter: RaceArbiter) -> None:
     """Submit one race candidate, letting the caller drop zones that answer 'unsupported'."""
     if arbiter.is_cancelled:
@@ -702,6 +709,26 @@ def _cleanup_losers(candidates: dict[str, tuple[str, PodConfig]], *, keep: str |
         _delete_candidate(name, config)
 
 
+def _cleanup_losers_async(candidates: dict[str, tuple[str, PodConfig]], *, keep: str | None) -> threading.Thread:
+    """Tear the losers down off the critical path.
+
+    Deleting ~29 candidates is ~29 serial control-plane calls, and the winning pod is READY
+    and idle for all of them. Setup is what the run is waiting on, so cleanup runs behind it
+    instead of in front of it.
+
+    Deliberately not a daemon thread: leaking a queued resource costs real money, so an
+    interpreter that is on its way out should wait for the deletes rather than abandon them.
+    """
+    thread = threading.Thread(
+        target=_cleanup_losers,
+        args=(candidates,),
+        kwargs={"keep": keep},
+        name=f"cleanup-losers-{keep or 'all'}",
+    )
+    thread.start()
+    return thread
+
+
 def race_spot_tpu(
     tpu_type: str,
     request: AllocationRequest,
@@ -747,7 +774,10 @@ def race_spot_tpu(
         raise RuntimeError(f"No zone could be prepared for a {tpu_type} race")
     logger.info("Racing %s across %d zones: %s", tpu_type, len(candidates), {z: n for z, (n, _) in candidates.items()})
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(candidates))
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(len(candidates), _MAX_RACE_SUBMIT_THREADS),
+        thread_name_prefix=f"submit-{tpu_type}",
+    )
     futures = {
         executor.submit(_prepare_candidate, name, config, arbiter): (name, config)
         for name, config in candidates.values()
@@ -781,6 +811,12 @@ def race_spot_tpu(
                 raise RuntimeError(f"No zone can supply {tpu_type}: every candidate is unsupported")
 
             for name, config in live:
+                # Re-checked per candidate, not once per poll: _requeue_failed makes two
+                # blocking control-plane calls and a zone that refuses the shape takes ~20s
+                # to say so, so a shape that lost mid-sweep would otherwise keep creating
+                # queued resources for minutes after the winner was already decided.
+                if arbiter.is_cancelled:
+                    raise RuntimeError(f"{tpu_type} race cancelled: another shape won")
                 if not _is_tpu_usable(name, config):
                     _requeue_failed(name, config)
                     continue
@@ -790,7 +826,7 @@ def race_spot_tpu(
                     raise RuntimeError(f"{tpu_type} race lost: another shape claimed the win")
                 executor.shutdown(wait=False, cancel_futures=True)
                 logger.info("Race winner: %s in %s", name, config.zone)
-                _cleanup_losers(candidates, keep=config.zone)
+                _cleanup_losers_async(candidates, keep=config.zone)
                 described = discovery.describe_pod(name, config.zone, request.project)
                 return Acquisition(name=name, config=with_discovered_nfs(config, pod=described))
             time.sleep(_RACE_POLL_SECONDS)
@@ -828,12 +864,23 @@ def race_spot_tpu_any(request: AllocationRequest) -> Acquisition:
             if error is None:
                 acquisition = future.result()
                 logger.info("Multi-shape race winner: %s (%s in %s)", shape, acquisition.name, acquisition.config.zone)
+                # Return on the winner rather than waiting for the losing shapes to finish
+                # tearing down. They each hold a live pod's worth of setup time hostage
+                # otherwise: a losing shape can be several minutes into a sweep of zones
+                # that refuse it, and the won pod sits idle for all of it. Cancelling is
+                # what they poll on, and each cleans up its own candidates, so the only
+                # thing given up by not waiting is the ordering of the log lines.
+                arbiter.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
                 return acquisition
             errors[shape] = str(error)[:200]
             logger.info("Shape %s dropped out of the multi-shape race: %s", shape, errors[shape])
-    finally:
-        # Every losing race observes this and tears its own candidates down; waiting for them
-        # to finish doing so keeps a launch from returning while pods it created still exist.
+        # No shape won. Here the wait is the point: returning while a losing race still holds
+        # queued resources is how a failed launch leaks pods.
         arbiter.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
+    except BaseException:
+        arbiter.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
     raise RuntimeError(f"No spot TPU of any shape {shapes} became usable: {errors}")

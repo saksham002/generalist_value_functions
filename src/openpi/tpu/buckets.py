@@ -22,6 +22,18 @@ logger = logging.getLogger(__name__)
 _GCS_TIMEOUT_SECONDS = 300
 _COPY_TIMEOUT_SECONDS = 7200
 
+# gcloud storage sizes its worker pool from the host's CPU count and buffers each shard in
+# memory, which is more than either launcher host can absorb: a default-parallelism copy of a
+# ~40 GiB checkpoint in ~1 GB shards took down the whole WSL2 VM on the laptop, and the GCE
+# launcher is a 2 GB e2-small. Sliced downloads are disabled for the same reason -- they are
+# what turns one object into several concurrent in-memory buffers. The carry happens once per
+# launch and is not on any critical path, so throughput is the cheap thing to give up.
+_COPY_ENV = {
+    "CLOUDSDK_STORAGE_PROCESS_COUNT": "1",
+    "CLOUDSDK_STORAGE_THREAD_COUNT": "1",
+    "CLOUDSDK_STORAGE_SLICED_OBJECT_DOWNLOAD_THRESHOLD": "0",
+}
+
 _GCS_URI = re.compile(r"^gs://(?P<bucket>[^/]+)/?(?P<path>.*)$")
 
 # Inter-continent egress, used to put a number on a refusal rather than an adjective.
@@ -32,7 +44,7 @@ CROSS_CONTINENT_USD_PER_GIB = 0.05
 WANDB_ID_FILENAME = "wandb_id.txt"
 
 
-def _run(args: list[str], *, timeout: int) -> subprocess.CompletedProcess:
+def _run(args: list[str], *, timeout: int, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Run a `gcloud storage` command through the shared retry/auth layer.
 
     GCS calls flake for the same reasons the TPU control plane does, so they get the same
@@ -41,7 +53,7 @@ def _run(args: list[str], *, timeout: int) -> subprocess.CompletedProcess:
     # args arrive as a full command line; run_gcloud supplies "gcloud" and --project itself.
     assert args[0] == "gcloud", f"expected a gcloud command, got {args[0]!r}"
     try:
-        return run_gcloud(args[1:], check=False, timeout=timeout)
+        return run_gcloud(args[1:], check=False, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args, 1, "", f"timed out after {timeout}s")
 
@@ -161,7 +173,11 @@ def copy_prefix(source_uri: str, destination_uri: str, *, allow_cross_continent:
         )
 
     logger.info("Copying %s -> %s (%s -> %s)", source_uri, destination_uri, source_region, destination_region)
-    result = _run(["gcloud", "storage", "rsync", "-r", source_uri, destination_uri], timeout=_COPY_TIMEOUT_SECONDS)
+    result = _run(
+        ["gcloud", "storage", "rsync", "-r", source_uri, destination_uri],
+        timeout=_COPY_TIMEOUT_SECONDS,
+        env=_COPY_ENV,
+    )
     if result.returncode != 0:
         raise RuntimeError(f"Failed to copy {source_uri} -> {destination_uri}: {result.stderr.strip()}")
 

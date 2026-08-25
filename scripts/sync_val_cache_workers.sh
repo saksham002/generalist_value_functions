@@ -47,20 +47,29 @@ if [ -z "$CACHE" ]; then
 fi
 CACHE=${CACHE%/}
 
+# The launcher rewrites an NFS path to "$HOME/..." for a pod with no filer -- literally
+# that string, expanded by the shell on the pod rather than here. "/home/..." is accepted
+# too for a path written that way by hand. Anything else is on shared storage and needs
+# nothing doing.
 case "$CACHE" in
-    /home/*) ;;
+    '$HOME'/*|/home/*) ;;
     "")  log "no validation-cache-dir in command; nothing to do"; exit 0 ;;
     *)   log "cache dir $CACHE is shared, not per-worker; nothing to do"; exit 0 ;;
 esac
 
-# Same region as the pod, so the staging round trip stays local and free.
-case "$ZONE" in
-    us-east1*)      BUCKET=saksham-use1 ;;
-    us-central1*)   BUCKET=saksham-usc1 ;;
-    us-central2*)   BUCKET=saksham-usc2 ;;
-    europe-west4*)  BUCKET=saksham-euw4 ;;
-    *)              log "no staging bucket known for zone $ZONE; giving up"; exit 0 ;;
-esac
+# Same region as the pod, so the staging round trip stays local and free. Derived rather
+# than listed: a hardcoded map silently gives up ("no staging bucket known") in exactly the
+# zones a widened race newly reaches, which is when this hook matters most. Mirrors
+# config.region_abbreviation: europe-west4 -> euw4, us-south1 -> uss1, us-central2 -> usc2.
+REGION=${ZONE%-*}
+LOCALITY=${REGION%%-*}
+DIRECTION=${REGION#*-}
+case "$LOCALITY" in europe*) CONTINENT=eu ;; *) CONTINENT=$LOCALITY ;; esac
+BUCKET="saksham-${CONTINENT}$(printf '%s' "$DIRECTION" | cut -c1)$(printf '%s' "$DIRECTION" | tr -cd '0-9')"
+if ! gcloud storage ls "gs://$BUCKET/" >/dev/null 2>&1; then
+    log "staging bucket gs://$BUCKET for zone $ZONE does not exist; giving up"
+    exit 0
+fi
 
 log "watching $CACHE (staging via gs://$BUCKET/tmp)"
 

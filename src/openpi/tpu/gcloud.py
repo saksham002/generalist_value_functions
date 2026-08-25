@@ -144,6 +144,7 @@ def run_gcloud(
     timeout: float | None = DEFAULT_GCLOUD_TIMEOUT_SECONDS,
     retries: int = 3,
     retry_delay: float = 10.0,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Execute a gcloud command, retrying failures that are transient.
 
@@ -158,8 +159,12 @@ def run_gcloud(
     Args:
         retries: Extra attempts after the first for a transient failure. 0 disables.
         retry_delay: Seconds between attempts, growing linearly with attempt number.
+        env: Extra environment for the subprocess, merged over the parent's. gcloud reads
+            its properties from CLOUDSDK_* variables, which is the only way to set them
+            per-call rather than for the whole machine.
     """
     cmd = ["gcloud", "--project", project, *args]
+    subprocess_env = {**os.environ, **env} if env else None
     logger.debug("Running: %s", " ".join(cmd))
     label = " ".join(args[:3])
 
@@ -172,6 +177,7 @@ def run_gcloud(
                 capture_output=capture_output,
                 timeout=timeout,
                 text=True,
+                env=subprocess_env,
             )
         except subprocess.TimeoutExpired:
             timed_out = True
