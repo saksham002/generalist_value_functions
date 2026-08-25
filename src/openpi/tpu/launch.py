@@ -268,9 +268,19 @@ class LaunchConfig:
     """Race every zone with live spot quota instead of reusing a reserved pod."""
 
     region: str | None = None
-    """Restrict a launch to one region, e.g. 'europe-west4'. Reuse, the capacity race and
+    """Restrict a launch to one region or a comma-separated list, e.g.
+    'europe-west4,us-central2'. Reuse, the capacity race and
     preempted-resource cleanup all stay inside it, so the pod lands next to the job's data
     instead of winning a distant zone and reading across regions for the whole run."""
+
+    zone: str | None = None
+    """Restrict to specific zones, comma-separated, e.g. 'europe-west4-a,europe-west4-b'.
+    Finer than --region; use when only certain zones have what the run needs."""
+
+    continent: str | None = None
+    """Restrict to 'us' and/or 'eu'. Coarser than --region and often the restriction that
+    actually matters, since it is what decides whether a pod reads its data across an
+    ocean."""
 
     only_my_pods: bool = False
     """Never reuse or reclaim a pod that does not carry this user's name. The idle probe is
@@ -371,6 +381,19 @@ class LaunchConfig:
     def run_id(self) -> str:
         """This run's certificate contents; see :mod:`openpi.tpu.certificate`."""
         return self.plan.run_id(user=self.user)
+
+    def tpu_name_for_attempt(self, retry_count: int) -> str | None:
+        """The pod this attempt should target by name, if any.
+
+        A named *spot* pod may have been preempted, so a retry must not go back to it. A
+        named reserved pod cannot be: it is still there, and it is the only pod the launch
+        was ever allowed to use. Dropping the name for it sent the retry down the reuse
+        path, which matched on the bare family prefix and claimed a colleague's v4 for a
+        launch pinned to one specific pod.
+        """
+        if retry_count == 0 or not self.spot:
+            return self.tpu_name
+        return None
 
     def resolve(self, pod: PodConfig) -> "ResolvedLaunch":
         """Bind this launch to a pod, enforcing the four placement guarantees."""

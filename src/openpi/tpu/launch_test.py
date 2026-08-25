@@ -15,6 +15,7 @@ from openpi.tpu import quota
 from openpi.tpu.config import RemoteLayout
 from openpi.tpu.config import get_tpu_name_prefix
 from openpi.tpu.config import get_tpu_type_prefix
+from openpi.tpu.filters import PodFilter
 from openpi.tpu.launch import CommandPlan
 from openpi.tpu.launch import LaunchConfig
 from openpi.tpu.launch import ProgressReporter
@@ -129,7 +130,7 @@ def test_nfs_paths_survive_untouched_on_a_filer_pod() -> None:
 
 def test_nfs_paths_become_home_paths_on_a_local_disk_pod() -> None:
     layout = _layout(uses_nfs=False)
-    assert layout.localize_path("/nfs/aidm_nfs/saksham3/robocoin/val_cache") == "~/robocoin/val_cache"
+    assert layout.localize_path("/nfs/aidm_nfs/saksham3/robocoin/val_cache") == "$HOME/robocoin/val_cache"
     assert layout.localize_path("/data/user_data/saksham3/cache") == "/data/user_data/saksham3/cache"
     assert layout.working_dir == "~/batch_value_learning"
     assert layout.sync_workers == list(range(8))
@@ -273,7 +274,7 @@ def test_nfs_args_are_localized_only_on_a_local_disk_pod(stub_gcs) -> None:
     assert "--validation-cache-dir /nfs/aidm_nfs/saksham3/robocoin/val_cache" in on_filer.command
 
     local = LaunchConfig(command=TRAIN_COMMAND).resolve(_pod("us-central2-b", uses_nfs=False))
-    assert "--validation-cache-dir ~/robocoin/val_cache" in local.command
+    assert "--validation-cache-dir $HOME/robocoin/val_cache" in local.command
     assert "/nfs/aidm_nfs" not in local.command
 
 
@@ -553,3 +554,90 @@ def test_a_run_resuming_high_still_reports() -> None:
     reporter = _reporter(r"(\d+)/(\d{5,}) \[")
     reporter.observe(" 96%|####| 220000/230000 [01:02<03:04]", "pod-0")
     assert reporter.notifier.milestones == [80]
+
+
+def test_a_launch_may_name_several_regions() -> None:
+    """The safe zones for a launch are defined by pod properties -- a filer, an existing
+    bucket -- and those span regions, so a single-region filter cannot express them."""
+    request = AllocationRequest(run_id="r-1", region="europe-west4,us-central2", spot=True)
+    assert request.regions == ("europe-west4", "us-central2")
+    assert request.in_region("europe-west4-b")
+    assert request.in_region("us-central2-b")
+    # us-south1 has no Filestore and no bucket of ours: exactly what this excludes.
+    assert not request.in_region("us-south1-a")
+
+
+def test_no_region_means_unrestricted() -> None:
+    request = AllocationRequest(run_id="r-1", spot=True)
+    assert request.regions == ()
+    assert request.in_region("us-west1-c")
+
+
+def test_a_single_region_still_works() -> None:
+    request = AllocationRequest(run_id="r-1", region="europe-west4", spot=True)
+    assert request.regions == ("europe-west4",)
+    assert request.in_region("europe-west4-a")
+    assert not request.in_region("us-central2-b")
+
+
+# --- PodFilter ----------------------------------------------------------------------------
+
+
+def _filter(**kw):
+    kw.setdefault("resource_owner", "saksham")
+    return PodFilter.parse(**kw)
+
+
+def test_the_filter_rejects_a_foreign_pod_of_the_wrong_shape() -> None:
+    """Both halves of the failure that put a v5e/v6e launch on a colleague's v4."""
+    f = _filter(tpu_type="v5e-64,v6e-32", only_my_pods=True)
+    assert "not this user's pod" in f.rejects(name="v4-vansh-spot-64-noprop", zone="us-central2-b")
+    # Even our own pod of an unasked-for shape is refused.
+    assert "families" in f.rejects(name="v4-saksham-spot-64-0", zone="us-central2-b")
+    assert f.rejects(name="v5e-saksham-spot-64-0", zone="europe-west4-b") is None
+
+
+def test_a_reported_accelerator_beats_the_name() -> None:
+    """A name is a guess; what the pod reports is authoritative."""
+    f = _filter(tpu_type="v5e-64")
+    assert f.rejects(name="v5e-saksham-spot-64-0", zone="europe-west4-b", accelerator_type="v5litepod-64") is None
+    assert "accelerator" in f.rejects(
+        name="v5e-saksham-spot-64-0", zone="europe-west4-b", accelerator_type="v5litepod-256"
+    )
+
+
+def test_zone_region_and_continent_filters() -> None:
+    assert _filter(zone="europe-west4-a").rejects(name="p", zone="europe-west4-b") is not None
+    assert _filter(zone="europe-west4-a").rejects(name="p", zone="europe-west4-a") is None
+    assert _filter(region="europe-west4").rejects(name="p", zone="us-central2-b") is not None
+    assert _filter(continent="eu").rejects(name="p", zone="us-central2-b") is not None
+    assert _filter(continent="eu").rejects(name="p", zone="europe-west4-c") is None
+    assert _filter(continent="us,eu").rejects(name="p", zone="us-west1-a") is None
+
+
+def test_an_empty_filter_accepts_everything() -> None:
+    assert _filter().rejects(name="anything", zone="us-west1-a") is None
+    assert _filter().describe() == "unrestricted"
+
+
+def test_the_resume_sweep_drops_only_the_shape() -> None:
+    """A relaunched launcher does not know which shape won, but still must not stray."""
+    f = _filter(tpu_type="v5e-64", region="europe-west4", only_my_pods=True).without_types()
+    assert f.rejects(name="v6e-saksham-spot-32-0", zone="europe-west4-a") is None
+    assert f.rejects(name="v6e-vansh-spot-32-0", zone="europe-west4-a") is not None
+    assert f.rejects(name="v6e-saksham-spot-32-0", zone="us-west1-a") is not None
+
+
+def test_a_reserved_launch_keeps_its_named_pod_across_retries() -> None:
+    """A reserved pod does not disappear, so a retry must not go looking elsewhere.
+
+    Dropping the name sent the retry to _find_idle_pod, which matched the family prefix
+    and took a colleague's v4 for a launch pinned to one pod.
+    """
+    reserved = LaunchConfig(command="python train.py cfg", tpu_name="v4-64-0", tpu_type="v4-64")
+    assert reserved.tpu_name_for_attempt(0) == "v4-64-0"
+    assert reserved.tpu_name_for_attempt(3) == "v4-64-0"
+
+    spot = LaunchConfig(command="python train.py cfg", tpu_name="v4-64-0", tpu_type="v4-64", spot=True)
+    assert spot.tpu_name_for_attempt(0) == "v4-64-0"
+    assert spot.tpu_name_for_attempt(1) is None

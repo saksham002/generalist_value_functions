@@ -190,13 +190,14 @@ class Launcher:
         return AllocationRequest(
             run_id=self.run_id,
             tpu_type=self.config.tpu_type,
-            # A retry must not go back to a pod that was named and has since been preempted.
-            tpu_name=self.config.tpu_name if self.retry_count == 0 else None,
+            tpu_name=self.config.tpu_name_for_attempt(self.retry_count),
             user=self.config.user,
             project=self.config.project,
             spot=self.config.spot,
             region=self.config.region,
             only_my_pods=self.config.only_my_pods,
+            zone=self.config.zone,
+            continent=self.config.continent,
             race_timeout=self.config.race_timeout,
             max_race_zones=self.config.max_race_zones,
         )

@@ -29,6 +29,7 @@ from openpi.tpu.config import get_tpu_user
 from openpi.tpu.config import resolve_from_pod
 from openpi.tpu.config import spot_race_configs
 from openpi.tpu.config import with_discovered_nfs
+from openpi.tpu.filters import PodFilter
 from openpi.tpu.gcloud import _TERMINAL_TPU_STATES
 from openpi.tpu.gcloud import TPU_STATE_UNKNOWN
 from openpi.tpu.gcloud import create_queued_resource
@@ -72,8 +73,27 @@ class AllocationRequest:
     spot: bool = False
     region: str | None = None
     only_my_pods: bool = False
+    zone: str | None = None
+    continent: str | None = None
     race_timeout: float = 21600
     max_race_zones: int | None = None
+
+    @property
+    def filters(self) -> PodFilter:
+        """Everything that decides whether a pod may be used, as one object.
+
+        Consulted by every acquisition path. Previously each applied its own subset, which
+        is how a retry that dropped ``--tpu-name`` reached the reuse path and took a
+        colleague's pod of a shape the launch never asked for.
+        """
+        return PodFilter.parse(
+            tpu_type=self.tpu_type,
+            region=self.region,
+            zone=self.zone,
+            continent=self.continent,
+            only_my_pods=self.only_my_pods,
+            resource_owner=self.resource_owner,
+        )
 
     @property
     def shapes(self) -> tuple[str, ...]:
@@ -102,8 +122,20 @@ class AllocationRequest:
     def resource_owner(self) -> str:
         return get_tpu_user(self.user).resource_owner
 
+    @property
+    def regions(self) -> tuple[str, ...]:
+        """Regions this request will accept, empty when unrestricted.
+
+        Comma-separated, because the useful restriction is rarely a single region: the
+        zones that are safe for a given launch are the ones whose *properties* match --
+        having a filer, having a bucket already created -- and those span regions.
+        """
+        return tuple(r.strip() for r in self.region.split(",") if r.strip()) if self.region else ()
+
     def in_region(self, zone: str | None) -> bool:
-        return self.region is None or bool(zone and zone.startswith(self.region))
+        if not self.regions:
+            return True
+        return bool(zone) and any(zone.startswith(r) for r in self.regions)
 
     @property
     def name_token(self) -> str:
@@ -336,9 +368,16 @@ def _candidate_pods(request: AllocationRequest) -> list[discovery.DiscoveredPod]
     the raw inventory, before anything is described or probed, so a pod elsewhere is never
     even looked at.
     """
-    pods = [
-        pod for pod in discovery.list_all_tpus(request.project) if pod.state == "READY" and request.in_region(pod.zone)
-    ]
+    where = request.filters.without_types()
+    pods = []
+    for pod in discovery.list_all_tpus(request.project):
+        if pod.state != "READY":
+            continue
+        reason = where.rejects(name=pod.name, zone=pod.zone)
+        if reason is not None:
+            logger.debug("Skipping %s in %s: %s", pod.name, pod.zone, reason)
+            continue
+        pods.append(pod)
     return sorted(pods, key=lambda pod: 0 if request.resource_owner in pod.name else 1)
 
 
@@ -450,21 +489,23 @@ def _find_idle_pod(
     killing another user's work is never acceptable, while borrowing a pod they are not
     using is.
     """
-    wanted_accelerator = accelerator_type_for(tpu_type)
-    type_prefix = get_tpu_type_prefix(tpu_type)
+    # This shape only, plus whatever else the launch restricts. Built from the request's
+    # filter rather than re-derived, so the reuse path cannot accept something the launch
+    # never asked for -- which is exactly what happened when a retry dropped --tpu-name and
+    # this path claimed a colleague's v4 for a launch scoped to v5e/v6e.
+    wanted = dataclasses.replace(request.filters, tpu_types=(tpu_type,))
 
     for pod in _candidate_pods(request):
-        if not pod.name.startswith(type_prefix):
+        reason = wanted.rejects(name=pod.name, zone=pod.zone)
+        if reason is not None:
+            logger.info("Skipping %s in %s: %s", pod.name, pod.zone, reason)
             continue
-        # Ownership does not gate *use*: an idle pod of the right shape is usable by anyone.
-        # It gates only whether we may kill what is running on it.
         owned = request.resource_owner in pod.name
-        if request.only_my_pods and not owned:
-            logger.info("Skipping %s in %s: not this user's pod (--only-my-pods)", pod.name, pod.zone)
-            continue
         try:
             described = discovery.describe_pod(pod.name, pod.zone, request.project)
-            if described.accelerator_type != wanted_accelerator:
+            accel_reason = wanted.rejects(name=pod.name, zone=pod.zone, accelerator_type=described.accelerator_type)
+            if accel_reason is not None:
+                logger.info("Skipping %s in %s: %s", pod.name, pod.zone, accel_reason)
                 continue
             config = resolve_from_pod(
                 pod.name, user=request.user, project=request.project, tpu_type=tpu_type, zone=pod.zone

@@ -148,7 +148,11 @@ class RemoteLayout:
         head, separator, rest = tail.partition("/")
         if separator and head == self.nfs_user:
             tail = rest
-        return f"~/{tail}" if tail else "~"
+        # "$HOME", not "~": the rewritten path is handed to a program as `--flag=<path>`,
+        # and a shell expands a tilde only at the start of a word (the rules after "=" vary
+        # between shells and versions), whereas "$HOME" expands anywhere. It also survives
+        # being matched by later tooling, which cannot know what "~" resolves to on the pod.
+        return f"$HOME/{tail}" if tail else "$HOME"
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -361,11 +365,23 @@ def spot_race_configs(
     occupied = frozenset(
         pod.zone
         for pod in discovery.list_all_tpus(project)
-        if pod.zone and (region is None or pod.zone.startswith(region))
+        if pod.zone and (region is None or any(pod.zone.startswith(r.strip()) for r in region.split(",")))
     )
-    zones = quota.spot_quota_zones(
-        family, size, project=project, occupied_zones=occupied, region=region, max_zones=max_zones
-    )
+    # Each region is asked separately and a region with nothing to offer is skipped rather
+    # than fatal: a list like "europe-west4,us-central2" names where a launch is *allowed*
+    # to land, and us-central2 having no v5e quota is not a reason to refuse the launch.
+    # Only every region coming back empty is an error.
+    zones: tuple[str, ...] = ()
+    failures: list[str] = []
+    for one_region in ([r.strip() for r in region.split(",")] if region else [None]):
+        try:
+            zones += quota.spot_quota_zones(
+                family, size, project=project, occupied_zones=occupied, region=one_region, max_zones=max_zones
+            )
+        except ValueError as e:
+            failures.append(str(e))
+    if not zones:
+        raise ValueError("; ".join(failures) or f"No eligible zone for {family}-{size}")
     return tuple(
         _build_config(
             tpu_type=tpu_type,
