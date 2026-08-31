@@ -4838,6 +4838,76 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/real_lid/validation_cache_dir_real_lid_paligemma_cql_rlds_finetune_subtask_ar/",
         include_repos = (),
     ),
+    # Same as real_lid_paligemma_cql_rlds_finetune_subtask_ar but with BestOfN
+    # num_samples=32, so eval scores all 32 cached candidates per state instead of the
+    # inherited 8. Points at the same counterfactual store, which is being refreshed in
+    # place from 8 to 32 samples off the same real_lid_pi05_subtask_annotated/40000
+    # checkpoint -- so this config is only correct once that refresh has landed; against
+    # the current 8-sample store the BestOfN reshape sees fewer candidates than it expects.
+    #
+    # The validation cache is shared with the 8-sample config on purpose: it holds
+    # validation episodes, which the candidate count does not affect.
+    FineTuneConfig(
+        name = "real_lid_paligemma_cql_rlds_finetune_subtask_ar_samples32",
+        data_factory = Hdf5RldsDataConfig(
+            repo_id = "real_lid",
+            rlds_data_dir = "gs://saksham-euw4/hdf5",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "real_lid", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/real_lid",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            use_eef = True,
+            state_dim = 14,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/real_lid_pi05_subtask_annotated/",
+            max_token_len = 96,
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        # q_network_config is byte-identical to the subtask_ar base's
+        # q_network_config (224x224 images, no_state=True, predict_subtask_ar=True,
+        # default paligemma backbone, no layernorm) -- restated so the pretrained
+        # checkpoint loads without any shape mismatch and the AR behavior is preserved.
+        model_overrides = {
+            "action_horizon": 60,
+            "q_network_config": _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                max_token_len = 96,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = True,
+            ),
+        },
+        # action_horizon 60 matches the 60-frame data chunks, as in the 8-sample config;
+        # num_samples is the only intended difference between the two.
+        policy_overrides = {
+            "action_horizon": 60,
+            "num_samples": 32,
+        },
+        action_horizon = 60,
+        num_train_steps = 20_000,
+        save_interval = 10_000,
+        plot_interval = 10_000,
+        keep_period = 10_000,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
+        ),
+        num_val_trajectories = 3,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/real_lid/validation_cache_dir_real_lid_paligemma_cql_rlds_finetune_subtask_ar/",
+        include_repos = (),
+    ),
     # LeRobot realworld_xarm_packing twin of the real_shirt_hang subtask_ar CQL FT:
     # same recipe, LeRobotRldsDataConfig (critic_mode, subsample) on the packing
     # dataset; max_token_len=160 (128 for the task + 32 for the predicted subtask).
@@ -4968,7 +5038,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             repo_id = "lego",
             rlds_data_dir = "gs://saksham-euw4/datasets",
             datasets = (
-                rlds_dataset.RLDSDataset(name = "lego", version = "2.0.0", weight = 1.0),
+                rlds_dataset.RLDSDataset(name = "lego", version = "3.0.0", weight = 1.0),
             ),
             assets = AssetsConfig(
                 assets_dir = "gs://saksham-euw4/datasets/lego",
@@ -5006,7 +5076,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         action_horizon = 60,
         num_train_steps = 20_000,
         save_interval = 2_500,
-        plot_interval = 50_000,
+        plot_interval = 1_000_000,
         keep_period = 10_000,
         lr_schedule = _optimizer.CosineDecaySchedule(
             warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
@@ -5034,7 +5104,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             repo_id = "lego",
             rlds_data_dir = "gs://saksham-euw4/datasets",
             datasets = (
-                rlds_dataset.RLDSDataset(name = "lego", version = "2.0.0", weight = 1.0),
+                rlds_dataset.RLDSDataset(name = "lego", version = "3.0.0", weight = 1.0),
             ),
             assets = AssetsConfig(
                 assets_dir = "gs://saksham-euw4/datasets/lego",
@@ -5072,7 +5142,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         action_horizon = 60,
         num_train_steps = 20_000,
         save_interval = 2_500,
-        plot_interval = 50_000,
+        plot_interval = 1_000_000,
         keep_period = 10_000,
         lr_schedule = _optimizer.CosineDecaySchedule(
             warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
@@ -6892,6 +6962,97 @@ _CONFIGS = [
         num_val_trajectories = 10,
         include_repos = ("RoboCOIN/Split_aloha_plate_storage", "RoboCOIN/Cobot_Magic_cut_banana", "RoboCOIN/R1_Lite_tableware_cleaning", "RoboCOIN/R1_Lite_place_the_dress_shirt_on_the_hanger", "RoboCOIN/Split_aloha_pour_tea"),
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/robocoin/val_episodes_cache_td_bon_task_description/",
+    ),
+    # TD-BoN + subtask_ar trained directly on real_shirt_hang, rather than as a fine-tune of a
+    # robocoin base. Equivalent to apply_overrides(robocoin_bimanual_paligemma_cql_rlds_subtask_ar,
+    # real_shirt_hang_finetune_subtask_ar_final) flattened into one config, verified field by
+    # field against that merge. Everything -- objective, BestOfN policy, PaliGemma init, the
+    # whole data block, action_horizon 60, predict_subtask_ar, max_token_len 96, discount 0.999
+    # -- comes from that pair unchanged. The deliberate departures are only these:
+    #
+    #   num_train_steps 20_000 rather than pretrained_step + 20_000. There is no pretrained
+    #     step to offset from, which is also why lr_schedule is a bare CosineDecaySchedule
+    #     instead of the OffsetSchedule the fine-tune path wraps around it.
+    #   warmup_steps 1000 rather than the fine-tune's 0. Training starts from PaliGemma, not
+    #     from a critic that is already near its operating point.
+    #   batch_size 128 rather than the base's 256, set here rather than passed as a launcher
+    #     flag so the config is correct on its own.
+    #
+    # peak_lr / decay_lr stay at the fine-tune's 5e-6 / 5e-7 despite starting from PaliGemma.
+    TrainConfig(
+        name = "real_shirt_hang_paligemma_td_bon_subtask_ar",
+        model = _value_function.CQLValueFunctionConfig(
+            q_network_config = _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                max_token_len = 96,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = True,
+            ),
+            q_head_config = _heads.RegressionHeadConfig(),
+            next_token_loss_weight = 0.1,
+            action_horizon = 60,
+            discount = 0.999,
+            tau = 0.005,
+            action_bounds = ActionBounds.from_uniform(-1.25, 1.25, action_dim = 14, is_normalized = True),
+            cql_alpha = 0.0,
+        ),
+        policy = _best_of_n.BestOfNWrapperConfig(
+            action_dim = 14,
+            action_horizon = 60,
+            base_model_config = None,
+            num_samples = 8,
+            use_target_value = True,
+        ),
+        policy_extraction = _policy_extraction.NoopPolicyConfig(),
+        weight_loader = weight_loaders.PaliGemmaWeightLoader(),
+        data = Hdf5RldsDataConfig(
+            repo_id = "real_shirt_hang",
+            rlds_data_dir = "gs://saksham-euw4/hdf5",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "real_shirt_hang", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-euw4/hdf5/real_shirt_hang",
+                asset_id = "norm_stats",
+            ),
+            discount = 0.999,
+            td_n = 60,
+            use_eef = True,
+            state_dim = 14,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            replace_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/real_shirt_hang_pi05/",
+            max_token_len = 96,
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        num_train_steps = 20_000,
+        batch_size = 128,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 1000,
+            peak_lr = 5e-6,
+            decay_steps = 20_000,
+            decay_lr = 5e-7,
+        ),
+        optimizer = _optimizer.AdamW(weight_decay = 1e-6),
+        num_workers = 0,
+        log_interval = 100,
+        save_interval = 10_000,
+        plot_interval = 10_000,
+        keep_period = 10_000,
+        fsdp_devices = 16,
+        action_horizon = 60,
+        num_val_trajectories = 3,
+        include_repos = (),
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/real_shirt_hang/validation_cache_dir_real_shirt_hang_paligemma_td_bon_subtask_ar/",
     ),
     # SARSA critic on sim_bimanual_assembly straight from PaliGemma: bootstrapped targets
     # anchored on the subtask countdown, with the AR subtask head and its next-token loss
