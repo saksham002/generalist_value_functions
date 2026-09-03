@@ -1,6 +1,7 @@
 """Evaluate a value function checkpoint on RoboCOIN cached trajectories."""
 
 import dataclasses
+import gc
 import logging
 import os
 import pickle
@@ -10,55 +11,24 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from openpi.models.best_of_n import BestOfNWrapper
-from openpi.models.best_of_n import BestOfNWrapperConfig
 from openpi.robocoin_utils.load_model_utils import load_critic
 from openpi.robocoin_utils.load_model_utils import load_train_module
+from openpi.robocoin_utils.utils import apply_override_prompt
 from openpi.robocoin_utils.utils import cache_val_episodes
 from openpi.robocoin_utils.utils import count_subtask_segments
 from openpi.robocoin_utils.utils import decode_episode_images
 from openpi.robocoin_utils.utils import get_obs_and_action
+from openpi.robocoin_utils.utils import inject_shuffled_actions
+from openpi.robocoin_utils.utils import predict_trajectory_values
 from openpi.robocoin_utils.utils import predict_values_with_subtasks
 from openpi.robocoin_utils.utils import subtask_boundary_indices
 from openpi.robocoin_utils.utils import subtask_segment_labels
-import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.sharding as _sharding
 import openpi.transforms as _transforms
-import openpi.value_functions.base_value_functions as _base_vf
 
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# Named BestOfN policy configs for counterfactual evaluation.
-# Pass the name via --policy-config on the CLI.
-# =============================================================================
-_POLICY_CONFIGS: dict[str, BestOfNWrapperConfig] = {
-    "robocoin_bimanual_sarsa": BestOfNWrapperConfig(
-        action_dim=14,
-        action_horizon=50,
-        base_model_config=None,
-        num_samples=8,
-        use_target_value=False,
-    ),
-    "robocoin_bimanual_cql": BestOfNWrapperConfig(
-        action_dim=14,
-        action_horizon=50,
-        base_model_config=None,
-        num_samples=8,
-        use_target_value=True,
-    ),
-}
-
-
-def get_policy_config(name: str) -> BestOfNWrapperConfig:
-    if name not in _POLICY_CONFIGS:
-        raise ValueError(
-            f"Unknown policy config '{name}'. Available: {sorted(_POLICY_CONFIGS.keys())}"
-        )
-    return _POLICY_CONFIGS[name]
 
 
 @dataclasses.dataclass(frozen = True)
@@ -74,50 +44,20 @@ class EvalConfig:
     cache_dir: str | None = None
     output_dir: str | None = None
     project_name: str = "robocoin_value_eval"
-    counterfactual_best_of_n: bool = False
     counterfactual_action_store_dir: str | None = None
-    policy_config: str | None = None
-    policy_checkpoint_path: str | None = None
     # Critic checkpoint step to load. If None, uses the latest step.
     step: int | None = None
     override_task_prompt: str | None = None
     batch_size: int = 32
     # If True, populate the validation cache and exit before plotting.
     cache_only: bool = False
-    # Action-gradient-norm mode (action-conditioned Q critics only). When set,
-    # write one ``<demo>.npz`` per evaluated validation demo into this dir — each
-    # holding the per-frame squared L2 norm of the action gradient,
-    # ``||grad_a Q(s, a)||^2`` (summed over the whole 60x14 action chunk), the
-    # predicted Q, and the MC return — then exit before the normal plotting /
-    # subtask / BestOfN paths. Demos are drawn from the validation split,
-    # filtered to is_partial=False and has_subtask_annotations=True.
-    action_gradient_norm_dir: str | None = None
-    # Number of validation demos to evaluate in action-gradient-norm mode.
-    num_grad_demos: int = 5
-    # Shared cache dir for action-gradient-norm mode. When set, demos are cached
-    # here (and reused if already populated) instead of under
-    # ``<action_gradient_norm_dir>/val_cache``. Point multiple runs (e.g. two
-    # critics) at the same dir so they evaluate the identical cached demos; the
-    # first run populates it and later runs reuse it. npz outputs still go to each
-    # run's own ``action_gradient_norm_dir``.
-    grad_cache_dir: str | None = None
-    # Which action to evaluate Q(s, a) / grad_a Q at in action-gradient-norm mode:
-    # "dataset" -> the behaviour action from the dataset (prefix="");
-    # "cached"  -> the first cached counterfactual action, cached_action[0]
-    #              (prefix="counterfactual_", i.e. counterfactual_actions[:, 0]).
-    # "cached" requires the counterfactual action store to be joined, which only
-    # happens on the train split (see rlds_dataset.py), so use --split train and
-    # set --counterfactual-action-store-dir (or a config that already sets it).
-    grad_action_source: str = "dataset"
     # Optional override of the data config's rlds_data_dir (e.g. point at a local
     # mirror of the TFDS data instead of the GCS default baked into the config).
     rlds_data_dir: str | None = None
-    # Subtask critics only. When set, additionally write one ``<traj>.npz`` per
-    # evaluated trajectory into this dir — holding every per-frame value
-    # prediction, the ground-truth subtask boundaries, and the
-    # autoregressively-decoded subtask predictions sampled at
-    # ``subtask_decode_stride`` frame intervals. The per-trajectory video is
-    # rendered either way.
+    # When set, additionally write one ``<traj>.npz`` per evaluated trajectory into this
+    # dir — holding every per-frame value prediction, the ground-truth subtask boundaries
+    # and, for a subtask critic, the subtask predictions sampled at
+    # ``subtask_decode_stride`` frame intervals. Plots and videos are rendered either way.
     subtask_npz_dir: str | None = None
     # Frame stride between autoregressive subtask decodes. None decodes once per
     # second (i.e. fps frames); 1 decodes at every frame instead of forward-filling
@@ -137,10 +77,9 @@ class EvalConfig:
     # titles the video); this flag only decides whether it feeds the value.
     # Orthogonal to counterfactual_value_action.
     condition_on_decoded_subtask: bool = False
-    # Force the standard validation plots even for a subtask critic, whose
-    # prompt_mode would otherwise route to the subtask video and run the
-    # autoregressive decode at every sampled frame. Use to score the cached
-    # ground-truth-subtask prompts with no decoding at all.
+    # Skip the subtask prediction (and its video) for a subtask critic, scoring the cached
+    # ground-truth-subtask prompts with no decoding at all. The standard validation plots
+    # are rendered regardless of this flag.
     disable_subtask_decoding: bool = False
     # ACTION axis (action-conditioned critics only). Selects which action the
     # per-frame Q is evaluated at: False uses the dataset (behaviour) action, True
@@ -148,6 +87,16 @@ class EvalConfig:
     # requires the counterfactual action store to be joined for this split.
     # Orthogonal to condition_on_decoded_subtask.
     counterfactual_value_action: bool = False
+    # Cache exactly these episode_index values instead of whichever trajectories come first.
+    # Empty (default) preserves the positional behaviour. Two configs that filter frames
+    # differently otherwise cache different episodes, which makes their metrics
+    # non-comparable per episode; naming the episodes pins them across arms.
+    val_episode_indices: tuple[int, ...] = ()
+    # Cache multiple trajectories from one repo id. Derived from --fine-tune by default,
+    # because a fine-tune targets a single-repo dataset; set explicitly for a TrainConfig on
+    # such a dataset (e.g. the shirt-hang ResNet), which would otherwise cache exactly one
+    # episode and not be comparable with the fine-tuned arms.
+    allow_duplicate_repos: bool = False
     # GRADIENT axis. When True, the subtask npz additionally carries per-frame
     # ``||grad_a Q(s, a)||^2`` at whichever action the value was read at. Costs one
     # backward pass per batch, so it is opt-in and orthogonal to the other two axes;
@@ -404,58 +353,213 @@ def _action_grad_sq_norms(
     return grads
 
 
-def _run_subtask_prediction(
+def _chosen_actions_from_candidates(frames: list[dict], candidate_values: list) -> list | None:
+    """Per-frame best cached action: the candidate whose Q was highest.
+
+    This is the point the value was read at under --counterfactual-value-action, so it is
+    also where the gradient must be taken — cached_action[0] would report the slope at an
+    arbitrary candidate instead.
+    """
+    if not candidate_values:
+        return None
+    return [
+        np.asarray(f["counterfactual_actions"])[int(np.argmax(candidate_values[i]))]
+        for i, f in enumerate(frames)
+    ]
+
+
+def _write_eval_npz(
+    npz_dir: str,
+    traj_idx: str,
+    *,
+    values,
+    candidate_values,
+    action_grad,
+    mc_returns,
+    boundaries,
+    num_frames: int,
+    sample_indices = None,
+    predicted_texts = None,
+    gt_texts = None,
+    predicted_ids = None,
+    gt_ids = None,
+) -> str:
+    """Write one trajectory's npz. Single writer for every eval path, so the payload cannot
+    drift between critic families.
+
+    Subtask fields are omitted rather than faked for critics that predict no subtask: a
+    whole-task critic has no subtask head, and an empty array says so unambiguously.
+    """
+    import io as _io
+
+    from etils import epath
+
+    payload = {
+        "predicted_values": np.asarray(values, dtype = np.float64),
+        # [num_frames, num_samples] when the cached action store was joined, so the analysis
+        # can take max or a random candidate without re-running the eval.
+        "candidate_values": np.asarray(candidate_values, dtype = np.float64),
+        "action_grad_sq_norm": np.asarray(action_grad, dtype = np.float64),
+        "mc_returns": np.asarray(mc_returns, dtype = np.float64),
+        "subtask_boundaries": np.asarray(boundaries, dtype = np.int32),
+        "num_frames": np.int32(num_frames),
+    }
+    if sample_indices is not None:
+        payload["subtask_pred_t"] = np.asarray(sample_indices, dtype = np.int32)
+        payload["predicted_subtasks"] = np.asarray([(predicted_texts[t] or "") for t in sample_indices])
+        payload["gt_subtasks"] = np.asarray([(gt_texts[t] or "") for t in sample_indices])
+    if predicted_ids is not None:
+        payload["predicted_subtask_ids"] = np.asarray(predicted_ids, dtype = np.int32)
+        payload["gt_subtask_ids"] = np.asarray(gt_ids, dtype = np.int32)
+
+    npz_path = f"{npz_dir.rstrip('/')}/{traj_idx}.npz"
+    # Serialize to bytes, then write via epath so a gs:// dir works as well as local/NFS
+    # (np.savez can't write to gs:// directly).
+    _buf = _io.BytesIO()
+    np.savez(_buf, **payload)
+    _out = epath.Path(npz_path)
+    _out.parent.mkdir(parents = True, exist_ok = True)
+    _out.write_bytes(_buf.getvalue())
+    return npz_path
+
+
+def _forward_fill_subtask_predictions(
+    result,
+    num_frames: int,
+) -> tuple[list[str | None], list[str | None], list[float]]:
+    """Per-frame display state: frames between samples show the most recent reading.
+
+    A per-frame critic fills every slot already, making this a no-op there.
+    """
+    predicted_texts = list(result.predicted_texts)
+    gt_texts = list(result.gt_texts)
+    perplexities = list(result.perplexities)
+    last_pred = last_gt = None
+    last_perp = float("nan")
+    for t in range(num_frames):
+        if predicted_texts[t] is None:
+            predicted_texts[t] = last_pred
+        if gt_texts[t] is None:
+            gt_texts[t] = last_gt
+        if perplexities[t] is None:
+            perplexities[t] = last_perp
+        last_pred, last_gt, last_perp = predicted_texts[t], gt_texts[t], perplexities[t]
+    return predicted_texts, gt_texts, perplexities
+
+
+def _log_subtask_accuracy(
+    sample_indices: list[int],
+    predicted_texts: list[str | None],
+    gt_texts: list[str | None],
+) -> None:
+    """Predicted-vs-GT agreement over the sampled frames.
+
+    Exact match after ``normalize_subtask_text``; for a categorical critic the texts are
+    vocab entries, so this is identical to comparing ids, and for a decoding critic it is
+    stricter — free-form text can miss by a word where an argmax cannot.
+    """
+    scored = [t for t in sample_indices if predicted_texts[t] is not None and gt_texts[t]]
+    if not scored:
+        logger.warning("  Subtask accuracy: no sampled frame carried a GT subtask.")
+        return
+    num_correct = sum(
+        1 for t in scored
+        if _transforms.normalize_subtask_text(predicted_texts[t]).casefold()
+        == _transforms.normalize_subtask_text(gt_texts[t]).casefold()
+    )
+    logger.info(
+        f"  Subtask accuracy ({len(scored)} sampled frames): "
+        f"{num_correct}/{len(scored)} = {num_correct / len(scored):.3f}"
+    )
+
+
+def _run_trajectory_evaluation(
     model,
+    train_module,
     val_tokenizer,
     cache_dir: str,
     image_size: tuple[int, int],
-    eval_config: "EvalConfig",
-    batch_size: int,
+    eval_config: EvalConfig,
     action_conditioned: bool,
+    *,
+    subtask_mode: bool,
+    override_prompt: tuple[np.ndarray, np.ndarray] | None,
     mesh = None,
 ) -> None:
-    """Render per-trajectory subtask-prediction videos and, optionally, per-episode npz.
+    """Score every cached trajectory once and derive every output from that one pass.
 
-    Fires when the critic was trained with
-    ``prompt_mode == "task_description_predict_current_subtask"``, for either critic family:
-    ``predict_values_with_subtasks`` hides whether the subtask arrives as decoded text or as
-    a classifier argmax, so accuracy, the gradient pass, the npz and the video exist once
-    here rather than once per family.
+    The per-trajectory pipeline is fixed; the config only switches steps on and off, so no
+    output depends on a setting it has nothing to do with:
 
-    Everything that issues JIT'd SPMD collectives — the subtask prediction, the value pass
-    and the gradient pass — runs on EVERY rank in lockstep; otherwise non-rank-0 hosts wait
-    at the next barrier for collectives that never fire. Only logging, the npz write and
-    rendering are gated to rank 0.
+    1. decode the cached images and apply the prompt override, if any;
+    2. subtask mode only: predict the subtask (decoded text or classifier argmax) and,
+       under --condition-on-decoded-subtask, rebuild the prompts the value pass sees;
+    3. the value pass — ``predict_values`` with every variant the cache supports (negative
+       prompt, random / shuffled / counterfactual actions, attention);
+    4. the action-gradient pass at the action the value was read at, when requested;
+    5. rank 0: the npz (--subtask-npz-dir), the subtask accuracy and video (subtask mode),
+       and the standard validation plots, rendered from step 3 whatever the other steps did.
+
+    Everything that issues JIT'd SPMD collectives — steps 2 to 4 — runs on EVERY rank in
+    lockstep; otherwise non-rank-0 hosts wait at the next barrier for collectives that never
+    fire. Only logging, the npz write and rendering are gated to rank 0.
     """
     is_rank0 = jax.process_index() == 0
+    batch_size = eval_config.batch_size
 
-    traj_frames = _load_cached_trajectories(cache_dir)
-    split_traj_frames, traj_to_repo_ep, _ = _split_trajectory_frames(traj_frames)
+    split_traj_frames, traj_to_repo_ep, ep_subtasks = _split_trajectory_frames(_load_cached_trajectories(cache_dir))
     if not split_traj_frames:
         if is_rank0:
-            logger.warning("No cached trajectories found for subtask prediction.")
+            logger.warning(f"No cached trajectories found in {cache_dir}.")
         return
 
     npz_mode = eval_config.subtask_npz_dir is not None
     grad_mode = npz_mode and eval_config.action_grad_norm and action_conditioned
 
     if is_rank0:
+        if not subtask_mode:
+            subtask_source = "none (cached prompt)"
+        else:
+            family = "categorical id" if val_tokenizer is None else "decoded text"
+            conditioning = "predicted" if eval_config.condition_on_decoded_subtask else "ground-truth"
+            subtask_source = f"{family}, value conditioned on {conditioning}"
         logger.info(
-            "Subtask critic (%s) | subtask source: %s | value action source: %s | action grad: %s",
-            "categorical id" if val_tokenizer is None else "decoded text",
-            "predicted" if eval_config.condition_on_decoded_subtask else "ground-truth",
+            "Trajectory evaluation | subtask: %s | value action source: %s | action grad: %s | "
+            "prompt override: %s | npz: %s",
+            subtask_source,
             "max over cached actions" if eval_config.counterfactual_value_action else "dataset",
             "on" if grad_mode else "off",
+            "on" if override_prompt is not None else "off",
+            eval_config.subtask_npz_dir or "off",
         )
         if eval_config.action_grad_norm and not npz_mode:
             logger.warning("--action-grad-norm set without --subtask-npz-dir: nothing to write it to.")
         if eval_config.action_grad_norm and not action_conditioned:
             logger.warning("--action-grad-norm set on a state-only critic: no action to differentiate.")
 
-    rendered: dict[str, object] = {}
+    # Accumulators for the standard validation plots, one entry per trajectory segment.
+    plot_predictions: dict[str, list[float]] = {}
+    plot_predictions_neg: dict[str, list[float]] = {}
+    plot_predictions_random: dict[str, list[float]] = {}
+    plot_predictions_counterfactual: dict[str, list[float]] = {}
+    plot_predictions_shuffled: dict[str, list[float]] = {}
+    plot_attn_scores: dict[str, list[np.ndarray]] = {}
+    ep_mc_returns: dict[str, list[float]] = {}
+    ep_frame_images: dict[str, list[np.ndarray]] = {}
+    ep_fps: dict[str, int] = {}
+    ep_include_masks: dict[str, list[bool]] = {}
+    ep_negative_subtasks: dict[str, list[str]] = {}
+    subtask_videos: dict[str, object] = {}
 
-    for traj_idx, frames in split_traj_frames.items():
+    # Pop each trajectory so its decoded frames are released before the next one loads;
+    # the plot accumulators keep only the stacked camera images.
+    for traj_idx in list(split_traj_frames):
+        frames = split_traj_frames.pop(traj_idx)
         decode_episode_images(frames, image_size)
+        if override_prompt is not None:
+            apply_override_prompt(frames, override_prompt)
+        inject_shuffled_actions(frames, action_conditioned = action_conditioned)
+
         repo_id, ep_idx, part_suffix = traj_to_repo_ep[traj_idx]
         mc_returns = [float(np.asarray(f["mc_return"])) for f in frames]
         fps = int(frames[0]["fps"])
@@ -465,111 +569,60 @@ def _run_subtask_prediction(
                 f"Traj {traj_idx} (repo {repo_id}, episode {ep_idx}{part_suffix}): {len(frames)} frames."
             )
 
-        result = predict_values_with_subtasks(
-            model, frames, traj_idx,
-            tokenizer = val_tokenizer,
-            stride = eval_config.subtask_decode_stride,
-            use_predicted_subtask = eval_config.condition_on_decoded_subtask,
-            use_counterfactual_actions = eval_config.counterfactual_value_action,
-            action_conditioned = action_conditioned,
-            score_gt_perplexity = eval_config.score_gt_perplexity,
-            batch_size = batch_size,
-            mesh = mesh,
-            is_rank0 = is_rank0,
-        )
+        subtask_result = None
+        if subtask_mode:
+            subtask_result = predict_values_with_subtasks(
+                model, frames, traj_idx,
+                tokenizer = val_tokenizer,
+                stride = eval_config.subtask_decode_stride,
+                use_predicted_subtask = eval_config.condition_on_decoded_subtask,
+                use_counterfactual_actions = eval_config.counterfactual_value_action,
+                action_conditioned = action_conditioned,
+                score_gt_perplexity = eval_config.score_gt_perplexity,
+                batch_size = batch_size,
+                mesh = mesh,
+                is_rank0 = is_rank0,
+            )
+            value_passes = subtask_result.value_passes
+            values = subtask_result.values
+            value_frames = subtask_result.value_frames
+        else:
+            value_passes = predict_trajectory_values(
+                model, frames, traj_idx, action_conditioned = action_conditioned, batch_size = batch_size, mesh = mesh,
+            )
+            values = value_passes.reported(
+                use_counterfactual_actions = eval_config.counterfactual_value_action, traj_key = traj_idx,
+            )
+            value_frames = frames
 
         # The gradient is taken at the action the value was read at — the best cached
         # candidate under --counterfactual-value-action, else the dataset action — and
         # against the prompt the value used (``value_frames``).
         action_grad: list[float] = []
         if grad_mode:
-            chosen_actions = None
-            if result.candidate_values:
-                chosen_actions = [
-                    np.asarray(f["counterfactual_actions"])[int(np.argmax(result.candidate_values[i]))]
-                    for i, f in enumerate(result.value_frames)
-                ]
             action_grad = _action_grad_sq_norms(
-                model, result.value_frames, chosen_actions,
-                strip_subtask_id = eval_config.condition_on_decoded_subtask,
+                model, value_frames,
+                _chosen_actions_from_candidates(value_frames, value_passes.candidate_values),
+                strip_subtask_id = subtask_mode and eval_config.condition_on_decoded_subtask,
                 batch_size = batch_size,
             )
-
-        boundaries = subtask_boundary_indices(frames)
 
         if not is_rank0:
             continue
 
-        # Forward-fill the display state so frames between samples show the most recent
-        # reading. A per-frame critic fills every slot already, making this a no-op there.
-        predicted_texts = list(result.predicted_texts)
-        gt_texts = list(result.gt_texts)
-        perplexities = list(result.perplexities)
-        last_pred = last_gt = None
-        last_perp = float("nan")
-        for t in range(len(frames)):
-            if predicted_texts[t] is None:
-                predicted_texts[t] = last_pred
-            if gt_texts[t] is None:
-                gt_texts[t] = last_gt
-            if perplexities[t] is None:
-                perplexities[t] = last_perp
-            last_pred, last_gt, last_perp = predicted_texts[t], gt_texts[t], perplexities[t]
-
-        # Predicted-vs-GT agreement over the sampled frames. Exact match after
-        # `normalize_subtask_text`; for a categorical critic the texts are vocab entries, so
-        # this is identical to comparing ids, and for a decoding critic it is stricter —
-        # free-form text can miss by a word where an argmax cannot.
-        scored = [t for t in result.sample_indices if predicted_texts[t] is not None and gt_texts[t]]
-        if scored:
-            num_correct = sum(
-                1 for t in scored
-                if _transforms.normalize_subtask_text(predicted_texts[t]).casefold()
-                == _transforms.normalize_subtask_text(gt_texts[t]).casefold()
-            )
-            logger.info(
-                f"  Subtask accuracy ({len(scored)} sampled frames): "
-                f"{num_correct}/{len(scored)} = {num_correct / len(scored):.3f}"
-            )
-        else:
-            logger.warning("  Subtask accuracy: no sampled frame carried a GT subtask.")
-
-        if npz_mode:
-            import io as _io
-
-            from etils import epath
-
-            payload = {
-                "predicted_values": np.asarray(result.values, dtype = np.float64),
-                # [num_frames, num_samples] when the cached action store was joined, so the
-                # analysis can take max or a random candidate without re-running the eval.
-                "candidate_values": np.asarray(result.candidate_values, dtype = np.float64),
-                "action_grad_sq_norm": np.asarray(action_grad, dtype = np.float64),
-                "mc_returns": np.asarray(mc_returns, dtype = np.float64),
-                "subtask_boundaries": np.asarray(boundaries, dtype = np.int32),
-                "subtask_pred_t": np.asarray(result.sample_indices, dtype = np.int32),
-                "predicted_subtasks": np.asarray([predicted_texts[t] or "" for t in result.sample_indices]),
-                "gt_subtasks": np.asarray([gt_texts[t] or "" for t in result.sample_indices]),
-                "num_frames": np.int32(len(frames)),
-            }
-            # Only a categorical critic has ids; a decoding one has no fixed vocab to index.
-            if result.predicted_ids is not None:
-                payload["predicted_subtask_ids"] = np.asarray(result.predicted_ids, dtype = np.int32)
-                payload["gt_subtask_ids"] = np.asarray(result.gt_ids, dtype = np.int32)
-
-            npz_path = f"{eval_config.subtask_npz_dir.rstrip('/')}/{traj_idx}.npz"
-            # Serialize to bytes, then write via epath so a gs:// subtask_npz_dir works as
-            # well as local/NFS (np.savez can't write to gs:// directly).
-            _buf = _io.BytesIO()
-            np.savez(_buf, **payload)
-            _out = epath.Path(npz_path)
-            _out.parent.mkdir(parents = True, exist_ok = True)
-            _out.write_bytes(_buf.getvalue())
-            logger.info(
-                f"Saved subtask npz to {npz_path}: {len(result.values)} value preds, "
-                f"{len(result.sample_indices)} subtask predictions."
-            )
-
+        plot_predictions[traj_idx] = value_passes.dataset
+        plot_predictions_neg[traj_idx] = value_passes.negative_prompt
+        plot_predictions_random[traj_idx] = value_passes.random_actions
+        plot_predictions_counterfactual[traj_idx] = value_passes.counterfactual_actions
+        plot_predictions_shuffled[traj_idx] = value_passes.shuffled_actions
+        plot_attn_scores[traj_idx] = value_passes.attn_scores
+        ep_mc_returns[traj_idx] = mc_returns
+        ep_fps[traj_idx] = fps
+        ep_include_masks[traj_idx] = [bool(f.get("include_subtask", True)) for f in frames]
+        ep_negative_subtasks[traj_idx] = (
+            count_subtask_segments(frames, prefix = "negative_")[2]
+            if "negative_subtask_1_text" in frames[0] else []
+        )
         frame_images = [
             np.stack([
                 np.asarray(f["image"]["left_wrist_0_rgb"]),
@@ -578,27 +631,69 @@ def _run_subtask_prediction(
             ])
             for f in frames
         ]
+        ep_frame_images[traj_idx] = frame_images
 
-        plot_key = f"val/{repo_id.removeprefix('RoboCOIN/')}_episode_{ep_idx}{part_suffix}_subtask"
-        rendered[plot_key] = _render_subtask_video(
-            mc_returns = mc_returns,
-            predicted_values = result.values,
-            perplexities = perplexities,
-            predicted_texts = predicted_texts,
-            gt_texts = gt_texts,
-            frame_images = frame_images,
-            fps = fps,
-            ep_idx = ep_idx,
-            subtask_texts = subtask_segment_labels(boundaries, gt_texts, len(frames)),
-            output_dir = eval_config.output_dir,
-            plot_key = plot_key,
-            condition_on_decoded = eval_config.condition_on_decoded_subtask,
-        )
+        boundaries = subtask_boundary_indices(frames)
+        npz_subtask_fields: dict = {}
+        if subtask_result is not None:
+            predicted_texts, gt_texts, perplexities = _forward_fill_subtask_predictions(subtask_result, len(frames))
+            _log_subtask_accuracy(subtask_result.sample_indices, predicted_texts, gt_texts)
+            npz_subtask_fields = {
+                "sample_indices": subtask_result.sample_indices,
+                "predicted_texts": predicted_texts,
+                "gt_texts": gt_texts,
+                "predicted_ids": subtask_result.predicted_ids,
+                "gt_ids": subtask_result.gt_ids,
+            }
+            plot_key = f"val/{repo_id.removeprefix('RoboCOIN/')}_episode_{ep_idx}{part_suffix}_subtask"
+            subtask_videos[plot_key] = _render_subtask_video(
+                mc_returns = mc_returns,
+                predicted_values = values,
+                perplexities = perplexities,
+                predicted_texts = predicted_texts,
+                gt_texts = gt_texts,
+                frame_images = frame_images,
+                fps = fps,
+                ep_idx = ep_idx,
+                subtask_texts = subtask_segment_labels(boundaries, gt_texts, len(frames)),
+                output_dir = eval_config.output_dir,
+                plot_key = plot_key,
+                condition_on_decoded = eval_config.condition_on_decoded_subtask,
+            )
 
-    if is_rank0 and eval_config.output_dir is None and rendered:
+        if npz_mode:
+            npz_path = _write_eval_npz(
+                eval_config.subtask_npz_dir, traj_idx,
+                values = values,
+                candidate_values = value_passes.candidate_values,
+                action_grad = action_grad,
+                mc_returns = mc_returns,
+                boundaries = boundaries,
+                num_frames = len(frames),
+                **npz_subtask_fields,
+            )
+            logger.info(f"Saved eval npz to {npz_path}: {len(values)} value preds.")
+
+        del frames, value_frames, subtask_result, value_passes
+        gc.collect()
+
+    if not is_rank0:
+        return
+
+    if eval_config.output_dir is None and subtask_videos:
         import wandb
 
-        wandb.log(rendered)
+        wandb.log(subtask_videos)
+
+    train_module.start_render_thread(
+        plot_predictions, plot_predictions_neg, plot_predictions_random,
+        plot_predictions_shuffled, plot_attn_scores,
+        ep_mc_returns, ep_frame_images, ep_fps, ep_include_masks,
+        ep_subtasks, ep_negative_subtasks,
+        traj_to_repo_ep, action_conditioned, 0,
+        all_predictions_counterfactual = plot_predictions_counterfactual,
+        output_dir = eval_config.output_dir,
+    )
 
 
 def _get_critic_network(model):
@@ -634,148 +729,11 @@ def _jitted_action_grad_sq_norm(model, obs, act):
     return grad_sq_norm, q
 
 
-def _run_action_gradient_norm(
-    model,
-    data_config,
-    action_horizon: int,
-    config,
-    val_input_transform,
-    split: str,
-    eval_config: EvalConfig,
-    action_conditioned: bool,
-) -> None:
-    """Compute and save per-frame ``||grad_a Q(s, a)||^2`` over validation demos.
-
-    Caches validation demos (allow_duplicate_repos so single-task datasets like
-    real_shirt_hang yield multiple trajectories), filters to the first
-    ``num_grad_demos`` demos with is_partial=False and has_subtask_annotations=True,
-    and writes one ``<demo>.npz`` per selected demo into ``action_gradient_norm_dir``.
-    """
-    if not action_conditioned:
-        raise ValueError("action_gradient_norm requires an action-conditioned (Q) critic.")
-
-    if eval_config.grad_action_source not in {"dataset", "cached"}:
-        raise ValueError(
-            f"--grad-action-source must be 'dataset' or 'cached', got {eval_config.grad_action_source!r}."
-        )
-    # "cached" evaluates Q / grad at cached_action[0] = counterfactual_actions[:, 0].
-    # get_obs_and_action now returns all cached candidates, so the [:, 0] is taken at
-    # the call site below (a single action is needed for the gradient).
-    action_prefix = "counterfactual_" if eval_config.grad_action_source == "cached" else ""
-
-    critic_network = _get_critic_network(model)
-    image_size = tuple(critic_network.config.image_size)
-
-    out_dir = eval_config.action_gradient_norm_dir
-    # Shared cache (grad_cache_dir) lets multiple runs reuse the identical cached
-    # demos; otherwise each run caches under its own output dir.
-    cache_dir = eval_config.grad_cache_dir or os.path.join(out_dir, "val_cache")
-
-    # Cache val demos. Only demos with is_partial=False and
-    # has_subtask_annotations=True are cached: a filtering generator drops the
-    # rest before cache_val_episodes sees them, so it keeps pulling trajectories
-    # until num_grad_demos passing demos are written. allow_duplicate_repos=True
-    # so a single-repo dataset (real_shirt_hang) yields distinct per-episode pkls
-    # (matches train_value_function.py's FT path).
-    val_trajectory_dataset = _data_loader.create_rlds_dataset(
-        data_config,
-        action_horizon,
-        config.batch_size,
-        split = split,
-        shuffle = False,
-        return_trajectories = True,
-    )
-
-    def _filter_passing_trajectories(dataset):
-        for traj in dataset:
-            if len(traj["repo_id"]) == 0:
-                continue
-            is_partial = bool(np.asarray(traj["is_partial"][0]))
-            has_annotations = bool(np.asarray(traj["has_subtask_annotations"][0]))
-            if (not is_partial) and has_annotations:
-                yield traj
-
-    cache_val_episodes(
-        _filter_passing_trajectories(val_trajectory_dataset),
-        eval_config.num_grad_demos,
-        cache_dir,
-        include_repos = (),
-        save_only = True,
-        input_transform = val_input_transform,
-        allow_duplicate_repos = True,
-    )
-    del val_trajectory_dataset
-
-    traj_frames = _load_cached_trajectories(cache_dir)
-    selected = [(key, traj_frames[key]) for key in sorted(traj_frames.keys()) if traj_frames[key]]
-    if len(selected) < eval_config.num_grad_demos:
-        logger.warning(
-            "Cached only %d/%d demos with is_partial=False and has_subtask_annotations=True; "
-            "the validation split may not contain enough passing demos.",
-            len(selected), eval_config.num_grad_demos,
-        )
-
-    if action_prefix == "counterfactual_" and selected and "counterfactual_actions" not in selected[0][1][0]:
-        raise ValueError(
-            "grad_action_source='cached' requires cached counterfactual_actions, but none are "
-            "present in the cached frames. The counterfactual action store is only joined on the "
-            "train split (see rlds_dataset.py); use --split train and a config / "
-            "--counterfactual-action-store-dir that points at a store covering this split."
-        )
-
-    os.makedirs(out_dir, exist_ok = True)
-    batch_size = eval_config.batch_size
-    for key, frames in selected:
-        decode_episode_images(frames, image_size)
-        grad_sq_norms: list[float] = []
-        q_values: list[float] = []
-        for batch_start in range(0, len(frames), batch_size):
-            batch_frames = frames[batch_start : batch_start + batch_size]
-            num_real = len(batch_frames)
-            # Pad partial last batches to a fixed leading-axis size so the JIT'd
-            # backward isn't recompiled per trailing-batch length.
-            if num_real < batch_size:
-                batch_frames = batch_frames + [batch_frames[-1]] * (batch_size - num_real)
-            obs, act = get_obs_and_action(batch_frames, prefix = action_prefix, action_conditioned = True)
-            if action_prefix == "counterfactual_" and act is not None:
-                act = act[:, 0]
-            grad_sq_norm_np, q_np = jax.device_get(_jitted_action_grad_sq_norm(model, obs, act))
-            grad_sq_norms.extend(grad_sq_norm_np[:num_real].tolist())
-            q_values.extend(q_np[:num_real].tolist())
-
-        repo_id = frames[0]["repo_id"]
-        if isinstance(repo_id, np.ndarray):
-            repo_id = repo_id.item()
-        if isinstance(repo_id, bytes):
-            repo_id = repo_id.decode("utf-8")
-
-        npz_path = os.path.join(out_dir, f"{key}.npz")
-        np.savez(
-            npz_path,
-            grad_sq_norm = np.asarray(grad_sq_norms, dtype = np.float64),
-            predicted_value = np.asarray(q_values, dtype = np.float64),
-            mc_return = np.asarray([float(np.asarray(f["mc_return"])) for f in frames], dtype = np.float64),
-            frame_index = np.asarray([int(np.asarray(f["_frame_index"])) for f in frames], dtype = np.int32),
-            episode_index = np.int32(int(np.asarray(frames[0]["episode_index"]))),
-            repo_id = str(repo_id),
-            num_frames = np.int32(len(frames)),
-            action_source = str(eval_config.grad_action_source),
-        )
-        logger.info(
-            "Saved action-gradient-norm npz to %s (%d frames, mean ||grad_a Q||^2=%.4e).",
-            npz_path, len(frames), float(np.mean(grad_sq_norms)),
-        )
-
-
 def main(eval_config: EvalConfig):
     logging.basicConfig(level = logging.INFO, format = "%(asctime)s %(levelname)s %(name)s: %(message)s", force = True)
 
     if eval_config.split not in {"train", "val"}:
         raise ValueError(f"--split must be 'train' or 'val', got {eval_config.split!r}.")
-    if eval_config.counterfactual_best_of_n and eval_config.counterfactual_action_store_dir is None:
-        raise ValueError("--counterfactual-action-store-dir is required with --counterfactual-best-of-n.")
-    if eval_config.counterfactual_best_of_n and eval_config.policy_checkpoint_path is None:
-        raise ValueError("--policy-checkpoint-path is required with --counterfactual-best-of-n.")
 
     platform = os.environ.get("PLATFORM", "gpu")
     if platform == "tpu":
@@ -803,7 +761,7 @@ def main(eval_config: EvalConfig):
         )
 
     resolved_fsdp_devices = eval_config.fsdp_devices or jax.device_count()
-    model, critic_norm_stats, config, critic_step = load_critic(
+    model, _, config, critic_step = load_critic(
         eval_config.config_name,
         eval_config.checkpoint_path,
         fine_tune = eval_config.fine_tune,
@@ -839,24 +797,6 @@ def main(eval_config: EvalConfig):
 
     cache_dir = _resolve_eval_cache_dir(eval_config)
     split = data_config.val_split if eval_config.split == "val" else eval_config.split
-
-    if eval_config.action_gradient_norm_dir is not None:
-        logger.info(
-            "Action-gradient-norm mode: computing ||grad_a Q(s, a)||^2 over %d validation demos -> %s",
-            eval_config.num_grad_demos, eval_config.action_gradient_norm_dir,
-        )
-        _run_action_gradient_norm(
-            model = model,
-            data_config = data_config,
-            action_horizon = action_horizon,
-            config = config,
-            val_input_transform = val_input_transform,
-            split = split,
-            eval_config = eval_config,
-            action_conditioned = action_conditioned,
-        )
-        logger.info("Action-gradient-norm computation complete.")
-        return
 
     cache_complete = False
     # epath.iterdir handles gs:// cache dirs (virtual prefix) as well as local/NFS.
@@ -896,7 +836,8 @@ def main(eval_config: EvalConfig):
             # Mirrors train_value_function.py's FT path: a fine-tune config targets a
             # single-repo dataset, so without this every val episode collapses onto one
             # repo_key and only one trajectory is ever cached.
-            allow_duplicate_repos = eval_config.fine_tune is not None,
+            allow_duplicate_repos = eval_config.fine_tune is not None or eval_config.allow_duplicate_repos,
+            episode_indices = eval_config.val_episode_indices or None,
         )
         del val_trajectory_dataset
 
@@ -935,11 +876,9 @@ def main(eval_config: EvalConfig):
             config = dataclasses.asdict(eval_config),
         )
 
-    # When the critic was trained with prompt_mode="task_description_predict_current_subtask",
-    # the subtask video (rendered below) already carries the camera + value
-    # subplots plus the per-second predicted/GT subtask titles and perplexity
-    # curve. Skip the default 4-subplot video entirely — it's a duplicate, and
-    # the value predictions are recomputed inside _run_subtask_prediction.
+    # A critic trained with prompt_mode="task_description_predict_current_subtask" predicts
+    # its own subtask, which adds the decode step and the subtask video to the evaluation;
+    # every other output (standard plots, npz, gradients) is produced the same way either way.
     critic_prompt_mode = (
         getattr(config.data, "prompt_mode", None)
         or getattr(config.data, "subtask_prompt_mode", None)
@@ -948,161 +887,19 @@ def main(eval_config: EvalConfig):
         critic_prompt_mode == "task_description_predict_current_subtask"
         and not eval_config.disable_subtask_decoding
     )
-    if not subtask_mode:
-        train_module.generate_validation_plots_dlimp(
-            model = model,
-            val_episode_indices = list(range(eval_config.num_trajectories)),
-            step = 0,
-            action_conditioned = action_conditioned,
-            data_config = data_config,
-            cache_dir = cache_dir,
-            output_dir = eval_config.output_dir,
-            batch_size = eval_config.batch_size,
-            override_prompt = override_prompt,
-        )
-    else:
-        logger.info(
-            "Subtask mode: skipping generate_validation_plots_dlimp; the subtask "
-            "video below carries the camera + value + perplexity subplots."
-        )
-        logger.info(
-            "Running subtask prediction (per-second autoregressive decode + GT perplexity)..."
-        )
-        image_size = data_config.rlds_kwargs.get("image_size", (224, 224))
-        _run_subtask_prediction(
-            model = model,
-            val_tokenizer = val_tokenizer,
-            cache_dir = cache_dir,
-            image_size = tuple(image_size),
-            eval_config = eval_config,
-            batch_size = eval_config.batch_size,
-            action_conditioned = action_conditioned,
-            mesh = inference_mesh,
-        )
-
-    if eval_config.counterfactual_best_of_n and action_conditioned:
-        logger.info("Running BestOfN counterfactual evaluation...")
-        import jax.numpy as jnp
-
-        if eval_config.policy_config is None:
-            raise ValueError(
-                "counterfactual_best_of_n requires --policy-config. "
-                f"Available: {sorted(_POLICY_CONFIGS.keys())}"
-            )
-        policy_cfg = get_policy_config(eval_config.policy_config)
-
-        traj_frames = _load_cached_trajectories(cache_dir)
-        split_traj_frames, traj_to_repo_ep, ep_subtasks = _split_trajectory_frames(traj_frames)
-
-        first_frames = next(iter(split_traj_frames.values()))
-        num_samples = first_frames[0]["counterfactual_actions"].shape[0]
-        network_config = config.model.network_config
-
-        policy_norm_stats_dir = os.path.join(eval_config.policy_checkpoint_path, "assets", data_config.asset_id)
-        policy_norm_stats = _normalize.load(policy_norm_stats_dir)
-        logger.info(f"Loaded policy norm stats from {policy_norm_stats_dir}")
-
-        bon_model = BestOfNWrapper(
-            action_dim = network_config.action_dim,
-            action_horizon = action_horizon,
-            max_token_len = network_config.max_token_len,
-            base_model = None,
-            num_samples = num_samples,
-            take_min_over_ensemble = policy_cfg.take_min_over_ensemble,
-            use_target_value = policy_cfg.use_target_value,
-            convert_to_global = policy_cfg.convert_to_global,
-            selection_mode = policy_cfg.selection_mode,
-            softmax_temperature = policy_cfg.softmax_temperature,
-            policy_norm_stats = policy_norm_stats,
-            critic_norm_stats = critic_norm_stats,
-        )
-
-        @nnx.jit
-        def _jitted_bon_eval(bon, vf, rng, obs, action, cf_actions):
-            transition = _base_vf.Transition(
-                observation = obs,
-                action = action,
-                counterfactual_actions = cf_actions,
-            )
-            best_action = bon.sample_actions(rng, transition, compute_next_action = False, value_function = vf)
-            result = vf.compute_value(obs, best_action, take_min_over_ensemble = True)
-            q_value = result[0] if isinstance(result, tuple) else result
-            return q_value
-
-        BATCH_SIZE = 8
-        bon_rng = jax.random.PRNGKey(86)
-        ep_mc_returns = {}
-        ep_frame_images = {}
-        ep_fps = {}
-        ep_include_masks = {}
-        bon_predictions: dict[str, list[float]] = {}
-
-        for traj_idx, frames in split_traj_frames.items():
-            ep_mc_returns[traj_idx] = [f["mc_return"] for f in frames]
-            ep_frame_images[traj_idx] = [
-                np.stack([
-                    np.asarray(f["image"]["left_wrist_0_rgb"]),
-                    np.asarray(f["image"]["right_wrist_0_rgb"]),
-                    np.asarray(f["image"]["base_0_rgb"]),
-                ])
-                for f in frames
-            ]
-            ep_fps[traj_idx] = int(frames[0]["fps"])
-            ep_include_masks[traj_idx] = [bool(f.get("include_subtask", True)) for f in frames]
-            bon_predictions[traj_idx] = []
-
-            for batch_start in range(0, len(frames), BATCH_SIZE):
-                batch_frames = frames[batch_start : batch_start + BATCH_SIZE]
-                obs, action = get_obs_and_action(batch_frames, prefix = "", action_conditioned = True)
-                cf_actions = jnp.asarray(np.stack([f["counterfactual_actions"] for f in batch_frames], axis = 0))
-                bon_rng, step_rng = jax.random.split(bon_rng)
-                q_values = jax.device_get(_jitted_bon_eval(bon_model, model, step_rng, obs, action, cf_actions))
-                bon_predictions[traj_idx].extend(q_values.tolist())
-
-        total = sum(len(preds) for preds in bon_predictions.values())
-        logger.info(f"Computed {total} BestOfN predictions")
-
-        if jax.process_index() == 0:
-            best_of_n_images = {}
-            for traj_idx in ep_mc_returns:
-                repo_id, ep_idx, part_suffix = traj_to_repo_ep[traj_idx]
-                plot_key = f"val/{repo_id.removeprefix('RoboCOIN/')}_episode_{ep_idx}{part_suffix}_best_of_n"
-                mc_returns = ep_mc_returns[traj_idx]
-                include_masks = ep_include_masks[traj_idx]
-                predicted_values = bon_predictions[traj_idx]
-
-                if len(predicted_values) != len(mc_returns):
-                    raise ValueError(
-                        f"BestOfN prediction length mismatch for {traj_idx}: "
-                        f"{len(predicted_values)} predictions vs {len(mc_returns)} returns."
-                    )
-
-                filtered_mc = [mc for mc, include in zip(mc_returns, include_masks, strict = True) if include]
-                filtered_pred = [pred for pred, include in zip(predicted_values, include_masks, strict = True) if include]
-                filtered_images = [img for img, include in zip(ep_frame_images[traj_idx], include_masks, strict = True) if include]
-
-                if not filtered_mc:
-                    continue
-
-                best_of_n_images[plot_key] = train_module._create_value_plot(
-                    filtered_mc,
-                    filtered_pred,
-                    ep_idx,
-                    0,
-                    " (BestOfN Q)",
-                    oracle_values = None,
-                    subtask_texts = ep_subtasks[traj_idx],
-                    plot_video = True,
-                    frame_images = filtered_images,
-                    fps = ep_fps[traj_idx],
-                    output_dir = eval_config.output_dir,
-                    plot_key = plot_key,
-                )
-
-            if eval_config.output_dir is None and best_of_n_images:
-                import wandb
-
-                wandb.log(best_of_n_images)
+    image_size = data_config.rlds_kwargs.get("image_size", (224, 224))
+    _run_trajectory_evaluation(
+        model = model,
+        train_module = train_module,
+        val_tokenizer = val_tokenizer,
+        cache_dir = cache_dir,
+        image_size = tuple(image_size),
+        eval_config = eval_config,
+        action_conditioned = action_conditioned,
+        subtask_mode = subtask_mode,
+        override_prompt = override_prompt,
+        mesh = inference_mesh,
+    )
 
     # Keep all hosts alive until rank 0 has fully completed async rendering/logging.
     if (

@@ -47,11 +47,13 @@ import openpi.transforms as _transforms
 import openpi.value_functions.base_value_functions as _value_fn
 import openpi.value_functions.value_function as _value_fn_impl
 from openpi.robocoin_utils.utils import (
+    apply_override_prompt,
     cache_val_episodes,
     count_subtask_segments,
     decode_episode_images,
     decode_text,
     get_obs_and_action,
+    inject_shuffled_actions,
     predict_values,
     SnapshotConfig,
     stack_frames,
@@ -2045,14 +2047,7 @@ def generate_validation_plots_dlimp(
             continue
 
         if override_prompt is not None:
-            override_tokens, override_mask = override_prompt
-            for frame in frames:
-                frame["tokenized_prompt"] = override_tokens
-                frame["tokenized_prompt_mask"] = override_mask
-                # Override is prefix-only — drop the cached subtask indices so the
-                # critic runs with subtask_start_index=None for the overridden prompt.
-                frame.pop("subtask_start_index", None)
-                frame.pop("subtask_end_index", None)
+            apply_override_prompt(frames, override_prompt)
 
         decode_episode_images(frames, image_size)
 
@@ -2090,14 +2085,7 @@ def generate_validation_plots_dlimp(
             if len(seg_frames) == 0:
                 continue
 
-            # Inject within-trajectory action permutation for the shuffled-actions plot.
-            # Deterministic per-segment seed so plots are reproducible across runs.
-            if action_conditioned and len(seg_frames) > 1 and "actions" in seg_frames[0]:
-                rng_perm = np.random.default_rng(seed = 86)
-                perm = rng_perm.permutation(len(seg_frames))
-                shuffled_arrays = [seg_frames[p]["actions"] for p in perm]
-                for i, frame in enumerate(seg_frames):
-                    frame["shuffled_actions"] = shuffled_arrays[i]
+            inject_shuffled_actions(seg_frames, action_conditioned = action_conditioned)
 
             traj_to_repo_ep[seg_key] = (repo_id_raw, ep_idx, part_suffix)
             ep_subtasks[seg_key] = seg_subtasks
@@ -2172,31 +2160,33 @@ def generate_validation_plots_dlimp(
     )
 
     if jax.process_index() == 0:
-        global _render_thread
-        if _render_thread is not None:
-            if _render_thread.is_alive():
-                logging.warning("Previous render thread still running, waiting for it to finish...")
-            _render_thread.join()
-            _render_thread = None
-        _render_thread = threading.Thread(
-            target = _render_and_log_plots,
-            args = (
-                all_predictions, all_predictions_neg, all_predictions_random,
-                all_predictions_shuffled,
-                all_attn_scores,
-                ep_mc_returns, ep_frame_images, ep_fps, ep_include_masks,
-                ep_subtasks, ep_negative_subtasks,
-                traj_to_repo_ep, action_conditioned, step,
-            ),
-            kwargs = dict(
-                all_predictions_counterfactual = all_predictions_counterfactual,
-                output_dir = output_dir,
-            ),
-            daemon = True,
+        start_render_thread(
+            all_predictions, all_predictions_neg, all_predictions_random,
+            all_predictions_shuffled, all_attn_scores,
+            ep_mc_returns, ep_frame_images, ep_fps, ep_include_masks,
+            ep_subtasks, ep_negative_subtasks,
+            traj_to_repo_ep, action_conditioned, step,
+            all_predictions_counterfactual = all_predictions_counterfactual,
+            output_dir = output_dir,
         )
-        _render_thread.start()
 
     return {}
+
+
+def start_render_thread(*args, **kwargs) -> None:
+    """Render the standard validation plots on a background thread.
+
+    Takes ``_render_and_log_plots``'s arguments. One render runs at a time: a still-running
+    previous render is joined first. Callers must join ``_render_thread`` before exiting.
+    """
+    global _render_thread
+    if _render_thread is not None:
+        if _render_thread.is_alive():
+            logging.warning("Previous render thread still running, waiting for it to finish...")
+        _render_thread.join()
+        _render_thread = None
+    _render_thread = threading.Thread(target = _render_and_log_plots, args = args, kwargs = kwargs, daemon = True)
+    _render_thread.start()
 
 
 def main(config: _config.TrainConfig):

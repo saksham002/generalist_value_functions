@@ -493,6 +493,7 @@ def cache_val_episodes(
     save_only: bool,
     input_transform = None,
     allow_duplicate_repos: bool = False,
+    episode_indices: tuple[int, ...] | None = None,
 ) -> dict[str, list[dict]]:
     """Load or collect validation episodes, optionally caching them to disk.
 
@@ -520,6 +521,11 @@ def cache_val_episodes(
         save_only: If True, collect and cache episodes then return {}.
         input_transform: Composed transform pipeline (Normalize + ResizeImages + TokenizePrompt)
             applied to each frame before caching. Required when collecting, ignored when loading.
+        episode_indices: Cache only these ``episode_index`` values, in place of taking whichever
+            trajectories come first. Default None keeps the original positional behaviour.
+            Selection is otherwise position-based, so two configs whose filters drop different
+            episodes end up caching different ones; naming the episodes is what makes a cache
+            comparable across configs.
 
     Returns:
         Dict mapping ``<sanitized_repo_key>`` (str) -> sorted list of frame dicts,
@@ -618,6 +624,15 @@ def cache_val_episodes(
 
             repo_id = _decode_repo_id(traj["repo_id"][0])
             repo_key: int | str = int(traj["repo_index"][0]) if "repo_index" in traj else repo_id
+
+            if episode_indices is not None:
+                if "episode_index" not in traj:
+                    raise ValueError(
+                        "episode_indices was given but the trajectories carry no episode_index; "
+                        "this dataset cannot be filtered by episode."
+                    )
+                if int(np.asarray(traj["episode_index"][0])) not in episode_indices:
+                    continue
 
             if not allow_duplicate_repos and repo_key in seen_repo_keys:
                 continue
@@ -730,6 +745,20 @@ def cache_val_episodes(
     return traj_frames
 
 
+def _variant_obs_and_action(
+    frame_dicts: list[dict],
+    prefix: str,
+    *,
+    action_conditioned: bool,
+    strip_subtask_id: bool,
+) -> tuple[_model.Observation, _model.Actions | None]:
+    """``get_obs_and_action`` for one prompt / action variant, minus the ground-truth id if asked."""
+    obs, act = get_obs_and_action(frame_dicts, prefix = prefix, action_conditioned = action_conditioned)
+    if strip_subtask_id:
+        obs = dataclasses.replace(obs, subtask_id = None)
+    return obs, act
+
+
 def predict_values(
     model: _value_fn.BaseValueFunction,
     all_frames: list[tuple],
@@ -737,6 +766,8 @@ def predict_values(
     action_conditioned: bool,
     batch_size: int = 64,
     mesh: "jax.sharding.Mesh | None" = None,
+    *,
+    strip_subtask_id: bool = False,
 ) -> tuple[
     dict[str, list[float]],
     dict[str, list[float]],
@@ -750,7 +781,11 @@ def predict_values(
 
     Performs up to four forward passes per batch where applicable: default prompt,
     negative (counterfactual) prompt, random actions, and shuffled actions
-    (within-trajectory permutation; injected upstream into each frame dict).
+    (within-trajectory permutation; see ``inject_shuffled_actions``).
+
+    ``strip_subtask_id`` drops the cached ground-truth ``subtask_id`` from every variant's
+    observation so a categorical-subtask critic conditions on its own argmax instead; the
+    same conditioning then holds across all variants of a frame.
 
     When the network's compute_value returns (val, attn_scores) (e.g. PaliGemma at
     inference), attention scores are collected alongside predictions and returned as
@@ -810,7 +845,9 @@ def predict_values(
         if len(frame_dicts) < batch_size:
             frame_dicts = frame_dicts + [frame_dicts[-1]] * (batch_size - len(frame_dicts))
 
-        obs, act = get_obs_and_action(frame_dicts, prefix="", action_conditioned=action_conditioned)
+        obs, act = _variant_obs_and_action(
+            frame_dicts, "", action_conditioned = action_conditioned, strip_subtask_id = strip_subtask_id,
+        )
 
         # Shard the default-path batch across devices when a mesh is provided.
         # Other obs variants below (negative / random / counterfactual /
@@ -843,19 +880,23 @@ def predict_values(
 
         pred_values_neg_np = None
         if "tokenized_negative_prompt" in frame_dicts[0]:
-            obs_neg, act_neg = get_obs_and_action(frame_dicts, prefix="negative_", action_conditioned=action_conditioned)
+            obs_neg, act_neg = _variant_obs_and_action(
+                frame_dicts, "negative_", action_conditioned = action_conditioned, strip_subtask_id = strip_subtask_id,
+            )
             pred_values_neg_np, _ = jax.device_get(_jitted_compute_value(model, obs_neg, act_neg))
 
         pred_values_random_np = None
         if "random_actions" in frame_dicts[0]:
-            obs_random, act_random = get_obs_and_action(frame_dicts, prefix="random_", action_conditioned=action_conditioned)
+            obs_random, act_random = _variant_obs_and_action(
+                frame_dicts, "random_", action_conditioned = action_conditioned, strip_subtask_id = strip_subtask_id,
+            )
             pred_values_random_np, _ = jax.device_get(_jitted_compute_value(model, obs_random, act_random))
 
         pred_values_counterfactual_np = None
         candidate_values_np = None
         if action_conditioned and "counterfactual_actions" in frame_dicts[0]:
-            obs_counterfactual, act_counterfactual = get_obs_and_action(
-                frame_dicts, prefix = "counterfactual_", action_conditioned = True
+            obs_counterfactual, act_counterfactual = _variant_obs_and_action(
+                frame_dicts, "counterfactual_", action_conditioned = True, strip_subtask_id = strip_subtask_id,
             )
             # act_counterfactual is [b, num_samples, ah, ad]; score all cached
             # candidates against a shared prefix cache, keep every candidate's value and
@@ -867,7 +908,9 @@ def predict_values(
 
         pred_values_shuffled_np = None
         if "shuffled_actions" in frame_dicts[0]:
-            obs_shuffled, act_shuffled = get_obs_and_action(frame_dicts, prefix="shuffled_", action_conditioned=action_conditioned)
+            obs_shuffled, act_shuffled = _variant_obs_and_action(
+                frame_dicts, "shuffled_", action_conditioned = action_conditioned, strip_subtask_id = strip_subtask_id,
+            )
             pred_values_shuffled_np, _ = jax.device_get(_jitted_compute_value(model, obs_shuffled, act_shuffled))
 
         for i, (ep_idx, _, _) in enumerate(batch_frames):
@@ -892,6 +935,92 @@ def predict_values(
         all_predictions_counterfactual, all_predictions_shuffled, all_attn_scores,
         all_counterfactual_candidate_values,
     )
+
+
+@dataclasses.dataclass
+class TrajectoryValuePredictions:
+    """Every value pass ``predict_values`` ran over one trajectory, unpacked by name.
+
+    A variant list is empty when its inputs were absent from the cached frames (no negative
+    prompt, no random / shuffled / counterfactual actions) or the critic has no per-modality
+    attention; a full list is one entry per frame. ``counterfactual_actions`` is the
+    per-frame max over ``candidate_values``, which keeps every cached candidate's value.
+    """
+
+    dataset: list[float]
+    negative_prompt: list[float]
+    random_actions: list[float]
+    counterfactual_actions: list[float]
+    shuffled_actions: list[float]
+    attn_scores: list[np.ndarray]
+    candidate_values: list[np.ndarray]
+
+    def reported(self, *, use_counterfactual_actions: bool, traj_key: str) -> list[float]:
+        """The value the evaluation reports: at the best cached action, or at the dataset one."""
+        if not use_counterfactual_actions:
+            return self.dataset
+        if not self.counterfactual_actions:
+            raise ValueError(
+                f"Counterfactual actions requested but none were cached for {traj_key}. The cached "
+                "action store must be joined for this split (see the 'skipping join' warning)."
+            )
+        return self.counterfactual_actions
+
+
+def predict_trajectory_values(
+    model: _value_fn.BaseValueFunction,
+    frames: list[dict],
+    traj_key: str,
+    *,
+    action_conditioned: bool,
+    batch_size: int = 64,
+    mesh: "jax.sharding.Mesh | None" = None,
+    strip_subtask_id: bool = False,
+) -> TrajectoryValuePredictions:
+    """``predict_values`` over one trajectory, with the per-episode dicts unpacked."""
+    indexed = [(traj_key, i, f) for i, f in enumerate(frames)]
+    preds, preds_neg, preds_random, preds_cf, preds_shuffled, attn, candidates = predict_values(
+        model, indexed, {traj_key: [f["mc_return"] for f in frames]}, action_conditioned,
+        batch_size = batch_size, mesh = mesh, strip_subtask_id = strip_subtask_id,
+    )
+    return TrajectoryValuePredictions(
+        dataset = preds[traj_key],
+        negative_prompt = preds_neg[traj_key],
+        random_actions = preds_random[traj_key],
+        counterfactual_actions = preds_cf[traj_key],
+        shuffled_actions = preds_shuffled[traj_key],
+        attn_scores = attn[traj_key],
+        candidate_values = candidates[traj_key],
+    )
+
+
+def apply_override_prompt(frames: list[dict], override_prompt: tuple[np.ndarray, np.ndarray]) -> None:
+    """Replace every frame's tokenized prompt with ``(tokens, mask)``.
+
+    The override is prefix-only, so the cached subtask indices are dropped and the critic
+    runs with ``subtask_start_index=None`` for the overridden prompt.
+    """
+    override_tokens, override_mask = override_prompt
+    for frame in frames:
+        frame["tokenized_prompt"] = override_tokens
+        frame["tokenized_prompt_mask"] = override_mask
+        frame.pop("subtask_start_index", None)
+        frame.pop("subtask_end_index", None)
+
+
+def inject_shuffled_actions(frames: list[dict], *, action_conditioned: bool) -> None:
+    """Add a within-trajectory permutation of ``actions`` as ``shuffled_actions`` on each frame.
+
+    Feeds the shuffled-actions pass of ``predict_values``. The permutation is seeded per
+    call so the plot is reproducible across runs; state-only critics and single-frame
+    trajectories get nothing.
+    """
+    if not (action_conditioned and len(frames) > 1 and "actions" in frames[0]):
+        return
+    permutation = np.random.default_rng(seed = 86).permutation(len(frames))
+    shuffled = [frames[p]["actions"] for p in permutation]
+    for frame, actions in zip(frames, shuffled, strict = True):
+        frame["shuffled_actions"] = actions
 
 
 
@@ -1307,15 +1436,19 @@ def subtask_segment_labels(boundaries: list[int], gt_texts: list[str | None], nu
 class SubtaskPredictions:
     """Per-frame subtask predictions and values for one trajectory, family-agnostic.
 
-    ``perplexities`` is NaN wherever the critic family has no teacher-forced perplexity
-    (the categorical head has none) or scoring was disabled. ``predicted_ids`` / ``gt_ids``
-    are None for text-decoding critics, whose subtasks are not drawn from a fixed vocab.
-    ``value_frames`` are the frames as actually scored, so a caller taking gradients
-    differentiates against the same prompt the value used.
+    ``values`` is the reported value under the chosen subtask / action axes; ``value_passes``
+    carries every pass the value run produced (dataset, negative prompt, random / shuffled /
+    counterfactual actions, attention), which the standard validation plots draw from
+    regardless of how the subtask was obtained. ``perplexities`` is NaN wherever the critic
+    family has no teacher-forced perplexity (the categorical head has none) or scoring was
+    disabled. ``predicted_ids`` / ``gt_ids`` are None for text-decoding critics, whose
+    subtasks are not drawn from a fixed vocab. ``value_frames`` are the frames as actually
+    scored, so a caller taking gradients differentiates against the same prompt the value
+    used.
     """
 
     values: list[float]
-    candidate_values: list[np.ndarray]
+    value_passes: TrajectoryValuePredictions
     predicted_texts: list[str | None]
     gt_texts: list[str | None]
     perplexities: list[float | None]
@@ -1425,21 +1558,13 @@ def _predict_with_decoded_subtask(
     else:
         value_frames = list(frames)
 
-    indexed = [(traj_key, i, f) for i, f in enumerate(value_frames)]
-    mc_returns = {traj_key: [f["mc_return"] for f in frames]}
-    preds, _, _, preds_cf, _, _, candidates = predict_values(
-        model, indexed, mc_returns, action_conditioned, batch_size = batch_size, mesh = mesh,
+    value_passes = predict_trajectory_values(
+        model, value_frames, traj_key, action_conditioned = action_conditioned, batch_size = batch_size, mesh = mesh,
     )
-    if use_counterfactual_actions and not preds_cf.get(traj_key):
-        raise ValueError(
-            f"Counterfactual actions requested but none were cached for {traj_key}. The cached "
-            "action store must be joined for this split (see the 'skipping join' warning)."
-        )
-    values = preds_cf[traj_key] if use_counterfactual_actions else preds[traj_key]
 
     return SubtaskPredictions(
-        values = values,
-        candidate_values = candidates.get(traj_key) or [],
+        values = value_passes.reported(use_counterfactual_actions = use_counterfactual_actions, traj_key = traj_key),
+        value_passes = value_passes,
         predicted_texts = predicted_texts,
         gt_texts = gt_texts,
         perplexities = perplexities,
@@ -1454,42 +1579,39 @@ def _predict_with_categorical_subtask(
 ) -> SubtaskPredictions:
     """Categorical-id implementation (ResNet).
 
-    The classifier head reads the shared image features, so one forward per frame yields the
-    value and the subtask id together. There is no autoregressive decode and no teacher-forced
-    perplexity, so perplexity stays NaN.
+    There is no autoregressive decode and no teacher-forced perplexity, so perplexity stays
+    NaN. The values come from the same ``predict_values`` pass as every other critic, with
+    the ground-truth id stripped when the critic is to condition on its own argmax; the
+    predicted ids come from one extra trunk pass, which reads the image features alone and so
+    scores the dataset action whatever the action axis is set to.
     """
     network = critic_network(model)
     vocab = network.config.subtask_vocab
     if vocab is None:
         raise ValueError("Categorical subtask evaluation requires subtask_vocab on the network config.")
+    if "subtask_id" not in frames[0]:
+        raise ValueError(
+            "Categorical subtask evaluation requires a cached subtask_id on every frame "
+            "(was the cache written by a config with a subtask_vocab?)."
+        )
 
+    value_passes = predict_trajectory_values(
+        model, frames, traj_key, action_conditioned = action_conditioned,
+        batch_size = batch_size, mesh = mesh, strip_subtask_id = use_predicted_subtask,
+    )
     indexed = [(traj_key, i, f) for i, f in enumerate(frames)]
-    values, resolved_ids, candidates = predict_values_categorical_subtask(
+    _, predicted_only, _ = predict_values_categorical_subtask(
         model, indexed, {traj_key}, action_conditioned,
-        use_predicted_subtask = use_predicted_subtask,
-        use_counterfactual_actions = use_counterfactual_actions,
+        use_predicted_subtask = True,
+        use_counterfactual_actions = False,
         batch_size = batch_size, mesh = mesh,
     )
-
-    if use_predicted_subtask:
-        predicted_ids = resolved_ids[traj_key]
-    else:
-        # The value used the ground-truth id, so the predictor's argmax needs its own pass.
-        # It reads the image features alone, so it scores the dataset action whatever the
-        # action axis is set to -- rescoring every cached candidate would cost double and
-        # return the same ids.
-        _, predicted_only, _ = predict_values_categorical_subtask(
-            model, indexed, {traj_key}, action_conditioned,
-            use_predicted_subtask = True,
-            use_counterfactual_actions = False,
-            batch_size = batch_size, mesh = mesh,
-        )
-        predicted_ids = predicted_only[traj_key]
+    predicted_ids = predicted_only[traj_key]
 
     gt_ids = [int(np.asarray(f["subtask_id"])) for f in frames]
     return SubtaskPredictions(
-        values = values[traj_key],
-        candidate_values = candidates.get(traj_key) or [],
+        values = value_passes.reported(use_counterfactual_actions = use_counterfactual_actions, traj_key = traj_key),
+        value_passes = value_passes,
         predicted_texts = [vocab[i] for i in predicted_ids],
         gt_texts = [vocab[i] for i in gt_ids],
         perplexities = [float("nan")] * len(frames),

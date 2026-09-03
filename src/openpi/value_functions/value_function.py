@@ -346,6 +346,23 @@ class MCValueFunction(ValueFunction):
             rng=rng,
         )
 
+    def compute_prefix_cache(
+        self,
+        observation: _model.Observation,
+    ) -> tuple[at.Array, at.Array, at.Array | None]:
+        """Expose the network's prefix-cache fast path, as the SARSA and CQL critics do.
+
+        Lets one encoder pass over images + prompt be shared across the N candidate actions
+        of a Best-of-N evaluation instead of re-encoding per candidate. No ``use_target``
+        argument: a Monte-Carlo critic bootstraps off nothing and so has no target network.
+        """
+        if not hasattr(self.network, "compute_prefix_cache"):
+            raise AttributeError(
+                f"{type(self.network).__name__} does not support prefix caching. "
+                "Callers should check hasattr before invoking."
+            )
+        return self.network.compute_prefix_cache(observation)
+
 
 class SARSAValueFunction(ValueFunction):
     """SARSA value function with target network."""
