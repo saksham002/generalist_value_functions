@@ -1530,7 +1530,7 @@ class LeRobotRldsDataConfig(DataConfigFactory):
     repo_id: str = "realworld_xarm_packing"
     assets: AssetsConfig = dataclasses.field(default_factory = AssetsConfig)
 
-    rlds_data_dir: str = "gs://saksham-euw4/datasets/realworld_xarm_packing"
+    rlds_data_dir: str = "gs://saksham-euw4/datasets"
     val_dataset_dir: str | None = None
     datasets: Sequence[rlds_dataset.RLDSDataset] = (
         rlds_dataset.RLDSDataset(name = "realworld_xarm_packing", version = "1.0.0", weight = 1.0),
@@ -5023,6 +5023,182 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         ),
         num_val_trajectories = 3,
         validation_cache_dir = "/nfs/aidm_nfs/saksham3/realworld_xarm_packing/validation_cache_dir_realworld_xarm_packing_paligemma_cql_rlds_finetune_subtask_ar/",
+        include_repos = (),
+    ),
+    # realworld_xarm_packing twins of the three shirt-hang fine-tunes, one per objective.
+    #
+    # Unlike the shirt-hang pair, these cannot be objective-agnostic. The shirt-hang FTs
+    # restate no network because shirt-hang's token budget already matches its bases (72 for
+    # the task-level ones, 96 for subtask_ar). Packing prompts are longer -- 128 for the task
+    # alone, 160 with the predicted subtask, per realworld_xarm_packing_pi05 -- so the
+    # network's max_token_len has to move, and the field holding it is objective-specific:
+    # MCValueFunctionConfig and SARSAValueFunctionConfig call it network_config, while
+    # CQLValueFunctionConfig calls it q_network_config. One dict cannot satisfy both, hence
+    # three configs rather than two.
+    #
+    # The data max_token_len must match the network's: it is what reaches get_tokenizer, so a
+    # mismatch pads to one length while the network slices for another.
+    #
+    # All three point at the packing CQL counterfactual store, which is the only one that
+    # exists for this dataset. It serves TD-BoN's Best-of-N candidates; MC and SARSA bootstrap
+    # off next_actions and load it without using it, exactly as on shirt-hang.
+    FineTuneConfig(
+        name = "realworld_xarm_packing_mc_finetune_task_description",
+        data_factory = LeRobotRldsDataConfig(
+            use_eef = True,
+            repo_id = "realworld_xarm_packing",
+            rlds_data_dir = "gs://saksham-usc2/datasets",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "realworld_xarm_packing", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-usc2/datasets/realworld_xarm_packing",
+                asset_id = "norm_stats",
+            ),
+            td_n = 60,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-usc2/robocoin/cached_actions/realworld_xarm_packing_pi05_subtask/",
+            discount = 0.9995,
+            max_token_len = 160,
+            prompt_mode = "task_description",
+        ),
+        model_overrides = {
+            "action_horizon": 60,
+            "network_config": _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                max_token_len = 160,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = False,
+            ),
+        },
+        policy_overrides = {
+            "action_horizon": 60,
+        },
+        action_horizon = 60,
+        num_train_steps = 20_000,
+        save_interval = 10_000,
+        plot_interval = 10_000,
+        keep_period = 10_000,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
+        ),
+        num_val_trajectories = 3,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/realworld_xarm_packing/validation_cache_dir_realworld_xarm_packing_mc_finetune_task_description/",
+        include_repos = (),
+    ),
+    FineTuneConfig(
+        name = "realworld_xarm_packing_td_bon_finetune_task_description",
+        data_factory = LeRobotRldsDataConfig(
+            use_eef = True,
+            repo_id = "realworld_xarm_packing",
+            rlds_data_dir = "gs://saksham-usc2/datasets",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "realworld_xarm_packing", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-usc2/datasets/realworld_xarm_packing",
+                asset_id = "norm_stats",
+            ),
+            td_n = 60,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-usc2/robocoin/cached_actions/realworld_xarm_packing_pi05_subtask/",
+            discount = 0.9995,
+            max_token_len = 160,
+            prompt_mode = "task_description",
+        ),
+        model_overrides = {
+            "action_horizon": 60,
+            "q_network_config": _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                max_token_len = 160,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = False,
+            ),
+        },
+        policy_overrides = {
+            "action_horizon": 60,
+        },
+        action_horizon = 60,
+        num_train_steps = 20_000,
+        save_interval = 10_000,
+        plot_interval = 10_000,
+        keep_period = 10_000,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
+        ),
+        num_val_trajectories = 3,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/realworld_xarm_packing/validation_cache_dir_realworld_xarm_packing_td_bon_finetune_task_description/",
+        include_repos = (),
+    ),
+    FineTuneConfig(
+        name = "realworld_xarm_packing_sarsa_finetune_subtask_ar",
+        data_factory = LeRobotRldsDataConfig(
+            use_eef = True,
+            repo_id = "realworld_xarm_packing",
+            rlds_data_dir = "gs://saksham-usc2/datasets",
+            datasets = (
+                rlds_dataset.RLDSDataset(name = "realworld_xarm_packing", version = "1.0.0", weight = 1.0),
+            ),
+            assets = AssetsConfig(
+                assets_dir = "gs://saksham-usc2/datasets/realworld_xarm_packing",
+                asset_id = "norm_stats",
+            ),
+            td_n = 60,
+            critic_mode = True,
+            use_chunk_wise_delta = True,
+            use_quantile_norm = True,
+            shuffle_buffer_size = 50_000,
+            mask_boundary_actions = False,
+            subsample = True,
+            counterfactual_action_store_dir = "gs://saksham-usc2/robocoin/cached_actions/realworld_xarm_packing_pi05_subtask/",
+            discount = 0.999,
+            max_token_len = 160,
+            prompt_mode = "task_description_predict_current_subtask",
+        ),
+        model_overrides = {
+            "action_horizon": 60,
+            "network_config": _paligemma_network.PaliGemmaNetworkConfig(
+                state_dim = 14,
+                num_cameras = 3,
+                image_size = (224, 224),
+                max_token_len = 160,
+                action_dim = 14,
+                dtype = "float32",
+                no_state = True,
+                predict_subtask_ar = True,
+            ),
+        },
+        policy_overrides = {
+            "action_horizon": 60,
+        },
+        action_horizon = 60,
+        num_train_steps = 20_000,
+        save_interval = 10_000,
+        plot_interval = 10_000,
+        keep_period = 10_000,
+        lr_schedule = _optimizer.CosineDecaySchedule(
+            warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
+        ),
+        num_val_trajectories = 3,
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/realworld_xarm_packing/validation_cache_dir_realworld_xarm_packing_sarsa_finetune_subtask_ar/",
         include_repos = (),
     ),
     # lego twin of the packing subtask_ar fine-tunes. The lego policy trains in joint
@@ -8924,7 +9100,7 @@ _CONFIGS = [
         ),
         data = LeRobotRldsDataConfig(
             use_eef = True,
-            rlds_data_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
+            rlds_data_dir = "gs://saksham-euw4/datasets",
             datasets = (rlds_dataset.RLDSDataset(name = "realworld_xarm_packing", version = "1.0.0", weight = 1.0),),
             assets = AssetsConfig(
                 assets_dir = "gs://saksham-euw4/datasets/realworld_xarm_packing",
