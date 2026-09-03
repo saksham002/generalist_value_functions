@@ -357,12 +357,20 @@ class ResNetValueNetwork(BaseValueNetwork):
     def _resolve_subtask_id(
         self, observation: _model.Observation, image_features: at.Float[at.Array, "b image_feature_dim"],
     ) -> at.Int[at.Array, "*b"]:
-        """Ground-truth id when the observation carries one, otherwise the predictor's argmax."""
-        if observation.subtask_id is not None:
-            return observation.subtask_id.astype(jnp.int32)
+        """The observation's ids when it carries them, otherwise the predictor's argmax.
+
+        A negative id is the serving path's "nothing cached yet" sentinel, so the same
+        traced graph serves both before and after the first cached prediction. The switch
+        is for the whole batch: serving sends one observation, so a batch never mixes
+        cached and uncached ids.
+        """
         predictor_features = self._subtask_predictor_features(image_features)
         logits = self.decode(predictor_features[:, None, :])[:, 0, :]
-        return jnp.argmax(logits, axis = -1).astype(jnp.int32)
+        predicted_id = jnp.argmax(logits, axis = -1).astype(jnp.int32)
+        if observation.subtask_id is None:
+            return predicted_id
+        given_id = observation.subtask_id.astype(jnp.int32)
+        return jnp.where(jnp.all(given_id >= 0), given_id, predicted_id)
 
     def predict_subtask_id(self, observation: _model.Observation) -> at.Int[at.Array, "*b"]:
         """Predicted subtask id from images alone (ignores any ground-truth id on the observation)."""

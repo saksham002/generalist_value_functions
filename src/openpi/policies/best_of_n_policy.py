@@ -249,7 +249,8 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         self._policy_use_decoded_subtask = bool(policy_use_decoded_subtask)
         self._subtask_decode_every = int(subtask_decode_every)
         self._critic_predict_subtask_ar = False
-        self._subtask_decoder: _subtask_decoder.SubtaskDecoder | None = None
+        self._critic_uses_subtask_id = False
+        self._subtask_decoder: _subtask_decoder.SubtaskPredictor | None = None
         self._cached_subtask_str: str | None = None
         self._subtask_iter = 0
 
@@ -714,31 +715,33 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                     f"task_description into critic tokenization."
                 )
 
-            # Detect predict_subtask_ar from the critic's value network. When set,
-            # the critic was trained with Q conditioned on
-            # `task_description + current_subtask + "\n"` (the subtask suffix
-            # visible to CLS/action). At eval we autoregressively decode the
-            # current subtask off the same observation and feed it back into the
-            # critic prompt so the Q matches training. A non-subtask_ar critic
-            # leaves the decoder None and the value prompt task-only (unchanged).
+            # A critic that predicts its own subtask was trained with Q conditioned on
+            # it: a predict_subtask_ar network on `task_description + current_subtask
+            # + "\n"` (the subtask suffix visible to CLS/action), a categorical network
+            # on the embedded `subtask_id`. At eval we predict the current subtask off
+            # the same observation every `subtask_decode_every` calls and feed the
+            # cached prediction back into the critic observation -- as prompt suffix
+            # or as id, whichever the network reads -- so the Q matches training. A
+            # critic with neither head leaves the decoder None and the value prompt
+            # task-only (unchanged).
             _critic_net = _subtask_decoder.critic_value_network(self._critic_model)
-            self._critic_predict_subtask_ar = bool(
-                getattr(getattr(_critic_net, "config", None), "predict_subtask_ar", False)
+            _critic_net_config = getattr(_critic_net, "config", None)
+            self._critic_predict_subtask_ar = bool(getattr(_critic_net_config, "predict_subtask_ar", False))
+            self._critic_uses_subtask_id = bool(getattr(_critic_net_config, "uses_subtask_id", False))
+            self._subtask_decoder = _subtask_decoder.build_subtask_predictor(
+                self._critic_model, self._critic_tokenizer,
+                decode_every = self._subtask_decode_every, max_tokens = 16,
             )
-            if self._critic_predict_subtask_ar:
-                self._subtask_decoder = _subtask_decoder.SubtaskDecoder(
-                    self._critic_model, self._critic_tokenizer,
-                    decode_every = self._subtask_decode_every, max_tokens = 16,
-                )
+            if self._subtask_decoder is not None:
                 logger.info(
-                    f"Critic predict_subtask_ar=True: subtask decoding enabled "
-                    f"(decode_every={self._subtask_decode_every})."
+                    f"Critic predicts its subtask ({type(self._subtask_decoder).__name__}): "
+                    f"subtask prediction enabled (decode_every={self._subtask_decode_every})."
                 )
             if self._policy_use_decoded_subtask:
                 if self._subtask_decoder is None:
                     raise ValueError(
-                        "policy_use_decoded_subtask=True requires a predict_subtask_ar "
-                        "critic (no subtask decoder is configured for this critic)."
+                        "policy_use_decoded_subtask=True requires a critic that predicts its "
+                        "subtask (no subtask predictor is configured for this critic)."
                     )
                 logger.info(
                     "policy_use_decoded_subtask=True: the policy prompt is conditioned "
@@ -826,9 +829,10 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             _mesh = self._mesh
             _sample_parallel = self._sample_parallel
             _critic_predict_subtask_ar = self._critic_predict_subtask_ar
+            _critic_uses_subtask_id = self._critic_uses_subtask_id
 
             @nnx.jit
-            def _bestofn_sample(bon, vf, rng, sample_rngs, transition, critic_prompt, critic_prompt_mask, critic_images, critic_is_null_prompt, subtask_start_index, subtask_end_index):
+            def _bestofn_sample(bon, vf, rng, sample_rngs, transition, critic_prompt, critic_prompt_mask, critic_images, critic_is_null_prompt, subtask_start_index, subtask_end_index, critic_subtask_id):
                 # BestOfNWrapper.sample_actions returns (all_actions, q_values).
                 # `rng` is replicated (used only for the softmax-selection rng);
                 # `sample_rngs` is leading-axis-sharded so each parallel sample
@@ -848,6 +852,10 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 if _critic_predict_subtask_ar:
                     replace_kwargs["subtask_start_index"] = subtask_start_index
                     replace_kwargs["subtask_end_index"] = subtask_end_index
+                # The categorical analog: the cached predicted id conditions Q, and the
+                # network's -1 sentinel means "none cached yet, resolve it from the images".
+                if _critic_uses_subtask_id:
+                    replace_kwargs["subtask_id"] = critic_subtask_id
                 critic_obs = dataclasses.replace(transition.observation, **replace_kwargs)
                 if critic_images is not None:
                     critic_obs = dataclasses.replace(critic_obs, images = critic_images)
@@ -1028,15 +1036,13 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # Subtask the critic conditioned its value forward on this call: the
         # cached subtask used to build the value prompt in the (re-)prepare
         # above (None on the cold-start call before the first decode). Only
-        # emitted for predict_subtask_ar critics (a decoder is configured);
-        # non-AR critics and the policy-only path are unchanged.
+        # emitted for critics that predict their subtask (a predictor is
+        # configured); other critics and the policy-only path are unchanged.
         if self._subtask_decoder is not None:
             result["critic_subtask"] = used_subtask
 
         if decode_out is not None:
-            result["predicted_subtask"] = decode_out["predicted_subtask"]
-            result["predicted_subtask_tokens"] = decode_out["predicted_subtask_tokens"]
-            result["subtask_perplexity"] = decode_out["subtask_perplexity"]
+            result.update(decode_out)
         return result
 
     # ---------------------------------------------------------------------
@@ -1149,7 +1155,11 @@ class BestOfNPolicy(_base_policy.BasePolicy):
         # a structurally different package than the workers' dummies and the
         # multi-host launch group desyncs (workers hang / one rank halts).
         # Fail loudly instead.
-        if self._subtask_decoder is not None and critic_task_desc is None:
+        if (
+            self._subtask_decoder is not None
+            and self._subtask_decoder.needs_task_description
+            and critic_task_desc is None
+        ):
             raise ValueError(
                 "Subtask-decoding critic needs a task description on every call: "
                 "send obs['task_description'] from the client or serve with "
@@ -1222,6 +1232,12 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             extras["subtask_start_index"] = jnp.zeros((1,), dtype = jnp.int32)
             extras["subtask_end_index"] = jnp.zeros((1,), dtype = jnp.int32)
             extras["critic_is_null_prompt"] = jnp.asarray(null_prompt, dtype = jnp.bool_)
+            if self._subtask_decoder is not None:
+                # The same decode leaves the AR path carries, so `_maybe_decode_subtask`
+                # builds the critic observation identically; a categorical head reads the
+                # images only and ignores the (zero) tokens.
+                extras["decode_critic_tokens"] = extras["critic_tokens"]
+                extras["decode_critic_token_mask"] = extras["critic_token_mask"]
             if self._expect_critic_images:
                 if critic_image_dict is None:
                     raise ValueError(
@@ -1286,12 +1302,25 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                     k: jnp.asarray(v)[None, ...].astype(jnp.float32) / 127.5 - 1.0
                     for k, v in critic_image_dict.items()
                 }
+        if self._bestofn is not None:
+            extras["critic_subtask_id"] = jnp.asarray([self._cached_subtask_id()], dtype = jnp.int32)
         if noise is not None:
             noise_arr = jnp.asarray(noise)
             if noise_arr.ndim == 2:
                 noise_arr = noise_arr[None, ...]
             extras["noise"] = noise_arr
         return batched, extras
+
+    def _cached_subtask_id(self) -> int:
+        """Categorical id of the cached predicted subtask for the critic observation.
+
+        -1 is the network's "resolve it from the images" sentinel: before the first
+        prediction, and for every critic without a categorical subtask head, where the
+        leaf is carried only to keep the broadcast package shape-stable and is never read.
+        """
+        if not self._critic_uses_subtask_id or self._cached_subtask_str is None:
+            return -1
+        return self._subtask_decoder.vocab_index(self._cached_subtask_str)
 
     def _make_dummy_inputs(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Workers 1..N-1: construct broadcast-package dummies of the exact
@@ -1314,6 +1343,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
             extras["critic_is_null_prompt"] = jnp.asarray(False, dtype = jnp.bool_)
             extras["subtask_start_index"] = jnp.zeros((1,), dtype = jnp.int32)
             extras["subtask_end_index"] = jnp.zeros((1,), dtype = jnp.int32)
+            extras["critic_subtask_id"] = jnp.full((1,), -1, dtype = jnp.int32)
             if self._subtask_decoder is not None:
                 extras["decode_critic_tokens"] = jnp.zeros((1, self._critic_max_token_len), dtype = jnp.int32)
                 extras["decode_critic_token_mask"] = jnp.zeros((1, self._critic_max_token_len), dtype = jnp.bool_)
@@ -1489,6 +1519,7 @@ class BestOfNPolicy(_base_policy.BasePolicy):
                 extras.get("critic_images"),
                 extras["critic_is_null_prompt"],
                 extras["subtask_start_index"], extras["subtask_end_index"],
+                extras["critic_subtask_id"],
             )
             return actions_out, q_values
         transition = _model.wrap_observation_as_transition(observation)

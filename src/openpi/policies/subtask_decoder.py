@@ -47,6 +47,9 @@ def critic_value_network(critic_model: Any) -> Any:
 class SubtaskDecoder:
     """Autoregressively decodes the current subtask from a loaded critic.
 
+    The decode reads the task-description prefix, so a task description is required on
+    every call (``needs_task_description``).
+
     Args:
         critic_model: A loaded value-function model whose backbone is a
             PaliGemma value network (resolved via `critic_value_network`).
@@ -59,6 +62,8 @@ class SubtaskDecoder:
             trailing "\n" (the model's learned terminator, emitted after the
             subtask) or once `max_tokens` is reached, whichever comes first.
     """
+
+    needs_task_description: bool = True
 
     def __init__(
         self,
@@ -358,3 +363,79 @@ class SubtaskDecoder:
         n_tokens = max(1, len(predicted))
         perplexity = float(np.exp(total_neg_logp / n_tokens))
         return predicted, decoded, perplexity
+
+
+class CategoricalSubtaskPredictor:
+    """Predicts the current subtask id from a critic with a categorical subtask head.
+
+    The ResNet sibling of ``SubtaskDecoder`` with the same ``predict`` / ``run_lockstep``
+    surface: no text pathway, so the id is the argmax of the network's
+    ``predict_subtask_id`` over the images alone, mapped back to text through the network
+    config's ``subtask_vocab``. The caller feeds the cached prediction back as
+    ``observation.subtask_id`` (``vocab_index``), the analog of the AR path's prompt suffix.
+    Reads no prompt, so no task description is needed.
+
+    Args:
+        critic_model: A loaded value-function model whose backbone declares
+            ``uses_subtask_id`` (resolved via ``critic_value_network``).
+    """
+
+    needs_task_description: bool = False
+
+    def __init__(self, critic_model: Any) -> None:
+        network = critic_value_network(critic_model)
+        config = getattr(network, "config", None)
+        if not getattr(config, "uses_subtask_id", False):
+            raise ValueError(
+                f"{type(network).__name__} has no categorical subtask head "
+                "(uses_subtask_id is False); CategoricalSubtaskPredictor does not apply."
+            )
+        self._critic_model = critic_model
+        self._vocab: tuple[str, ...] = tuple(config.subtask_vocab or ())
+
+        @nnx.jit
+        def _predict(critic_model, observation):
+            return critic_value_network(critic_model).predict_subtask_id(observation)
+
+        self._predict = _predict
+
+    def predict(self, critic_observation: _model.Observation) -> dict[str, Any]:
+        """Predict the subtask id; returns the fields to merge into an infer result."""
+        subtask_id = int(np.asarray(self._predict(self._critic_model, critic_observation))[0])
+        text = self._vocab[subtask_id] if subtask_id < len(self._vocab) else f"subtask_{subtask_id}"
+        logger.info(f"[subtask_predict] id={subtask_id} subtask={text!r}")
+        return {
+            "predicted_subtask": text,
+            "predicted_subtask_id": subtask_id,
+        }
+
+    def run_lockstep(self, critic_observation: _model.Observation) -> None:
+        """Drive the same JIT call on a participating (non-rank-0) host; output discarded."""
+        self._predict(self._critic_model, critic_observation)
+
+    def vocab_index(self, subtask: str) -> int:
+        """Categorical id of a subtask string this predictor produced."""
+        return self._vocab.index(subtask)
+
+
+SubtaskPredictor = SubtaskDecoder | CategoricalSubtaskPredictor
+
+
+def build_subtask_predictor(
+    critic_model: Any,
+    critic_tokenizer: Any,
+    *,
+    decode_every: int,
+    max_tokens: int,
+) -> SubtaskPredictor | None:
+    """The subtask predictor a critic's network calls for, or None when it predicts none.
+
+    ``predict_subtask_ar`` networks decode text through the tokenizer; ``uses_subtask_id``
+    networks classify. A network with neither head conditions on no predicted subtask.
+    """
+    config = getattr(critic_value_network(critic_model), "config", None)
+    if getattr(config, "predict_subtask_ar", False):
+        return SubtaskDecoder(critic_model, critic_tokenizer, decode_every = decode_every, max_tokens = max_tokens)
+    if getattr(config, "uses_subtask_id", False):
+        return CategoricalSubtaskPredictor(critic_model)
+    return None

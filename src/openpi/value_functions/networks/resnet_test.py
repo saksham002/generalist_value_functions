@@ -116,6 +116,17 @@ def test_inference_uses_predicted_id_and_matches_prefix_cache(network):
     assert network.prefix_cache_batch_axis == 0
 
 
+def test_negative_subtask_id_falls_back_to_prediction(network):
+    obs = make_observation()
+    predicted = network.predict_subtask_id(obs)
+    sentinel = jnp.full((BATCH,), -1, dtype = jnp.int32)
+    _, resolved_id, _ = network.compute_prefix_cache(dataclasses.replace(obs, subtask_id = sentinel))
+    np.testing.assert_array_equal(resolved_id, predicted)
+    given = (predicted + 1) % network.config.num_subtask_categories
+    _, resolved_id, _ = network.compute_prefix_cache(dataclasses.replace(obs, subtask_id = given))
+    np.testing.assert_array_equal(resolved_id, given)
+
+
 def test_masks_zero_contributions(network):
     obs = make_observation(subtask_id = jnp.array([1, 1]))
     action = jnp.ones((BATCH, ACTION_HORIZON, 3))
