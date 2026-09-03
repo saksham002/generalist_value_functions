@@ -256,12 +256,21 @@ def install_uv(tpu_name: str, config: PodConfig, layout: RemoteLayout) -> None:
 
 
 def install_deps(tpu_name: str, config: PodConfig, layout: RemoteLayout) -> None:
-    """Install Python dependencies on TPU using uv."""
+    """Install Python dependencies on TPU using uv.
+
+    ``umask 000`` because on a shared-NFS pod the uv cache outlives the pod that created it,
+    and uids are not stable across pods -- the same user is a different uid on every worker
+    of every pod. Under the default umask 002 uv creates its cache directories 775 owned by
+    whichever uid happened to populate them first, and the next pod's uid then cannot write
+    them: ``failed to open file .../cache/sdists-v9/.git: Permission denied``. World-writable
+    is what makes the cache genuinely shared rather than owned by its first writer.
+    """
     logger.info("Installing dependencies on TPU %s", tpu_name)
     ssh_command(
         tpu_name,
         config.zone,
         (
+            "umask 000 && "
             f'export PATH="{layout.uv_root}/bin:$PATH" && '
             f'export UV_CACHE_DIR="{layout.uv_root}/cache" && '
             f'export UV_PROJECT_ENVIRONMENT="{layout.venv}" && '
