@@ -443,6 +443,7 @@ def _flatten_transition_for_policy(
             next_observation=flat_next_obs,
             next_action=flatten(transition.next_action),
             mc_return=flatten(transition.mc_return),
+            mc_return_mask=flatten(transition.mc_return_mask),
             termination=flatten(transition.termination),
             truncation=flatten(transition.truncation),
             td_discount=flatten(transition.td_discount) if transition.td_discount is not None else None,
@@ -809,8 +810,8 @@ def cql_objective(
             "td_error_std": jnp.std(td_error),
         }
         if q_pred_mc_diff is not None:
-            info["mc_loss"] = jnp.mean(jnp.square(q_pred_mc_diff))
-            info["avg_q_minus_mc"] = jnp.mean(q_pred_mc_diff)
+            info["mc_loss"] = _base_vf.masked_mean(jnp.square(q_pred_mc_diff), transition.mc_return_mask)
+            info["avg_q_minus_mc"] = _base_vf.masked_mean(q_pred_mc_diff, transition.mc_return_mask)
             info["q_pred_per_sample"] = q_pred_for_logging
             info["mc_return_per_sample"] = transition.mc_return
         if next_token_loss is not None:
@@ -964,8 +965,8 @@ def cql_objective(
         }
     )
     if q_pred_mc_diff is not None:
-        info["mc_loss"] = jnp.mean(jnp.square(q_pred_mc_diff))
-        info["avg_q_minus_mc"] = jnp.mean(q_pred_mc_diff)
+        info["mc_loss"] = _base_vf.masked_mean(jnp.square(q_pred_mc_diff), transition.mc_return_mask)
+        info["avg_q_minus_mc"] = _base_vf.masked_mean(q_pred_mc_diff, transition.mc_return_mask)
     if next_token_loss is not None:
         info["next_token_loss"] = next_token_loss
     return q_loss, cql_loss, info

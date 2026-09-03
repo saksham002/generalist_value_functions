@@ -717,6 +717,12 @@ def value_function_train_step(
     # stats to the valid prefix so the padded slots don't pollute mean/std.
     if getattr(config.data, "subsample", False):
         action = action[:, : config.action_horizon // 2, :]
+    mc_return_mask = transition.mc_return_mask
+    valid_mc_return = (
+        transition.mc_return
+        if mc_return_mask is None
+        else jnp.where(mc_return_mask, transition.mc_return, jnp.nan)
+    )
     batch_stats = {
         # Observation stats
         "batch/obs_mean": jnp.mean(obs_state),
@@ -735,11 +741,11 @@ def value_function_train_step(
         "batch/reward_std": jnp.std(transition.reward),
         "batch/reward_min": jnp.min(transition.reward),
         "batch/reward_max": jnp.max(transition.reward),
-        # MC return stats
-        "batch/mc_return_mean": jnp.mean(transition.mc_return),
-        "batch/mc_return_std": jnp.std(transition.mc_return),
-        "batch/mc_return_min": jnp.min(transition.mc_return),
-        "batch/mc_return_max": jnp.max(transition.mc_return),
+        # MC return stats, over frames whose return is trustworthy (see Transition.mc_return_mask).
+        "batch/mc_return_mean": jnp.nanmean(valid_mc_return),
+        "batch/mc_return_std": jnp.nanstd(valid_mc_return),
+        "batch/mc_return_min": jnp.nanmin(valid_mc_return),
+        "batch/mc_return_max": jnp.nanmax(valid_mc_return),
         # Termination stats
         "batch/termination_mean": jnp.mean(transition.termination.astype(jnp.float32)),
         "batch/termination_std": jnp.std(transition.termination.astype(jnp.float32)),
@@ -784,7 +790,9 @@ def value_function_train_step(
 
     if "mc_loss" in value_info:
         mc_loss_arr = value_info.pop("mc_loss")
-        value_stats["mc_loss"] = jnp.mean(mc_loss_arr)
+        value_stats["mc_loss"] = _value_fn.masked_mean(mc_loss_arr, mc_return_mask)
+    if mc_return_mask is not None:
+        value_stats["mc_return_valid_frac"] = jnp.mean(mc_return_mask.astype(jnp.float32))
 
     if "next_token_loss" in value_info:
         next_token_loss_arr = value_info.pop("next_token_loss")
@@ -809,7 +817,10 @@ def value_function_train_step(
             per_sample_mc_loss = jnp.square(q_pred_per_sample - mc_return_per_sample)
             half_action_chunk = config.action_horizon // 2
             k_threshold = jnp.where(jnp.asarray(batch["fps"]) == 30, 3 * half_action_chunk // 5, half_action_chunk)
-            long_horizon_mask = (jnp.asarray(batch["variable_k_native"]) >= k_threshold).astype(jnp.float32)
+            long_horizon_mask = jnp.asarray(batch["variable_k_native"]) >= k_threshold
+            if mc_return_mask is not None:
+                long_horizon_mask = jnp.logical_and(long_horizon_mask, mc_return_mask)
+            long_horizon_mask = long_horizon_mask.astype(jnp.float32)
             num_long_horizon = jnp.sum(long_horizon_mask)
             value_stats["mc_loss_long_horizon"] = (
                 jnp.sum(per_sample_mc_loss * long_horizon_mask) / jnp.maximum(num_long_horizon, 1.0)

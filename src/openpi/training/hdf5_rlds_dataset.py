@@ -571,6 +571,15 @@ class Hdf5RldsDataset(rlds_dataset.BaseRldsDataset):
             tf.constant(2.5, dtype = tf.float32),
         )
         mapped_traj["mc_return"] = tf.pow(self._discount, exponent_per_step * steps_f)
+        # `is_partial` is per episode here: the final subtask never reached its success
+        # state, so the countdown-based return above is fiction for every frame whose
+        # subtask runs to the episode end. Earlier subtasks did complete (the next one
+        # started), so their returns stand. Consumers mask MC diagnostics with this.
+        frame_indices = tf.range(traj_len, dtype = tf.int32)
+        subtask_ends_at_episode_end = (frame_indices + steps) >= (traj_len - 1)
+        mapped_traj["mc_return_mask"] = tf.logical_not(
+            tf.logical_and(mapped_traj["is_partial"], subtask_ends_at_episode_end)
+        )
 
         td_n = self._td_n if self._td_n is not None else 0
         if self._variable_horizon:

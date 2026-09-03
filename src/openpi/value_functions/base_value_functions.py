@@ -70,6 +70,18 @@ def _extract_observations_from_batch(batch: dict) -> tuple[_model.Observation, _
     return observation, next_observation
 
 
+def masked_mean(values: at.Array, mask: at.Bool[at.Array, "..."] | None) -> at.Array:
+    """Mean of ``values`` over the entries where ``mask`` is True.
+
+    ``mask`` None means every entry counts. A mask with no True entry yields NaN rather
+    than a made-up zero, so an all-invalid batch is visible in the logs.
+    """
+    if mask is None:
+        return jnp.mean(values)
+    mask = mask.astype(values.dtype)
+    return jnp.sum(values * mask) / jnp.sum(mask)
+
+
 @struct.dataclass
 class Transition:
     """A transition (o, a, r, o', a') plus MC return for value function training.
@@ -89,6 +101,10 @@ class Transition:
     next_observation: _model.Observation | None = None
     next_action: at.Float[at.Array, "*b action_dim"] | None = None
     mc_return: at.Float[at.Array, "*b"] | None = None
+    # True where mc_return is a trustworthy target: False on frames whose subtask never
+    # reached its success state (partial demos), where the countdown-based return is
+    # fiction. None means every return is valid. Only MC diagnostics honour it so far.
+    mc_return_mask: at.Bool[at.Array, "*b"] | None = None
     termination: at.Bool[at.Array, "*b"] | None = None
     truncation: at.Bool[at.Array, "*b"] | None = None
     td_discount: at.Float[at.Array, "*b"] | None = None
@@ -127,6 +143,7 @@ class Transition:
             next_observation=next_observation,
             next_action=jnp.asarray(batch["next_actions"]),
             mc_return=jnp.asarray(batch["mc_return"]),
+            mc_return_mask=jnp.asarray(batch["mc_return_mask"]) if "mc_return_mask" in batch else None,
             termination=jnp.asarray(batch["termination"]),
             truncation=jnp.asarray(batch["truncation"]),
             td_discount = jnp.asarray(batch["td_discount"]) if "td_discount" in batch else None,
@@ -149,6 +166,8 @@ class MultiTransition:
     next_observation: _model.Observation | None = None
     next_action: at.Float[at.Array, "*b n action_dim"] | None = None
     mc_return: at.Float[at.Array, "*b n"] | None = None
+    # See Transition.mc_return_mask.
+    mc_return_mask: at.Bool[at.Array, "*b n"] | None = None
     termination: at.Bool[at.Array, "*b n"] | None = None
     truncation: at.Bool[at.Array, "*b n"] | None = None
     td_discount: at.Float[at.Array, "*b n"] | None = None
@@ -173,6 +192,7 @@ class MultiTransition:
             next_observation=next_observation,
             next_action=jnp.asarray(batch["next_actions"]),
             mc_return=jnp.asarray(batch["mc_return"]),
+            mc_return_mask=jnp.asarray(batch["mc_return_mask"]) if "mc_return_mask" in batch else None,
             termination=jnp.asarray(batch["termination"]),
             truncation=jnp.asarray(batch["truncation"]),
             td_discount = jnp.asarray(batch["td_discount"]) if "td_discount" in batch else None,

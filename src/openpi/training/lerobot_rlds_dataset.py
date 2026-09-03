@@ -75,9 +75,6 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
             raise ValueError(f"td_n must be a multiple of 2, got {td_n}")
         if filter_n is not None and filter_n % 2 != 0:
             raise ValueError(f"filter_n must be a multiple of 2, got {filter_n}")
-        assert not (critic_mode and prompt_mode == "task_description"), (
-            "critic_mode=True is incompatible with prompt_mode='task_description'"
-        )
 
         self._split = split
         self._use_eef = use_eef
@@ -201,13 +198,14 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
         # first. `is_partial` is a genuine [T] field carrying the same values, so it
         # subsamples correctly and needs no gather. Unlike Hdf5RldsDataset there is no
         # heuristic to infer it.
+        if "is_partial" in traj:
+            result["is_partial"] = tf.cast(traj["is_partial"], tf.bool)
         if self._filter_partial:
             if "is_partial" not in traj:
                 raise ValueError(
                     "filter_partial=True requires a per-step is_partial field, "
                     "which this dataset does not provide."
                 )
-            result["is_partial"] = tf.cast(traj["is_partial"], tf.bool)
             # task_description overwrote steps_to_subtask_end with the countdown to the
             # EPISODE end above, so carry the subtask countdown separately for this filter:
             # partiality is a subtask-level property and its tail must be measured against
@@ -391,6 +389,14 @@ class LeRobotRldsDataset(rlds_dataset.BaseRldsDataset):
             tf.constant(2.5, dtype=tf.float32),
         )
         mapped_traj["mc_return"] = tf.pow(self._discount, exponent_per_step * steps_f)
+        # `is_partial` is per subtask here, so it is the MC-return validity mask directly:
+        # a partial subtask never reached its success state and the countdown-based
+        # return above is fiction for it. Datasets without the field have no partial
+        # demos (see module docstring), so every return is trustworthy.
+        if "is_partial" in mapped_traj:
+            mapped_traj["mc_return_mask"] = tf.logical_not(mapped_traj["is_partial"])
+        else:
+            mapped_traj["mc_return_mask"] = tf.ones_like(steps, dtype=tf.bool)
 
         td_n = self._td_n if self._td_n is not None else 0
         # 5.0 * td_n/2 = 2.5 * td_n at fps=30 and 2.5 * td_n at fps=60.
