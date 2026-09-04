@@ -5212,12 +5212,12 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
         data_factory = LeRobotRldsDataConfig(
             use_eef = True,
             repo_id = "lego",
-            rlds_data_dir = "gs://saksham-euw4/datasets",
+            rlds_data_dir = "gs://saksham-euw4/datasets/lego_new",
             datasets = (
-                rlds_dataset.RLDSDataset(name = "lego", version = "3.0.0", weight = 1.0),
+                rlds_dataset.RLDSDataset(name = "lego", version = "1.0.0", weight = 1.0),
             ),
             assets = AssetsConfig(
-                assets_dir = "gs://saksham-euw4/datasets/lego",
+                assets_dir = "gs://saksham-euw4/datasets/lego_new",
                 asset_id = "norm_stats_eef",
             ),
             discount = 0.999,
@@ -5230,7 +5230,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             shuffle_buffer_size = 50_000,
             mask_boundary_actions = False,
             subsample = True,
-            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/lego_pi05_subtask/",
+            counterfactual_action_store_dir = "gs://saksham-euw4/robocoin/cached_actions/lego_pi05_subtask_20k/",
             max_token_len = 160,
             prompt_mode = "task_description_predict_current_subtask",
         ),
@@ -5258,7 +5258,7 @@ _FINE_TUNE_CONFIGS: list[FineTuneConfig] = [
             warmup_steps = 0, peak_lr = 5e-6, decay_steps = 20_000, decay_lr = 5e-7,
         ),
         num_val_trajectories = 3,
-        validation_cache_dir = "/nfs/aidm_nfs/saksham3/lego/validation_cache_dir_lego_paligemma_cql_rlds_finetune_subtask_ar/",
+        validation_cache_dir = "/nfs/aidm_nfs/saksham3/lego_new/validation_cache_dir_lego_paligemma_cql_rlds_finetune_subtask_ar/",
         include_repos = (),
     ),
     # Same as lego_paligemma_cql_rlds_finetune_subtask_ar but with td_n = 4 * action_horizon
@@ -9259,10 +9259,10 @@ _CONFIGS = [
         ),
         data = LeRobotRldsDataConfig(
             repo_id = "lego",
-            rlds_data_dir = "gs://saksham-usc2/datasets",
-            datasets = (rlds_dataset.RLDSDataset(name = "lego", version = "2.0.0", weight = 1.0),),
+            rlds_data_dir = "gs://saksham-euw4/datasets/lego_new",
+            datasets = (rlds_dataset.RLDSDataset(name = "lego", version = "1.0.0", weight = 1.0),),
             assets = AssetsConfig(
-                assets_dir = "gs://saksham-usc2/datasets/lego",
+                assets_dir = "gs://saksham-euw4/datasets/lego_new",
                 asset_id = "norm_stats",
             ),
             use_chunk_wise_delta = True,
@@ -9276,12 +9276,12 @@ _CONFIGS = [
             prompt_mode = "subtask",
         ),
         weight_loader = weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps = 40_000,
+        num_train_steps = 20_000,
         batch_size = 256,
         lr_schedule = _optimizer.CosineDecaySchedule(
             warmup_steps = 1000,
             peak_lr = 5e-5,
-            decay_steps = 40_000,
+            decay_steps = 20_000,
             decay_lr = 5e-6,
         ),
         optimizer = _optimizer.AdamW(),
@@ -9292,9 +9292,8 @@ _CONFIGS = [
         fsdp_devices = 16,
         action_horizon = 60,
     ),
-    # Identical to above except the prompt is the full task description
-    # instead of the current subtask, and the data/assets are read from the euw4
-    # mirror (identical contents to the usc2 copy the subtask config points at).
+    # Same recipe as above except the prompt is the full task description instead
+    # of the current subtask
     TrainConfig(
         name = "lego_pi05_task",
         model = pi0_config.Pi0Config(
