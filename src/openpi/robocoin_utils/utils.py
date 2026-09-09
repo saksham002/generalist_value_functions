@@ -494,6 +494,7 @@ def cache_val_episodes(
     input_transform = None,
     allow_duplicate_repos: bool = False,
     episode_indices: tuple[int, ...] | None = None,
+    episode_keys: tuple[tuple[str, int], ...] | None = None,
 ) -> dict[str, list[dict]]:
     """Load or collect validation episodes, optionally caching them to disk.
 
@@ -512,6 +513,13 @@ def cache_val_episodes(
     — when deciding whether to claim the repo and again right before writing
     — and skips if another worker already produced that file.
 
+    With ``episode_indices`` the roles collapse: the trajectory dataset is sharded
+    across hosts, so a pinned episode can only be seen by the host whose shard holds
+    it, and that host caches it whatever its rank or ``include_repos``. The cache is
+    then complete once it holds one file per pinned episode. Files keep the
+    ``<repo_key>_<n>`` naming, so two pinned episodes with the same ``repo_key`` on
+    different hosts would collide on ``_0``; pin episodes with distinct keys.
+
     Args:
         trajectory_iter: RLDS dataset yielding full trajectories (stacked dicts),
             or None when loading from an existing cache.
@@ -526,12 +534,25 @@ def cache_val_episodes(
             Selection is otherwise position-based, so two configs whose filters drop different
             episodes end up caching different ones; naming the episodes is what makes a cache
             comparable across configs.
+        episode_keys: Like ``episode_indices`` but as ``(repo_id, episode_index)`` pairs, for
+            datasets whose ``episode_index`` restarts per repo (RoboCOIN: every repo has an
+            episode 0), where a bare index would match one episode in each repo. Mutually
+            exclusive with ``episode_indices``.
 
     Returns:
         Dict mapping ``<sanitized_repo_key>`` (str) -> sorted list of frame dicts,
         or {} if save_only=True.
     """
     import jax  # local import to keep this util usable from non-JAX callers
+
+    if episode_indices is not None and episode_keys is not None:
+        raise ValueError("Pass either episode_indices or episode_keys, not both.")
+    pinned_count = None
+    if episode_indices is not None:
+        pinned_count = len(episode_indices)
+    elif episode_keys is not None:
+        pinned_count = len(episode_keys)
+    pinned_key_set = set(episode_keys) if episode_keys is not None else None
 
     traj_frames: dict[str, list[dict]] = {}
     process_index = jax.process_index() if jax is not None else 0
@@ -563,8 +584,12 @@ def cache_val_episodes(
         else:
             required_pkls = {f"{_sanitize(repo)}.pkl" for repo in include_repos}
         all_required = required_pkls.issubset(existing_pkls)
-        # Worker 0 is the only worker that fills the non-required slots.
-        if process_index == 0:
+        if pinned_count is not None:
+            # Any host may hold a pinned episode, so every host has to keep iterating
+            # until the cache holds one file per pinned episode.
+            all_required = len(existing_pkls) >= pinned_count
+        elif process_index == 0:
+            # Worker 0 is the only worker that fills the non-required slots.
             all_required = all_required and len(existing_pkls) >= num_val_trajectories
         if all_required:
             logger.info(
@@ -599,10 +624,18 @@ def cache_val_episodes(
         repo_counters: dict[str, int] = {}
         num_non_required_slots = num_val_trajectories - len(include_repos)
         collected_count = 0
-        logger.info(
-            f"[pidx={process_index}] Collecting validation trajectories "
-            f"({'all repos up to ' + str(num_val_trajectories) if process_index == 0 else 'include_repos only'})"
-        )
+        pinned = pinned_count is not None
+        # How many trajectories a host stops after: every pinned episode when pinned, the
+        # full-coverage quota on worker 0 otherwise (workers > 0 stop on include_repos).
+        target_count = pinned_count if pinned else num_val_trajectories
+        if pinned:
+            pinned_desc = tuple(episode_indices) if episode_indices is not None else tuple(episode_keys)
+            collect_scope = f"pinned episodes {pinned_desc} in this host's shard"
+        elif process_index == 0:
+            collect_scope = f"all repos up to {num_val_trajectories}"
+        else:
+            collect_scope = "include_repos only"
+        logger.info(f"[pidx={process_index}] Collecting validation trajectories ({collect_scope})")
 
         if cache_dir:
             os.makedirs(cache_dir, exist_ok = True)
@@ -625,24 +658,28 @@ def cache_val_episodes(
             repo_id = _decode_repo_id(traj["repo_id"][0])
             repo_key: int | str = int(traj["repo_index"][0]) if "repo_index" in traj else repo_id
 
-            if episode_indices is not None:
+            if pinned:
                 if "episode_index" not in traj:
                     raise ValueError(
-                        "episode_indices was given but the trajectories carry no episode_index; "
-                        "this dataset cannot be filtered by episode."
+                        "episode_indices/episode_keys was given but the trajectories carry no "
+                        "episode_index; this dataset cannot be filtered by episode."
                     )
-                if int(np.asarray(traj["episode_index"][0])) not in episode_indices:
+                episode_index = int(np.asarray(traj["episode_index"][0]))
+                if episode_indices is not None and episode_index not in episode_indices:
+                    continue
+                if pinned_key_set is not None and (repo_id, episode_index) not in pinned_key_set:
                     continue
 
             if not allow_duplicate_repos and repo_key in seen_repo_keys:
                 continue
 
-            # Worker > 0: only claim repos in include_repos.
-            if process_index != 0 and repo_id not in include_set:
+            # Worker > 0: only claim repos in include_repos, unless episodes are pinned —
+            # then whichever host's shard holds the episode is the one that must cache it.
+            if process_index != 0 and not pinned and repo_id not in include_set:
                 continue
 
             is_required = repo_id in include_repos and repo_id not in seen_required_repo_ids
-            if process_index == 0 and not is_required and num_non_required_slots <= 0:
+            if process_index == 0 and not pinned and not is_required and num_non_required_slots <= 0:
                 continue
 
             sanitized_base = _sanitize(str(repo_key))
@@ -666,9 +703,9 @@ def cache_val_episodes(
                 elif process_index == 0:
                     num_non_required_slots -= 1
                 collected_count += 1
-                if process_index == 0 and collected_count >= num_val_trajectories:
+                if (pinned or process_index == 0) and collected_count >= target_count:
                     break
-                if process_index != 0 and len(seen_required_repo_ids) >= len(include_set):
+                if not pinned and process_index != 0 and len(seen_required_repo_ids) >= len(include_set):
                     break
                 continue
 
@@ -731,7 +768,7 @@ def cache_val_episodes(
                 num_non_required_slots -= 1
             collected_count += 1
 
-            if process_index == 0 and collected_count >= num_val_trajectories:
+            if (pinned or process_index == 0) and collected_count >= target_count:
                 break
 
         logger.info(

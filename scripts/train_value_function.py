@@ -1692,6 +1692,23 @@ def _compute_oracle_ranking_metrics(
 _render_thread: threading.Thread | None = None
 
 
+def attn_modality_labels(num_modalities: int, *, action_conditioned: bool) -> list[str]:
+    """Names for the per-modality CLS attention groups, in the network's grouping order.
+
+    Mirrors ``_group_attn_scores``: three cameras, the text prompt, the state token when
+    the network embeds one, and the action chunk for a Q-function. The state slot is
+    inferred from the count because the plotting side does not see the network config.
+    """
+    labels = [f"img{i + 1}" for i in range(3)] + ["text"]
+    if num_modalities > 4 + int(action_conditioned):
+        labels.append("state")
+    if action_conditioned:
+        labels.append("action")
+    if len(labels) != num_modalities:
+        raise ValueError(f"Cannot name {num_modalities} attention groups (action_conditioned={action_conditioned})")
+    return labels
+
+
 def _create_attn_plot(
     attn_scores: list[np.ndarray],
     ep_idx: int,
@@ -1704,11 +1721,7 @@ def _create_attn_plot(
     """Create a line plot of per-modality CLS attention scores over time."""
     scores = np.stack(attn_scores, axis=0)  # [T, n_modalities]
     timesteps = np.arange(len(scores))
-    labels = [f"img{i+1}" for i in range(3)] + ["text"]
-    if scores.shape[1] > 4 + int(action_conditioned):
-        labels.append("state")
-    if action_conditioned:
-        labels.append("action")
+    labels = attn_modality_labels(scores.shape[1], action_conditioned = action_conditioned)
 
     fig, ax = plt.subplots(figsize=(10, 5))
     for i, label in enumerate(labels):

@@ -92,6 +92,11 @@ class EvalConfig:
     # differently otherwise cache different episodes, which makes their metrics
     # non-comparable per episode; naming the episodes pins them across arms.
     val_episode_indices: tuple[int, ...] = ()
+    # Same pinning as ``val_episode_indices`` but repo-qualified, ``"<repo_id>:<episode_index>"``
+    # per entry (e.g. ``RoboCOIN/Split_aloha_pour_tea:71``), for multi-repo datasets whose
+    # episode_index restarts per repo, where a bare index would match one episode in every
+    # repo. Mutually exclusive with ``val_episode_indices``.
+    val_episodes: tuple[str, ...] = ()
     # Cache multiple trajectories from one repo id. Derived from --fine-tune by default,
     # because a fine-tune targets a single-repo dataset; set explicitly for a TrainConfig on
     # such a dataset (e.g. the shirt-hang ResNet), which would otherwise cache exactly one
@@ -112,6 +117,24 @@ class EvalConfig:
     # Optional wandb run name (used when output_dir is None → wandb logging).
     # Defaults to f"eval_{config_name}" when unset.
     wandb_run_name: str | None = None
+    # False skips wandb entirely: no run is created and neither the standard validation
+    # plots nor the subtask videos are rendered (they only exist to be logged; --output-dir
+    # still writes them to disk). Rendering and upload cost about as much as the value pass
+    # itself, so this is the switch for runs whose only product is the npz -- which is why
+    # it requires --subtask-npz-dir: with both off the evaluation computes nothing anyone
+    # can read.
+    wandb_logging: bool = True
+
+
+def _parse_val_episodes(entries: tuple[str, ...]) -> tuple[tuple[str, int], ...]:
+    """``"<repo_id>:<episode_index>"`` entries -> ``(repo_id, episode_index)`` pairs."""
+    keys = []
+    for entry in entries:
+        repo_id, sep, index = entry.rpartition(":")
+        if not sep or not repo_id or not index.isdigit():
+            raise ValueError(f"--val-episodes entries must look like '<repo_id>:<episode_index>', got {entry!r}.")
+        keys.append((repo_id, int(index)))
+    return tuple(keys)
 
 
 def _resolve_eval_cache_dir(eval_config: EvalConfig) -> str:
@@ -378,6 +401,8 @@ def _write_eval_npz(
     mc_returns,
     boundaries,
     num_frames: int,
+    attn_scores = None,
+    attn_modalities = None,
     sample_indices = None,
     predicted_texts = None,
     gt_texts = None,
@@ -388,7 +413,9 @@ def _write_eval_npz(
     drift between critic families.
 
     Subtask fields are omitted rather than faked for critics that predict no subtask: a
-    whole-task critic has no subtask head, and an empty array says so unambiguously.
+    whole-task critic has no subtask head, and an empty array says so unambiguously. The
+    same goes for attention: a network with no per-modality CLS attention (the ResNet)
+    writes no ``attn_scores`` key at all.
     """
     import io as _io
 
@@ -404,6 +431,14 @@ def _write_eval_npz(
         "subtask_boundaries": np.asarray(boundaries, dtype = np.int32),
         "num_frames": np.int32(num_frames),
     }
+    if attn_scores:
+        # [num_frames, num_modalities]: per-group CLS attention at the dataset action, under
+        # the same prompt the reported value used. ``attn_modalities`` names the columns.
+        scores = np.stack(attn_scores, axis = 0).astype(np.float64)
+        if scores.shape[0] != num_frames:
+            raise ValueError(f"attn_scores has {scores.shape[0]} rows for {num_frames} frames")
+        payload["attn_scores"] = scores
+        payload["attn_modalities"] = np.asarray(attn_modalities)
     if sample_indices is not None:
         payload["subtask_pred_t"] = np.asarray(sample_indices, dtype = np.int32)
         payload["predicted_subtasks"] = np.asarray([(predicted_texts[t] or "") for t in sample_indices])
@@ -536,6 +571,9 @@ def _run_trajectory_evaluation(
             logger.warning("--action-grad-norm set without --subtask-npz-dir: nothing to write it to.")
         if eval_config.action_grad_norm and not action_conditioned:
             logger.warning("--action-grad-norm set on a state-only critic: no action to differentiate.")
+    # Plots and videos are rendered only where something consumes them: a wandb run or
+    # --output-dir.
+    render_outputs = eval_config.wandb_logging or eval_config.output_dir is not None
 
     # Accumulators for the standard validation plots, one entry per trajectory segment.
     plot_predictions: dict[str, list[float]] = {}
@@ -646,20 +684,21 @@ def _run_trajectory_evaluation(
                 "gt_ids": subtask_result.gt_ids,
             }
             plot_key = f"val/{repo_id.removeprefix('RoboCOIN/')}_episode_{ep_idx}{part_suffix}_subtask"
-            subtask_videos[plot_key] = _render_subtask_video(
-                mc_returns = mc_returns,
-                predicted_values = values,
-                perplexities = perplexities,
-                predicted_texts = predicted_texts,
-                gt_texts = gt_texts,
-                frame_images = frame_images,
-                fps = fps,
-                ep_idx = ep_idx,
-                subtask_texts = subtask_segment_labels(boundaries, gt_texts, len(frames)),
-                output_dir = eval_config.output_dir,
-                plot_key = plot_key,
-                condition_on_decoded = eval_config.condition_on_decoded_subtask,
-            )
+            if render_outputs:
+                subtask_videos[plot_key] = _render_subtask_video(
+                    mc_returns = mc_returns,
+                    predicted_values = values,
+                    perplexities = perplexities,
+                    predicted_texts = predicted_texts,
+                    gt_texts = gt_texts,
+                    frame_images = frame_images,
+                    fps = fps,
+                    ep_idx = ep_idx,
+                    subtask_texts = subtask_segment_labels(boundaries, gt_texts, len(frames)),
+                    output_dir = eval_config.output_dir,
+                    plot_key = plot_key,
+                    condition_on_decoded = eval_config.condition_on_decoded_subtask,
+                )
 
         if npz_mode:
             npz_path = _write_eval_npz(
@@ -670,6 +709,13 @@ def _run_trajectory_evaluation(
                 mc_returns = mc_returns,
                 boundaries = boundaries,
                 num_frames = len(frames),
+                attn_scores = value_passes.attn_scores,
+                attn_modalities = (
+                    train_module.attn_modality_labels(
+                        len(value_passes.attn_scores[0]), action_conditioned = action_conditioned,
+                    )
+                    if value_passes.attn_scores else None
+                ),
                 **npz_subtask_fields,
             )
             logger.info(f"Saved eval npz to {npz_path}: {len(values)} value preds.")
@@ -677,7 +723,7 @@ def _run_trajectory_evaluation(
         del frames, value_frames, subtask_result, value_passes
         gc.collect()
 
-    if not is_rank0:
+    if not is_rank0 or not render_outputs:
         return
 
     if eval_config.output_dir is None and subtask_videos:
@@ -734,6 +780,13 @@ def main(eval_config: EvalConfig):
 
     if eval_config.split not in {"train", "val"}:
         raise ValueError(f"--split must be 'train' or 'val', got {eval_config.split!r}.")
+    if eval_config.val_episode_indices and eval_config.val_episodes:
+        raise ValueError("--val-episode-indices and --val-episodes are mutually exclusive.")
+    if not eval_config.wandb_logging and eval_config.subtask_npz_dir is None:
+        raise ValueError(
+            "--no-wandb-logging without --subtask-npz-dir: nothing would be logged or written, "
+            "so the evaluation would be wasted compute. Set --subtask-npz-dir or re-enable wandb."
+        )
 
     platform = os.environ.get("PLATFORM", "gpu")
     if platform == "tpu":
@@ -838,6 +891,7 @@ def main(eval_config: EvalConfig):
             # repo_key and only one trajectory is ever cached.
             allow_duplicate_repos = eval_config.fine_tune is not None or eval_config.allow_duplicate_repos,
             episode_indices = eval_config.val_episode_indices or None,
+            episode_keys = _parse_val_episodes(eval_config.val_episodes) or None,
         )
         del val_trajectory_dataset
 
@@ -867,7 +921,7 @@ def main(eval_config: EvalConfig):
             f"(prompt_mode={critic_prompt_mode!r})"
         )
 
-    if eval_config.output_dir is None and jax.process_index() == 0:
+    if eval_config.wandb_logging and eval_config.output_dir is None and jax.process_index() == 0:
         import wandb
 
         wandb.init(
@@ -915,7 +969,7 @@ def main(eval_config: EvalConfig):
         logger.info("Waiting at post-render multihost barrier")
         jax.experimental.multihost_utils.sync_global_devices("evaluate_value_function_post_render_join")
 
-    if eval_config.output_dir is None and jax.process_index() == 0:
+    if eval_config.wandb_logging and eval_config.output_dir is None and jax.process_index() == 0:
         import wandb
 
         wandb.finish()
