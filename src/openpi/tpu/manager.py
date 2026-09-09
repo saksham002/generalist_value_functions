@@ -729,6 +729,32 @@ def _cleanup_losers_async(candidates: dict[str, tuple[str, PodConfig]], *, keep:
     return thread
 
 
+def race_zone_configs(tpu_type: str, request: AllocationRequest) -> tuple[PodConfig, ...]:
+    """One candidate config per zone the race may open, in quota order.
+
+    ``spot_race_configs`` narrows by region only, because that is what shapes the quota
+    query; the zone and continent restrictions live on the request's filter and are
+    applied here. Without this step the reuse pass honoured ``--zone`` while the race
+    ignored it, and a launch pinned to one zone could win a pod on another continent.
+    """
+    configs = spot_race_configs(
+        tpu_type,
+        user=request.user,
+        project=request.project,
+        region=request.region,
+        max_zones=request.max_race_zones,
+    )
+    placement = dataclasses.replace(request.filters, tpu_types=(), only_my_pods=False)
+    allowed = tuple(config for config in configs if placement.accepts(name="", zone=config.zone))
+    if not allowed:
+        raise RuntimeError(
+            f"No zone with {tpu_type} spot quota passes the launch's placement restriction "
+            f"(zones={list(placement.zones)}, regions={list(placement.regions)}, "
+            f"continents={list(placement.continents)}); quota zones were {[c.zone for c in configs]}"
+        )
+    return allowed
+
+
 def race_spot_tpu(
     tpu_type: str,
     request: AllocationRequest,
@@ -744,13 +770,7 @@ def race_spot_tpu(
     guarantees exactly one of them keeps a pod.
     """
     arbiter = arbiter or RaceArbiter()
-    configs = spot_race_configs(
-        tpu_type,
-        user=request.user,
-        project=request.project,
-        region=request.region,
-        max_zones=request.max_race_zones,
-    )
+    configs = race_zone_configs(tpu_type, request)
     prefix_of = {
         config.zone: get_tpu_name_prefix(
             tpu_type, resource_owner=config.user.resource_owner, is_spot=True, run_token=request.name_token

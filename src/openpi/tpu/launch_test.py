@@ -641,3 +641,30 @@ def test_a_reserved_launch_keeps_its_named_pod_across_retries() -> None:
     spot = LaunchConfig(command="python train.py cfg", tpu_name="v4-64-0", tpu_type="v4-64", spot=True)
     assert spot.tpu_name_for_attempt(0) == "v4-64-0"
     assert spot.tpu_name_for_attempt(1) is None
+
+
+# ---------------------------------------------------------------------------------------
+# The spot race honours the same placement restriction as the reuse pass.
+# ---------------------------------------------------------------------------------------
+
+
+def test_race_keeps_only_zones_the_launch_allows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--zone`` narrowed the reuse pass but not the race, which once put a launch pinned
+    to europe-west4-a on a pod in us-west1-c with no filer."""
+    from openpi.tpu import manager
+
+    quota_zones = ("europe-west4-b", "us-east1-d", "europe-west4-a", "us-west1-c")
+    monkeypatch.setattr(manager, "spot_race_configs", lambda *_, **__: tuple(_pod(z) for z in quota_zones))
+
+    by_zone = AllocationRequest(run_id="r-1", tpu_type="v5e-64", spot=True, zone="europe-west4-a")
+    assert [c.zone for c in manager.race_zone_configs("v5e-64", by_zone)] == ["europe-west4-a"]
+
+    by_continent = AllocationRequest(run_id="r-1", tpu_type="v5e-64", spot=True, continent="eu")
+    assert [c.zone for c in manager.race_zone_configs("v5e-64", by_continent)] == ["europe-west4-b", "europe-west4-a"]
+
+    unrestricted = AllocationRequest(run_id="r-1", tpu_type="v5e-64", spot=True)
+    assert [c.zone for c in manager.race_zone_configs("v5e-64", unrestricted)] == list(quota_zones)
+
+    nowhere = AllocationRequest(run_id="r-1", tpu_type="v5e-64", spot=True, zone="us-central2-b")
+    with pytest.raises(RuntimeError, match="placement restriction"):
+        manager.race_zone_configs("v5e-64", nowhere)
