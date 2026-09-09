@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """TPU wrapper for counterfactual action generation.
 
-Runs the same episode/shard traversal as the GPU worker, but executes sampling in
-lockstep across TPU hosts. Each host samples a fixed local slice of the global
-sampling batch, host 0 gathers all sampled actions, applies the same output
-transforms as the GPU path, and writes the final TFDS shards directly.
+Runs the same episode/shard traversal as the GPU worker
+(``compute_counterfactual_actions.py``), but executes sampling in lockstep across TPU
+hosts. Each host samples a fixed local slice of the global sampling batch, host 0 gathers
+all sampled actions, applies the same output transforms as the GPU path, and writes the
+final TFDS shards directly. Prompt construction, EEF state/action handling, action-dim
+masking and the debug metrics mirror the GPU worker; the per-worker output directories,
+``--reverse`` convergence and the SLURM launch/merge subcommands do not apply here.
 """
 
 from collections import defaultdict
@@ -15,8 +18,8 @@ import logging
 import time
 from typing import Any
 
+import openpi.training.yam_eef as yam_eef
 from rlds_build_utils import get_rlds_episode_index
-from rlds_build_utils import resolve_config
 from etils import epath
 import numpy as np
 import tqdm
@@ -31,6 +34,8 @@ class Args:
     config_name: str
     checkpoint_dir: str
     output_dir: str
+    # Optional FineTuneConfig name whose data/model overrides are applied on top of config_name.
+    fine_tune: str | None = None
     split: str = "train"
     num_samples: int = 32
     samples_per_batch: int = 32
@@ -42,6 +47,16 @@ class Args:
     profile_log_dir: str | None = None
     profile_num_batches: int = 1
     profile_skip_batches: int = 0
+    # Override the config's rlds_data_dir (e.g. a GCS mirror or a subset dataset instead of the
+    # cluster path baked into the config).
+    rlds_data_dir: str | None = None
+    # Override the flow-matching integration steps used by the policy's sample_actions.
+    sampling_num_steps: int | None = None
+    # Convert sampled joint actions to EEF actions via forward kinematics after unnormalization.
+    convert_joint_actions_to_eef: bool = False
+    yam_fk_dir: str = yam_eef.DEFAULT_YAM_FK_DIR
+    # Process exactly one source shard (index into the split's shard list) instead of all of them.
+    only_shard: int | None = None
 
 
 @dataclasses.dataclass
@@ -54,6 +69,37 @@ class PendingRequest:
     action_mask: np.ndarray | None
     encoded_images: Any
     written_samples: int = 0
+
+
+def _resolve_config_with_fine_tune(config_name: str, fine_tune: str | None, rlds_data_dir: str | None = None):
+    """Resolve openpi config and optionally apply a FineTuneConfig's overrides.
+
+    Mirrors the fine-tune handling in `scripts/train_value_function.py` (with
+    `pretrained_step = None`, since we are not training): only data/model/interval
+    overrides are applied, no schedule offsetting.
+
+    ``rlds_data_dir`` optionally overrides the config's data dir (e.g. to point at a
+    local mirror / a mini dataset instead of the GCS default baked into the config).
+
+    Returns (config, data_config, dataset_cfg, model_config).
+    """
+    import openpi.training.config as _config
+
+    config = _config.get_config(config_name)
+    if fine_tune is not None:
+        ft_config = _config.get_fine_tune_config(fine_tune)
+        config = ft_config.apply_overrides(config)
+    if rlds_data_dir is not None:
+        config = dataclasses.replace(config, data = dataclasses.replace(config.data, rlds_data_dir = rlds_data_dir))
+    data_config = config.data.create(config.assets_dirs, config.model)
+    if data_config.rlds_data_dir is None:
+        raise ValueError("Config must have rlds_data_dir set.")
+    datasets = data_config.datasets
+    if not datasets:
+        raise ValueError("Config must have datasets configured.")
+    if len(datasets) > 1:
+        logger.warning("Multiple datasets configured, only processing first one.")
+    return config, data_config, datasets[0], config.model
 
 
 def _build_policy_prompt(subtask_texts: list[str], first_null_index: int) -> str | None:
@@ -113,12 +159,18 @@ def _slice_tree_axis0(tree: Any, start: int, end: int) -> Any:
 
 
 def _construct_eef_repr_np(action: np.ndarray, eef_action: np.ndarray) -> np.ndarray:
+    # Gripper slots within `action` depend on its dim: left at dim//2 - 1, right at
+    # dim - 1, matching the 14D (6, 13) and 16D (7, 15) raw layouts. Mirrors
+    # Hdf5RldsDataset._construct_eef_repr so 16D joint states map grippers correctly.
+    total_dim = action.shape[-1]
+    left_gripper_index = total_dim // 2 - 1
+    right_gripper_index = total_dim - 1
     return np.concatenate(
         [
             eef_action[..., :6],
-            action[..., 6:7],
+            action[..., left_gripper_index : left_gripper_index + 1],
             eef_action[..., 6:12],
-            action[..., 13:14],
+            action[..., right_gripper_index : right_gripper_index + 1],
         ],
         axis = -1,
     ).astype(np.float32)
@@ -137,7 +189,13 @@ def _read_existing_shard_metadata(shard_path: epath.Path) -> dict[str, int]:
 
 
 def _select_policy_subtask(
-    step: dict[str, Any], subtask_texts: list[str], fps: int, action_horizon: int, max_subtasks: int
+    step: dict[str, Any],
+    subtask_texts: list[str],
+    fps: int,
+    action_horizon: int,
+    max_subtasks: int,
+    *,
+    mask_boundary_actions: bool,
 ) -> tuple[str | None, int, np.ndarray]:
     first_null_index_val = int(step["first_null_index"])
     if first_null_index_val == 0:
@@ -147,7 +205,7 @@ def _select_policy_subtask(
     include_subtasks = np.zeros(max_subtasks, dtype = np.bool_)
     for idx, text in enumerate(subtask_texts[:first_null_index_val]):
         lowered = text.rstrip(". ").strip().lower()
-        include_subtasks[idx] = lowered not in {"static", "abnormal"}
+        include_subtasks[idx] = lowered not in {"dummy", "static", "abnormal"}
 
     policy_prompt = _build_policy_prompt(subtask_texts, first_null_index_val)
     if policy_prompt is None:
@@ -156,12 +214,51 @@ def _select_policy_subtask(
     masked_steps = np.where(include_subtasks, steps_all, np.iinfo(np.int32).max)
     sampled_idx = int(np.argmin(masked_steps))
     selected_steps = int(steps_all[sampled_idx])
-    action_mask = np.arange(action_horizon, dtype = np.int32) <= selected_steps
+    if mask_boundary_actions:
+        action_mask = np.arange(action_horizon, dtype = np.int32) <= selected_steps
+    else:
+        action_mask = np.ones(action_horizon, dtype = np.bool_)
     if fps == 30:
         valid_30fps_actions = 3 * action_horizon // 5
         action_mask &= np.arange(action_horizon, dtype = np.int32) < valid_30fps_actions
 
     return policy_prompt, sampled_idx, action_mask
+
+
+def _select_task_description_prompt(
+    step: dict[str, Any], fps: int, task_description: str, action_horizon: int, *, mask_boundary_actions: bool,
+) -> tuple[str | None, int, np.ndarray]:
+    """Constant-per-episode prompt; mirrors hdf5_rlds_dataset.py:569-572."""
+    if not task_description:
+        return None, 0, np.zeros(action_horizon, dtype = np.bool_)
+    if mask_boundary_actions:
+        steps_value = int(np.asarray(step["steps_to_subtask_end"]).flatten()[0])
+        action_mask = np.arange(action_horizon, dtype = np.int32) <= steps_value
+    else:
+        action_mask = np.ones(action_horizon, dtype = np.bool_)
+    if fps == 30:
+        valid_30fps_actions = 3 * action_horizon // 5
+        action_mask &= np.arange(action_horizon, dtype = np.int32) < valid_30fps_actions
+    return task_description, 0, action_mask
+
+
+def _select_lerobot_subtask_prompt(step: dict[str, Any], action_horizon: int) -> tuple[str | None, int, np.ndarray]:
+    """LeRobot subtask-conditioned prompt: the per-step `subtask` text verbatim.
+
+    Mirrors LeRobotRldsDataset under prompt_mode="subtask" (frame["prompt"] =
+    frame["subtask"]). The LeRobot schema exposes a single `subtask` field (no
+    subtask_1..5 / first_null_index), so the prompt is that string as-is. The action
+    mask is all-ones: that config runs with critic_mode=False, where the training data
+    path never sets an action_mask, so the model defaults it to all-ones (pi0.py).
+    """
+    subtask_text = step["subtask"]
+    if hasattr(subtask_text, "numpy"):
+        subtask_text = subtask_text.numpy()
+    if isinstance(subtask_text, bytes):
+        subtask_text = subtask_text.decode("utf-8")
+    if not subtask_text:
+        return None, 0, np.zeros(action_horizon, dtype = np.bool_)
+    return subtask_text, 0, np.ones(action_horizon, dtype = np.bool_)
 
 
 def _format_timing(times: dict[str, float]) -> str:
@@ -285,8 +382,19 @@ def main() -> int:
 
     tf.config.set_visible_devices([], "GPU")
 
-    config, data_config, dataset_cfg, _ = resolve_config(args.config_name)
+    config, data_config, dataset_cfg, _ = _resolve_config_with_fine_tune(
+        args.config_name, args.fine_tune, args.rlds_data_dir,
+    )
+    # No subsample support: sampling runs on the raw (un-subsampled) steps, so a
+    # subsample=True config would misalign the cache with training.
+    assert not data_config.rlds_kwargs.get("subsample", False), (
+        "compute_counterfactual_actions_tpu.py does not support subsample=True configs."
+    )
     source_builder = tfds.builder(dataset_cfg.name, data_dir = data_config.rlds_data_dir, version = dataset_cfg.version)
+    logger.info(
+        "Source dataset resolved to %s (rlds_data_dir=%s, name=%s, version=%s)",
+        source_builder.data_dir, data_config.rlds_data_dir, dataset_cfg.name, dataset_cfg.version,
+    )
     split_info = source_builder.info.splits[args.split]
     total_episodes = split_info.num_examples
     shard_lengths = split_info.shard_lengths
@@ -296,13 +404,19 @@ def main() -> int:
         shard_info.append((offset, length))
         offset += length
     num_shards = len(shard_info)
+    shard_indices = list(range(num_shards))
+    if args.only_shard is not None:
+        if args.only_shard < 0 or args.only_shard >= num_shards:
+            raise ValueError(f"--only-shard={args.only_shard} out of range [0, {num_shards}).")
+        shard_indices = [args.only_shard]
 
     logger.info(
-        "Initialized TPU counterfactual run: process %d/%d, local_samples_per_batch=%d, num_shards=%d",
+        "Initialized TPU counterfactual run: process %d/%d, local_samples_per_batch=%d, num_shards=%d (processing %d)",
         process_index,
         process_count,
         local_samples_per_batch,
         num_shards,
+        len(shard_indices),
     )
 
     policy_model_config = config.policy if config.policy is not None else config.model
@@ -325,6 +439,13 @@ def main() -> int:
     model = nnx.merge(graphdef, state)
     data_config_for_policy = config.data.create(config.assets_dirs, policy_model_config)
     norm_stats = _checkpoints.load_norm_stats(checkpoint_dir_path / "assets", data_config_for_policy.asset_id)
+    # Keep only the norm-stat keys the Normalize / Unnormalize transforms reference at
+    # inference. Checkpoints also store "action_diff" (chunk-wise-delta stats); leaving
+    # it in trips Unnormalize's strict key check since the output dict has no such key.
+    # Mirrors best_of_n_policy._INFERENCE_NORM_KEYS.
+    if norm_stats is not None:
+        inference_norm_keys = {"state", "actions", "next_state", "next_actions"}
+        norm_stats = {k: v for k, v in norm_stats.items() if k in inference_norm_keys}
 
     policy = _policy.Policy(
         model,
@@ -351,6 +472,9 @@ def main() -> int:
     input_transform = policy._input_transform  # noqa: SLF001
     output_transform = policy._output_transform  # noqa: SLF001
     sample_kwargs = dict(policy._sample_kwargs)  # noqa: SLF001
+    if args.sampling_num_steps is not None:
+        sample_kwargs["num_steps"] = args.sampling_num_steps
+        logger.info("Overriding flow-matching integration steps: num_steps=%d", args.sampling_num_steps)
     rng = policy._rng  # noqa: SLF001
 
     if hasattr(model, "config") and hasattr(model.config, "guidance"):
@@ -365,8 +489,36 @@ def main() -> int:
     seen_sampling_batches = 0
 
     action_horizon = policy_model_config.action_horizon
-    action_dim = policy_model_config.action_dim
+    # The model may emit a padded action vector; the store holds only the meaningful
+    # contiguous block (mirrors PadStatesAndActions._resolve_offset and BestOfNPolicy.infer).
+    model_action_dim = policy_model_config.action_dim
+    action_dim_mask = getattr(policy_model_config, "action_dim_mask", None)
+    if action_dim_mask is not None:
+        action_dim_mask = np.asarray(action_dim_mask, dtype = np.bool_)
+        action_dim = int(np.sum(action_dim_mask))
+        true_indices = np.where(action_dim_mask)[0]
+        assert (true_indices == np.arange(true_indices[0], true_indices[-1] + 1)).all(), (
+            f"action_dim_mask must be a contiguous True block, got {action_dim_mask.tolist()}"
+        )
+        action_dim_offset = int(true_indices[0])
+    else:
+        action_dim = model_action_dim
+        action_dim_offset = getattr(policy_model_config, "action_dim_offset", 0)
     max_subtasks = 5
+    prompt_mode = data_config.rlds_kwargs.get("prompt_mode", "subtask")
+    mask_boundary_actions = bool(data_config.rlds_kwargs.get("mask_boundary_actions", False))
+    # LeRobot datasets (rlds_dataset_class="lerobot") carry a single per-step `subtask`
+    # field (no subtask_1..5 / first_null_index) and the prompt is that text verbatim;
+    # RoboCoin/HDF5 datasets carry subtask_1..5 and build a composite prompt.
+    is_lerobot = getattr(data_config, "rlds_dataset_class", None) == "lerobot"
+    logger.info(
+        "Action horizon=%d, action_dim=%d (model %d, offset %d), num_samples=%d, action_dim_mask=%s, "
+        "prompt_mode=%s, mask_boundary_actions=%s, use_chunk_wise_delta=%s, use_eef=%s, rng_seed=0 (hardcoded in Policy)",
+        action_horizon, action_dim, model_action_dim, action_dim_offset, args.num_samples,
+        None if action_dim_mask is None else action_dim_mask.tolist(),
+        prompt_mode, mask_boundary_actions, data_config.rlds_kwargs.get("use_chunk_wise_delta"),
+        data_config_for_policy.robocoin_use_eef,
+    )
 
     manifest = ca_store.CounterfactualActionStoreManifest(
         version = "1.0",
@@ -388,7 +540,7 @@ def main() -> int:
     worker_times = defaultdict(float)
     timed_episode_count = 0
 
-    for shard_idx in range(num_shards):
+    for shard_idx in shard_indices:
         start_pos, num_episodes = shard_info[shard_idx]
 
         if args.max_episodes is not None:
@@ -471,10 +623,28 @@ def main() -> int:
                 repo_id = repo_id.numpy()
             embodiment = extract_embodiment(repo_id)
             fps = int(episode["episode_metadata"]["fps"])
+            # Optional (dexterous/hdf5 configs only): whether this episode carries subtask
+            # boundary annotations. Logged alongside the debug metrics below.
+            has_subtask_annotations = episode["episode_metadata"].get("has_subtask_annotations")
+            if hasattr(has_subtask_annotations, "numpy"):
+                has_subtask_annotations = has_subtask_annotations.numpy()
+            if has_subtask_annotations is not None:
+                has_subtask_annotations = bool(has_subtask_annotations)
+
+            episode_task_description = ""
+            if prompt_mode == "task_description":
+                td = episode["episode_metadata"]["task_description"]
+                if hasattr(td, "numpy"):
+                    td = td.numpy()
+                if isinstance(td, bytes):
+                    td = td.decode("utf-8")
+                # Raw task_description verbatim: training feeds it unmodified and the
+                # tokenizer only strips whitespace, so stripping a trailing period here
+                # would diverge the tokenized prompt from training.
+                episode_task_description = td or ""
 
             episode_actions = None
             if args.debug_metrics:
-                logger.info("Episode %d fps=%d", rlds_episode_index, fps)
                 episode_actions = []
                 for step in episode["steps"]:
                     step_action = step["action"]
@@ -504,7 +674,16 @@ def main() -> int:
             episode_cov_trace_sum = 0.0
             episode_cov_trace_num_valid = 0.0
 
-            if any(int(step["first_null_index"]) > 0 for step in episode["steps"]):
+            if prompt_mode == "task_description":
+                skip_whole_episode = not episode_task_description
+            elif is_lerobot:
+                # Every LeRobot step normally carries a `subtask`; the per-step path skips
+                # any empty one (leaving zeros, same as a whole-episode skip).
+                skip_whole_episode = False
+            else:
+                skip_whole_episode = not any(int(step["first_null_index"]) > 0 for step in episode["steps"])
+
+            if not skip_whole_episode:
                 pending_requests: deque[PendingRequest] = deque()
                 step_requests: dict[int, list[PendingRequest]] = {}
                 step_encoding_inputs: list[tuple[int, dict[str, Any]]] = []
@@ -541,22 +720,34 @@ def main() -> int:
                 for strided_idx, step_idx in enumerate(range(0, num_steps, args.stride)):
                     step = episode["steps"][step_idx]
 
+                    # subtask_1..subtask_5 exist only in the RoboCoin/HDF5 subtask schema and
+                    # feed the composite subtask prompt; the other prompt modes skip the read.
                     subtask_texts = []
-                    for si in range(1, max_subtasks + 1):
-                        text = step[f"subtask_{si}"]
-                        if hasattr(text, "numpy"):
-                            text = text.numpy()
-                        if isinstance(text, bytes):
-                            text = text.decode("utf-8")
-                        subtask_texts.append(text)
+                    if prompt_mode != "task_description" and not is_lerobot:
+                        for si in range(1, max_subtasks + 1):
+                            text = step[f"subtask_{si}"]
+                            if hasattr(text, "numpy"):
+                                text = text.numpy()
+                            if isinstance(text, bytes):
+                                text = text.decode("utf-8")
+                            subtask_texts.append(text)
 
-                    policy_prompt, _, action_mask = _select_policy_subtask(
-                        step,
-                        subtask_texts,
-                        fps,
-                        action_horizon,
-                        max_subtasks,
-                    )
+                    if prompt_mode == "task_description":
+                        policy_prompt, _, action_mask = _select_task_description_prompt(
+                            step, fps, episode_task_description, action_horizon,
+                            mask_boundary_actions = mask_boundary_actions,
+                        )
+                    elif is_lerobot:
+                        if prompt_mode != "subtask":
+                            raise ValueError(
+                                f"LeRobot counterfactual caching supports prompt_mode='subtask', got {prompt_mode!r}."
+                            )
+                        policy_prompt, _, action_mask = _select_lerobot_subtask_prompt(step, action_horizon)
+                    else:
+                        policy_prompt, _, action_mask = _select_policy_subtask(
+                            step, subtask_texts, fps, action_horizon, max_subtasks,
+                            mask_boundary_actions = mask_boundary_actions,
+                        )
                     if policy_prompt is None:
                         continue
 
@@ -566,6 +757,19 @@ def main() -> int:
                     if hasattr(step_state, "numpy"):
                         step_state = step_state.numpy()
                     step_state = np.array(step_state, dtype = np.float32)
+                    if data_config_for_policy.robocoin_use_eef:
+                        # Mirrors RoboCoinRldsDataset._construct_eef_state: 14-D EEF layout
+                        # (left xyz/rpy + left gripper + right xyz/rpy + right gripper) built
+                        # from 12-D eef_sim_pose_state and the joint state's gripper slots.
+                        step_eef_state = step["eef_sim_pose_state"]
+                        if hasattr(step_eef_state, "numpy"):
+                            step_eef_state = step_eef_state.numpy()
+                        step_eef_state = np.asarray(step_eef_state, dtype = np.float32)
+                        step_state = _construct_eef_repr_np(step_state, step_eef_state)
+                    elif data_config.rlds_kwargs.get("state_dim") == 16 and step_state.shape[-1] == 14:
+                        step_state = np.concatenate(
+                            [step_state[:6], [0.0], step_state[6:13], [0.0], step_state[13:]], axis = 0,
+                        ).astype(np.float32)
 
                     decoded_images = {}
                     with episode_timer.context("image_decode"):
@@ -597,16 +801,16 @@ def main() -> int:
                             step_idx + np.arange(action_horizon, dtype = np.int32),
                             num_steps - 1,
                         )
+                        # Absolute actions; the input transform's DeltaActions step converts
+                        # them to state-relative deltas when use_chunk_wise_delta is enabled.
                         gt_actions = episode_actions[gt_action_indices].copy()
-                        if data_config.rlds_kwargs["use_chunk_wise_delta"]:
-                            gt_actions = gt_actions - gt_actions[:1, :]
                         transform_with_actions["actions"] = gt_actions
 
                     with episode_timer.context("input_transform"):
                         transformed = input_transform(transform_with_actions)
 
                     gt_actions_transformed = None
-                    action_mask_transformed = np.asarray(transformed["action_mask"], dtype = np.bool_)
+                    action_mask_transformed = action_mask.astype(np.bool_)
                     if args.debug_metrics:
                         gt_actions_transformed = np.asarray(transformed["actions"], dtype = np.float32)
 
@@ -753,7 +957,7 @@ def main() -> int:
                     seen_sampling_batches += 1
 
                     local_actions_shape = tuple(local_actions_out.shape)
-                    expected_local_shape = (local_samples_per_batch, action_horizon, action_dim)
+                    expected_local_shape = (local_samples_per_batch, action_horizon, model_action_dim)
                     if local_actions_shape != expected_local_shape:
                         raise AssertionError(
                             "Unexpected local sampled action shape: "
@@ -798,9 +1002,17 @@ def main() -> int:
                                     f"mismatch_sum = {mismatch_sum}, actual_batch_size = {actual_batch_size}"
                                 )
 
+                        # Slice the padded model output down to the meaningful contiguous block
+                        # before output_transform: norm_stats["actions"] is stored at the
+                        # unpadded dim and Unnormalize is strict on shape.
+                        actions_np = actions_np[..., action_dim_offset : action_dim_offset + action_dim]
+                        # The transformed (normalized) state, which Unnormalize / AbsoluteActions
+                        # in the output transform expect; the raw state would be un-normalized twice.
                         batch_states = np.concatenate(
                             [
-                                np.broadcast_to(request.state[None], (n, *request.state.shape))
+                                np.broadcast_to(
+                                    request.transformed["state"][None], (n, *request.transformed["state"].shape),
+                                )
                                 for request, n in batch_requests
                             ],
                             axis = 0,
@@ -816,26 +1028,24 @@ def main() -> int:
                                 }
                             )
                         output_actions = transformed_outputs["actions"]
+                        if args.convert_joint_actions_to_eef:
+                            # Must run here: output_transform has already applied Unnormalize +
+                            # AbsoluteActions, so these are absolute joint positions. FK on a
+                            # delta or on normalized values is meaningless.
+                            output_actions = yam_eef.joint_actions_to_eef(output_actions, yam_fk_dir = args.yam_fk_dir)
 
                         offset = 0
                         for request, n in batch_requests:
                             request_actions = actions_np[offset : offset + n]
                             if args.debug_metrics:
-                                gt_actions_broadcast = np.broadcast_to(
-                                    request.gt_actions[None, ...],
-                                    request_actions.shape,
-                                )
+                                gt_actions = request.gt_actions
+                                if action_dim_mask is not None:
+                                    gt_actions = gt_actions[..., action_dim_mask]
+                                gt_actions_broadcast = np.broadcast_to(gt_actions[None, ...], request_actions.shape)
                                 abs_diff = np.abs(request_actions - gt_actions_broadcast)
                                 sq_diff = np.square(request_actions - gt_actions_broadcast)
-
-                                if getattr(model, "action_dim_mask", None) is not None:
-                                    dim_mask = np.asarray(model.action_dim_mask, dtype = np.float32)[None, None, :]
-                                    dim_mask_den = max(float(np.sum(dim_mask)), 1.0)
-                                    l1_per_step = np.sum(abs_diff * dim_mask, axis = -1) / dim_mask_den
-                                    mse_per_step = np.sum(sq_diff * dim_mask, axis = -1) / dim_mask_den
-                                else:
-                                    l1_per_step = np.mean(abs_diff, axis = -1)
-                                    mse_per_step = np.mean(sq_diff, axis = -1)
+                                l1_per_step = np.mean(abs_diff, axis = -1)
+                                mse_per_step = np.mean(sq_diff, axis = -1)
 
                                 step_mask = request.action_mask.astype(np.float32)[None, :]
                                 episode_sampling_l1_sum += float(np.sum(l1_per_step * step_mask))
@@ -867,6 +1077,7 @@ def main() -> int:
                 _emit_progress_log(
                     (
                         "TPU shard %d episode_index=%d num_steps=%d valid_frames=%d "
+                        "has_subtask_annotations=%s "
                         "sampling_l1=%.6f sampling_mse=%.6f cov_trace_per_timestep=%.6f "
                         "debug_metrics=%s elapsed=%.2fs"
                     )
@@ -875,6 +1086,7 @@ def main() -> int:
                         rlds_episode_index,
                         num_steps,
                         episode_valid_frames,
+                        has_subtask_annotations,
                         episode_sampling_l1_sum / max(episode_sampling_num_valid, 1.0),
                         episode_sampling_mse_sum / max(episode_sampling_num_valid, 1.0),
                         episode_cov_trace_sum / max(episode_cov_trace_num_valid, 1.0),
@@ -894,12 +1106,14 @@ def main() -> int:
                 )
                 logger.info(
                     "TPU shard %d episode_index=%d num_steps=%d valid_frames=%d "
+                    "has_subtask_annotations=%s "
                     "sampling_l1=%.6f sampling_mse=%.6f cov_trace_per_timestep=%.6f "
                     "debug_metrics=%s elapsed=%.2fs",
                     shard_idx,
                     rlds_episode_index,
                     num_steps,
                     episode_valid_frames,
+                    has_subtask_annotations,
                     episode_sampling_l1_sum / max(episode_sampling_num_valid, 1.0),
                     episode_sampling_mse_sum / max(episode_sampling_num_valid, 1.0),
                     episode_cov_trace_sum / max(episode_cov_trace_num_valid, 1.0),
