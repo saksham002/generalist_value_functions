@@ -788,9 +788,17 @@ class BestOfNWrapper(_model.BaseModel):
             and hasattr(network, "compute_prefix_cache")
             and hasattr(value_function, "compute_prefix_cache")
         ):
-            raw_kv_cache, raw_prefix_mask, raw_subtask_mask = value_function.compute_prefix_cache(
-                prefix_observation, use_target = self.use_target_value
-            )
+            # Only bootstrapping critics (SARSA, CQL) take `use_target`; a Monte-Carlo
+            # critic has no target network and its wrapper rejects the keyword, so pass
+            # it only when a target prefix is actually requested.
+            if self.use_target_value:
+                raw_kv_cache, raw_prefix_mask, raw_subtask_mask = value_function.compute_prefix_cache(
+                    prefix_observation, use_target = True
+                )
+            else:
+                raw_kv_cache, raw_prefix_mask, raw_subtask_mask = value_function.compute_prefix_cache(
+                    prefix_observation
+                )
             # Gemma 4 KV cache has batch at axis 0 (per-layer dict, 1-D end_index leaf);
             # gemma_2b stacks layers with batch at axis 1.
             paligemma_variant = getattr(getattr(network, "config", None), "paligemma_variant", "")
