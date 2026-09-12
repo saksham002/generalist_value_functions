@@ -19,7 +19,9 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import pathlib
 import queue
+import sys
 import threading
 import time
 from typing import Any
@@ -39,6 +41,12 @@ import tyro
 
 from openpi_client import websocket_client_policy as _websocket_client_policy
 from openpi_client import eval_image_helper as _eval_image_helper
+
+# The client runs as a plain script, so the repo root is not on sys.path.
+_REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[4])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from eval.helpers import pause_timing as _pause_timing
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 logger = logging.getLogger(__name__)
@@ -153,6 +161,15 @@ class Args:
     video_subdir: str = ""
     """Optional subdirectory under eval/xarm_scripts/tpu_eval/lid_seal/videos/ in which to store
     this run's mp4s. Empty string saves directly into videos/."""
+
+    log_pause_timing: bool = False
+    """If set, record the wall-clock time at which every env step was sent and returned, and write
+    episode_<n>_pause_timing.json into the same directory as the videos. cut_pauses.py uses it to
+    remove the inference pauses from an external camera recording."""
+
+    sync_tone: bool = True
+    """With log_pause_timing, play a short tone through the speaker at the first and last step so
+    the camera audio can be aligned to the log. Needs `aplay`; silently disabled without it."""
 
     use_critic_subtasks: bool = True
     """If True, send the per-step subtask prompt to the critic via obs["prompt"]. If False,
@@ -529,25 +546,40 @@ def run_episode(
 ) -> None:
     logger.info(f"Starting episode {episode_idx}")
 
+    # The robot was reset before the operator staged the scene, so the observation handed in
+    # predates the objects being placed. Refresh it so the first policy query sees the real scene.
+    obs = env.get_observation()
+
     tracker = SubtaskTracker()
     if args.manual:
         logger.info("Manual subtask switching enabled — press Enter to advance subtask.")
 
     # Per-episode video logger. With a critic, the Q-value plot panel is animated;
     # without one, that panel is left blank and the video shows only the 3 cameras.
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "videos")
+    if args.video_subdir:
+        output_dir = os.path.join(output_dir, args.video_subdir)
+
     video_logger: VideoLogger | None = None
     if args.log_videos:
-        video_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "videos")
-        if args.video_subdir:
-            video_dir = os.path.join(video_dir, args.video_subdir)
         video_fps = args.control_freq / args.query_freq
         video_logger = VideoLogger(
-            output_dir = video_dir,
+            output_dir = output_dir,
             fps = video_fps,
             num_samples = args.num_samples,
             has_critic = args.has_critic,
         )
         video_logger.start_episode(episode_idx)
+
+    pause_logger: _pause_timing.PauseTimingLogger | None = None
+    if args.log_pause_timing:
+        pause_logger = _pause_timing.PauseTimingLogger(
+            output_dir = output_dir,
+            control_freq = args.control_freq,
+            query_freq = args.query_freq,
+            play_tones = args.sync_tone,
+        )
+        pause_logger.start_episode(episode_idx)
 
     action_plan: np.ndarray | None = None
     t = 0
@@ -605,6 +637,8 @@ def run_episode(
                 #     )
 
                 elapsed = time.perf_counter() - t0
+                if pause_logger is not None:
+                    pause_logger.mark_replan(t, elapsed, server_ms)
 
                 action_plan = full_actions[
                     :, args.real_action_start : args.real_action_start + args.real_action_dim
@@ -652,11 +686,19 @@ def run_episode(
             action = action_plan[plan_idx]
             # action = np.zeros_like(action)
 
+            if pause_logger is not None:
+                pause_logger.mark_step_sent(t)
             obs, reward, terminated, truncated, _ = env.step(action)
+            if pause_logger is not None:
+                pause_logger.mark_step_returned(t)
             t += 1
 
         logger.info(f"Episode {episode_idx} finished after {t} steps (terminated={terminated}, truncated={truncated})")
     finally:
+        # The end tone is played here, before the (slow) video render, so it lands right after
+        # the last step on the camera recording.
+        if pause_logger is not None:
+            pause_logger.finish_episode()
         if video_logger is not None:
             video_logger.finish_episode()
 

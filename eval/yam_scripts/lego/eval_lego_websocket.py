@@ -25,7 +25,9 @@ import dataclasses
 import json
 import logging
 import os
+import pathlib
 import queue
+import sys
 import threading
 import time
 from typing import Any
@@ -41,6 +43,12 @@ import tyro
 from openpi_client import eval_image_helper as _eval_image_helper
 from openpi_client import websocket_client_policy as _websocket_client_policy
 from yam_teleop.env import YAMBimanualEnv
+
+# The client runs as a plain script, so the repo root is not on sys.path.
+_REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[3])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from eval.helpers import pause_timing as _pause_timing
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 logger = logging.getLogger(__name__)
@@ -138,6 +146,15 @@ class Args:
 
     video_subdir: str = "BC"
     """Subdirectory under eval/yam_scripts/lego/videos/ for this run's mp4s (e.g. BC, BoN)."""
+
+    log_pause_timing: bool = False
+    """If set, record the wall-clock time at which every env step was sent and returned, and write
+    episode_<n>_pause_timing.json into the same directory as the videos. cut_pauses.py uses it to
+    remove the inference pauses from an external camera recording."""
+
+    sync_tone: bool = True
+    """With log_pause_timing, play a short tone through the speaker at the first and last step so
+    the camera audio can be aligned to the log. Needs `aplay`; silently disabled without it."""
 
 
 # =============================================================================
@@ -326,19 +343,34 @@ def run_episode(
     episode early; the video is still written because the logger is flushed in `finally`."""
     logger.info(f"Starting episode {episode_idx}")
 
+    # The robot was reset before the operator staged the scene, so the observation handed in
+    # predates the objects being placed. Refresh it so the first policy query sees the real scene.
+    obs = env._get_obs()
+
     subtask_idx = 0
     logger.info(f"Subtask 0/{len(args.subtasks) - 1}: {args.subtasks[0]!r} (press Enter to advance)")
 
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "videos", args.video_subdir)
+
     video_logger: VideoLogger | None = None
     if args.log_videos:
-        video_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "videos", args.video_subdir)
         video_logger = VideoLogger(
-            output_dir = video_dir,
+            output_dir = output_dir,
             fps = args.control_freq / args.query_freq,
             num_samples = args.num_samples,
             has_critic = args.has_critic,
         )
         video_logger.start_episode(episode_idx)
+
+    pause_logger: _pause_timing.PauseTimingLogger | None = None
+    if args.log_pause_timing:
+        pause_logger = _pause_timing.PauseTimingLogger(
+            output_dir = output_dir,
+            control_freq = args.control_freq,
+            query_freq = args.query_freq,
+            play_tones = args.sync_tone,
+        )
+        pause_logger.start_episode(episode_idx)
 
     action_plan: np.ndarray | None = None
     t = 0
@@ -367,6 +399,8 @@ def run_episode(
                 t0 = time.perf_counter()
                 infer_result = client.infer(element)
                 elapsed = time.perf_counter() - t0
+                if pause_logger is not None:
+                    pause_logger.mark_replan(t, elapsed, infer_result.get("server_timing", {}).get("infer_ms"))
 
                 full_actions = np.asarray(infer_result["actions"], dtype = np.float32)
                 action_plan = full_actions[:, : args.real_action_dim]
@@ -392,13 +426,21 @@ def run_episode(
 
             plan_idx = min(t % args.query_freq, action_plan.shape[0] - 1)
             # YAMBimanualEnv.step blocks on the next broker frame, so this loop runs at the env's rate.
+            if pause_logger is not None:
+                pause_logger.mark_step_sent(t)
             obs, _, terminated, truncated, _ = env.step(action_plan[plan_idx])
+            if pause_logger is not None:
+                pause_logger.mark_step_returned(t)
             t += 1
             if terminated or truncated:
                 break
 
         logger.info(f"Episode {episode_idx} finished after {t} steps")
     finally:
+        # The end tone is played here, before the (slow) video render, so it lands right after
+        # the last step on the camera recording.
+        if pause_logger is not None:
+            pause_logger.finish_episode()
         if video_logger is not None:
             video_logger.finish_episode()
 
