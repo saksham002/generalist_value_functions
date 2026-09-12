@@ -7,24 +7,24 @@ set -e
 # =============================================================================
 # Configuration — edit these before running
 # =============================================================================
-TPU_TYPE="v5e-64"
-TPU_NAME="v5e-tpu-64-1"
+TPU_TYPE="v4-64"
+TPU_NAME="v4-64-0"
 PORT=8005
 
 POLICY_CONFIG="real_shirt_hang_pi05"
-POLICY_DIR="gs://saksham-euw4/checkpoints/robocoin/pi05_finetune/real_shirt_hang_pi05/real_shirt_hang_pi05"
+POLICY_DIR="gs://saksham-usc2/checkpoints/robocoin/pi05_finetune/real_shirt_hang_pi05/real_shirt_hang_pi05"
 POLICY_STEP=60000
 
 # Set CRITIC_ENABLE=false to serve the policy without BestOfN.
 CRITIC_ENABLE=true
-CRITIC_CONFIG="robocoin_bimanual_paligemma_cql_rlds"
-CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/robocoin_bimanual_paligemma_cql_rlds/robocoin_bimanual_paligemma_cql_rlds/real_shirt_hang_paligemma_cql_rlds_finetune_task_description_final"
-CRITIC_STEP=240000
-CRITIC_FT_CONFIG="real_shirt_hang_paligemma_cql_rlds_finetune_task_description_final"
+CRITIC_CONFIG="real_shirt_hang_paligemma_td_bon_subtask_ar"
+CRITIC_DIR="gs://saksham-euw4/checkpoints/robocoin/value_functions/Q/real_shirt_hang_paligemma_td_bon_subtask_ar/real_shirt_hang_paligemma_td_bon_subtask_ar"
+CRITIC_STEP=20000
+CRITIC_FT_CONFIG=""
 NUM_SAMPLES=8
 # AR-subtask decode cadence: the critic AR-decodes the predicted subtask once every
 # N critic calls (and conditions Q on it). Experiment with 4 and 10.
-#SUBTASK_DECODE_EVERY=10
+SUBTASK_DECODE_EVERY=4
 # When true, pass --critic.expect-critic-images: the critic consumes a separate obs["critic_image"]
 # stream (the eval client must send it; needed when the critic's image size/pipeline differs from the
 # policy, e.g. a gemma4 critic). When false, the critic reuses the policy's obs["image"].
@@ -49,10 +49,10 @@ if [ "${CRITIC_ENABLE}" = true ]; then
     else
         CRITIC_FT_FLAG=""
     fi
-    CRITIC_BLOCK="critic:critic-args --critic.config ${CRITIC_CONFIG} --critic.dir ${CRITIC_DIR} --critic.step ${CRITIC_STEP} ${CRITIC_FT_FLAG} --critic.num-samples ${NUM_SAMPLES} --critic.sample-parallel --critic.fsdp-devices 16 ${CRITIC_IMAGES_FLAG}"
+    CRITIC_BLOCK="critic:critic-args --critic.config ${CRITIC_CONFIG} --critic.dir ${CRITIC_DIR} --critic.step ${CRITIC_STEP} ${CRITIC_FT_FLAG} --critic.num-samples ${NUM_SAMPLES} --critic.sample-parallel --critic.subtask-decode-every ${SUBTASK_DECODE_EVERY} --critic.fsdp-devices 16 ${CRITIC_IMAGES_FLAG}"
 else
     # --use-bestofn-loader routes through BestOfNPolicy so the action-dim slice runs before Unnormalize.
-    PRE_POLICY_FLAGS="--use-bestofn-loader"
+    PRE_POLICY_FLAGS="--use-bestofn-loader --fsdp-devices 16"
     CRITIC_BLOCK=""
 fi
 
@@ -78,7 +78,7 @@ if [ "${CRITIC_ENABLE}" = true ]; then
 fi
 echo ""
 echo "Health check:    curl http://<tpu-worker-0-ip>:${PORT}/healthz"
-echo "Reattach to job: gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=europe-west4-b --worker=0 --command=\"tmux attach -t job\""
+echo "Reattach to job: gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=us-central2-b --worker=0 --command=\"tmux attach -t job\""
 echo "Local terminal:  ctrl-C to release; the remote server keeps running."
 echo ""
 

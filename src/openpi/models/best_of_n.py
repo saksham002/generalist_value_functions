@@ -326,18 +326,18 @@ class BestOfNWrapper(_model.BaseModel):
                 "critic": {k: critic_norm_stats[k] for k in ("state", "actions")},
             }
         elif policy_norm_stats is not None:
-            # Only the core transition keys must match between policy and critic
-            # norm stats; extra keys (e.g. 'action_diff', which a chunk-wise-delta
-            # critic carries but a non-delta policy does not) are ignored for both
-            # the key-set check and the per-key value comparison.
-            _core_keys = {"state", "actions", "next_state", "next_actions"}
+            # Only the keys used when scoring Q(s, a) at BestOfN inference — state and
+            # actions — must match between policy and critic norm stats. Critic-only keys
+            # carried from training (next_state / next_actions for TD/SARSA targets, and
+            # 'action_diff' for chunk-wise-delta critics) are never used here, so they are
+            # ignored for both the key-set check and the per-key value comparison.
+            _core_keys = {"state", "actions"}
             p_core = set(policy_norm_stats) & _core_keys
             c_core = set(critic_norm_stats) & _core_keys
             if p_core != c_core:
                 raise ValueError(
                     "BestOfNWrapper requires identical policy/critic core norm-stat keys "
-                    f"(state/actions/next_state/next_actions); differ: {sorted(p_core)} "
-                    f"vs {sorted(c_core)}."
+                    f"(state/actions); differ: {sorted(p_core)} vs {sorted(c_core)}."
                 )
             for stats_key in sorted(p_core):
                 p_stats = policy_norm_stats[stats_key]

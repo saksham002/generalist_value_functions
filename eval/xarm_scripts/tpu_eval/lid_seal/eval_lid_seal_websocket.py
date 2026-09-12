@@ -1,4 +1,4 @@
-"""Eval script for shirt-hang task via WebSocket policy server.
+"""Eval script for lid-seal task via WebSocket policy server.
 
 Connects to a remote policy server (serve_policy.py on a TPU pod) over WebSocket
 and a remote robot environment server, then runs episodes by querying the server
@@ -6,10 +6,10 @@ for actions and sending them to the physical robot.
 
 Usage:
     # Start the policy server on the TPU pod first:
-    ./eval/xarm_scripts/tpu_eval/serve_policy_shirt_hang.sh
+    ./eval/xarm_scripts/tpu_eval/lid_seal/serve_policy_lid_seal.sh
 
     # Then run the eval client:
-    uv run eval/xarm_scripts/tpu_eval/eval_shirt_hang_websocket.py \
+    uv run eval/xarm_scripts/tpu_eval/lid_seal/eval_lid_seal_websocket.py \
         --args.policy-host <tpu-worker-0-ip> \
         --args.robot-host xarmpc.pc.cs.cmu.edu
 """
@@ -59,6 +59,27 @@ def _start_key_listener() -> None:
             _advance_q.put(None)
 
     threading.Thread(target = _listen, daemon = True).start()
+
+
+def _wait_for_enter(message: str, *, manual: bool) -> bool:
+    """Block until the operator presses Enter. Returns False once stdin is closed.
+
+    In manual mode the key-listener thread owns stdin, so calling input() here would race it
+    for the keypress and the prompt could hang forever. Wait on the listener's queue instead.
+    Presses queued during the episode (or during video encoding) are drained first, so only a
+    fresh press satisfies the prompt.
+    """
+    while not _advance_q.empty():
+        _advance_q.get_nowait()
+    logger.info(message)
+    if manual:
+        _advance_q.get()
+        return True
+    try:
+        input()
+    except EOFError:
+        return False
+    return True
 
 
 # =============================================================================
@@ -111,7 +132,7 @@ class Args:
     """Debug mode: skip policy connection, save camera images to disk and print state instead."""
 
     debug_output_dir: str = ""
-    """Directory to save debug images when --debug is set. Defaults to eval/xarm_scripts/tpu_eval/debug/."""
+    """Directory to save debug images when --debug is set. Defaults to eval/xarm_scripts/tpu_eval/lid_seal/debug/."""
 
     manual: bool = False
     """If set, advance subtasks manually by pressing Enter (auto heuristic is disabled)."""
@@ -127,10 +148,10 @@ class Args:
 
     log_videos: bool = False
     """If set, save a per-episode 4-panel mp4 (wrist + base + Q-value plot)
-    to eval/xarm_scripts/tpu_eval/videos/episode_<n>.mp4 at FPS = control_freq / query_freq."""
+    to eval/xarm_scripts/tpu_eval/lid_seal/videos/episode_<n>.mp4 at FPS = control_freq / query_freq."""
 
     video_subdir: str = ""
-    """Optional subdirectory under eval/xarm_scripts/tpu_eval/videos/ in which to store
+    """Optional subdirectory under eval/xarm_scripts/tpu_eval/lid_seal/videos/ in which to store
     this run's mp4s. Empty string saves directly into videos/."""
 
     use_critic_subtasks: bool = True
@@ -157,41 +178,17 @@ _SUBTASK_PROMPTS = [
     "Place the hanger on the rod",
 ]
 
-_GRIP_THRESH = 400
-_MIN_BOUNDARY_GAP = 75
-
-
 class SubtaskTracker:
-    """Real-time subtask detector mirroring the heuristics in solve_subtask_boundaries.py.
+    """Manual subtask tracker: advances only when force_advance() is called (--manual mode).
 
-    Maintains a state machine over the 6 shirt-hang subtasks and advances to the next
-    subtask when the corresponding sensor transition is detected from the live observation
-    stream. Call update() every env step; read prompt to get the current subtask string.
-
-    Signals used (all from obs["state"]):
-        left/gripper_pos, right/gripper_pos  — gripper open/close state
-        right/tcp_pose[2]                    — absolute right-arm TCP Z height (metres)
+    Holds the current subtask index and exposes the corresponding prompt string, which is
+    sent to the critic when --use-critic-subtasks is set. There is no automatic transition
+    detection from the observation stream — the caller drives progression explicitly (e.g.
+    on an Enter keypress).
     """
 
-    def __init__(self, manual: bool = False) -> None:
+    def __init__(self) -> None:
         self._subtask = 0
-        self._steps_in_subtask = 0
-        self._step = 0
-        self._last_boundary_step = -_MIN_BOUNDARY_GAP - 1
-        self._manual = manual
-
-        self._prev_lg_open: bool | None = None
-        self._prev_rg_open: bool | None = None
-
-        self._t01_step: int | None = None
-        self._t12_step: int | None = None
-        self._t23_pending_step: int | None = None
-        self._t23_left_close_streak: int = 0
-        self._t23_step: int | None = None
-        self._t34_step: int | None = None
-        self._t45_candidate_step: int | None = None
-        self._t45_steps_since_candidate: int = 0
-        self._t45_step: int | None = None
 
     @property
     def subtask(self) -> int:
@@ -201,127 +198,12 @@ class SubtaskTracker:
     def prompt(self) -> str:
         return _SUBTASK_PROMPTS[self._subtask]
 
-    def update(self, obs: dict[str, Any]) -> None:
-        state = obs["state"]
-
-        def _scalar(key: str) -> float:
-            val = state.get(key)
-            if val is None:
-                return 0.0
-            arr = np.asarray(val, dtype=np.float32)
-            return float(arr[-1].flat[0] if arr.ndim > 1 else arr.flat[0])
-
-        def _vec(key: str, dim: int = 3) -> np.ndarray:
-            val = state.get(key)
-            if val is None:
-                return np.zeros(dim, dtype=np.float32)
-            arr = np.asarray(val, dtype=np.float32)
-            return arr[-1] if arr.ndim > 1 else arr
-
-        lg = _scalar("left/gripper_pos")
-        rg = _scalar("right/gripper_pos")
-        if "right/tcp_pose" not in state and self._step == 0:
-            logger.warning(
-                "SubtaskTracker: 'right/tcp_pose' not found in obs['state']. "
-                "T0->1 and T1->2 transitions require absolute TCP Z and will not fire. "
-                "Available keys: %s", list(state.keys())
-            )
-        rz = float(_vec("right/tcp_pose", dim=7)[2])
-
-        lg_open = lg > _GRIP_THRESH
-        rg_open = rg > _GRIP_THRESH
-
-        if not self._manual and self._subtask < len(_SUBTASK_PROMPTS) - 1:
-            self._check_transition(lg, rg, rz, lg_open, rg_open)
-
-        self._prev_lg_open = lg_open
-        self._prev_rg_open = rg_open
-
-        self._step += 1
-        self._steps_in_subtask += 1
-
     def force_advance(self) -> None:
         """Manually move to the next subtask (used by --manual mode)."""
         if self._subtask < len(_SUBTASK_PROMPTS) - 1:
-            self._advance(self._step)
-
-    def _can_accept_boundary(self, boundary_step: int) -> bool:
-        return boundary_step - self._last_boundary_step > _MIN_BOUNDARY_GAP
-
-    def _advance(self, boundary_step: int) -> None:
-        logger.info(f"SubtaskTracker: subtask {self._subtask} -> {self._subtask + 1} "
-                    f"({_SUBTASK_PROMPTS[self._subtask + 1]!r}) at step {self._step} "
-                    f"(boundary_step={boundary_step})")
-        self._subtask += 1
-        self._steps_in_subtask = 0
-        self._last_boundary_step = boundary_step
-        self._t23_pending_step = None
-        self._t23_left_close_streak = 0
-        self._t45_candidate_step = None
-        self._t45_steps_since_candidate = 0
-
-    def _check_transition(self, lg: float, rg: float, rz: float, lg_open: bool, rg_open: bool) -> None:
-        if self._subtask == 0:
-            self._check_t01(rz, rg_open)
-        elif self._subtask == 1:
-            self._check_t12(rz)
-        elif self._subtask == 2:
-            self._check_t23(lg_open)
-        elif self._subtask == 3:
-            self._check_t34(rg, lg)
-        elif self._subtask == 4:
-            self._check_t45(lg_open)
-
-    def _check_t01(self, rz: float, rg_open: bool) -> None:
-        right_close_edge = self._prev_rg_open is True and not rg_open
-        if right_close_edge and rz > 0.30 and self._can_accept_boundary(self._step):
-            self._t01_step = self._step
-            self._advance(self._step)
-
-    def _check_t12(self, rz: float) -> None:
-        if rz < 0.22 and self._can_accept_boundary(self._step):
-            self._t12_step = self._step
-            self._advance(self._step)
-
-    def _check_t23(self, lg_open: bool) -> None:
-        left_close_edge = self._prev_lg_open is True and not lg_open
-        assert self._t01_step is not None
-
-        if self._t23_pending_step is None:
-            if left_close_edge and self._step > self._t01_step + 50:
-                self._t23_pending_step = self._step
-                self._t23_left_close_streak = 1
-        elif not lg_open:
-            self._t23_left_close_streak += 1
-            if self._t23_left_close_streak >= 40:
-                if self._can_accept_boundary(self._t23_pending_step):
-                    self._t23_step = self._t23_pending_step
-                    self._advance(self._t23_pending_step)
-        else:
-            self._t23_pending_step = None
-            self._t23_left_close_streak = 0
-
-    def _check_t34(self, rg: float, lg: float) -> None:
-        if rg < 200 and lg > _GRIP_THRESH and self._can_accept_boundary(self._step):
-            self._t34_step = self._step
-            self._advance(self._step)
-
-    def _check_t45(self, lg_open: bool) -> None:
-        left_open_edge = self._prev_lg_open is False and lg_open
-
-        if left_open_edge:
-            self._t45_candidate_step = self._step
-            self._t45_steps_since_candidate = 1
-        elif self._t45_candidate_step is not None and lg_open:
-            self._t45_steps_since_candidate += 1
-        else:
-            self._t45_candidate_step = None
-            self._t45_steps_since_candidate = 0
-
-        if self._t45_candidate_step is not None and self._t45_steps_since_candidate >= 30:
-            if self._can_accept_boundary(self._t45_candidate_step):
-                self._t45_step = self._t45_candidate_step
-                self._advance(self._t45_candidate_step)
+            logger.info(f"SubtaskTracker: subtask {self._subtask} -> {self._subtask + 1} "
+                        f"({_SUBTASK_PROMPTS[self._subtask + 1]!r})")
+            self._subtask += 1
 
 
 # =============================================================================
@@ -372,6 +254,9 @@ class VideoLogger:
         self._q_values: list[np.ndarray] = []
         self._steps: list[int] = []
         self._advance_steps: list[int] = []
+        # Per-replan critic-predicted subtask (carried forward from the last AR-decode
+        # step); used as the Q-value plot title.
+        self._predicted_subtasks: list[str | None] = []
         self._episode_idx: int | None = None
 
     def start_episode(self, episode_idx: int) -> None:
@@ -383,6 +268,7 @@ class VideoLogger:
         images: dict[str, np.ndarray],
         q_values: np.ndarray | None,
         t: int,
+        predicted_subtask: str | None = None,
     ) -> None:
         """Snapshot the latest cameras + Q-values at the env step where predict() ran."""
         self._images.append({k: np.asarray(v).copy() for k, v in images.items()})
@@ -391,6 +277,11 @@ class VideoLogger:
         else:
             self._q_values.append(np.asarray(q_values, dtype = np.float32).reshape(-1))
         self._steps.append(t)
+        # The critic only AR-decodes a subtask every N steps; carry the last decoded
+        # value forward so every frame's plot title reflects the current prediction.
+        if predicted_subtask is None and self._predicted_subtasks:
+            predicted_subtask = self._predicted_subtasks[-1]
+        self._predicted_subtasks.append(predicted_subtask)
 
     def record_advance(self, t: int) -> None:
         """Mark an env step at which the user pressed Enter (manual subtask switch)."""
@@ -401,6 +292,10 @@ class VideoLogger:
             return
         q_matrix = np.stack(self._q_values, axis = 0)  # (T_replans, N)
         steps = np.asarray(self._steps, dtype = np.int64)
+        # Persisting the exact per-replan Q-values plotted in the video is disabled.
+        # qval_path = os.path.join(self.output_dir, f"Final Video q values_episode_{self._episode_idx}.npz")
+        # np.savez(qval_path, steps = steps, q_values = q_matrix)
+        # logger.info(f"Saved episode Q-values: {qval_path}")
         frames = [self._render_frame(i, q_matrix, steps) for i in range(len(self._images))]
         out_path = os.path.join(self.output_dir, f"episode_{self._episode_idx}.mp4")
         # imageio bundles its own ffmpeg with libx264; system ffmpeg on this cluster
@@ -429,7 +324,10 @@ class VideoLogger:
         right_wrist = _panel(images.get("right_wrist_0_rgb"))
         base_rgb = _panel(images.get("base_0_rgb"))
         if self.has_critic:
-            value_panel = self._render_value_plot(size, q_matrix, steps, current_step)
+            predicted_subtask = (
+                self._predicted_subtasks[frame_idx] if frame_idx < len(self._predicted_subtasks) else None
+            )
+            value_panel = self._render_value_plot(size, q_matrix, steps, current_step, predicted_subtask)
         else:
             # No critic → no Q-values to plot; show a blank panel so the layout
             # and mp4 dimensions stay constant.
@@ -445,6 +343,7 @@ class VideoLogger:
         q_matrix: np.ndarray,
         steps: np.ndarray,
         current_step: int,
+        predicted_subtask: str | None = None,
     ) -> np.ndarray:
         dpi = 100
         figsize = (size / dpi, size / dpi)
@@ -459,6 +358,11 @@ class VideoLogger:
         if x_hi == x_lo:
             x_hi = x_lo + 1
         ax.set_xlim(x_lo, x_hi)
+        if predicted_subtask:
+            title = str(predicted_subtask)
+            if len(title) > 42:
+                title = title[:39] + "..."
+            ax.set_title(title, fontsize = 6)
         ax.set_xlabel("env step", fontsize = 6)
         ax.set_ylabel("Q value", fontsize = 6)
         ax.tick_params(labelsize = 5)
@@ -621,15 +525,12 @@ def run_episode(
     image_helper: _eval_image_helper.EvalImageHelper,
     args: Args,
     episode_idx: int,
+    obs: dict[str, Any],
 ) -> None:
     logger.info(f"Starting episode {episode_idx}")
-    obs, _ = env.reset(seed=episode_idx)
 
-    tracker = SubtaskTracker(manual = args.manual)
+    tracker = SubtaskTracker()
     if args.manual:
-        # Drain any Enter presses queued before this episode started.
-        while not _advance_q.empty():
-            _advance_q.get_nowait()
         logger.info("Manual subtask switching enabled — press Enter to advance subtask.")
 
     # Per-episode video logger. With a critic, the Q-value plot panel is animated;
@@ -660,7 +561,6 @@ def run_episode(
 
     try:
         while not (terminated or truncated) and t < args.max_steps:
-            tracker.update(obs)
             if args.manual:
                 while not _advance_q.empty():
                     _advance_q.get_nowait()
@@ -719,11 +619,16 @@ def run_episode(
                     log_line += f", q_values=[{values_str}]"
                 logger.info(log_line)
 
-                # When the server decodes the current subtask (returns
-                # 'predicted_subtask'), dump the right/top camera frame so the
-                # decode can be eyeballed against what the critic actually saw.
+                # When the server AR-decodes the current subtask (returns
+                # 'predicted_subtask' on decode steps), log it next to the tracker's
+                # current subtask (the annotation) so alignment can be checked, and
+                # dump the right/top frame the critic saw.
                 predicted_subtask = infer_result.get("predicted_subtask")
                 if predicted_subtask is not None:
+                    logger.info(
+                        f"[subtask decode] step {t}: predicted={predicted_subtask!r}  "
+                        #f"annotation(tracker)=subtask{tracker.subtask}:{tracker.prompt!r}"
+                    )
                     decode_dir = os.path.join(
                         os.path.dirname(os.path.abspath(__file__)), "decoded_subtask_images"
                     )
@@ -734,16 +639,12 @@ def run_episode(
                             c if c.isalnum() else "_" for c in str(predicted_subtask)
                         )[:60]
                         out_path = os.path.join(
-                            decode_dir, f"ep{episode_idx}_step{t}_{safe_subtask}.png"
+                            decode_dir, f"ep{episode_idx}_step{t}_ann{tracker.subtask}_pred_{safe_subtask}.png"
                         )
                         imageio.imwrite(out_path, right_top_rgb)
-                        logger.info(
-                            f"[subtask decode] predicted={predicted_subtask!r} → "
-                            f"saved right/top image to {out_path}"
-                        )
 
                 if video_logger is not None:
-                    video_logger.record_predict(images_rgb, q_values, t)
+                    video_logger.record_predict(images_rgb, q_values, t, predicted_subtask)
 
 
             plan_idx = min(t % args.query_freq, action_plan.shape[0] - 1)
@@ -809,7 +710,7 @@ def main(args: Args) -> None:
     import sys
     from pathlib import Path
 
-    sys.path.insert(0, str(Path(__file__).parent.parent))
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     from remote_environment_adapter import RemoteEnvironmentAdapter
 
     if args.manual:
@@ -829,33 +730,55 @@ def main(args: Args) -> None:
 
     client = None
     for episode_idx in range(args.start_episode_idx, args.start_episode_idx + args.num_episodes):
-        # Reconnect per episode so a response left buffered by a Ctrl-C'd inference in the
-        # previous episode can't carry over. A stale buffered response would be returned by
-        # the next episode's first infer() call, desyncing every request/response by one.
-        if client is not None:
-            logger.info(f"Reconnecting policy client to {args.policy_host}:{args.policy_port} for episode {episode_idx}")
-            try:
-                client._ws.close()
-            except Exception as e:
-                logger.warning(f"Error closing previous client websocket (ignored, reconnecting anyway): {e}")
-                pass
-        else:
-            logger.info(f"Connecting policy client to {args.policy_host}:{args.policy_port} for episode {episode_idx}")
-        client = _websocket_client_policy.WebsocketClientPolicy(args.policy_host, args.policy_port)
-        image_helper = _eval_image_helper.EvalImageHelper.from_client(client)
-        logger.info(
-            f"EvalImageHelper: policy={image_helper.policy_image_size}, "
-            f"critic={image_helper.critic_image_size}, "
-            f"expect_critic_images={image_helper.expect_critic_images}"
-        )
+        # Two separate Enters bracket every episode: the first homes the robot, the second
+        # starts it moving. Splitting them leaves the scene-staging window entirely after the
+        # reset, so the previous episode's video finishes encoding while the operator is still
+        # being asked to reset rather than while the robot is already homed and waiting.
         try:
-            run_episode(env, client, image_helper, args, episode_idx)
+            if not _wait_for_enter(
+                f"Press Enter to reset the robot for episode {episode_idx}...", manual=args.manual
+            ):
+                break
+            logger.info(f"Resetting environment for episode {episode_idx}...")
+            obs, _ = env.reset(seed=episode_idx)
+
+            # Reconnect per episode so a response left buffered by a Ctrl-C'd inference in the
+            # previous episode can't carry over. A stale buffered response would be returned by
+            # the next episode's first infer() call, desyncing every request/response by one.
+            # Done after the reset so the fresh socket sits idle for as little as possible.
+            if client is not None:
+                logger.info(
+                    f"Reconnecting policy client to {args.policy_host}:{args.policy_port} for episode {episode_idx}"
+                )
+                try:
+                    client._ws.close()
+                except Exception as e:
+                    logger.warning(f"Error closing previous client websocket (ignored, reconnecting anyway): {e}")
+            else:
+                logger.info(f"Connecting policy client to {args.policy_host}:{args.policy_port} for episode {episode_idx}")
+            client = _websocket_client_policy.WebsocketClientPolicy(args.policy_host, args.policy_port)
+            image_helper = _eval_image_helper.EvalImageHelper.from_client(client)
+            logger.info(
+                f"EvalImageHelper: policy={image_helper.policy_image_size}, "
+                f"critic={image_helper.critic_image_size}, "
+                f"expect_critic_images={image_helper.expect_critic_images}"
+            )
+
+            if not _wait_for_enter(
+                f"Reset complete. Stage the scene, then press Enter to start episode {episode_idx}...",
+                manual=args.manual,
+            ):
+                break
         except KeyboardInterrupt:
-            logger.info(f"Episode {episode_idx} interrupted by Ctrl+C")
-        try:
-            input(f"Episode {episode_idx} done. Press Enter to continue to the next episode...")
-        except EOFError:
+            logger.info("Ctrl+C at the episode prompt; stopping.")
             break
+
+        try:
+            run_episode(env, client, image_helper, args, episode_idx, obs)
+        except KeyboardInterrupt:
+            # run_episode's finally has already written this episode's video by the time the
+            # interrupt surfaces here.
+            logger.info(f"Episode {episode_idx} interrupted by Ctrl+C")
 
     env.close()
 

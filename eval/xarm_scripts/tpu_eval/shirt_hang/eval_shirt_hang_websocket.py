@@ -61,6 +61,27 @@ def _start_key_listener() -> None:
     threading.Thread(target = _listen, daemon = True).start()
 
 
+def _wait_for_enter(message: str, *, manual: bool) -> bool:
+    """Block until the operator presses Enter. Returns False once stdin is closed.
+
+    In manual mode the key-listener thread owns stdin, so calling input() here would race it
+    for the keypress and the prompt could hang forever. Wait on the listener's queue instead.
+    Presses queued during the episode (or during video encoding) are drained first, so only a
+    fresh press satisfies the prompt.
+    """
+    while not _advance_q.empty():
+        _advance_q.get_nowait()
+    logger.info(message)
+    if manual:
+        _advance_q.get()
+        return True
+    try:
+        input()
+    except EOFError:
+        return False
+    return True
+
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -372,6 +393,9 @@ class VideoLogger:
         self._q_values: list[np.ndarray] = []
         self._steps: list[int] = []
         self._advance_steps: list[int] = []
+        # Per-replan critic-predicted subtask (carried forward from the last AR-decode
+        # step); used as the Q-value plot title.
+        self._predicted_subtasks: list[str | None] = []
         self._episode_idx: int | None = None
 
     def start_episode(self, episode_idx: int) -> None:
@@ -383,6 +407,7 @@ class VideoLogger:
         images: dict[str, np.ndarray],
         q_values: np.ndarray | None,
         t: int,
+        predicted_subtask: str | None = None,
     ) -> None:
         """Snapshot the latest cameras + Q-values at the env step where predict() ran."""
         self._images.append({k: np.asarray(v).copy() for k, v in images.items()})
@@ -391,6 +416,11 @@ class VideoLogger:
         else:
             self._q_values.append(np.asarray(q_values, dtype = np.float32).reshape(-1))
         self._steps.append(t)
+        # The critic only AR-decodes a subtask every N steps; carry the last decoded
+        # value forward so every frame's plot title reflects the current prediction.
+        if predicted_subtask is None and self._predicted_subtasks:
+            predicted_subtask = self._predicted_subtasks[-1]
+        self._predicted_subtasks.append(predicted_subtask)
 
     def record_advance(self, t: int) -> None:
         """Mark an env step at which the user pressed Enter (manual subtask switch)."""
@@ -401,11 +431,10 @@ class VideoLogger:
             return
         q_matrix = np.stack(self._q_values, axis = 0)  # (T_replans, N)
         steps = np.asarray(self._steps, dtype = np.int64)
-        # Persist the exact per-replan Q-values plotted in the video so the numbers
-        # behind the rendered "Final Video" can be recovered for offline analysis.
-        qval_path = os.path.join(self.output_dir, f"Final Video q values_episode_{self._episode_idx}.npz")
-        np.savez(qval_path, steps = steps, q_values = q_matrix)
-        logger.info(f"Saved episode Q-values: {qval_path}")
+        # Persisting the exact per-replan Q-values plotted in the video is disabled.
+        # qval_path = os.path.join(self.output_dir, f"Final Video q values_episode_{self._episode_idx}.npz")
+        # np.savez(qval_path, steps = steps, q_values = q_matrix)
+        # logger.info(f"Saved episode Q-values: {qval_path}")
         frames = [self._render_frame(i, q_matrix, steps) for i in range(len(self._images))]
         out_path = os.path.join(self.output_dir, f"episode_{self._episode_idx}.mp4")
         # imageio bundles its own ffmpeg with libx264; system ffmpeg on this cluster
@@ -434,7 +463,10 @@ class VideoLogger:
         right_wrist = _panel(images.get("right_wrist_0_rgb"))
         base_rgb = _panel(images.get("base_0_rgb"))
         if self.has_critic:
-            value_panel = self._render_value_plot(size, q_matrix, steps, current_step)
+            predicted_subtask = (
+                self._predicted_subtasks[frame_idx] if frame_idx < len(self._predicted_subtasks) else None
+            )
+            value_panel = self._render_value_plot(size, q_matrix, steps, current_step, predicted_subtask)
         else:
             # No critic → no Q-values to plot; show a blank panel so the layout
             # and mp4 dimensions stay constant.
@@ -450,6 +482,7 @@ class VideoLogger:
         q_matrix: np.ndarray,
         steps: np.ndarray,
         current_step: int,
+        predicted_subtask: str | None = None,
     ) -> np.ndarray:
         dpi = 100
         figsize = (size / dpi, size / dpi)
@@ -464,6 +497,11 @@ class VideoLogger:
         if x_hi == x_lo:
             x_hi = x_lo + 1
         ax.set_xlim(x_lo, x_hi)
+        if predicted_subtask:
+            title = str(predicted_subtask)
+            if len(title) > 42:
+                title = title[:39] + "..."
+            ax.set_title(title, fontsize = 6)
         ax.set_xlabel("env step", fontsize = 6)
         ax.set_ylabel("Q value", fontsize = 6)
         ax.tick_params(labelsize = 5)
@@ -626,15 +664,12 @@ def run_episode(
     image_helper: _eval_image_helper.EvalImageHelper,
     args: Args,
     episode_idx: int,
+    obs: dict[str, Any],
 ) -> None:
     logger.info(f"Starting episode {episode_idx}")
-    obs, _ = env.reset(seed=episode_idx)
 
     tracker = SubtaskTracker(manual = args.manual)
     if args.manual:
-        # Drain any Enter presses queued before this episode started.
-        while not _advance_q.empty():
-            _advance_q.get_nowait()
         logger.info("Manual subtask switching enabled — press Enter to advance subtask.")
 
     # Per-episode video logger. With a critic, the Q-value plot panel is animated;
@@ -749,7 +784,7 @@ def run_episode(
                         imageio.imwrite(out_path, right_top_rgb)
 
                 if video_logger is not None:
-                    video_logger.record_predict(images_rgb, q_values, t)
+                    video_logger.record_predict(images_rgb, q_values, t, predicted_subtask)
 
 
             plan_idx = min(t % args.query_freq, action_plan.shape[0] - 1)
@@ -835,33 +870,55 @@ def main(args: Args) -> None:
 
     client = None
     for episode_idx in range(args.start_episode_idx, args.start_episode_idx + args.num_episodes):
-        # Reconnect per episode so a response left buffered by a Ctrl-C'd inference in the
-        # previous episode can't carry over. A stale buffered response would be returned by
-        # the next episode's first infer() call, desyncing every request/response by one.
-        if client is not None:
-            logger.info(f"Reconnecting policy client to {args.policy_host}:{args.policy_port} for episode {episode_idx}")
-            try:
-                client._ws.close()
-            except Exception as e:
-                logger.warning(f"Error closing previous client websocket (ignored, reconnecting anyway): {e}")
-                pass
-        else:
-            logger.info(f"Connecting policy client to {args.policy_host}:{args.policy_port} for episode {episode_idx}")
-        client = _websocket_client_policy.WebsocketClientPolicy(args.policy_host, args.policy_port)
-        image_helper = _eval_image_helper.EvalImageHelper.from_client(client)
-        logger.info(
-            f"EvalImageHelper: policy={image_helper.policy_image_size}, "
-            f"critic={image_helper.critic_image_size}, "
-            f"expect_critic_images={image_helper.expect_critic_images}"
-        )
+        # Two separate Enters bracket every episode: the first homes the robot, the second
+        # starts it moving. Splitting them leaves the scene-staging window entirely after the
+        # reset, so the previous episode's video finishes encoding while the operator is still
+        # being asked to reset rather than while the robot is already homed and waiting.
         try:
-            run_episode(env, client, image_helper, args, episode_idx)
+            if not _wait_for_enter(
+                f"Press Enter to reset the robot for episode {episode_idx}...", manual=args.manual
+            ):
+                break
+            logger.info(f"Resetting environment for episode {episode_idx}...")
+            obs, _ = env.reset(seed=episode_idx)
+
+            # Reconnect per episode so a response left buffered by a Ctrl-C'd inference in the
+            # previous episode can't carry over. A stale buffered response would be returned by
+            # the next episode's first infer() call, desyncing every request/response by one.
+            # Done after the reset so the fresh socket sits idle for as little as possible.
+            if client is not None:
+                logger.info(
+                    f"Reconnecting policy client to {args.policy_host}:{args.policy_port} for episode {episode_idx}"
+                )
+                try:
+                    client._ws.close()
+                except Exception as e:
+                    logger.warning(f"Error closing previous client websocket (ignored, reconnecting anyway): {e}")
+            else:
+                logger.info(f"Connecting policy client to {args.policy_host}:{args.policy_port} for episode {episode_idx}")
+            client = _websocket_client_policy.WebsocketClientPolicy(args.policy_host, args.policy_port)
+            image_helper = _eval_image_helper.EvalImageHelper.from_client(client)
+            logger.info(
+                f"EvalImageHelper: policy={image_helper.policy_image_size}, "
+                f"critic={image_helper.critic_image_size}, "
+                f"expect_critic_images={image_helper.expect_critic_images}"
+            )
+
+            if not _wait_for_enter(
+                f"Reset complete. Stage the scene, then press Enter to start episode {episode_idx}...",
+                manual=args.manual,
+            ):
+                break
         except KeyboardInterrupt:
-            logger.info(f"Episode {episode_idx} interrupted by Ctrl+C")
-        try:
-            input(f"Episode {episode_idx} done. Press Enter to continue to the next episode...")
-        except EOFError:
+            logger.info("Ctrl+C at the episode prompt; stopping.")
             break
+
+        try:
+            run_episode(env, client, image_helper, args, episode_idx, obs)
+        except KeyboardInterrupt:
+            # run_episode's finally has already written this episode's video by the time the
+            # interrupt surfaces here.
+            logger.info(f"Episode {episode_idx} interrupted by Ctrl+C")
 
     env.close()
 

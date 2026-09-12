@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shirt-hang eval client. Connects to a remote serve_policy.py (TPU) and the
+# Lid-seal eval client. Connects to a remote serve_policy.py (TPU) and the
 # physical robot environment server, then runs episodes.
 
 set -e
@@ -9,7 +9,7 @@ set -e
 # =============================================================================
 # External IP of the rank-0 TPU worker (from the "Creating server" line in the
 # server startup logs). Re-check per launch — rank-0 placement can change.
-POLICY_HOST="34.12.73.186"
+POLICY_HOST="35.186.17.145"
 POLICY_PORT=8005
 ROBOT_HOST="xarmpc.pc.cs.cmu.edu"
 ROBOT_PORT=8080
@@ -21,25 +21,25 @@ QUERY_FREQ=30
 MAX_STEPS=7200
 
 HAS_CRITIC=true
-NUM_SAMPLES=8
+NUM_SAMPLES=32
 # true: critic conditioned on per-step subtask prompts; false: critic gets TASK_DESCRIPTION (same prompt as the policy).
 # Requires a critic served with a prompt_mode that reads the client prompt (NOT task_description_predict_current_subtask).
-USE_CRITIC_SUBTASKS=true
-# Sent to the critic when USE_CRITIC_SUBTASKS=false; must match serve_policy_shirt_hang.sh --task-description.
-TASK_DESCRIPTION="Place the shirt on the hanger and hang it from the rod."
+USE_CRITIC_SUBTASKS=false
+# Sent to the critic when USE_CRITIC_SUBTASKS=false; must match serve_policy_lid_seal.sh --task-description.
+TASK_DESCRIPTION="Place the lid on the pot."
 
 LOG_VIDEOS=true
-VIDEO_SUBDIR="robocoin_bimanual_paligemma_cql_rlds_subtask_no_ntp, real_shirt_hang_paligemma_cql_rlds_finetune_subtask_final, 250k N=8, redo"   # optional subdir under eval/xarm_scripts/tpu_eval/videos/ (empty = save directly there)
+VIDEO_SUBDIR="real_lid_pi05_subtask_annotated 40k, robocoin_bimanual_paligemma_cql_rlds_subtask_ar_samples32 250k N=32"   # optional subdir under eval/xarm_scripts/tpu_eval/lid_seal/videos/ (empty = save directly there)
 DEBUG_VALUES=false
 MANUAL=true
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 echo "================================================"
-echo "Shirt-hang WebSocket eval client"
+echo "Lid-seal WebSocket eval client"
 echo "================================================"
 echo "  Policy server: ${POLICY_HOST}:${POLICY_PORT}"
 echo "  Robot server:  ${ROBOT_HOST}:${ROBOT_PORT}"
@@ -62,7 +62,7 @@ ARGS=""
 [ "${USE_CRITIC_SUBTASKS}" = true ]  && ARGS="${ARGS} --args.use-critic-subtasks"
 [ "${USE_CRITIC_SUBTASKS}" = false ] && ARGS="${ARGS} --args.no-use-critic-subtasks"
 
-uv run eval/xarm_scripts/tpu_eval/eval_shirt_hang_websocket.py \
+uv run eval/xarm_scripts/tpu_eval/lid_seal/eval_lid_seal_websocket.py \
     --args.policy-host "${POLICY_HOST}" \
     --args.policy-port "${POLICY_PORT}" \
     --args.robot-host "${ROBOT_HOST}" \

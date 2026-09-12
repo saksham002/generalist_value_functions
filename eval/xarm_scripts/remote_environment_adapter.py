@@ -32,7 +32,7 @@ class RemoteEnvironmentAdapter:
         self,
         host: str = "localhost",
         port: int = 8080,
-        timeout: float = 30.0,
+        timeout: float = 180.0,
         retry_attempts: int = 3,
         retry_delay: float = 1.0,
         control_freq: int = 30,
@@ -43,7 +43,10 @@ class RemoteEnvironmentAdapter:
         Args:
             host: Robot server hostname or IP address
             port: Robot server port
-            timeout: Request timeout in seconds
+            timeout: Request timeout in seconds. Must comfortably exceed the server's worst-case
+                reset, which servos both arms home and can take tens of seconds. A read timeout
+                here does not cancel the server's work, so timing out early and retrying puts a
+                second request thread on the server's non-thread-safe ZMQ socket.
             retry_attempts: Number of retry attempts for failed requests
             retry_delay: Delay between retry attempts in seconds
             control_freq: Frequency (Hz) at which the robot server should expect
@@ -102,6 +105,16 @@ class RemoteEnvironmentAdapter:
                 response = requests.request(method, url, timeout=self.timeout, **kwargs)
                 response.raise_for_status()
                 return response
+            except requests.ReadTimeout as e:
+                # The server accepted the request and may still be executing it. Flask runs
+                # threaded, so a retry would run concurrently with the in-flight handler and
+                # both would touch the same ZMQ socket, which is not thread-safe and aborts
+                # the server process. Fail fast instead and let the operator restart.
+                logger.error(
+                    f"Read timeout after {self.timeout}s on {method} {endpoint}; not retrying, "
+                    f"the server may still be processing this request: {e}"
+                )
+                raise
             except requests.RequestException as e:
                 if attempt < self.retry_attempts - 1:
                     logger.warning(f"Request failed (attempt {attempt + 1}/{self.retry_attempts}): {e}")

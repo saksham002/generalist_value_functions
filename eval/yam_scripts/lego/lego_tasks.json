@@ -1,0 +1,749 @@
+{
+  "description": "15 lego sort tasks from the eval template (Desktop/eval (new) (1).xlsx, BC sheet). Task idx = episode idx in eval_lego_websocket.py; subtasks are sent in order as the policy prompt.",
+  "tasks": [
+    {
+      "task_index": 0,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the red tray, put the green blocks in the green tray and put the blue blocks in the blue tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "red",
+          "prompt": "Place red block in red tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "green",
+          "prompt": "Place green block in green tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "blue",
+          "prompt": "Place blue block in blue tray"
+        }
+      ]
+    },
+    {
+      "task_index": 1,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the red tray, put the green blocks in the blue tray and put the blue blocks in the green tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "red",
+          "prompt": "Place red block in red tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "blue",
+          "prompt": "Place green block in blue tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "green",
+          "prompt": "Place blue block in green tray"
+        }
+      ]
+    },
+    {
+      "task_index": 2,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the green tray, put the green blocks in the red tray and put the blue blocks in the blue tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "green",
+          "prompt": "Place red block in green tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "red",
+          "prompt": "Place green block in red tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "blue",
+          "prompt": "Place blue block in blue tray"
+        }
+      ]
+    },
+    {
+      "task_index": 3,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the green tray, put the green blocks in the blue tray and put the blue blocks in the red tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "green",
+          "prompt": "Place red block in green tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "blue",
+          "prompt": "Place green block in blue tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "red",
+          "prompt": "Place blue block in red tray"
+        }
+      ]
+    },
+    {
+      "task_index": 4,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the blue tray, put the green blocks in the red tray and put the blue blocks in the green tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "blue",
+          "prompt": "Place red block in blue tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "red",
+          "prompt": "Place green block in red tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "green",
+          "prompt": "Place blue block in green tray"
+        }
+      ]
+    },
+    {
+      "task_index": 5,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the blue tray, put the green blocks in the green tray and put the blue blocks in the red tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "blue",
+          "prompt": "Place red block in blue tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "green",
+          "prompt": "Place green block in green tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "red",
+          "prompt": "Place blue block in red tray"
+        }
+      ]
+    },
+    {
+      "task_index": 6,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the red tray, put the green blocks in the green tray and put the blue blocks in the blue tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "red",
+          "prompt": "Place red block in red tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "green",
+          "prompt": "Place green block in green tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "blue",
+          "prompt": "Place blue block in blue tray"
+        }
+      ]
+    },
+    {
+      "task_index": 7,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the red tray, put the green blocks in the blue tray and put the blue blocks in the green tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "red",
+          "prompt": "Place red block in red tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "blue",
+          "prompt": "Place green block in blue tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "green",
+          "prompt": "Place blue block in green tray"
+        }
+      ]
+    },
+    {
+      "task_index": 8,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the green tray, put the green blocks in the red tray and put the blue blocks in the blue tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "green",
+          "prompt": "Place red block in green tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "red",
+          "prompt": "Place green block in red tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "blue",
+          "prompt": "Place blue block in blue tray"
+        }
+      ]
+    },
+    {
+      "task_index": 9,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the green tray, put the green blocks in the blue tray and put the blue blocks in the red tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "green",
+          "prompt": "Place red block in green tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "blue",
+          "prompt": "Place green block in blue tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "red",
+          "prompt": "Place blue block in red tray"
+        }
+      ]
+    },
+    {
+      "task_index": 10,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the blue tray, put the green blocks in the red tray and put the blue blocks in the green tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "blue",
+          "prompt": "Place red block in blue tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "red",
+          "prompt": "Place green block in red tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "green",
+          "prompt": "Place blue block in green tray"
+        }
+      ]
+    },
+    {
+      "task_index": 11,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the blue tray, put the green blocks in the green tray and put the blue blocks in the red tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "blue",
+          "prompt": "Place red block in blue tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "green",
+          "prompt": "Place green block in green tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "red",
+          "prompt": "Place blue block in red tray"
+        }
+      ]
+    },
+    {
+      "task_index": 12,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the red tray, put the green blocks in the green tray and put the blue blocks in the blue tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "red",
+          "prompt": "Place red block in red tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "green",
+          "prompt": "Place green block in green tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "blue",
+          "prompt": "Place blue block in blue tray"
+        }
+      ]
+    },
+    {
+      "task_index": 13,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the red tray, put the green blocks in the blue tray and put the blue blocks in the green tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "red",
+          "prompt": "Place red block in red tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "blue",
+          "prompt": "Place green block in blue tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "green",
+          "prompt": "Place blue block in green tray"
+        }
+      ]
+    },
+    {
+      "task_index": 14,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the green tray, put the green blocks in the red tray and put the blue blocks in the blue tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "green",
+          "prompt": "Place red block in green tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "red",
+          "prompt": "Place green block in red tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "blue",
+          "prompt": "Place blue block in blue tray"
+        }
+      ]
+    },
+    {
+      "task_index": 15,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the green tray, put the green blocks in the blue tray and put the blue blocks in the red tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "green",
+          "prompt": "Place red block in green tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "blue",
+          "prompt": "Place green block in blue tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "red",
+          "prompt": "Place blue block in red tray"
+        }
+      ]
+    },
+    {
+      "task_index": 16,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the blue tray, put the green blocks in the red tray and put the blue blocks in the green tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "blue",
+          "prompt": "Place red block in blue tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "red",
+          "prompt": "Place green block in red tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "green",
+          "prompt": "Place blue block in green tray"
+        }
+      ]
+    },
+    {
+      "task_index": 17,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the blue tray, put the green blocks in the green tray and put the blue blocks in the red tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "blue",
+          "prompt": "Place red block in blue tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "green",
+          "prompt": "Place green block in green tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "red",
+          "prompt": "Place blue block in red tray"
+        }
+      ]
+    },
+    {
+      "task_index": 18,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the red tray, put the green blocks in the green tray and put the blue blocks in the blue tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "red",
+          "prompt": "Place red block in red tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "green",
+          "prompt": "Place green block in green tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "blue",
+          "prompt": "Place blue block in blue tray"
+        }
+      ]
+    },
+    {
+      "task_index": 19,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the red tray, put the green blocks in the blue tray and put the blue blocks in the green tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "red",
+          "prompt": "Place red block in red tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "blue",
+          "prompt": "Place green block in blue tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "green",
+          "prompt": "Place blue block in green tray"
+        }
+      ]
+    },
+    {
+      "task_index": 20,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the green tray, put the green blocks in the red tray and put the blue blocks in the blue tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "green",
+          "prompt": "Place red block in green tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "red",
+          "prompt": "Place green block in red tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "blue",
+          "prompt": "Place blue block in blue tray"
+        }
+      ]
+    },
+    {
+      "task_index": 21,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the green tray, put the green blocks in the blue tray and put the blue blocks in the red tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "green",
+          "prompt": "Place red block in green tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "blue",
+          "prompt": "Place green block in blue tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "red",
+          "prompt": "Place blue block in red tray"
+        }
+      ]
+    },
+    {
+      "task_index": 22,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the blue tray, put the green blocks in the red tray and put the blue blocks in the green tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "blue",
+          "prompt": "Place red block in blue tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "red",
+          "prompt": "Place green block in red tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "green",
+          "prompt": "Place blue block in green tray"
+        }
+      ]
+    },
+    {
+      "task_index": 23,
+      "shape": "C",
+      "task_description": "Take apart the lego structure and sort the blocks: put the red blocks in the blue tray, put the green blocks in the green tray and put the blue blocks in the red tray.",
+      "subtasks": [
+        {
+          "index": 0,
+          "object": null,
+          "target_bin": null,
+          "prompt": "Take apart the blocks"
+        },
+        {
+          "index": 1,
+          "object": "red",
+          "target_bin": "blue",
+          "prompt": "Place red block in blue tray"
+        },
+        {
+          "index": 2,
+          "object": "green",
+          "target_bin": "green",
+          "prompt": "Place green block in green tray"
+        },
+        {
+          "index": 3,
+          "object": "blue",
+          "target_bin": "red",
+          "prompt": "Place blue block in red tray"
+        }
+      ]
+    }
+  ]
+}

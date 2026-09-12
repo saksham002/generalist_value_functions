@@ -1,0 +1,633 @@
+{
+  "description": "24 harder synthetic packing tasks (8 per two-box pairing), composed only from (object, box) subtasks that appear as possible in chunks.json. Each task uses exactly the two listed box sizes and consists of 5-8 single-object Pack subtasks (6 tasks of each length: 5, 6, 7, 8; 2 tasks of each length per box pairing). Subtasks are grouped smaller-box-first (the first listed box gets the smaller share of objects), matching the majority ordering in chunks.json. Objects are distinct within a task.",
+  "small_medium": [
+    {
+      "task_number": 0,
+      "boxes": [
+        "small",
+        "medium"
+      ],
+      "num_subtasks": 5,
+      "task": "Pack the Soccer ball plush and Box of M&Ms into the small box, then pack the Marker, Sponge, and Soda can into the medium box.",
+      "subtasks": [
+        "Pack the Soccer ball plush into the small box",
+        "Pack the Box of M&Ms into the small box",
+        "Pack the Marker into the medium box",
+        "Pack the Sponge into the medium box",
+        "Pack the Soda can into the medium box"
+      ],
+      "setup": [
+        "Soccer ball plush",
+        "Soda can",
+        "Box of M&Ms",
+        "Marker",
+        "Sponge"
+      ]
+    },
+    {
+      "task_number": 1,
+      "boxes": [
+        "small",
+        "medium"
+      ],
+      "num_subtasks": 5,
+      "task": "Pack the Croissant into the small box, then pack the Cinnamon Toast Crunch cereal, Marker, Stuffed yak, and Pringles chip bag into the medium box.",
+      "subtasks": [
+        "Pack the Croissant into the small box",
+        "Pack the Cinnamon Toast Crunch cereal into the medium box",
+        "Pack the Marker into the medium box",
+        "Pack the Stuffed yak into the medium box",
+        "Pack the Pringles chip bag into the medium box"
+      ],
+      "setup": [
+        "Cinnamon Toast Crunch cereal",
+        "Croissant",
+        "Stuffed yak",
+        "Marker",
+        "Pringles chip bag"
+      ]
+    },
+    {
+      "task_number": 2,
+      "boxes": [
+        "small",
+        "medium"
+      ],
+      "num_subtasks": 6,
+      "task": "Pack the Croissant and Cheez-It container into the small box, then pack the Nesquik container, Soda can, Donut, and Nutella container into the medium box.",
+      "subtasks": [
+        "Pack the Croissant into the small box",
+        "Pack the Cheez-It container into the small box",
+        "Pack the Nesquik container into the medium box",
+        "Pack the Soda can into the medium box",
+        "Pack the Donut into the medium box",
+        "Pack the Nutella container into the medium box"
+      ],
+      "setup": [
+        "Croissant",
+        "Nutella container",
+        "Donut",
+        "Cheez-It container",
+        "Nesquik container",
+        "Soda can"
+      ]
+    },
+    {
+      "task_number": 3,
+      "boxes": [
+        "small",
+        "medium"
+      ],
+      "num_subtasks": 6,
+      "task": "Pack the Donut and Microfiber cloth into the small box, then pack the Baking soda, Sponge, Altoids container, and Box of M&Ms into the medium box.",
+      "subtasks": [
+        "Pack the Donut into the small box",
+        "Pack the Microfiber cloth into the small box",
+        "Pack the Baking soda into the medium box",
+        "Pack the Sponge into the medium box",
+        "Pack the Altoids container into the medium box",
+        "Pack the Box of M&Ms into the medium box"
+      ],
+      "setup": [
+        "Altoids container",
+        "Microfiber cloth",
+        "Baking soda",
+        "Donut",
+        "Sponge",
+        "Box of M&Ms"
+      ]
+    },
+    {
+      "task_number": 4,
+      "boxes": [
+        "small",
+        "medium"
+      ],
+      "num_subtasks": 7,
+      "task": "Pack the Marker and Nutella container into the small box, then pack the Box of M&Ms, Donut, GoGo fruit pouch, Sponge, and Pink tumbler into the medium box.",
+      "subtasks": [
+        "Pack the Marker into the small box",
+        "Pack the Nutella container into the small box",
+        "Pack the Box of M&Ms into the medium box",
+        "Pack the Donut into the medium box",
+        "Pack the GoGo fruit pouch into the medium box",
+        "Pack the Sponge into the medium box",
+        "Pack the Pink tumbler into the medium box"
+      ],
+      "setup": [
+        "Box of M&Ms",
+        "Pink tumbler",
+        "Sponge",
+        "Marker",
+        "Donut",
+        "GoGo fruit pouch",
+        "Nutella container"
+      ]
+    },
+    {
+      "task_number": 5,
+      "boxes": [
+        "small",
+        "medium"
+      ],
+      "num_subtasks": 7,
+      "task": "Pack the Sponge, Croissant, and Donut into the small box, then pack the Marker, Mustard, Cheez-It container, and Microfiber cloth into the medium box.",
+      "subtasks": [
+        "Pack the Sponge into the small box",
+        "Pack the Croissant into the small box",
+        "Pack the Donut into the small box",
+        "Pack the Marker into the medium box",
+        "Pack the Mustard into the medium box",
+        "Pack the Cheez-It container into the medium box",
+        "Pack the Microfiber cloth into the medium box"
+      ],
+      "setup": [
+        "Marker",
+        "Sponge",
+        "Cheez-It container",
+        "Microfiber cloth",
+        "Croissant",
+        "Mustard",
+        "Donut"
+      ]
+    },
+    {
+      "task_number": 6,
+      "boxes": [
+        "small",
+        "medium"
+      ],
+      "num_subtasks": 8,
+      "task": "Pack the Nutella container, Marker, Donut, and Cheez-It container into the small box, then pack the Liquid hand soap, GoGo fruit pouch, Altoids container, and Nesquik container into the medium box.",
+      "subtasks": [
+        "Pack the Nutella container into the small box",
+        "Pack the Marker into the small box",
+        "Pack the Donut into the small box",
+        "Pack the Cheez-It container into the small box",
+        "Pack the Liquid hand soap into the medium box",
+        "Pack the GoGo fruit pouch into the medium box",
+        "Pack the Altoids container into the medium box",
+        "Pack the Nesquik container into the medium box"
+      ],
+      "setup": [
+        "Altoids container",
+        "Donut",
+        "Nesquik container",
+        "Marker",
+        "GoGo fruit pouch",
+        "Nutella container",
+        "Cheez-It container",
+        "Liquid hand soap"
+      ]
+    },
+    {
+      "task_number": 7,
+      "boxes": [
+        "small",
+        "medium"
+      ],
+      "num_subtasks": 8,
+      "task": "Pack the Pringles chip bag into the small box, then pack the Soda can, Liquid hand soap, Marker, GoGo fruit pouch, Donut, Pink tumbler, and Microfiber cloth into the medium box.",
+      "subtasks": [
+        "Pack the Pringles chip bag into the small box",
+        "Pack the Soda can into the medium box",
+        "Pack the Liquid hand soap into the medium box",
+        "Pack the Marker into the medium box",
+        "Pack the GoGo fruit pouch into the medium box",
+        "Pack the Donut into the medium box",
+        "Pack the Pink tumbler into the medium box",
+        "Pack the Microfiber cloth into the medium box"
+      ],
+      "setup": [
+        "Pringles chip bag",
+        "Soda can",
+        "Donut",
+        "Microfiber cloth",
+        "Marker",
+        "Liquid hand soap",
+        "GoGo fruit pouch",
+        "Pink tumbler"
+      ]
+    }
+  ],
+  "small_large": [
+    {
+      "task_number": 8,
+      "boxes": [
+        "small",
+        "large"
+      ],
+      "num_subtasks": 5,
+      "task": "Pack the Nutella container into the small box, then pack the Donut, Cinnamon Toast Crunch cereal, Soda can, and Mustard into the large box.",
+      "subtasks": [
+        "Pack the Nutella container into the small box",
+        "Pack the Donut into the large box",
+        "Pack the Cinnamon Toast Crunch cereal into the large box",
+        "Pack the Soda can into the large box",
+        "Pack the Mustard into the large box"
+      ],
+      "setup": [
+        "Cinnamon Toast Crunch cereal",
+        "Soda can",
+        "Nutella container",
+        "Mustard",
+        "Donut"
+      ]
+    },
+    {
+      "task_number": 9,
+      "boxes": [
+        "small",
+        "large"
+      ],
+      "num_subtasks": 5,
+      "task": "Pack the Marker into the small box, then pack the Nutella container, Croissant, Nesquik container, and Pringles chip bag into the large box.",
+      "subtasks": [
+        "Pack the Marker into the small box",
+        "Pack the Nutella container into the large box",
+        "Pack the Croissant into the large box",
+        "Pack the Nesquik container into the large box",
+        "Pack the Pringles chip bag into the large box"
+      ],
+      "setup": [
+        "Nutella container",
+        "Croissant",
+        "Nesquik container",
+        "Pringles chip bag",
+        "Marker"
+      ]
+    },
+    {
+      "task_number": 10,
+      "boxes": [
+        "small",
+        "large"
+      ],
+      "num_subtasks": 6,
+      "task": "Pack the Cheez-It container into the small box, then pack the Altoids container, Cling n' seal wrap, Liquid hand soap, Stuffed yak, and Pink tumbler into the large box.",
+      "subtasks": [
+        "Pack the Cheez-It container into the small box",
+        "Pack the Altoids container into the large box",
+        "Pack the Cling n' seal wrap into the large box",
+        "Pack the Liquid hand soap into the large box",
+        "Pack the Stuffed yak into the large box",
+        "Pack the Pink tumbler into the large box"
+      ],
+      "setup": [
+        "Altoids container",
+        "Stuffed yak",
+        "Liquid hand soap",
+        "Pink tumbler",
+        "Cling n' seal wrap",
+        "Cheez-It container"
+      ]
+    },
+    {
+      "task_number": 11,
+      "boxes": [
+        "small",
+        "large"
+      ],
+      "num_subtasks": 6,
+      "task": "Pack the GoGo fruit pouch into the small box, then pack the Cinnamon Toast Crunch cereal, Soccer ball plush, Donut, Box of M&Ms, and Altoids container into the large box.",
+      "subtasks": [
+        "Pack the GoGo fruit pouch into the small box",
+        "Pack the Cinnamon Toast Crunch cereal into the large box",
+        "Pack the Soccer ball plush into the large box",
+        "Pack the Donut into the large box",
+        "Pack the Box of M&Ms into the large box",
+        "Pack the Altoids container into the large box"
+      ],
+      "setup": [
+        "Soccer ball plush",
+        "Altoids container",
+        "Cinnamon Toast Crunch cereal",
+        "GoGo fruit pouch",
+        "Donut",
+        "Box of M&Ms"
+      ]
+    },
+    {
+      "task_number": 12,
+      "boxes": [
+        "small",
+        "large"
+      ],
+      "num_subtasks": 7,
+      "task": "Pack the Cheez-It container into the small box, then pack the Mustard, Nutella container, Pringles chip bag, Donut, Box of M&Ms, and Microfiber cloth into the large box.",
+      "subtasks": [
+        "Pack the Cheez-It container into the small box",
+        "Pack the Mustard into the large box",
+        "Pack the Nutella container into the large box",
+        "Pack the Pringles chip bag into the large box",
+        "Pack the Donut into the large box",
+        "Pack the Box of M&Ms into the large box",
+        "Pack the Microfiber cloth into the large box"
+      ],
+      "setup": [
+        "Microfiber cloth",
+        "Mustard",
+        "Nutella container",
+        "Box of M&Ms",
+        "Donut",
+        "Cheez-It container",
+        "Pringles chip bag"
+      ]
+    },
+    {
+      "task_number": 13,
+      "boxes": [
+        "small",
+        "large"
+      ],
+      "num_subtasks": 7,
+      "task": "Pack the Microfiber cloth into the small box, then pack the Nutella container, Soda can, Croissant, Donut, Box of M&Ms, and Pink tumbler into the large box.",
+      "subtasks": [
+        "Pack the Microfiber cloth into the small box",
+        "Pack the Nutella container into the large box",
+        "Pack the Soda can into the large box",
+        "Pack the Croissant into the large box",
+        "Pack the Donut into the large box",
+        "Pack the Box of M&Ms into the large box",
+        "Pack the Pink tumbler into the large box"
+      ],
+      "setup": [
+        "Microfiber cloth",
+        "Donut",
+        "Croissant",
+        "Soda can",
+        "Pink tumbler",
+        "Nutella container",
+        "Box of M&Ms"
+      ]
+    },
+    {
+      "task_number": 14,
+      "boxes": [
+        "small",
+        "large"
+      ],
+      "num_subtasks": 8,
+      "task": "Pack the Soda can into the small box, then pack the Croissant, Altoids container, Soccer ball plush, Pink tumbler, Microfiber cloth, Mustard, and Marker into the large box.",
+      "subtasks": [
+        "Pack the Soda can into the small box",
+        "Pack the Croissant into the large box",
+        "Pack the Altoids container into the large box",
+        "Pack the Soccer ball plush into the large box",
+        "Pack the Pink tumbler into the large box",
+        "Pack the Microfiber cloth into the large box",
+        "Pack the Mustard into the large box",
+        "Pack the Marker into the large box"
+      ],
+      "setup": [
+        "Soccer ball plush",
+        "Soda can",
+        "Pink tumbler",
+        "Croissant",
+        "Altoids container",
+        "Microfiber cloth",
+        "Marker",
+        "Mustard"
+      ]
+    },
+    {
+      "task_number": 15,
+      "boxes": [
+        "small",
+        "large"
+      ],
+      "num_subtasks": 8,
+      "task": "Pack the Nutella container, Pink tumbler, and Altoids container into the small box, then pack the Mustard, Donut, Croissant, Soda can, and Cheez-It container into the large box.",
+      "subtasks": [
+        "Pack the Nutella container into the small box",
+        "Pack the Pink tumbler into the small box",
+        "Pack the Altoids container into the small box",
+        "Pack the Mustard into the large box",
+        "Pack the Donut into the large box",
+        "Pack the Croissant into the large box",
+        "Pack the Soda can into the large box",
+        "Pack the Cheez-It container into the large box"
+      ],
+      "setup": [
+        "Nutella container",
+        "Cheez-It container",
+        "Altoids container",
+        "Donut",
+        "Croissant",
+        "Mustard",
+        "Pink tumbler",
+        "Soda can"
+      ]
+    }
+  ],
+  "medium_large": [
+    {
+      "task_number": 16,
+      "boxes": [
+        "medium",
+        "large"
+      ],
+      "num_subtasks": 5,
+      "task": "Pack the Nesquik container and Nutella container into the medium box, then pack the Cheez-It container, Altoids container, and Donut into the large box.",
+      "subtasks": [
+        "Pack the Nesquik container into the medium box",
+        "Pack the Nutella container into the medium box",
+        "Pack the Cheez-It container into the large box",
+        "Pack the Altoids container into the large box",
+        "Pack the Donut into the large box"
+      ],
+      "setup": [
+        "Altoids container",
+        "Donut",
+        "Nesquik container",
+        "Nutella container",
+        "Cheez-It container"
+      ]
+    },
+    {
+      "task_number": 17,
+      "boxes": [
+        "medium",
+        "large"
+      ],
+      "num_subtasks": 5,
+      "task": "Pack the Nesquik container and Sponge into the medium box, then pack the Pringles chip bag, Box of M&Ms, and Pink tumbler into the large box.",
+      "subtasks": [
+        "Pack the Nesquik container into the medium box",
+        "Pack the Sponge into the medium box",
+        "Pack the Pringles chip bag into the large box",
+        "Pack the Box of M&Ms into the large box",
+        "Pack the Pink tumbler into the large box"
+      ],
+      "setup": [
+        "Sponge",
+        "Nesquik container",
+        "Pringles chip bag",
+        "Box of M&Ms",
+        "Pink tumbler"
+      ]
+    },
+    {
+      "task_number": 18,
+      "boxes": [
+        "medium",
+        "large"
+      ],
+      "num_subtasks": 6,
+      "task": "Pack the Pink tumbler into the medium box, then pack the Cheez-It container, Marker, Croissant, Soccer ball plush, and Soda can into the large box.",
+      "subtasks": [
+        "Pack the Pink tumbler into the medium box",
+        "Pack the Cheez-It container into the large box",
+        "Pack the Marker into the large box",
+        "Pack the Croissant into the large box",
+        "Pack the Soccer ball plush into the large box",
+        "Pack the Soda can into the large box"
+      ],
+      "setup": [
+        "Marker",
+        "Cheez-It container",
+        "Croissant",
+        "Pink tumbler",
+        "Soda can",
+        "Soccer ball plush"
+      ]
+    },
+    {
+      "task_number": 19,
+      "boxes": [
+        "medium",
+        "large"
+      ],
+      "num_subtasks": 6,
+      "task": "Pack the Marker and Pink tumbler into the medium box, then pack the Box of M&Ms, Soccer ball plush, Donut, and Cheez-It container into the large box.",
+      "subtasks": [
+        "Pack the Marker into the medium box",
+        "Pack the Pink tumbler into the medium box",
+        "Pack the Box of M&Ms into the large box",
+        "Pack the Soccer ball plush into the large box",
+        "Pack the Donut into the large box",
+        "Pack the Cheez-It container into the large box"
+      ],
+      "setup": [
+        "Soccer ball plush",
+        "Box of M&Ms",
+        "Donut",
+        "Marker",
+        "Pink tumbler",
+        "Cheez-It container"
+      ]
+    },
+    {
+      "task_number": 20,
+      "boxes": [
+        "medium",
+        "large"
+      ],
+      "num_subtasks": 7,
+      "task": "Pack the Altoids container and Donut into the medium box, then pack the Box of M&Ms, Croissant, Sponge, Cling n' seal wrap, and Spatula into the large box.",
+      "subtasks": [
+        "Pack the Altoids container into the medium box",
+        "Pack the Donut into the medium box",
+        "Pack the Box of M&Ms into the large box",
+        "Pack the Croissant into the large box",
+        "Pack the Sponge into the large box",
+        "Pack the Cling n' seal wrap into the large box",
+        "Pack the Spatula into the large box"
+      ],
+      "setup": [
+        "Croissant",
+        "Spatula",
+        "Cling n' seal wrap",
+        "Box of M&Ms",
+        "Donut",
+        "Sponge",
+        "Altoids container"
+      ]
+    },
+    {
+      "task_number": 21,
+      "boxes": [
+        "medium",
+        "large"
+      ],
+      "num_subtasks": 7,
+      "task": "Pack the Pringles chip bag into the medium box, then pack the Nutella container, Cheez-It container, Altoids container, Marker, Soccer ball plush, and Donut into the large box.",
+      "subtasks": [
+        "Pack the Pringles chip bag into the medium box",
+        "Pack the Nutella container into the large box",
+        "Pack the Cheez-It container into the large box",
+        "Pack the Altoids container into the large box",
+        "Pack the Marker into the large box",
+        "Pack the Soccer ball plush into the large box",
+        "Pack the Donut into the large box"
+      ],
+      "setup": [
+        "Soccer ball plush",
+        "Altoids container",
+        "Marker",
+        "Nutella container",
+        "Cheez-It container",
+        "Pringles chip bag",
+        "Donut"
+      ]
+    },
+    {
+      "task_number": 22,
+      "boxes": [
+        "medium",
+        "large"
+      ],
+      "num_subtasks": 8,
+      "task": "Pack the Cinnamon Toast Crunch cereal into the medium box, then pack the Microfiber cloth, Altoids container, Box of M&Ms, Sponge, Liquid hand soap, Nesquik container, and Croissant into the large box.",
+      "subtasks": [
+        "Pack the Cinnamon Toast Crunch cereal into the medium box",
+        "Pack the Microfiber cloth into the large box",
+        "Pack the Altoids container into the large box",
+        "Pack the Box of M&Ms into the large box",
+        "Pack the Sponge into the large box",
+        "Pack the Liquid hand soap into the large box",
+        "Pack the Nesquik container into the large box",
+        "Pack the Croissant into the large box"
+      ],
+      "setup": [
+        "Croissant",
+        "Microfiber cloth",
+        "Nesquik container",
+        "Box of M&Ms",
+        "Cinnamon Toast Crunch cereal",
+        "Sponge",
+        "Altoids container",
+        "Liquid hand soap"
+      ]
+    },
+    {
+      "task_number": 23,
+      "boxes": [
+        "medium",
+        "large"
+      ],
+      "num_subtasks": 8,
+      "task": "Pack the Mustard, Soda can, Croissant, and Donut into the medium box, then pack the Soccer ball plush, Nutella container, Altoids container, and Cheez-It container into the large box.",
+      "subtasks": [
+        "Pack the Mustard into the medium box",
+        "Pack the Soda can into the medium box",
+        "Pack the Croissant into the medium box",
+        "Pack the Donut into the medium box",
+        "Pack the Soccer ball plush into the large box",
+        "Pack the Nutella container into the large box",
+        "Pack the Altoids container into the large box",
+        "Pack the Cheez-It container into the large box"
+      ],
+      "setup": [
+        "Soda can",
+        "Mustard",
+        "Donut",
+        "Soccer ball plush",
+        "Nutella container",
+        "Altoids container",
+        "Cheez-It container",
+        "Croissant"
+      ]
+    }
+  ]
+}

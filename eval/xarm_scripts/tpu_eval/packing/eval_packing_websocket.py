@@ -97,7 +97,13 @@ class Args:
     """How many env steps between policy replans."""
 
     max_steps: int = 7200
-    """Maximum env steps per episode."""
+    """Maximum env steps per episode. Only used for episodes with no subtask list (i.e. when
+    tasks_file is missing); otherwise the budget is derived from seconds_per_subtask."""
+
+    seconds_per_subtask: float = 25.0
+    """Wall-clock budget allotted per subtask. An episode's step budget is
+    seconds_per_subtask * len(subtasks) * control_freq, so longer tasks get proportionally
+    more time instead of every task sharing one fixed limit."""
 
     real_action_start: int = 0
     """Index into the policy action vector where real actions begin."""
@@ -133,6 +139,14 @@ class Args:
     video_subdir: str = ""
     """Optional subdirectory under eval/xarm_scripts/tpu_eval/packing/videos/ in which to store
     this run's mp4s. Empty string saves directly into videos/."""
+
+    use_policy_subtasks: bool = True
+    """Controls how the POLICY is conditioned. If True, the policy is conditioned on the live
+    per-step subtask prompt (obs["prompt"] = tracker.prompt); if False, on the constant task
+    description (obs["prompt"] = task_description, i.e. the packing task loaded from tasks_file).
+    This eval is policy-only (no BestOfN critic), so obs["prompt"] is consumed directly by the
+    policy — which must be trained to read the client prompt (its prompt_mode reads obs["prompt"],
+    not a server-side --task-description override)."""
 
     use_critic_subtasks: bool = True
     """If True, send the per-step subtask prompt to the critic via obs["prompt"]. If False,
@@ -334,6 +348,44 @@ class SubtaskTracker:
 
 
 # =============================================================================
+# Packing subtask tracker (Enter-advanced)
+# =============================================================================
+
+
+class PackingSubtaskTracker:
+    """Steps through a fixed, ordered list of packing subtasks, advanced manually by Enter.
+
+    Unlike SubtaskTracker (which auto-detects shirt-hang boundaries from robot sensors), the
+    packing subtasks are the per-object steps loaded from packing_tasks.json ("subtasks" field).
+    They carry no sensor heuristics — the operator advances to the next subtask by pressing Enter.
+    The index wraps: advancing past the final subtask returns to the first, so the operator
+    can cycle back through the list without restarting the episode.
+    """
+
+    def __init__(self, subtasks: list[str]) -> None:
+        if not subtasks:
+            raise ValueError("PackingSubtaskTracker requires a non-empty list of subtasks.")
+        self._subtasks = list(subtasks)
+        self._index = 0
+
+    @property
+    def index(self) -> int:
+        return self._index
+
+    @property
+    def num_subtasks(self) -> int:
+        return len(self._subtasks)
+
+    @property
+    def prompt(self) -> str:
+        return self._subtasks[self._index]
+
+    def advance(self) -> None:
+        """Move to the next subtask, wrapping from the last back to the first."""
+        self._index = (self._index + 1) % len(self._subtasks)
+
+
+# =============================================================================
 # Video logging
 # =============================================================================
 
@@ -341,6 +393,10 @@ class SubtaskTracker:
 # Each panel is a square. 256 satisfies libx264's "divisible by 16" requirement,
 # and the final 2x2 mosaic is 512x512 — small enough to keep encoding fast.
 _VIDEO_PANEL_SIZE = 256
+
+# Height of the title band that shows the latest AR-decoded subtask. 32 keeps the mosaic
+# height (512 + 32 = 544) divisible by 16 for libx264.
+_VIDEO_TITLE_HEIGHT = 32
 
 
 class VideoLogger:
@@ -357,6 +413,10 @@ class VideoLogger:
     The Q-value plot is the only animated panel: lines = Q-values per candidate over
     replan ticks (static across frames), blue verticals = manual subtask advances
     (static), red vertical = current frame's tick (moves frame to frame).
+
+    When the server AR-decodes subtasks (predict_subtask_ar), a title band above the
+    mosaic shows the most recent decoded subtask, held across the replan ticks between
+    decodes. Episodes with no decode at all get no band, so the layout is unchanged.
     """
 
     def __init__(
@@ -381,6 +441,9 @@ class VideoLogger:
         self._q_values: list[np.ndarray] = []
         self._steps: list[int] = []
         self._advance_steps: list[int] = []
+        # Per-frame decoded subtask, carried forward from the last decode tick.
+        self._predicted_subtasks: list[str | None] = []
+        self._latest_predicted_subtask: str | None = None
         self._episode_idx: int | None = None
 
     def start_episode(self, episode_idx: int) -> None:
@@ -392,14 +455,22 @@ class VideoLogger:
         images: dict[str, np.ndarray],
         q_values: np.ndarray | None,
         t: int,
+        predicted_subtask: str | None = None,
     ) -> None:
-        """Snapshot the latest cameras + Q-values at the env step where predict() ran."""
+        """Snapshot the latest cameras + Q-values at the env step where predict() ran.
+
+        `predicted_subtask` is only non-None on server decode ticks; it is held for the
+        following frames so the title band shows the currently-believed subtask.
+        """
         self._images.append({k: np.asarray(v).copy() for k, v in images.items()})
         if q_values is None:
             self._q_values.append(np.zeros(self.num_samples, dtype = np.float32))
         else:
             self._q_values.append(np.asarray(q_values, dtype = np.float32).reshape(-1))
         self._steps.append(t)
+        if predicted_subtask is not None:
+            self._latest_predicted_subtask = str(predicted_subtask)
+        self._predicted_subtasks.append(self._latest_predicted_subtask)
 
     def record_advance(self, t: int) -> None:
         """Mark an env step at which the user pressed Enter (manual subtask switch)."""
@@ -410,7 +481,11 @@ class VideoLogger:
             return
         q_matrix = np.stack(self._q_values, axis = 0)  # (T_replans, N)
         steps = np.asarray(self._steps, dtype = np.int64)
-        frames = [self._render_frame(i, q_matrix, steps) for i in range(len(self._images))]
+        # Decided once per episode so every frame has identical dimensions.
+        show_title = any(subtask is not None for subtask in self._predicted_subtasks)
+        frames = [
+            self._render_frame(i, q_matrix, steps, show_title = show_title) for i in range(len(self._images))
+        ]
         out_path = os.path.join(self.output_dir, f"episode_{self._episode_idx}.mp4")
         # imageio bundles its own ffmpeg with libx264; system ffmpeg on this cluster
         # lacks libx264 (see CLAUDE.md > "Saving Videos on HPC").
@@ -424,7 +499,14 @@ class VideoLogger:
         )
         logger.info(f"Saved episode video: {out_path}")
 
-    def _render_frame(self, frame_idx: int, q_matrix: np.ndarray, steps: np.ndarray) -> np.ndarray:
+    def _render_frame(
+        self,
+        frame_idx: int,
+        q_matrix: np.ndarray,
+        steps: np.ndarray,
+        *,
+        show_title: bool = False,
+    ) -> np.ndarray:
         images = self._images[frame_idx]
         current_step = int(steps[frame_idx])
         size = _VIDEO_PANEL_SIZE
@@ -446,7 +528,43 @@ class VideoLogger:
 
         top = np.concatenate([left_wrist, value_panel], axis = 1)
         bottom = np.concatenate([right_wrist, base_rgb], axis = 1)
-        return np.concatenate([top, bottom], axis = 0)
+        mosaic = np.concatenate([top, bottom], axis = 0)
+        if not show_title:
+            return mosaic
+        title = self._render_title(self._predicted_subtasks[frame_idx], mosaic.shape[1])
+        return np.concatenate([title, mosaic], axis = 0)
+
+    @staticmethod
+    def _render_title(predicted_subtask: str | None, width: int) -> np.ndarray:
+        """Draw the latest decoded subtask into a _VIDEO_TITLE_HEIGHT-tall banner."""
+        banner = np.zeros((_VIDEO_TITLE_HEIGHT, width, 3), dtype = np.uint8)
+        text = f"subtask: {predicted_subtask}" if predicted_subtask is not None else "subtask: (not decoded yet)"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        thickness = 1
+        margin = 6
+        max_text_width = width - 2 * margin
+        # Shrink the font before truncating: the longest packing subtasks (~57 chars) fit at
+        # the smaller scales, so full prompts stay readable instead of ending in an ellipsis.
+        font_scale = 0.45
+        for candidate_scale in (0.45, 0.40, 0.35, 0.30):
+            font_scale = candidate_scale
+            if cv2.getTextSize(text, font, font_scale, thickness)[0][0] <= max_text_width:
+                break
+        while cv2.getTextSize(text, font, font_scale, thickness)[0][0] > max_text_width and len(text) > 4:
+            text = text[: len(text) - 4] + "..."
+        text_height = cv2.getTextSize(text, font, font_scale, thickness)[0][1]
+        baseline_y = (_VIDEO_TITLE_HEIGHT + text_height) // 2
+        cv2.putText(
+            banner,
+            text,
+            (margin, baseline_y),
+            font,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+        return banner
 
     def _render_value_plot(
         self,
@@ -630,15 +748,48 @@ def run_episode(
     image_helper: _eval_image_helper.EvalImageHelper,
     args: Args,
     episode_idx: int,
+    obs: dict[str, Any],
+    subtasks: list[str] | None = None,
 ) -> None:
     logger.info(f"Starting episode {episode_idx}")
-    obs, _ = env.reset(seed=episode_idx)
 
     tracker = SubtaskTracker(manual = args.manual)
-    if args.manual:
-        # Drain any Enter presses queued before this episode started.
+    # When subtask conditioning is on, the policy prompt comes from the packing task's ordered
+    # subtask list (packing_tasks.json "subtasks"), advanced by Enter — not the sensor-heuristic
+    # SubtaskTracker above.
+    packing_tracker: PackingSubtaskTracker | None = None
+    if args.use_policy_subtasks:
+        if not subtasks:
+            raise ValueError(
+                f"use_policy_subtasks=True but episode {episode_idx} has no 'subtasks' in "
+                f"packing_tasks.json. Add a subtasks list to the task entry or run with "
+                f"--no-use-policy-subtasks."
+            )
+        packing_tracker = PackingSubtaskTracker(subtasks)
+
+    # Scale the episode budget with task length so an 8-subtask task is not held to the same
+    # wall-clock limit as a 5-subtask one. Falls back to the fixed budget when the episode has
+    # no subtask list to size against.
+    if subtasks:
+        episode_max_steps = int(args.seconds_per_subtask * len(subtasks) * args.control_freq)
+        logger.info(
+            f"Episode budget: {episode_max_steps} steps "
+            f"({args.seconds_per_subtask:g}s x {len(subtasks)} subtasks x {args.control_freq}Hz)"
+        )
+    else:
+        episode_max_steps = args.max_steps
+        logger.info(f"Episode budget: {episode_max_steps} steps (fixed max_steps; no subtask list)")
+
+    # Drain any Enter presses queued before this episode started (both manual flows use Enter).
+    if args.manual or args.use_policy_subtasks:
         while not _advance_q.empty():
             _advance_q.get_nowait()
+    if args.use_policy_subtasks:
+        logger.info(
+            f"Subtask conditioning ON — press Enter to advance through "
+            f"{packing_tracker.num_subtasks} subtasks. Subtask 0: {packing_tracker.prompt!r}"
+        )
+    elif args.manual:
         logger.info("Manual subtask switching enabled — press Enter to advance subtask.")
 
     # Per-episode video logger. With a critic, the Q-value plot panel is animated;
@@ -668,22 +819,38 @@ def run_episode(
     # qval_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qvalues")
 
     try:
-        while not (terminated or truncated) and t < args.max_steps:
-            tracker.update(obs)
-            if args.manual:
+        while not (terminated or truncated) and t < episode_max_steps:
+            if args.use_policy_subtasks:
+                # Advance through the packing subtask list on each Enter press.
                 while not _advance_q.empty():
                     _advance_q.get_nowait()
-                    tracker.force_advance()
-                    logger.info(f"Manual advance → subtask {tracker.subtask} ({tracker.prompt!r})")
+                    packing_tracker.advance()
+                    logger.info(
+                        f"Manual advance → subtask {packing_tracker.index}/"
+                        f"{packing_tracker.num_subtasks - 1} ({packing_tracker.prompt!r})"
+                    )
                     if video_logger is not None:
                         video_logger.record_advance(t)
+            else:
+                tracker.update(obs)
+                if args.manual:
+                    while not _advance_q.empty():
+                        _advance_q.get_nowait()
+                        tracker.force_advance()
+                        logger.info(f"Manual advance → subtask {tracker.subtask} ({tracker.prompt!r})")
+                        if video_logger is not None:
+                            video_logger.record_advance(t)
 
             if t % args.query_freq == 0:
-                # With use_critic_subtasks=False, obs["prompt"] carries the task loaded from
-                # tasks_file (args.task_description) so the policy is conditioned on the selected
-                # packing task. With use_critic_subtasks=True it instead carries the per-step
-                # subtask prompt for the critic.
-                critic_prompt = tracker.prompt if args.use_critic_subtasks else args.task_description
+                # Policy-only eval: obs["prompt"] is consumed by the policy. use_policy_subtasks
+                # conditions the policy on the current packing subtask (from packing_tasks.json,
+                # advanced by Enter); otherwise on the constant task description.
+                if args.use_policy_subtasks:
+                    policy_prompt = packing_tracker.prompt
+                    subtask_idx = packing_tracker.index
+                else:
+                    policy_prompt = args.task_description
+                    subtask_idx = tracker.subtask
                 state, initial_eef_pose = extract_state(obs)
                 images_rgb = extract_images_rgb(obs, args.camera_names)
                 element_images = image_helper.process_images({
@@ -694,8 +861,14 @@ def run_episode(
                 obs_dict = {
                     **element_images,
                     "state": state,
-                    "prompt": critic_prompt,
+                    "prompt": policy_prompt,
                 }
+                if args.has_critic:
+                    # The critic (prompt_mode=task_description_predict_current_subtask) uses this as
+                    # its task prefix and AR-decodes the subtask itself. Sending the per-episode
+                    # packing task (from packing_tasks.json) overrides the server's pinned
+                    # --task-description; the policy (prompt_mode=subtask) ignores it.
+                    obs_dict["task_description"] = args.task_description
 
                 t0 = time.perf_counter()
 
@@ -721,8 +894,8 @@ def run_episode(
                     :, args.real_action_start : args.real_action_start + args.real_action_dim
                 ]
                 log_line = (
-                    f"Episode {episode_idx} step {t}: subtask={tracker.subtask} "
-                    f"critic_prompt={critic_prompt!r}, inference={elapsed:.3f}s"
+                    f"Episode {episode_idx} step {t}: subtask={subtask_idx} "
+                    f"policy_prompt={policy_prompt!r}, inference={elapsed:.3f}s"
                 )
                 if q_values is not None:
                     # B = 1 in the eval flow; flatten and format.
@@ -755,7 +928,7 @@ def run_episode(
                         imageio.imwrite(out_path, right_top_rgb)
 
                 if video_logger is not None:
-                    video_logger.record_predict(images_rgb, q_values, t)
+                    video_logger.record_predict(images_rgb, q_values, t, predicted_subtask)
 
 
             plan_idx = min(t % args.query_freq, action_plan.shape[0] - 1)
@@ -822,7 +995,7 @@ def load_packing_task(tasks_file: str, task_index: int) -> tuple[str, dict]:
 
     Tasks are stored under the category keys small_medium / small_large / medium_large and are
     flattened in that order, so `task_index` runs 0-23 across all three pairings. Returns the
-    task prompt string and its full metadata entry (global_chunk_index, repo_id, boxes, ...).
+    task prompt string and its full metadata entry (task_number, boxes, subtasks, setup, ...).
     """
     with open(tasks_file) as f:
         data = json.load(f)
@@ -847,7 +1020,7 @@ def main(args: Args) -> None:
     if not tasks_available:
         logger.warning(f"tasks_file {tasks_file!r} not found; using --args.task-description as the policy prompt for all episodes.")
 
-    if args.manual:
+    if args.manual or args.use_policy_subtasks:
         _start_key_listener()
 
     if args.debug:
@@ -884,6 +1057,8 @@ def main(args: Args) -> None:
             f"expect_critic_images={image_helper.expect_critic_images}"
         )
         # Each episode loads its own task from tasks_file, keyed on episode_idx.
+        subtasks_for_episode: list[str] | None = None
+        setup_for_episode: list[str] | None = None
         if tasks_available:
             try:
                 task_text, task_meta = load_packing_task(tasks_file, episode_idx)
@@ -891,21 +1066,32 @@ def main(args: Args) -> None:
                 logger.error(f"No task available for episode {episode_idx}: {e}")
                 break
             args.task_description = task_text
+            subtasks_for_episode = task_meta.get("subtasks")
+            setup_for_episode = task_meta.get("setup")
             logger.info(
                 f"Loaded task #{episode_idx} from {os.path.basename(tasks_file)} "
-                f"(chunk {task_meta.get('global_chunk_index')}, boxes={'+'.join(task_meta.get('boxes', []))})"
+                f"(task_number {task_meta.get('task_number')}, boxes={'+'.join(task_meta.get('boxes', []))}, "
+                f"subtasks={len(subtasks_for_episode) if subtasks_for_episode else 0})"
             )
 
         # Print the task and block on an extra Enter so the scene can be set up before the robot
         # starts moving.
         logger.info(f"=== Episode {episode_idx} task: {args.task_description!r} ===")
+        # Log the setup order before resetting so objects can be gathered while the robot homes.
+        if setup_for_episode:
+            setup_str = ", ".join(f"{i + 1}) {obj}" for i, obj in enumerate(setup_for_episode))
+            logger.info(f"Scene setup order ({len(setup_for_episode)} objects): {setup_str}")
+        # Reset (home the robot) as soon as the task is announced, so the scene can be set up
+        # with the robot already in its reset pose rather than homing right before it moves.
+        logger.info(f"Resetting environment for episode {episode_idx}...")
+        obs, _ = env.reset(seed=episode_idx)
         logger.info("Set up the scene for the task above, then press Enter to start the episode.")
         try:
             input(f"Episode {episode_idx}: press Enter to start...")
         except EOFError:
             break
         try:
-            run_episode(env, client, image_helper, args, episode_idx)
+            run_episode(env, client, image_helper, args, episode_idx, obs, subtasks_for_episode)
         except KeyboardInterrupt:
             logger.info(f"Episode {episode_idx} interrupted by Ctrl+C")
         try:
